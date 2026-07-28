@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/mascot-dark.svg">
+    <img src="assets/readme/mascot-light.svg" width="128" alt="the aye-aye">
+  </picture>
+</p>
+
 # Aye, Aye
 
 **Your agents ask. You tap. Aye, aye.**
