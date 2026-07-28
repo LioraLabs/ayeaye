@@ -37,7 +37,7 @@ fi
 
 # Session marker, for tools that can only see the rendered pane.
 #
-# voice-remote reads panes with `tmux capture-pane`, which gives text and no
+# ayeaye reads panes with `tmux capture-pane`, which gives text and no
 # session context. Printing a short, greppable tag here means anything looking
 # at the pane can find the session and open its transcript JSONL directly --
 # no guessing from cwd and mtime, which is ambiguous when several agents share

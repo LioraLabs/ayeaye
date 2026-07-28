@@ -27,13 +27,17 @@ def _load_env_file():
     """Fill os.environ from the install.sh config file; the real environment
     always wins. Client devices without the file lose nothing: every
     variable this daemon reads has a working default."""
-    path = os.path.join(os.environ.get("XDG_CONFIG_HOME")
-                        or os.path.expanduser("~/.config"),
-                        "voice-remote", "env")
-    try:
-        with open(path) as fh:
-            lines = fh.readlines()
-    except OSError:
+    base = (os.environ.get("XDG_CONFIG_HOME")
+            or os.path.expanduser("~/.config"))
+    lines = None
+    for name in ("ayeaye", "voice-remote"):     # new name first, legacy second
+        try:
+            with open(os.path.join(base, name, "env")) as fh:
+                lines = fh.readlines()
+            break
+        except OSError:
+            continue
+    if lines is None:
         return
     for line in lines:
         line = line.strip()

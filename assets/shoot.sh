@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phone-framed screenshot of a running voice-remote.
+# Phone-framed screenshot of a running ayeaye.
 # usage: shoot.sh [url] [out.png]   (url defaults to localhost + your token)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-TOKEN_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/voice-remote/token"
+TOKEN_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token"
 URL=${1:-"http://127.0.0.1:8911/?token=$(cat "$TOKEN_FILE")"}
 OUT=${2:-"$HERE/phone.png"}
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT

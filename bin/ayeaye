@@ -36,18 +36,22 @@ def _load_env_file():
     """Fill os.environ from the install.sh config file.
 
     One file serves both entry points: systemd user units read it through
-    EnvironmentFile=, and a bare `bin/voice-remote` picks it up here. A
+    EnvironmentFile=, and a bare `bin/ayeaye` picks it up here. A
     variable already present in the environment always wins, so unit-level
     settings and one-off overrides behave as expected. Values are literal:
     no shell expansion, matching how systemd reads the same file.
     """
-    path = os.path.join(os.environ.get("XDG_CONFIG_HOME")
-                        or os.path.expanduser("~/.config"),
-                        "voice-remote", "env")
-    try:
-        with open(path) as fh:
-            lines = fh.readlines()
-    except OSError:
+    base = (os.environ.get("XDG_CONFIG_HOME")
+            or os.path.expanduser("~/.config"))
+    lines = None
+    for name in ("ayeaye", "voice-remote"):     # new name first, legacy second
+        try:
+            with open(os.path.join(base, name, "env")) as fh:
+                lines = fh.readlines()
+            break
+        except OSError:
+            continue
+    if lines is None:
         return
     for line in lines:
         line = line.strip()
@@ -61,6 +65,19 @@ def _load_env_file():
 
 _load_env_file()
 
+
+def _env(name, default=""):
+    """AYEAYE_<name>, falling back to the legacy VOICE_REMOTE_<name>."""
+    return os.environ.get("AYEAYE_" + name,
+                          os.environ.get("VOICE_REMOTE_" + name, default))
+
+
+def _state_dir():
+    """State under ayeaye/, but an existing legacy dir keeps working."""
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    new, old = os.path.join(state, "ayeaye"), os.path.join(state, "voice-remote")
+    return old if (os.path.isdir(old) and not os.path.isdir(new)) else new
+
 # Reuse the pipeline rather than reimplementing it: same whisper server, same
 # rewrite model, same silence gate, same log. Imported after the env file is
 # loaded, because voice-dictate reads its configuration at import time.
@@ -70,21 +87,24 @@ vd = SourceFileLoader("voice_dictate", _vd_path).load_module()
 # The UI ships in share/ next to bin/, so a fresh clone serves straight from
 # the repo. A ~/.local/share install (the old symlink layout) still wins when
 # it exists; VOICE_REMOTE_SHARE overrides both.
-_LOCAL_SHARE = os.path.expanduser("~/.local/share/voice-remote")
+_LOCAL_SHARE = next((p for p in (os.path.expanduser("~/.local/share/ayeaye"),
+                                 os.path.expanduser("~/.local/share/voice-remote"))
+                     if os.path.exists(os.path.join(p, "app.html"))),
+                    os.path.expanduser("~/.local/share/ayeaye"))
 _REPO_SHARE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "share")
-SHARE_DIR = (os.environ.get("VOICE_REMOTE_SHARE")
+SHARE_DIR = (_env("SHARE", None)
              or (_LOCAL_SHARE
                  if os.path.exists(os.path.join(_LOCAL_SHARE, "app.html"))
                  else _REPO_SHARE))
 APP_HTML = os.path.join(SHARE_DIR, "app.html")
 BOARD_HTML = os.path.join(SHARE_DIR, "board.html")
-BIND = os.environ.get("VOICE_REMOTE_BIND", "127.0.0.1")
-PORT = int(os.environ.get("VOICE_REMOTE_PORT", "8911"))
-PANE_LINES = int(os.environ.get("VOICE_REMOTE_LINES", "24"))
+BIND = _env("BIND", "127.0.0.1")
+PORT = int(_env("PORT", "8911"))
+PANE_LINES = int(_env("LINES", "24"))
 # Display name for the "host" field of /api/panes and /api/overview.
 # Overridable so screenshots need not reveal the machine's real hostname.
-HOST_NAME = os.environ.get("VOICE_REMOTE_NAME", "").strip() or os.uname().nodename
+HOST_NAME = _env("NAME").strip() or os.uname().nodename
 # Gap between typing text and pressing Enter. See /api/send.
 SEND_ENTER_DELAY = float(os.environ.get("VOICE_SEND_DELAY", "0.4"))
 
@@ -108,13 +128,12 @@ NOTIFY_STATES = set(filter(None, os.environ.get(
 # /login sets so a phone browser only ever types the token once.
 
 def _load_token():
-    """The shared secret: VOICE_REMOTE_TOKEN, else a state file, generated
+    """The shared secret: AYEAYE_TOKEN (legacy VOICE_REMOTE_TOKEN), else a state file, generated
     0600 on first run so the app is never accidentally open."""
-    tok = os.environ.get("VOICE_REMOTE_TOKEN", "").strip()
+    tok = _env("TOKEN").strip()
     if tok:
         return tok
-    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    path = os.path.join(state, "voice-remote", "token")
+    path = os.path.join(_state_dir(), "token")
     try:
         with open(path) as fh:
             tok = fh.read().strip()
@@ -141,13 +160,13 @@ def _allowed_hosts():
 
     Defaults cover direct access to the bind address; anything fronting this
     (tailscale serve, a reverse proxy) presents its own Host and must be
-    listed in VOICE_REMOTE_ALLOWED_HOSTS.
+    listed in AYEAYE_ALLOWED_HOSTS (or the legacy VOICE_REMOTE_ prefix).
     """
     hosts = set()
     for h in (BIND, "localhost", "127.0.0.1"):
         hosts.add(h.lower())
         hosts.add("%s:%d" % (h.lower(), PORT))
-    for h in os.environ.get("VOICE_REMOTE_ALLOWED_HOSTS", "").split(","):
+    for h in _env("ALLOWED_HOSTS").split(","):
         h = h.strip().lower().rstrip("/")
         if h:
             hosts.add(h)
@@ -1144,7 +1163,7 @@ def main():
         threading.Thread(target=watch_and_notify, daemon=True).start()
         sys.stderr.write("notifying %s on %s\n"
                          % (NTFY_URL, ",".join(sorted(NOTIFY_STATES))))
-    sys.stderr.write("voice-remote on %s:%d · token auth on, browsers "
+    sys.stderr.write("ayeaye on %s:%d · token auth on, browsers "
                      "log in once via /?token=<token>\n" % (BIND, PORT))
     sys.stderr.write("voice: %s\n" % (
         "available" if voice_available()

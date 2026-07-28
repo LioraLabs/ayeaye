@@ -5,11 +5,11 @@ After=network.target
 [Service]
 Type=simple
 # All configuration lives in the env file; edit it, then
-# `systemctl --user restart voice-remote`. Nothing is configured here.
+# `systemctl --user restart ayeaye`. Nothing is configured here.
 # install.sh fills the two @…@ paths and installs this as
-# ~/.config/systemd/user/voice-remote.service.
+# ~/.config/systemd/user/ayeaye.service.
 EnvironmentFile=@ENV_FILE@
-ExecStart=@REPO@/bin/voice-remote
+ExecStart=@REPO@/bin/ayeaye
 Restart=on-failure
 RestartSec=5
 

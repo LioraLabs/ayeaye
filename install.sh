@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command setup for voice-remote. Safe to re-run: it never overwrites an
+# One-command setup for ayeaye. Safe to re-run: it never overwrites an
 # existing config without asking, and regenerating everything else is
 # harmless.
 #
@@ -9,15 +9,15 @@
 #
 # What it does:
 #   1. checks hard deps (tmux, python3); reports optional voice-tier deps
-#   2. writes ${XDG_CONFIG_HOME:-~/.config}/voice-remote/env from env.template
+#   2. writes ${XDG_CONFIG_HOME:-~/.config}/ayeaye/env from env.template
 #   3. ensures the auth token exists (0600) and prints the bookmark URL
-#   4. installs a systemd user unit running bin/voice-remote from this repo
+#   4. installs a systemd user unit running bin/ayeaye from this repo
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/voice-remote"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye"
 ENV_FILE="$CONF_DIR/env"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/voice-remote"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye"
 TOKEN_FILE="$STATE_DIR/token"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
@@ -54,7 +54,7 @@ confirm() {
 }
 
 # ------------------------------------------------------------- dependencies
-head_ "voice-remote setup"
+head_ "ayeaye setup"
 say "repo: $REPO"
 
 missing=0
@@ -144,9 +144,9 @@ for line in open(sys.argv[1]):
 sys.stdout.write(val)
 PY
 }
-bind=$(get_env VOICE_REMOTE_BIND 127.0.0.1)
-port=$(get_env VOICE_REMOTE_PORT 8911)
-hosts=$(get_env VOICE_REMOTE_ALLOWED_HOSTS "")
+bind=$(get_env AYEAYE_BIND 127.0.0.1)
+port=$(get_env AYEAYE_PORT 8911)
+hosts=$(get_env AYEAYE_ALLOWED_HOSTS "")
 ntfy=$(get_env VOICE_NTFY_URL "")
 
 # -------------------------------------------------------------------- token
@@ -163,7 +163,7 @@ token=$(cat "$TOKEN_FILE")
 # ------------------------------------------------------------------ systemd
 head_ "service"
 
-manual_cmd="$REPO/bin/voice-remote"
+manual_cmd="$REPO/bin/ayeaye"
 have_systemd=0
 if [ "$NO_SYSTEMD" = 0 ] && command -v systemctl >/dev/null 2>&1 \
    && systemctl --user show-environment >/dev/null 2>&1; then
@@ -173,16 +173,16 @@ fi
 if [ "$have_systemd" = 1 ]; then
   mkdir -p "$UNIT_DIR"
   sed -e "s|@REPO@|$REPO|g" -e "s|@ENV_FILE@|$ENV_FILE|g" \
-    "$REPO/systemd/user/voice-remote.service.template" \
-    > "$UNIT_DIR/voice-remote.service"
+    "$REPO/systemd/user/ayeaye.service.template" \
+    > "$UNIT_DIR/ayeaye.service"
   systemctl --user daemon-reload
-  say "installed $UNIT_DIR/voice-remote.service"
+  say "installed $UNIT_DIR/ayeaye.service"
   say "(regenerated on every run; put settings in $ENV_FILE, not the unit)"
   if [ "$DEFAULTS" = 0 ] && confirm "enable and start it now?" "y"; then
-    systemctl --user enable --now voice-remote.service
-    say "started. status: systemctl --user status voice-remote"
+    systemctl --user enable --now ayeaye.service
+    say "started. status: systemctl --user status ayeaye"
   else
-    say "start it with: systemctl --user enable --now voice-remote"
+    say "start it with: systemctl --user enable --now ayeaye"
   fi
   if command -v loginctl >/dev/null 2>&1 \
      && [ "$(loginctl show-user "$USER" -P Linger 2>/dev/null)" != "yes" ]; then
@@ -218,7 +218,7 @@ fi
 say "open the bookmark URL once on the phone; it sets a cookie and"
 say "redirects to /. Bookmark it and you never type the token again."
 if [ "$have_systemd" = 1 ]; then
-  say "logs    : journalctl --user -u voice-remote -f"
+  say "logs    : journalctl --user -u ayeaye -f"
 else
   say "logs    : stderr of $manual_cmd"
 fi
