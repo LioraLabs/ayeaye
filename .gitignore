@@ -5,3 +5,4 @@ __pycache__/
 *.jsonl
 token
 .DS_Store
+assets/*.png
