@@ -3,183 +3,297 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#16161d">
+<meta name="theme-color" content="#16161e">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Cdefs%3E%3Cpath id='q' fill='%23cad3f5' d='M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z'/%3E%3C/defs%3E%3Cuse href='%23q'/%3E%3Cuse href='%23q' transform='rotate(90 48 48)'/%3E%3Cuse href='%23q' transform='rotate(180 48 48)'/%3E%3Cuse href='%23q' transform='rotate(270 48 48)'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Crect width='96' height='96' fill='%231a1b26'/%3E%3Cg fill='%23cad3f5' transform='translate(14.4,14.4) scale(0.7)'%3E%3Cpath d='M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z'/%3E%3Cpath transform='rotate(90 48 48)' d='M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z'/%3E%3Cpath transform='rotate(180 48 48)' d='M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z'/%3E%3Cpath transform='rotate(270 48 48)' d='M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z'/%3E%3C/g%3E%3C/svg%3E">
 <title>cliban board</title>
 <style>
   :root{
-    --bg:#16161d; --panel:#1f1f28; --line:#2a2a37; --fg:#dcd7ba;
-    --dim:#727169; --accent:#98bb6c; --rec:#e46876; --blue:#7e9cd8;
-    --amber:#dca561;
+    --bg0:#16161e; --bg1:#1a1b26;
+    --panel:#24273a; --panel2:#1e2030; --well:#181926;
+    --line:#2c2f44; --line2:#3b3f58;
+    --fg:#cad3f5; --muted:#8087a2; --faint:#5b6078;
+    --green:#a6da95; --orange:#f5a97f; --yellow:#eed49f;
+    --red:#ed8796; --blue:#8aadf4;
+    --r-s:8px; --r-m:12px; --r-l:16px;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,
+           "Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,
+           "Liberation Mono",monospace;
+    --ease:cubic-bezier(.3,.7,.4,1);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%}
+  #board,#tbody{scrollbar-width:none}
+  #board::-webkit-scrollbar,#tbody::-webkit-scrollbar{display:none}
   body{
-    margin:0;background:var(--bg);color:var(--fg);
-    font:15px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    margin:0;color:var(--fg);
+    background:linear-gradient(180deg,var(--bg1) 0%,var(--bg0) 45%) fixed var(--bg0);
+    font:15px/1.5 var(--sans);
     display:flex;flex-direction:column;
     padding:env(safe-area-inset-top) env(safe-area-inset-right)
             env(safe-area-inset-bottom) env(safe-area-inset-left);
     overscroll-behavior:none;
+    -webkit-font-smoothing:antialiased;
   }
+  button{font:inherit;color:inherit;cursor:pointer}
+  button:active{transform:scale(.97)}
+  button{transition:background .15s var(--ease),border-color .15s var(--ease),
+                    color .15s var(--ease),transform .1s var(--ease)}
+
+  /* ---- header ------------------------------------------------------------ */
   header{
-    display:flex;align-items:center;gap:.5rem;padding:.7rem .9rem;
-    border-bottom:1px solid var(--line);flex:none;
+    display:flex;align-items:center;gap:10px;padding:10px 14px;flex:none;
+    border-bottom:1px solid var(--line);
   }
-  header b{font-weight:600}
+  .brand{display:flex;align-items:center;gap:8px;min-width:0}
+  .brand svg{flex:none;display:block;opacity:.92}
+  .brand b{font-size:15px;font-weight:650;letter-spacing:.01em;white-space:nowrap}
   .spacer{flex:1}
   .hbtn{
-    padding:.25rem .6rem;border:1px solid var(--line);border-radius:.4rem;
-    background:transparent;color:var(--dim);font:inherit;font-size:12.5px;
-    cursor:pointer;text-decoration:none;
+    display:inline-flex;align-items:center;gap:6px;min-height:34px;
+    padding:6px 12px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel2);color:var(--muted);font-size:12px;font-weight:550;
+    cursor:pointer;text-decoration:none;line-height:1.3;
   }
   .hbtn:active{background:var(--line)}
+  .seg{
+    display:flex;flex:none;background:var(--panel2);border:1px solid var(--line);
+    border-radius:10px;padding:2px;gap:2px;
+  }
+  .seg a{
+    padding:5px 12px;border-radius:8px;font-size:12px;font-weight:550;
+    color:var(--muted);text-decoration:none;line-height:1.3;
+    transition:background .15s var(--ease),color .15s var(--ease);
+  }
+  .seg a.on{background:var(--panel);color:var(--fg);
+            box-shadow:0 1px 3px rgba(0,0,0,.35)}
 
-  #projrow{display:flex;gap:.4rem;overflow-x:auto;padding:.6rem .9rem;flex:none;
-           border-bottom:1px solid var(--line);scrollbar-width:none}
+  /* ---- project chips ----------------------------------------------------- */
+  #projrow{display:flex;gap:8px;overflow-x:auto;padding:10px 14px;flex:none;
+           scrollbar-width:none}
   #projrow::-webkit-scrollbar{display:none}
   .chip{
-    flex:none;padding:.4rem .7rem;border:1px solid var(--line);
-    border-radius:.5rem;background:var(--panel);color:var(--dim);
-    font-size:13px;white-space:nowrap;cursor:pointer;
+    flex:none;padding:7px 12px;border:1px solid var(--line);
+    border-radius:999px;background:var(--panel2);color:var(--muted);
+    font-size:12.5px;font-weight:550;white-space:nowrap;cursor:pointer;
+    transition:border-color .15s var(--ease),color .15s var(--ease),
+               background .15s var(--ease);
   }
-  .chip.sel{border-color:var(--accent);color:var(--fg)}
-  .chip small{color:var(--dim);margin-left:.3rem}
+  .chip.sel{border-color:var(--line2);background:var(--panel);color:var(--fg)}
+  .chip small{color:var(--faint);margin-left:6px;font-size:11px;
+              font-family:var(--mono)}
+  .chip.sel small{color:var(--muted)}
 
-  #board{flex:1;overflow:auto;padding:.6rem .9rem 3rem;
+  /* ---- board ------------------------------------------------------------- */
+  #board{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 14px 48px;
          -webkit-overflow-scrolling:touch}
-  .sect{display:flex;align-items:center;gap:.5rem;margin:1rem 0 .35rem;
-        color:var(--dim);font-size:12px;letter-spacing:.03em}
-  .sect:first-child{margin-top:.2rem}
-  .sect .n{color:var(--dim)}
+  .sect{display:flex;align-items:center;gap:8px;margin:18px 2px 8px;
+        color:var(--muted);font-size:11px;font-weight:650;
+        letter-spacing:.08em;text-transform:uppercase}
+  .sect:first-child{margin-top:8px}
+  .sect .n{color:var(--faint);font-weight:550}
   .sect button{
-    margin-left:auto;padding:.15rem .5rem;border:1px solid var(--line);
-    border-radius:.35rem;background:transparent;color:var(--dim);font:inherit;
-    font-size:11px;cursor:pointer;
+    margin-left:auto;padding:4px 11px;min-height:28px;
+    border:1px solid var(--line);border-radius:999px;background:transparent;
+    color:var(--muted);font-size:11px;font-weight:550;
+    letter-spacing:0;text-transform:none;
   }
-  .sect button.on{border-color:var(--blue);color:var(--blue)}
+  .sect button.on{border-color:rgba(138,173,244,.4);color:var(--blue);
+                  background:rgba(138,173,244,.08)}
+  .note{color:var(--faint);font-size:12.5px;margin:10px 2px}
 
+  /* milestones */
   .ms{
-    border:1px solid var(--line);border-radius:.6rem;background:var(--panel);
-    padding:.55rem .7rem;margin:.45rem 0;cursor:pointer;
+    border:1px solid var(--line);border-radius:var(--r-m);
+    background:var(--panel2);padding:10px 12px;margin:8px 0;cursor:pointer;
+    transition:border-color .15s var(--ease);
   }
-  .ms.sel{border-color:var(--blue)}
-  .ms .top{display:flex;align-items:center;gap:.5rem}
-  .ms .name{font-size:13.5px}
-  .ms .meta{margin-left:auto;color:var(--dim);font-size:11px;white-space:nowrap}
-  .ms .bar{height:3px;background:var(--line);border-radius:2px;margin-top:.5rem}
-  .ms .bar i{display:block;height:100%;background:var(--accent);border-radius:2px}
-  .ms.closed .name{color:var(--dim)}
+  .ms.sel{border-color:rgba(138,173,244,.5)}
+  .ms .top{display:flex;align-items:center;gap:8px;min-width:0}
+  .ms .name{font-size:13.5px;font-weight:600;white-space:nowrap;
+            overflow:hidden;text-overflow:ellipsis}
+  .ms .meta{margin-left:auto;flex:none;color:var(--faint);font-size:11px;
+            white-space:nowrap}
+  .ms .bar{height:4px;background:var(--well);border-radius:2px;margin-top:8px;
+           overflow:hidden}
+  .ms .bar i{display:block;height:100%;background:var(--green);
+             border-radius:2px;transition:width .3s var(--ease)}
+  .ms.closed .name{color:var(--muted);font-weight:500}
 
+  /* kanban columns: horizontal snap scroll on a phone */
+  .cols{
+    display:flex;gap:10px;overflow-x:auto;overflow-y:hidden;
+    scroll-snap-type:x mandatory;margin:4px -14px 0;padding:4px 14px 14px;
+    scrollbar-width:none;-webkit-overflow-scrolling:touch;
+  }
+  .cols::-webkit-scrollbar{display:none}
+  .col{
+    flex:0 0 min(80vw,320px);scroll-snap-align:start;align-self:flex-start;
+    background:var(--panel2);border:1px solid var(--line);
+    border-radius:var(--r-l);padding:10px 10px 8px;
+  }
+  .colhead{display:flex;align-items:center;gap:8px;padding:2px 4px 8px}
+  .colhead .n{margin-left:auto;color:var(--faint);font-size:11px;
+              font-family:var(--mono)}
+
+  .st{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:11px;font-weight:600;letter-spacing:.02em;
+    padding:3px 10px 3px 8px;border-radius:999px;
+    border:1px solid var(--line);color:var(--muted);
+  }
+  .st i{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+  .st.in-progress{color:var(--green);border-color:rgba(166,218,149,.25);
+                  background:rgba(166,218,149,.07)}
+  .st.blocked{color:var(--orange);border-color:rgba(245,169,127,.35);
+              background:rgba(245,169,127,.1)}
+  .st.in-review{color:var(--blue);border-color:rgba(138,173,244,.28);
+                background:rgba(138,173,244,.08)}
+  .st.done{color:var(--green);border-color:rgba(166,218,149,.2)}
+  .st.backlog{color:var(--faint)}
+
+  /* ticket cards: priority as a colored left accent, cliban TUI colors */
   .iss{
-    display:flex;align-items:baseline;gap:.5rem;padding:.5rem .2rem;
-    border-bottom:1px solid var(--line);cursor:pointer;
+    position:relative;border:1px solid var(--line);border-radius:var(--r-m);
+    background:var(--panel);padding:9px 11px 9px 14px;margin:6px 0;
+    cursor:pointer;overflow:hidden;
+    transition:border-color .15s var(--ease);
   }
-  .iss .key{color:var(--dim);font-size:11.5px;flex:none}
-  .iss .title{font-size:13.5px;overflow-wrap:anywhere}
-  .iss.done .title{color:var(--dim)}
-  .iss .tags{margin-left:auto;flex:none;display:flex;gap:.3rem;align-items:baseline}
+  .iss::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+               background:var(--line2)}
+  .iss.p-urgent::before{background:var(--red)}
+  .iss.p-high::before{background:var(--orange)}
+  .iss.p-medium::before{background:var(--yellow)}
+  .iss.p-low::before{background:var(--blue)}
+  .iss:active{border-color:var(--line2)}
+  .iss .key{font:10.5px var(--mono);color:var(--faint)}
+  .iss .title{font-size:13px;line-height:1.4;margin-top:2px;
+              overflow-wrap:anywhere}
+  .iss.done .title{color:var(--muted)}
+  .iss .tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
   .badge{
-    font-size:10.5px;padding:.1rem .4rem;border-radius:.3rem;
-    border:1px solid var(--line);color:var(--dim);white-space:nowrap;
+    font-size:10px;font-weight:600;letter-spacing:.03em;
+    padding:2px 7px;border-radius:999px;
+    border:1px solid var(--line2);color:var(--muted);background:var(--well);
+    white-space:nowrap;
   }
-  .pri{font-size:11px;flex:none}
-  .pri.urgent,.pri.high{color:var(--rec)}
-  .pri.medium{color:var(--amber)}
-  .pri.low{color:var(--blue)}
-  .note{color:var(--dim);font-size:12px;margin:.5rem 0}
+  .pri{
+    font-size:10px;font-weight:650;letter-spacing:.05em;
+    text-transform:uppercase;padding:2px 7px;border-radius:999px;
+    border:1px solid var(--line2);color:var(--muted);white-space:nowrap;
+  }
+  .pri.urgent{color:var(--red);border-color:rgba(237,135,150,.4);
+              background:rgba(237,135,150,.1)}
+  .pri.high{color:var(--orange);border-color:rgba(245,169,127,.4);
+            background:rgba(245,169,127,.1)}
+  .pri.medium{color:var(--yellow);border-color:rgba(238,212,159,.35);
+              background:rgba(238,212,159,.08)}
+  .pri.low{color:var(--blue);border-color:rgba(138,173,244,.35);
+           background:rgba(138,173,244,.08)}
 
-  /* ---- ticket overlay ---- */
+  /* ---- ticket overlay ---------------------------------------------------- */
   #ticket{
-    position:fixed;inset:0;background:var(--bg);display:none;
-    flex-direction:column;
+    position:fixed;inset:0;display:none;flex-direction:column;
+    background:linear-gradient(180deg,var(--bg1) 0%,var(--bg0) 45%) fixed var(--bg0);
     padding:env(safe-area-inset-top) env(safe-area-inset-right)
             env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
   #ticket.show{display:flex}
-  #thead{display:flex;align-items:center;gap:.5rem;padding:.7rem .9rem;
+  #thead{display:flex;align-items:center;gap:10px;padding:10px 14px;
          border-bottom:1px solid var(--line);flex:none}
-  #trun{border-color:var(--accent);color:var(--accent)}
-  #tbody{flex:1;overflow:auto;padding:.8rem .9rem 3rem;
+  #trun{border-color:rgba(166,218,149,.45);color:var(--green);
+        background:rgba(166,218,149,.08);font-weight:600}
+  #tbody{flex:1;overflow:auto;padding:14px 14px 48px;
          -webkit-overflow-scrolling:touch;overflow-wrap:anywhere}
-  #tbody .keyline{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
-  #tbody .key{color:var(--dim);font-size:12px}
-  #tbody h1.title{font-size:16px;margin:.5rem 0 .2rem;line-height:1.35}
-  .st{font-size:11px}
-  .st.backlog{color:var(--dim)}
-  .st.in-progress{color:var(--accent)}
-  .st.blocked{color:var(--amber)}
-  .st.in-review{color:var(--blue)}
-  .st.done{color:var(--accent)}
-  .rel{color:var(--blue);cursor:pointer}
-  .metarow{color:var(--dim);font-size:12px;margin:.15rem 0}
-  #tmsg{font-size:12.5px;color:var(--dim);min-height:1.2em;margin:.4rem 0}
-  #tmsg.err{color:var(--rec)}
-  #tmsg a{color:var(--accent)}
+  #tbody .keyline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  #tbody .key{color:var(--faint);font:12px var(--mono)}
+  #tbody h1.title{font-size:17px;font-weight:650;margin:10px 0 4px;
+                  line-height:1.35}
+  .rel{color:var(--blue);cursor:pointer;font-family:var(--mono);font-size:12px}
+  .metarow{color:var(--muted);font-size:12px;margin:3px 0}
+  #tmsg{font-size:12.5px;color:var(--muted);min-height:1.2em;margin:8px 0}
+  #tmsg.err{color:var(--red)}
+  #tmsg a{color:var(--green)}
 
   /* run picker (mirrors the main page's new-agent flow) */
-  #runbox{display:none;border:1px solid var(--line);border-radius:.6rem;
-          background:var(--panel);padding:.6rem;margin:.6rem 0}
+  #runbox{display:none;border:1px solid var(--line);border-radius:var(--r-l);
+          background:var(--panel2);padding:12px;margin:10px 0}
   #runbox.show{display:block}
-  #agents{display:flex;gap:.4rem;margin-bottom:.6rem}
+  #agents{display:flex;gap:8px;margin-bottom:10px}
   #agents button{
-    flex:1;padding:.45rem;border:1px solid var(--line);border-radius:.45rem;
-    background:transparent;color:var(--dim);font:inherit;font-size:13px;
-    cursor:pointer;
+    flex:1;min-height:44px;padding:9px;border:1px solid var(--line);
+    border-radius:var(--r-m);background:var(--well);color:var(--muted);
+    font-size:13px;font-weight:550;
   }
-  #agents button.sel{border-color:var(--accent);color:var(--accent)}
+  #agents button.sel{border-color:rgba(166,218,149,.45);color:var(--green);
+                     background:rgba(166,218,149,.08)}
   #rq{
-    width:100%;padding:.6rem;border:1px solid var(--line);border-radius:.5rem;
-    background:var(--bg);color:var(--fg);font:inherit;font-size:14px;
-    margin-bottom:.4rem;
+    width:100%;min-height:44px;padding:10px 14px;margin-bottom:6px;
+    border:1px solid var(--line2);border-radius:var(--r-m);
+    background:var(--well);color:var(--fg);font:14px var(--sans);outline:none;
+    transition:border-color .15s var(--ease);
   }
+  #rq:focus{border-color:var(--blue)}
+  #rq::placeholder{color:var(--faint)}
   .proj{
-    padding:.5rem .4rem;border-bottom:1px solid var(--line);cursor:pointer;
-    display:flex;align-items:center;gap:.5rem;
+    min-height:44px;padding:10px 4px;border-bottom:1px solid var(--line);
+    cursor:pointer;display:flex;align-items:center;gap:10px;
   }
   .proj:last-child{border-bottom:0}
-  .proj .p{font-size:13px}
-  .proj .s{margin-left:auto;font-size:11px;color:var(--dim)}
+  .proj .p{font-size:13.5px}
+  .proj .s{margin-left:auto;font:11px var(--mono);color:var(--faint);
+           white-space:nowrap}
 
-  /* ---- rendered markdown ---- */
-  .mdb{font-size:13px;line-height:1.55;margin-top:.8rem}
+  /* ---- rendered markdown ------------------------------------------------- */
+  .mdb{font-size:13.5px;line-height:1.6;margin-top:14px}
   .mdb h1,.mdb h2,.mdb h3,.mdb h4,.mdb h5,.mdb h6{
-    margin:1.1em 0 .35em;line-height:1.3;font-weight:600}
-  .mdb h1{font-size:15px}
+    margin:1.15em 0 .35em;line-height:1.3;font-weight:650}
+  .mdb h1{font-size:15.5px}
   .mdb h2{font-size:14.5px;border-bottom:1px solid var(--line);
-          padding-bottom:.25em;color:var(--accent)}
-  .mdb h3{font-size:13.5px;color:var(--blue)}
-  .mdb h4,.mdb h5,.mdb h6{font-size:13px;color:var(--dim)}
+          padding-bottom:.3em;color:var(--green)}
+  .mdb h3{font-size:14px;color:var(--blue)}
+  .mdb h4,.mdb h5,.mdb h6{font-size:13.5px;color:var(--muted)}
   .mdb p{margin:.55em 0;white-space:pre-wrap}
-  .mdb code{background:var(--bg);border:1px solid var(--line);
-            border-radius:.25em;padding:0 .25em;font:inherit;font-size:.95em}
-  .mdb pre{background:var(--bg);border:1px solid var(--line);
-           border-radius:.5rem;padding:.6rem;overflow-x:auto;
-           font-size:12px;line-height:1.45;margin:.6em 0}
-  .mdb pre code{background:none;border:0;padding:0;font-size:inherit;
+  .mdb code{background:var(--well);border:1px solid var(--line);
+            border-radius:5px;padding:0 .3em;
+            font:.92em var(--mono)}
+  .mdb pre{background:var(--well);border:1px solid var(--line);
+           border-radius:var(--r-m);padding:10px 12px;overflow-x:auto;
+           font:12px/1.5 var(--mono);margin:.7em 0}
+  .mdb pre code{background:none;border:0;padding:0;font:inherit;
                 white-space:pre}
   .mdb ul,.mdb ol{margin:.5em 0;padding-left:1.4em}
-  .mdb li{margin:.2em 0}
-  .mdb blockquote{border-left:3px solid var(--line);margin:.6em 0;
-                  padding:.05em .8em;color:var(--dim)}
-  .mdb hr{border:0;border-top:1px solid var(--line);margin:1em 0}
+  .mdb li{margin:.25em 0}
+  .mdb blockquote{border-left:3px solid var(--line2);margin:.6em 0;
+                  padding:.05em .9em;color:var(--muted)}
+  .mdb hr{border:0;border-top:1px solid var(--line);margin:1.1em 0}
   .mdb a{color:var(--blue)}
-  .mdb table{border-collapse:collapse;font-size:12px;display:block;
-             overflow-x:auto;margin:.6em 0;max-width:100%}
-  .mdb th,.mdb td{border:1px solid var(--line);padding:.25rem .5rem;
+  .mdb table{border-collapse:collapse;font-size:12.5px;display:block;
+             overflow-x:auto;margin:.7em 0;max-width:100%}
+  .mdb th,.mdb td{border:1px solid var(--line);padding:.3rem .6rem;
                   text-align:left;vertical-align:top}
-  .mdb th{color:var(--dim)}
-  .cb{color:var(--dim)}
-  .cb.x{color:var(--accent)}
+  .mdb th{color:var(--muted);background:var(--panel2)}
+  .cb{color:var(--faint)}
+  .cb.x{color:var(--green)}
 </style>
 </head>
 <body>
 
 <header>
-  <b>cliban</b>
+  <span class="brand">
+    <svg width="18" height="18" viewBox="0 0 96 96" aria-hidden="true"><g fill="#cad3f5"><path d="M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z"/><path transform="rotate(90 48 48)" d="M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z"/><path transform="rotate(180 48 48)" d="M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z"/><path transform="rotate(270 48 48)" d="M 20,4 H 38 A 7 7 0 0 1 45,11 V 31 A 4 4 0 0 1 41,35 H 39 A 4 4 0 0 0 35,39 V 41 A 4 4 0 0 1 31,45 H 11 A 7 7 0 0 1 4,38 V 20 A 16 16 0 0 1 20,4 Z"/></g></svg>
+    <b>cliban</b>
+  </span>
   <span class="spacer"></span>
   <button class="hbtn" id="refresh">↻ refresh</button>
-  <a class="hbtn" href="/">remote →</a>
+  <nav class="seg">
+    <a href="/">remote</a>
+    <a class="on" href="/board">board</a>
+  </nav>
 </header>
 
 <div id="projrow"></div>
@@ -404,25 +518,25 @@ function renderMilestones(box){
 }
 
 const STATUSES = [
-  ['blocked','◆ blocked'], ['in-progress','● in progress'],
-  ['in-review','◇ in review'], ['backlog','○ backlog'], ['done','✓ done'],
+  ['blocked','blocked'], ['in-progress','in progress'],
+  ['in-review','in review'], ['backlog','backlog'], ['done','done'],
 ];
 
 function issueRow(x){
   const el = document.createElement('div');
-  el.className = 'iss' + (x.status==='done'?' done':'');
+  el.className = 'iss p-'+escH(x.priority||'none') +
+                 (x.status==='done'?' done':'');
   const tags = [];
   if(x.priority && x.priority!=='none')
-    tags.push('<span class="pri '+x.priority+'">'+
-      (x.priority==='urgent'?'!!':x.priority==='high'?'!':x.priority)+
-      '</span>');
+    tags.push('<span class="pri '+escH(x.priority)+'">'+
+              escH(x.priority)+'</span>');
   (x.labels||[]).slice(0,2).forEach(l=>
     tags.push('<span class="badge">'+escH(l)+'</span>'));
   if(x.milestone && !msSel)
     tags.push('<span class="badge">'+escH(x.milestone)+'</span>');
-  el.innerHTML = '<span class="key">'+escH(x.key)+'</span>'+
-    '<span class="title"></span>'+
-    '<span class="tags">'+tags.join('')+'</span>';
+  el.innerHTML = '<div class="key">'+escH(x.key)+'</div>'+
+    '<div class="title"></div>'+
+    (tags.length ? '<div class="tags">'+tags.join('')+'</div>' : '');
   el.querySelector('.title').textContent = x.title;
   el.onclick = ()=>{ location.hash = x.key; };
   return el;
@@ -445,20 +559,25 @@ function renderIssues(box){
   }
   box.appendChild(head);
 
+  // Kanban: one snap-scrollable column per status with issues in it.
+  const cols = document.createElement('div');
+  cols.className = 'cols';
   STATUSES.forEach(([st, label])=>{
     let group = iss.filter(x=> x.status===st);
     if(!group.length) return;
+    const col = document.createElement('div');
+    col.className = 'col';
     const h = document.createElement('div');
-    h.className = 'sect';
-    h.innerHTML = '<span class="st '+st+'">'+label+'</span>'+
-                  '<span class="n">· '+group.length+'</span>';
-    box.appendChild(h);
+    h.className = 'colhead';
+    h.innerHTML = '<span class="st '+st+'"><i></i>'+label+'</span>'+
+                  '<span class="n">'+group.length+'</span>';
+    col.appendChild(h);
     if(st==='done' && !showAllDone && group.length > 15){
       group = group.slice()
         .sort((a,b)=> (b.completed_at||'').localeCompare(a.completed_at||''))
         .slice(0,15);
     }
-    group.forEach(x=> box.appendChild(issueRow(x)));
+    group.forEach(x=> col.appendChild(issueRow(x)));
     if(st==='done' && !showAllDone &&
        iss.filter(x=>x.status==='done').length > 15){
       const b = document.createElement('div');
@@ -466,9 +585,11 @@ function renderIssues(box){
       b.textContent = '… show all '+iss.filter(x=>x.status==='done').length+
                       ' done';
       b.onclick = ()=>{ showAllDone = true; render(); };
-      box.appendChild(b);
+      col.appendChild(b);
     }
+    cols.appendChild(col);
   });
+  if(cols.children.length) box.appendChild(cols);
   if(!iss.length){
     const n = document.createElement('div');
     n.className = 'note'; n.textContent = 'no issues here';
@@ -504,7 +625,7 @@ async function showTicket(key){
   if(d.git_branch_name) meta.push('branch: '+d.git_branch_name);
   b.innerHTML =
     '<div class="keyline"><span class="key">'+escH(d.key)+'</span>'+
-    '<span class="st '+escH(d.status)+'">'+escH(d.status)+'</span>'+
+    '<span class="st '+escH(d.status)+'"><i></i>'+escH(d.status)+'</span>'+
     (d.priority!=='none'
       ? '<span class="pri '+escH(d.priority)+'">'+escH(d.priority)+'</span>' : '')+
     '</div>'+
@@ -527,7 +648,7 @@ async function showTicket(key){
     '</div>'+
     '<div class="mdb">'+
       (d.description ? linkKeys(md(d.description))
-                     : '<p style="color:var(--dim)">no description</p>')+
+                     : '<p style="color:var(--faint)">no description</p>')+
     '</div>';
   b.querySelector('h1.title').textContent = d.title;
   b.querySelectorAll('.rel').forEach(el=>

@@ -82,6 +82,9 @@ BOARD_HTML = os.path.join(SHARE_DIR, "board.html")
 BIND = os.environ.get("VOICE_REMOTE_BIND", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_REMOTE_PORT", "8911"))
 PANE_LINES = int(os.environ.get("VOICE_REMOTE_LINES", "24"))
+# Display name for the "host" field of /api/panes and /api/overview.
+# Overridable so screenshots need not reveal the machine's real hostname.
+HOST_NAME = os.environ.get("VOICE_REMOTE_NAME", "").strip() or os.uname().nodename
 # Gap between typing text and pressing Enter. See /api/send.
 SEND_ENTER_DELAY = float(os.environ.get("VOICE_SEND_DELAY", "0.4"))
 
@@ -920,15 +923,19 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "unauthorized"}, 401)
 
     def _login(self):
-        """GET /login?token=… (or /?token=…): set the auth cookie and bounce
-        to /. The user bookmarks the URL once; every later visit is clean."""
+        """GET /login?token=…&next=/board (or /?token=…): set the auth cookie
+        and bounce to next (a local path only; anything else becomes /). The
+        user bookmarks the URL once; every later visit is clean."""
         tok = self._query().get("token", [""])[0]
         if not (tok and hmac.compare_digest(tok, TOKEN)):
             return self._unauthorized()
+        nxt = self._query().get("next", ["/"])[0]
+        if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+            nxt = "/"
         cookie = ("voice_token=%s; Path=/; Max-Age=31536000; "
                   "HttpOnly; SameSite=Strict" % TOKEN)
         self._send(303, b"", "text/plain",
-                   {"Location": "/", "Set-Cookie": cookie})
+                   {"Location": nxt, "Set-Cookie": cookie})
 
     # -- routes -----------------------------------------------------------
     def handle_one_request(self):
@@ -992,10 +999,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "unreadable cliban output"}, 500)
 
         if path == "/api/panes":
-            return self._json({"host": os.uname().nodename, "panes": list_panes()})
+            return self._json({"host": HOST_NAME, "panes": list_panes()})
 
         if path == "/api/overview":
-            return self._json({"host": os.uname().nodename,
+            return self._json({"host": HOST_NAME,
                                "panes": overview(),
                                "voice": voice_available()})
 
