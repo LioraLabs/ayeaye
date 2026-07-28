@@ -341,7 +341,8 @@ The template documents every variable with its default; the highlights:
 | `AYEAYE_TOKEN` | generated | auth token; unset = generated 0600 in `$XDG_STATE_HOME/ayeaye/token` |
 | `AYEAYE_ALLOWED_HOSTS` | unset | extra allowed `Host` values (your https front), comma separated |
 | `AYEAYE_SHARE` | auto | dir holding `app.html`; defaults to the repo's `share/` |
-| `AYEAYE_LINES` | `24` | pane lines in the terminal view |
+| `AYEAYE_LINES` | `24` | history lines above the visible screen in the terminal view |
+| `AYEAYE_FIT_TTL` | `12` | seconds an auto-fit lease survives without the pane being polled |
 | `VOICE_TX_ROWS` | `200` | transcript entries sent on connect |
 | `VOICE_IDLE_AFTER` | `300` | seconds before an agent reads as idle |
 | `VOICE_SEND_DELAY` | `0.4` | gap between typing text and Enter |
@@ -450,6 +451,16 @@ and a bad rewrite (`final`). Other outcomes: `silence`, `empty`,
 - **A freshly spawned agent shows no transcript** until it does something.
   That's correct, not a bug: there's nothing written yet.
 - **Codex without a rollout can't be mapped.** Same reason.
+- **The terminal view resizes the real window.** tmux keeps one grid per
+  pane, so the phone and the desktop cannot each get their own width;
+  opening the terminal view fits the window to the phone's screen exactly
+  (`resize-window`, which sets `window-size manual`), reflowing it for
+  every attached client. The fit is held as a lease -- renewed by the pane
+  poll, released on leaving the view, swept server-side within
+  ~`AYEAYE_FIT_TTL` seconds if the browser simply dies, and persisted so a
+  server restart restores any window it was holding. The desktop always
+  gets its window back. Both agent TUIs reflow cleanly, so this is safe to
+  round-trip.
 - The transcript view shows the last `VOICE_TX_ROWS` entries. There is no
   pagination; scrolling back further means reading the JSONL directly.
 - Linux only. Session mapping depends on `/proc`.

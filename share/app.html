@@ -115,9 +115,12 @@
   #live.on{color:var(--green)}
 
   /* ---- terminal view ----------------------------------------------------- */
+  /* pre, not pre-wrap: the pane is a grid tmux already wrapped at its own
+     width, and re-wrapping it a second time is what shreds TUIs. The fit
+     below keeps the grid exactly the width of this box anyway. */
   #out{
-    flex:1;overflow:auto;padding:12px 14px 24px;margin:0;white-space:pre-wrap;
-    word-break:break-word;font:12px/1.55 var(--mono);color:var(--muted);
+    flex:1;overflow:auto;padding:12px 14px 24px;margin:0;white-space:pre;
+    font:12px/1.35 var(--mono);color:var(--fg);
     -webkit-overflow-scrolling:touch;
   }
   #out.hide{display:none}
@@ -310,14 +313,15 @@
   .row button.go{border-color:rgba(138,173,244,.5);color:var(--blue);
                  background:rgba(138,173,244,.08)}
   .keys{display:flex;gap:8px}
-  #kEnter,#kEsc{
-    flex:0 0 64px;min-height:54px;padding:0;border:1px solid var(--line2);
+  #kEnter,#kEsc,#kType{
+    flex:0 0 56px;min-height:54px;padding:0;border:1px solid var(--line2);
     border-radius:var(--r-l);background:var(--panel2);font-size:14px;
     font-weight:550;
   }
   #kEnter{color:var(--blue);border-color:rgba(138,173,244,.4)}
-  #kEsc{color:var(--muted)}
-  #kEnter:active,#kEsc:active{background:var(--line)}
+  #kEsc,#kType{color:var(--muted)}
+  #kType{font-size:17px;line-height:1}
+  #kEnter:active,#kEsc:active,#kType:active{background:var(--line)}
   #talk{
     flex:1;display:flex;align-items:center;justify-content:center;gap:9px;
     min-height:54px;padding:12px;border:0;border-radius:var(--r-l);
@@ -378,7 +382,7 @@
 
 <footer>
   <div id="msg"></div>
-  <textarea id="draft" spellcheck="false"></textarea>
+  <textarea id="draft" spellcheck="false" placeholder="message the pane…"></textarea>
   <div class="row" id="actions">
     <button id="discard">discard</button>
     <button id="send">send</button>
@@ -387,6 +391,7 @@
   <div class="keys">
     <button id="kEnter">⏎</button>
     <button id="kEsc">esc</button>
+    <button id="kType" title="type a message">⌨</button>
     <button id="talk"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><path d="M12 18v3"/></svg><span id="talklbl">talk</span></button>
   </div>
 </footer>
@@ -423,6 +428,85 @@ function linkify(s){
     : e;
 }
 
+// ---- ansi -----------------------------------------------------------------
+// capture-pane -e reproduces the pane's styling as SGR sequences and nothing
+// else, so a full terminal emulator is overkill: track colour and attribute
+// state through one pass and wrap each run in a styled span. The 16-colour
+// palette is the app's own, so the terminal sits in the theme instead of
+// fighting it.
+const PAL = ['#1e2030','#ed8796','#a6da95','#eed49f','#8aadf4','#f5bde6',
+             '#8bd5ca','#cad3f5','#5b6078','#ed8796','#a6da95','#eed49f',
+             '#8aadf4','#f5bde6','#8bd5ca','#ffffff'];
+function color256(n){
+  if(n<16) return PAL[n];
+  if(n<232){ n-=16; const v=[0,95,135,175,215,255];
+    return `rgb(${v[Math.floor(n/36)]},${v[Math.floor(n/6)%6]},${v[n%6]})`; }
+  const g=8+(n-232)*10; return `rgb(${g},${g},${g})`;
+}
+function sgrApply(st, params){
+  const p = params.length ? params.split(/[;:]/).map(x=>x?parseInt(x,10):0) : [0];
+  for(let i=0;i<p.length;i++){
+    const n=p[i];
+    if(n===0) Object.assign(st,{fg:null,bg:null,b:0,d:0,i:0,u:0,r:0});
+    else if(n===1) st.b=1;
+    else if(n===2) st.d=1;
+    else if(n===3) st.i=1;
+    else if(n===4) st.u=1;
+    else if(n===7) st.r=1;
+    else if(n===22) st.b=st.d=0;
+    else if(n===23) st.i=0;
+    else if(n===24) st.u=0;
+    else if(n===27) st.r=0;
+    else if(n>=30&&n<=37) st.fg=PAL[n-30];
+    else if(n===39) st.fg=null;
+    else if(n>=40&&n<=47) st.bg=PAL[n-40];
+    else if(n===49) st.bg=null;
+    else if(n>=90&&n<=97) st.fg=PAL[n-82];
+    else if(n>=100&&n<=107) st.bg=PAL[n-92];
+    else if(n===38||n===48){
+      let c=null;
+      if(p[i+1]===5){ c=color256(p[i+2]||0); i+=2; }
+      else if(p[i+1]===2){ c=`rgb(${p[i+2]||0},${p[i+3]||0},${p[i+4]||0})`; i+=4; }
+      if(n===38) st.fg=c; else st.bg=c;
+    }
+  }
+}
+function sgrCSS(st){
+  // Reverse swaps the roles; the fallbacks are the pane's default colours.
+  const fg = st.r ? (st.bg||'#181926') : st.fg;
+  const bg = st.r ? (st.fg||'#cad3f5') : st.bg;
+  let css='';
+  if(fg) css+='color:'+fg+';';
+  if(bg) css+='background:'+bg+';';
+  if(st.b) css+='font-weight:700;';
+  if(st.d) css+='opacity:.55;';
+  if(st.i) css+='font-style:italic;';
+  if(st.u) css+='text-decoration:underline;';
+  return css;
+}
+function ansiHTML(text){
+  // Defensive: drop anything that is not SGR before parsing, so a stray
+  // OSC title or cursor code degrades to nothing rather than to garbage.
+  text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g,'')
+             .replace(/\x1b\[[0-9;:?]*[A-LN-Za-ln-z]/g,'')
+             .replace(/\x1b[()#][0-9A-Za-z]/g,'');
+  const st={fg:null,bg:null,b:0,d:0,i:0,u:0,r:0};
+  const re=/\x1b\[([0-9;:]*)m/g;
+  let out='', last=0, m;
+  const emit = t=>{
+    if(!t) return;
+    const css=sgrCSS(st), body=linkify(t);
+    out += css ? '<span style="'+css+'">'+body+'</span>' : body;
+  };
+  while((m=re.exec(text))){
+    emit(text.slice(last, m.index));
+    sgrApply(st, m[1]);
+    last = re.lastIndex;
+  }
+  emit(text.slice(last));
+  return out;
+}
+
 async function loadPanes(){
   try{
     const r = await fetch('/api/panes');
@@ -446,6 +530,7 @@ function renderPanes(){
     el.innerHTML = `${esc(p.session)}:${esc(p.window)}<small>${esc(p.cmd)}</small>`;
     el.onclick = ()=>{
       sel=p.id; renderPanes(); loadOut();
+      if(mode==='term') autoFit();       // moves the fit to the new pane
       // Switching pane means a different session: re-resolve, and restart the
       // stream if we are watching one.
       loadSession().then(()=>{ if(mode==='tx') startStream(); });
@@ -742,6 +827,7 @@ function setMode(m){
   $('#tx').classList.toggle('show', m==='tx');
   if(m==='tx') startStream(); else stopStream();
   if(m==='ov') loadOverview();
+  if(m==='term') autoFit(); else releaseFit();
 }
 
 async function loadOut(){
@@ -751,10 +837,115 @@ async function loadOut(){
     const d = await r.json();
     const out = $('#out');
     const stuck = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
-    out.innerHTML = linkify(d.text || '(empty)');
+    out.innerHTML = ansiHTML(d.text || '(empty)');
     if(stuck) out.scrollTop = out.scrollHeight;
+    // Drift check: if the window is not the size we hold it at -- lease lost
+    // to a server restart, or something resized it underneath us -- while
+    // this view is the one watching, re-assert. Damped so two viewers
+    // disagreeing degrades to a slow tug-of-war rather than a fast one.
+    if(fitted===sel && lastFit && d.cols &&
+       (d.cols!==lastFit.cols || d.rows!==lastFit.rows) &&
+       Date.now()-(window._healT||0) > 5000){
+      window._healT = Date.now();
+      autoFit();
+    }
   }catch(e){}
 }
+
+// ---- fit ------------------------------------------------------------------
+// tmux keeps one grid per pane, so the only way to make it readable on a
+// phone is to actually resize the window -- which reflows it for the desktop
+// too. Viewing the terminal IS the request: the fit is acquired on entering
+// the view, renewed implicitly by the pane poll, released on leaving -- and
+// if the browser just dies, the server's sweeper restores the window once
+// the polls stop. The desktop always gets its window back.
+let fitted = null;              // pane we currently hold at phone size
+let lastFit = null;             // size we asked for, to detect drift
+
+const FIT_BASE = 12;            // px; the font the cell is measured at
+function cellSize(){
+  // Measure the real rendered cell, not a guess: 40 glyphs wide, two lines
+  // tall, at the base font. Division averages away subpixel rounding.
+  const out = $('#out');
+  const probe = document.createElement('span');
+  probe.textContent = '0'.repeat(40) + '\n' + '0'.repeat(40);
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;'
+    + 'font:' + FIT_BASE + 'px/1.35 ' + getComputedStyle(out).fontFamily;
+  out.appendChild(probe);
+  const r = probe.getBoundingClientRect();
+  probe.remove();
+  return {w: r.width/40, h: r.height/2};
+}
+function fitBody(){
+  // Exact content box, from the computed style rather than constants.
+  const out = $('#out'), cs = getComputedStyle(out);
+  const availW = out.clientWidth - parseFloat(cs.paddingLeft)
+                                 - parseFloat(cs.paddingRight);
+  const availH = out.clientHeight - parseFloat(cs.paddingTop)
+                                  - parseFloat(cs.paddingBottom);
+  const c = cellSize();
+  const cols = Math.max(20, Math.floor(availW / c.w));
+  // The floor leaves a sliver; scale the font so `cols` columns span the
+  // width edge to edge instead. Glyph advances round per font size, so
+  // scaling is not linear -- render a probe of exactly `cols` characters
+  // and correct until it fits with less than one cell to spare.
+  const probe = document.createElement('span');
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;'
+    + 'line-height:1.35;font-family:' + cs.fontFamily;
+  probe.textContent = '0'.repeat(cols) + '\n' + '0'.repeat(cols);
+  out.appendChild(probe);
+  let font = FIT_BASE * availW / (cols * c.w), lineH = c.h, w = availW;
+  for(let i = 0; i < 4; i++){
+    probe.style.fontSize = font.toFixed(2) + 'px';
+    const r = probe.getBoundingClientRect();
+    w = r.width; lineH = r.height / 2;
+    if(w <= availW && availW - w < c.w) break;
+    font = font * availW / w - (w > availW ? 0.02 : 0);
+  }
+  probe.remove();
+  if(w > availW) font -= 0.1;          // never wider than the screen
+  font = Math.min(FIT_BASE * 1.3, Math.max(FIT_BASE * 0.7, font));
+  const rows = Math.max(8, Math.floor(availH / lineH));
+  return {cols, rows, font: +font.toFixed(2)};
+}
+async function autoFit(){
+  if(!sel || mode!=='term') return;
+  if(fitted && fitted!==sel) releaseFit();
+  const body = fitBody();
+  try{
+    const r = await fetch('/api/resize', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pane: sel, auto: true,
+                            cols: body.cols, rows: body.rows})});
+    const d = await r.json();
+    if(d.error) return msg(d.error, true);
+    fitted = sel; lastFit = body;
+    $('#out').style.fontSize = body.font + 'px';
+    // The TUI needs a beat to repaint at the new size before we capture it.
+    setTimeout(loadOut, 400);
+  }catch(e){}
+}
+function releaseFit(){
+  if(!fitted) return;
+  // sendBeacon so the release survives navigation and tab close. If even
+  // that is lost, the server lease expires and restores on its own.
+  navigator.sendBeacon('/api/resize',
+    new Blob([JSON.stringify({pane: fitted, release: true})],
+             {type:'application/json'}));
+  fitted = null; lastFit = null;
+}
+// Refit on rotation. Width is the tell: the on-screen keyboard only changes
+// the height, and resizing tmux every time the composer opens would churn.
+window.addEventListener('resize', ()=>{
+  clearTimeout(window._fitT);
+  window._fitT = setTimeout(()=>{
+    if(mode==='term' && fitted && lastFit && fitBody().cols !== lastFit.cols)
+      autoFit();
+  }, 300);
+});
+// bfcache: pagehide releases the fit, pageshow on return re-acquires it.
+window.addEventListener('pagehide', releaseFit);
+window.addEventListener('pageshow', ()=>{ if(mode==='term') autoFit(); });
 
 // ---- recording ------------------------------------------------------------
 async function startRec(){
@@ -866,6 +1057,17 @@ async function sendKey(key){
 }
 $('#kEnter').onclick = ()=> sendKey('enter');
 $('#kEsc').onclick   = ()=> sendKey('esc');
+// The same composer dictation lands in, opened empty -- sometimes you just
+// want to type. Tapping again with nothing written closes it.
+$('#kType').onclick  = ()=>{
+  const d = $('#draft');
+  if(d.classList.contains('show') && !d.value.trim()){
+    clearDraft(); msg(''); return;
+  }
+  d.classList.add('show');
+  $('#actions').classList.add('show');
+  d.focus();
+};
 $('#send').onclick      = () => doSend(false);
 $('#sendEnter').onclick = () => doSend(true);
 $('#discard').onclick   = () => { clearDraft(); msg(''); };
@@ -893,7 +1095,9 @@ setInterval(loadPanes, 10000);
 pollTimer = setInterval(()=>{ if(!busy && !rec && mode==='term') loadOut(); }, 2000);
 setInterval(()=>{ if(mode!=='tx') loadSession(); }, 15000);
 document.addEventListener('visibilitychange', ()=>{
-  if(!document.hidden){ loadPanes(); if(mode==='term') loadOut(); }
+  // Coming back after a long lock, the sweeper may have restored the window
+  // already; autoFit re-acquires rather than assuming the lease survived.
+  if(!document.hidden){ loadPanes(); if(mode==='term'){ autoFit(); loadOut(); } }
 });
 </script>
 </body>

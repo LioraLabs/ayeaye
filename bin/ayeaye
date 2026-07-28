@@ -844,12 +844,135 @@ def voice_available():
     return ok
 
 
-def pane_text(pane_id, lines):
-    raw = tmux("capture-pane", "-p", "-t", pane_id, "-S", "-%d" % lines)
-    kept = [ln.rstrip() for ln in raw.splitlines()]
-    while kept and not kept[-1]:
+# SGR only: capture-pane -e emits colour/attribute codes, nothing cursor-y.
+_SGR = re.compile(r"\x1b\[[0-9;:]*m")
+
+
+def pane_view(pane_id, lines):
+    """The pane as displayed: full visible screen plus `lines` of history,
+    with colours, and the grid size so the client can render at the width
+    tmux actually wrapped for.
+
+    -e keeps the escapes; the browser turns them into styled spans. The whole
+    capture is returned rather than the last N rows -- trimming decapitates a
+    full-screen TUI, whose top box is as important as its bottom. Lines with
+    escapes keep their trailing spaces: they may be painted background.
+    """
+    raw = tmux("capture-pane", "-p", "-e", "-t", pane_id, "-S", "-%d" % lines)
+    kept = [ln if "\x1b" in ln else ln.rstrip() for ln in raw.splitlines()]
+    while kept and not _SGR.sub("", kept[-1]).strip():
         kept.pop()
-    return "\n".join(kept[-lines:])
+    size = tmux("display-message", "-p", "-t", pane_id,
+                "#{pane_width}\t#{pane_height}").strip().split("\t")
+    cols, rows = (int(size[0]), int(size[1])) \
+        if len(size) == 2 and all(s.isdigit() for s in size) else (0, 0)
+    return {"text": "\n".join(kept), "cols": cols, "rows": rows}
+
+
+# ---------------------------------------------------------------- fit leases
+# Auto-fit is a lease, not a latch. The client asks for the size it wants and
+# the pane poll renews the lease as a side effect of watching; when the polls
+# stop -- view switched, tab closed, phone locked -- the sweeper restores the
+# window. So the browser dying abruptly can never leave the desktop stuck at
+# phone width. The pre-fit state is captured once per lease: a window that
+# was already sized manually goes back to that size, anything else goes back
+# to automatic sizing.
+FIT_TTL = float(_env("FIT_TTL", "12"))
+_fits = {}                     # pane_id -> {"expires": t, "prev": tuple}
+_fits_lock = threading.Lock()
+# Leases survive a server restart on disk, so a crash mid-fit cannot strand
+# a window at phone size: startup restores anything the file still lists,
+# and a client that is still watching simply re-acquires on its next drift
+# check.
+_FITS_FILE = os.path.join(_state_dir(), "fits.json")
+
+
+def _fits_save():
+    with _fits_lock:
+        snap = {p: list(st["prev"]) for p, st in _fits.items()}
+    try:
+        os.makedirs(os.path.dirname(_FITS_FILE), exist_ok=True)
+        with open(_FITS_FILE, "w") as fh:
+            json.dump(snap, fh)
+    except OSError:
+        pass
+
+
+def fits_recover():
+    """Restore windows a previous process left fitted, then start clean."""
+    try:
+        with open(_FITS_FILE) as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError):
+        return
+    for pane, prev in snap.items():
+        if isinstance(prev, list) and prev:
+            _fit_restore(pane, tuple(prev))
+    try:
+        os.remove(_FITS_FILE)
+    except OSError:
+        pass
+
+
+def _fit_prev(pane_id):
+    opt = tmux("show-options", "-w", "-t", pane_id, "window-size").strip()
+    if opt.split()[-1:] == ["manual"]:
+        size = tmux("display-message", "-p", "-t", pane_id,
+                    "#{window_width}\t#{window_height}").strip().split("\t")
+        if len(size) == 2 and all(s.isdigit() for s in size):
+            return ("manual", size[0], size[1])
+    return ("auto",)
+
+
+def _fit_restore(pane_id, prev):
+    if prev[0] == "manual":
+        tmux("resize-window", "-t", pane_id, "-x", prev[1], "-y", prev[2])
+    else:
+        tmux("set-option", "-w", "-t", pane_id, "-u", "window-size")
+
+
+def fit_touch(pane_id):
+    """Renew the lease as a side effect of the pane being watched."""
+    with _fits_lock:
+        if pane_id in _fits:
+            _fits[pane_id]["expires"] = time.time() + FIT_TTL
+
+
+def fit_acquire(pane_id):
+    """Record the pre-fit state, once, before the first auto resize."""
+    with _fits_lock:
+        if pane_id in _fits:
+            _fits[pane_id]["expires"] = time.time() + FIT_TTL
+            return
+    prev = _fit_prev(pane_id)              # tmux call outside the lock
+    with _fits_lock:
+        _fits.setdefault(pane_id, {"expires": time.time() + FIT_TTL,
+                                   "prev": prev})
+    _fits_save()
+
+
+def fit_release(pane_id):
+    with _fits_lock:
+        st = _fits.pop(pane_id, None)
+    if st:
+        _fit_restore(pane_id, st["prev"])
+        _fits_save()
+    return bool(st)
+
+
+def fit_sweeper():
+    while True:
+        time.sleep(2)
+        now = time.time()
+        with _fits_lock:
+            due = [(p, st["prev"]) for p, st in _fits.items()
+                   if st["expires"] < now]
+            for p, _ in due:
+                del _fits[p]
+        for p, prev in due:
+            _fit_restore(p, prev)
+        if due:
+            _fits_save()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1032,7 +1155,8 @@ class Handler(BaseHTTPRequestHandler):
             pane = self._query().get("id", [""])[0]
             if not pane:
                 return self._json({"error": "no pane"}, 400)
-            return self._json({"text": pane_text(pane, PANE_LINES)})
+            fit_touch(pane)
+            return self._json(pane_view(pane, PANE_LINES))
 
         if path == "/api/session":
             pane = self._query().get("pane", [""])[0]
@@ -1134,6 +1258,44 @@ class Handler(BaseHTTPRequestHandler):
                               str(req.get("prompt") or "")[:4000])
             return self._json(res, 400 if res.get("error") else 200)
 
+        if path == "/api/resize":
+            # tmux keeps one grid per pane, so the phone and the desktop
+            # cannot each get their own width -- resizing here reflows the
+            # window for every attached client. The agent TUIs reflow
+            # cleanly, so with `auto` the page holds the fit as a lease (see
+            # fit_sweeper) and the desktop gets its window back the moment
+            # the phone stops watching. resize-window flips the window to
+            # `window-size manual`; restore unsets the option and tmux
+            # immediately recomputes from the attached clients.
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            pane = req.get("pane", "")
+            if not pane:
+                return self._json({"error": "no pane"}, 400)
+            if req.get("release"):
+                # End an auto-fit lease: back to the recorded pre-fit state.
+                return self._json({"ok": True, "restored": fit_release(pane)})
+            if req.get("restore"):
+                # Manual escape hatch: drop any lease and hand sizing back to
+                # tmux outright, whatever the window was before.
+                with _fits_lock:
+                    _fits.pop(pane, None)
+                _fits_save()
+                tmux("set-option", "-w", "-t", pane, "-u", "window-size")
+                return self._json({"ok": True, "restored": True})
+            try:
+                cols = max(20, min(400, int(req.get("cols", 0))))
+                rows = max(5, min(200, int(req.get("rows", 0))))
+            except (TypeError, ValueError):
+                return self._json({"error": "bad size"}, 400)
+            if req.get("auto"):
+                # Capture the pre-fit state before the resize changes it.
+                fit_acquire(pane)
+            tmux("resize-window", "-t", pane, "-x", str(cols), "-y", str(rows))
+            return self._json({"ok": True, "cols": cols, "rows": rows})
+
         if path == "/api/send":
             try:
                 req = json.loads(self._body() or b"{}")
@@ -1159,6 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not os.path.exists(APP_HTML):
         sys.exit("missing UI at %s" % APP_HTML)
+    fits_recover()
+    threading.Thread(target=fit_sweeper, daemon=True).start()
     if NTFY_URL:
         threading.Thread(target=watch_and_notify, daemon=True).start()
         sys.stderr.write("notifying %s on %s\n"
