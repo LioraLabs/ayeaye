@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Mic recorder daemon. Runs on the CLIENT device you SSH *from*.
+
+The tmux host calls this over the tailnet when you hit M-v:
+    POST /start  -> begin recording
+    POST /stop   -> end recording, return the audio bytes
+    GET  /health -> platform + recorder probe
+
+Auth is a shared token in ~/.config/voice-dictate/token. Without it any
+peer on the tailnet could turn your microphone on remotely, so the daemon
+refuses to start if the token is missing.
+"""
+import hmac
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _load_env_file():
+    """Fill os.environ from the install.sh config file; the real environment
+    always wins. Client devices without the file lose nothing: every
+    variable this daemon reads has a working default."""
+    path = os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                        or os.path.expanduser("~/.config"),
+                        "voice-remote", "env")
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition("=")
+        key = key.strip()
+        if sep and key and key not in os.environ:
+            os.environ[key] = val.strip().strip('"').strip("'")
+
+
+_load_env_file()
+
+TOKEN_PATH = os.path.expanduser("~/.config/voice-dictate/token")
+MAX_SECONDS = 120  # hard cap so a dropped connection can't leave the mic hot
+
+
+def detect_recorder():
+    """Pick a recording backend. Returns (name, extension)."""
+    if shutil.which("termux-microphone-record"):
+        return "termux", "m4a"
+    if shutil.which("ffmpeg"):
+        if sys.platform == "darwin":
+            return "ffmpeg-avfoundation", "wav"
+        return "ffmpeg-pulse", "wav"
+    if shutil.which("rec"):
+        return "sox", "wav"
+    return None, None
+
+
+class Recorder:
+    """One recording at a time, guarded by a lock."""
+
+    def __init__(self):
+        self.backend, self.ext = detect_recorder()
+        self.lock = threading.Lock()
+        self.proc = None
+        self.path = None
+        self.timer = None
+
+    def start(self):
+        with self.lock:
+            if self.path is not None:
+                raise RuntimeError("already recording")
+            if self.backend is None:
+                raise RuntimeError("no recording backend found")
+            fd, self.path = tempfile.mkstemp(suffix="." + self.ext, prefix="voice-")
+            os.close(fd)
+            os.unlink(self.path)  # recorders want to create it themselves
+
+            if self.backend == "termux":
+                # Ask for 16 kHz: the default encoder records at 8 kHz
+                # telephone quality, and no amount of resampling later puts
+                # back detail the microphone never captured. -r isn't in every
+                # termux-api version though, so fall back to bare -f/-l rather
+                # than failing outright.
+                base = ["termux-microphone-record", "-f", self.path,
+                        "-l", str(MAX_SECONDS)]
+                try:
+                    subprocess.run(base + ["-r", "16000", "-c", "1"],
+                                   check=True, capture_output=True, timeout=10)
+                except subprocess.CalledProcessError:
+                    subprocess.run(base, check=True, capture_output=True,
+                                   timeout=10)
+            else:
+                source = os.environ.get("VOICE_SOURCE")
+                if self.backend == "ffmpeg-avfoundation":
+                    cmd = ["ffmpeg", "-f", "avfoundation", "-i", source or ":default"]
+                elif self.backend == "ffmpeg-pulse":
+                    cmd = ["ffmpeg", "-f", "pulse", "-i", source or "default"]
+                else:
+                    cmd = ["rec"]
+                if self.backend.startswith("ffmpeg"):
+                    cmd += ["-ac", "1", "-ar", "16000", "-t", str(MAX_SECONDS),
+                            "-y", self.path]
+                else:
+                    cmd += ["-c", "1", "-r", "16000", self.path,
+                            "trim", "0", str(MAX_SECONDS)]
+                self.proc = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+
+            # Belt-and-braces: stop ourselves if /stop never arrives.
+            self.timer = threading.Timer(MAX_SECONDS + 5, self._force_stop)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def _force_stop(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    def stop(self):
+        with self.lock:
+            if self.path is None:
+                raise RuntimeError("not recording")
+            path, self.path = self.path, None
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+
+            if self.backend == "termux":
+                subprocess.run(["termux-microphone-record", "-q"],
+                               capture_output=True, timeout=10)
+            elif self.proc is not None:
+                # SIGINT lets ffmpeg/sox finalise the container properly.
+                self.proc.send_signal(signal.SIGINT)
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                self.proc = None
+
+            # Recorders flush asynchronously; wait for the file to settle.
+            deadline = time.time() + 5
+            last = -1
+            while time.time() < deadline:
+                if os.path.exists(path):
+                    size = os.path.getsize(path)
+                    if size > 0 and size == last:
+                        break
+                    last = size
+                time.sleep(0.2)
+
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                raise RuntimeError("recording produced no audio")
+            try:
+                with open(path, "rb") as fh:
+                    return fh.read()
+            finally:
+                os.unlink(path)
+
+
+REC = Recorder()
+
+
+def read_token():
+    try:
+        with open(TOKEN_PATH) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+TOKEN = read_token()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _authed(self):
+        tok = self.headers.get("X-Voice-Token", "")
+        if TOKEN and hmac.compare_digest(tok, TOKEN):
+            return True
+        self._send(401, b'{"error":"bad token"}', "application/json")
+        return False
+
+    def _send(self, code, body, ctype, extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    def do_GET(self):
+        if self.path != "/health":
+            return self._json(404, {"error": "not found"})
+        if not self._authed():
+            return
+        self._json(200, {"ok": REC.backend is not None,
+                         "platform": sys.platform,
+                         "recorder": REC.backend or "none"})
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        try:
+            if self.path == "/start":
+                REC.start()
+                self._json(200, {"ok": True})
+            elif self.path == "/stop":
+                audio = REC.stop()
+                self._send(200, audio, "application/octet-stream",
+                           {"X-Audio-Ext": REC.ext})
+            else:
+                self._json(404, {"error": "not found"})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+
+def selftest():
+    """Record 2s and report what came back. Run this on a new device first --
+    it isolates 'the microphone works' from 'the network works'."""
+    print("backend : %s" % (REC.backend or "NONE FOUND"))
+    print("platform: %s" % sys.platform)
+    if REC.backend is None:
+        print("\nno recorder. install one:")
+        print("  Android  pkg install termux-api  (+ the Termux:API app)")
+        print("  macOS    brew install ffmpeg")
+        print("  Linux    pacman -S ffmpeg")
+        return 1
+    print("token   : %s" % ("found" if TOKEN else "MISSING at " + TOKEN_PATH))
+    print("\nrecording 2 seconds -- say something...")
+    try:
+        REC.start()
+        time.sleep(2)
+        audio = REC.stop()
+    except Exception as exc:
+        print("FAILED: %s" % exc)
+        if REC.backend == "termux":
+            print("\non Android this usually means either:")
+            print("  - the Termux:API app isn't installed (the app, not just"
+                  " the pkg)")
+            print("  - microphone permission was never granted")
+            print("  - Android suspended us in the background;"
+                  " run `termux-wake-lock` first")
+        return 1
+    print("OK: captured %d bytes of .%s" % (len(audio), REC.ext))
+    if len(audio) < 2000:
+        print("WARNING: that is suspiciously small -- likely no real audio")
+        return 1
+    return 0
+
+
+def main():
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    if TOKEN is None:
+        sys.exit("refusing to start: no token at %s\n"
+                 "copy it from the tmux host first (voice-dictate-setup "
+                 "prints the steps)." % TOKEN_PATH)
+    # Loopback by default. Set VOICE_BIND to this device's tailnet address
+    # when the tmux host has to reach it -- never 0.0.0.0.
+    bind = os.environ.get("VOICE_BIND", "127.0.0.1")
+    port = int(os.environ.get("VOICE_PORT", "8787"))
+    if REC.backend is None:
+        sys.stderr.write("warning: no recorder found "
+                         "(install ffmpeg, sox, or termux-api)\n")
+    sys.stderr.write("voice-agent on %s:%d backend=%s\n"
+                     % (bind, port, REC.backend))
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

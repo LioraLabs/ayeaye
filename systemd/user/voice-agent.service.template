@@ -1,0 +1,17 @@
+[Unit]
+Description=voice-dictate mic recorder (local, for M-v when attached locally)
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Loopback only by default (VOICE_BIND in the env file). On the tmux host
+# the agent exists purely so a locally attached client has a mic to talk
+# to; remote devices run their own agent and are reached over the tailnet,
+# never this one. install.sh fills the two @…@ paths.
+EnvironmentFile=@ENV_FILE@
+ExecStart=@REPO@/bin/voice-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,34 @@
+# Reverse-proxy snippet for a Caddy front door on another host.
+#
+# The mic is the reason TLS is not optional: browsers only expose
+# getUserMedia on a secure origin, so http://<tailnet-ip>:8911 will render
+# the page and then fail the moment you press talk.
+#
+# The remote_ip matcher is the actual access control. Do not rely on DNS
+# scoping: if your resolver rewrites *.example.com to the proxy, any device
+# using that resolver reaches it, tailnet or not. This endpoint types into
+# live agent sessions and can approve their commands, so it is deliberately
+# stricter than the other services behind the same front door.
+
+agents.example.com {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	# `route` because directive order matters here: the 403 must be
+	# evaluated before the proxy, and Caddy's default sorting does not
+	# guarantee that.
+	route {
+		@offTailnet not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
+		respond @offTailnet "tailnet-only" 403
+		reverse_proxy 100.64.0.5:8911      # the host running voice-remote
+	}
+}
+
+# Simpler alternative, if you have no front door: Tailscale will serve it
+# with a real certificate on the machine itself.
+#
+#   tailscale serve --bg http://127.0.0.1:8911
+#
+# That publishes https://<machine>.<tailnet>.ts.net/ to your tailnet only,
+# and needs no DNS or certificate setup at all.

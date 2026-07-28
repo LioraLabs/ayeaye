@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#16161d">
+<meta name="mobile-web-app-capable" content="yes">
+<title>voice remote</title>
+<style>
+  :root{
+    --bg:#16161d; --panel:#1f1f28; --line:#2a2a37; --fg:#dcd7ba;
+    --dim:#727169; --accent:#98bb6c; --rec:#e46876; --blue:#7e9cd8;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex;flex-direction:column;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right)
+            env(safe-area-inset-bottom) env(safe-area-inset-left);
+    overscroll-behavior:none;
+  }
+  header{
+    display:flex;align-items:center;gap:.5rem;padding:.7rem .9rem;
+    border-bottom:1px solid var(--line);flex:none;
+  }
+  header b{font-weight:600}
+  #boardlink{
+    color:var(--dim);text-decoration:none;font-size:12px;
+    border:1px solid var(--line);border-radius:.4rem;padding:.15rem .45rem;
+  }
+  .dot{width:.5rem;height:.5rem;border-radius:50%;background:var(--dim)}
+  .dot.live{background:var(--accent)}
+  .spacer{flex:1}
+
+  #panes{display:flex;gap:.4rem;overflow-x:auto;padding:.6rem .9rem;flex:none;
+         border-bottom:1px solid var(--line);scrollbar-width:none}
+  #panes::-webkit-scrollbar{display:none}
+  .pane{
+    flex:none;padding:.45rem .7rem;border:1px solid var(--line);
+    border-radius:.5rem;background:var(--panel);color:var(--dim);
+    font-size:13px;white-space:nowrap;cursor:pointer;
+  }
+  .pane.sel{border-color:var(--accent);color:var(--fg)}
+  .pane small{color:var(--dim);margin-left:.35rem}
+
+  #modes{display:flex;gap:.4rem;padding:.5rem .9rem 0;flex:none}
+  .mode{
+    padding:.3rem .7rem;border:1px solid var(--line);border-radius:.4rem;
+    background:transparent;color:var(--dim);font:inherit;font-size:12px;
+    cursor:pointer;
+  }
+  .mode.sel{border-color:var(--blue);color:var(--blue)}
+  .mode:disabled{opacity:.35;cursor:default}
+
+  #out{
+    flex:1;overflow:auto;padding:.8rem .9rem;margin:0;white-space:pre-wrap;
+    word-break:break-word;font-size:12.5px;color:var(--dim);
+    -webkit-overflow-scrolling:touch;
+  }
+  #tx{
+    flex:1;overflow:auto;padding:.6rem .9rem 2rem;display:none;
+    -webkit-overflow-scrolling:touch;overflow-wrap:anywhere;
+  }
+  #tx.show{display:block}
+  #out.hide{display:none}
+  .m{border-left:3px solid var(--line);padding:.35rem .7rem;margin:.6rem 0}
+  .m.user{border-color:var(--blue)}
+  .m.assistant{border-color:var(--accent)}
+  .m.tool{border-color:#dca561;color:#c8c093;font-size:12.5px}
+  .m.result{border-color:var(--line);color:#8a8780;font-size:12px}
+  .m .h{color:var(--dim);font-size:11px;letter-spacing:.03em}
+  .m pre{white-space:pre-wrap;word-break:break-word;margin:.25rem 0;font:inherit}
+  .m summary{color:var(--dim);font-size:12px;cursor:pointer}
+  .m details[open] summary{color:var(--fg)}
+  #txnote{color:var(--dim);font-size:12px;margin:.2rem 0 .6rem}
+
+  #ov{flex:1;overflow:auto;padding:.6rem .9rem 2rem;display:none}
+  #ov.show{display:block}
+  .card{
+    border:1px solid var(--line);border-radius:.6rem;background:var(--panel);
+    padding:.65rem .8rem;margin:.55rem 0;cursor:pointer;
+  }
+  .card.cur{border-color:var(--accent)}
+  .card .top{display:flex;align-items:center;gap:.5rem}
+  .card .who{font-weight:600}
+  .card .cmd{color:var(--dim);font-size:12px}
+  .card .when{margin-left:auto;color:var(--dim);font-size:11px}
+  .card .snip{
+    color:var(--dim);font-size:12px;margin-top:.35rem;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+    overflow:hidden;
+  }
+  .badge{
+    font-size:10.5px;padding:.1rem .4rem;border-radius:.3rem;
+    border:1px solid var(--line);color:var(--dim);
+  }
+  .st{font-size:11px}
+  .st.working{color:var(--accent)}
+  .st.waiting{color:var(--blue)}
+  .st.idle{color:var(--dim)}
+  .st.blocked{color:#dca561}
+  .card.blocked{border-color:#dca561}
+  .ask{
+    margin-top:.5rem;padding:.5rem .6rem;border-radius:.4rem;
+    background:#16161d;border:1px solid var(--line);
+  }
+  .ask .q{font-size:12px;color:var(--fg);white-space:pre-wrap;
+    display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;
+    overflow:hidden;margin-bottom:.45rem}
+  .ask button{
+    display:block;width:100%;text-align:left;margin:.25rem 0;padding:.5rem .6rem;
+    border:1px solid var(--line);border-radius:.4rem;background:var(--panel);
+    color:var(--fg);font:inherit;font-size:12.5px;cursor:pointer;
+  }
+  .ask button:first-of-type{border-color:var(--accent);color:var(--accent)}
+  .ask button .k{color:var(--dim);margin-right:.4rem}
+  .nav{display:flex;gap:.35rem;margin-top:.5rem}
+  .nav button{
+    flex:1;width:auto;margin:0;text-align:center;padding:.55rem .3rem;
+    font-size:13px;
+  }
+  .nav button.go{border-color:var(--accent);color:var(--accent);flex:2}
+  .nav button.cancel{border-color:var(--line);color:var(--dim)}
+  .hint{color:var(--dim);font-size:11px;margin-top:.4rem}
+
+  #newbtn{
+    width:100%;padding:.7rem;margin:.2rem 0 .4rem;border:1px dashed var(--line);
+    border-radius:.6rem;background:transparent;color:var(--dim);font:inherit;
+    font-size:13px;cursor:pointer;
+  }
+  #newbtn:hover{border-color:var(--accent);color:var(--accent)}
+  #picker{display:none}
+  #picker.show{display:block}
+  #pq{
+    width:100%;padding:.6rem;border:1px solid var(--line);border-radius:.5rem;
+    background:var(--panel);color:var(--fg);font:inherit;font-size:14px;
+    margin-bottom:.5rem;
+  }
+  #agents{display:flex;gap:.4rem;margin-bottom:.6rem}
+  #agents button{
+    flex:1;padding:.45rem;border:1px solid var(--line);border-radius:.45rem;
+    background:transparent;color:var(--dim);font:inherit;font-size:13px;
+    cursor:pointer;
+  }
+  #agents button.sel{border-color:var(--accent);color:var(--accent)}
+  .proj{
+    padding:.5rem .6rem;border-bottom:1px solid var(--line);cursor:pointer;
+    display:flex;align-items:center;gap:.5rem;
+  }
+  .proj .p{font-size:13px}
+  .proj .s{margin-left:auto;font-size:11px;color:var(--dim)}
+  #live{font-size:11px;color:var(--dim)}
+  #live.on{color:var(--accent)}
+
+  footer{flex:none;border-top:1px solid var(--line);padding:.8rem .9rem;
+         display:flex;flex-direction:column;gap:.6rem}
+  #draft{
+    width:100%;min-height:4.5rem;resize:vertical;background:var(--panel);
+    color:var(--fg);border:1px solid var(--line);border-radius:.5rem;
+    padding:.6rem;font:inherit;font-size:14px;display:none;
+  }
+  #draft.show{display:block}
+  .keys{display:flex;gap:.5rem}
+  #kEnter,#kEsc{
+    flex:0 0 4.5rem;padding:1.15rem 0;border:1px solid var(--line);
+    border-radius:.75rem;background:var(--panel);color:var(--fg);
+    font:inherit;font-size:15px;cursor:pointer;
+  }
+  #kEnter{border-color:var(--blue);color:var(--blue)}
+  #kEsc{color:var(--dim)}
+  #kEnter:active,#kEsc:active{background:var(--line)}
+  #talk{
+    flex:1;padding:1.15rem;border:0;border-radius:.75rem;
+    background:var(--accent);color:#16161d;font:inherit;font-size:17px;
+    font-weight:700;letter-spacing:.02em;cursor:pointer;
+  }
+  #talk.rec{background:var(--rec);color:#fff}
+  #talk.busy{background:var(--line);color:var(--dim)}
+  #talk:disabled{background:var(--line);color:var(--dim);cursor:default}
+  .row{display:flex;gap:.6rem}
+  .row button{
+    flex:1;padding:.8rem;border:1px solid var(--line);border-radius:.6rem;
+    background:var(--panel);color:var(--fg);font:inherit;font-size:14px;
+    cursor:pointer;
+  }
+  .row button.go{border-color:var(--blue);color:var(--blue)}
+  .row{display:none}
+  .row.show{display:flex}
+  #msg{font-size:12.5px;color:var(--dim);min-height:1.2em}
+  #msg.err{color:var(--rec)}
+  a.tick{color:var(--blue);text-decoration:none;
+         border-bottom:1px dotted var(--blue)}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <b id="host">…</b>
+  <a href="/board" id="boardlink">▤ board</a>
+  <span class="spacer"></span>
+  <span id="target" style="color:var(--dim);font-size:12.5px"></span>
+  <span id="live"></span>
+</header>
+
+<div id="panes"></div>
+<div id="modes">
+  <button class="mode sel" id="mOv">sessions</button>
+  <button class="mode" id="mTerm">terminal</button>
+  <button class="mode" id="mTx">transcript</button>
+</div>
+<div id="ov">
+  <button id="newbtn">+ new agent</button>
+  <div id="picker">
+    <input id="pq" placeholder="project directory…" autocomplete="off" spellcheck="false">
+    <div id="agents">
+      <button data-a="claude" class="sel">claude</button>
+      <button data-a="codex">codex</button>
+    </div>
+    <div id="plist"></div>
+  </div>
+  <div id="ovlist"></div>
+</div>
+<pre id="out">select a pane…</pre>
+<div id="tx"><div id="txnote"></div><div id="txrows"></div></div>
+
+<footer>
+  <div id="msg"></div>
+  <textarea id="draft" spellcheck="false"></textarea>
+  <div class="row" id="actions">
+    <button id="discard">discard</button>
+    <button id="send">send</button>
+    <button id="sendEnter" class="go">send ⏎</button>
+  </div>
+  <div class="keys">
+    <button id="kEnter">⏎</button>
+    <button id="kEsc">esc</button>
+    <button id="talk">🎤 talk</button>
+  </div>
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+let panes = [], sel = null, rec = null, chunks = [], busy = false, pollTimer = null;
+
+function msg(t, err){ const m=$('#msg'); m.textContent=t||''; m.className=err?'err':''; }
+
+// ---- ticket links ---------------------------------------------------------
+// Agents talk about tickets constantly; a ticket key anywhere in their
+// output becomes a link into /board. Only real project keys are matched --
+// a generic [A-Z]+-\d+ would turn SHA-256 and UTF-8 into tickets.
+let KEYS_RE = null;
+async function loadKeys(){
+  try{
+    const d = await (await fetch('/api/cliban/projects')).json();
+    if(d.keys && d.keys.length)
+      KEYS_RE = new RegExp('\\b(?:'+d.keys.join('|')+')-\\d+\\b', 'g');
+  }catch(e){ /* no cliban, no links */ }
+}
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function linkify(s){
+  const e = esc(s);
+  return KEYS_RE
+    ? e.replace(KEYS_RE, m=>'<a class="tick" href="/board#'+m+'">'+m+'</a>')
+    : e;
+}
+
+async function loadPanes(){
+  try{
+    const r = await fetch('/api/panes');
+    if(r.status === 401){
+      $('#dot').className = 'dot';
+      return msg('not authorised — open /?token=<your token> once', true);
+    }
+    const d = await r.json();
+    $('#host').textContent = d.host; $('#dot').className = 'dot live';
+    panes = d.panes;
+    if(!sel && panes.length) sel = (panes.find(p=>p.active)||panes[0]).id;
+    renderPanes();
+  }catch(e){ $('#dot').className='dot'; msg('cannot reach the server', true); }
+}
+
+function renderPanes(){
+  const box = $('#panes'); box.innerHTML='';
+  panes.forEach(p=>{
+    const el = document.createElement('div');
+    el.className = 'pane' + (p.id===sel?' sel':'');
+    el.innerHTML = `${esc(p.session)}:${esc(p.window)}<small>${esc(p.cmd)}</small>`;
+    el.onclick = ()=>{
+      sel=p.id; renderPanes(); loadOut();
+      // Switching pane means a different session: re-resolve, and restart the
+      // stream if we are watching one.
+      loadSession().then(()=>{ if(mode==='tx') startStream(); });
+    };
+    box.appendChild(el);
+  });
+  const p = panes.find(x=>x.id===sel);
+  $('#target').textContent = p ? `${p.session}:${p.window} ${p.cmd}` : '';
+}
+
+// ---- transcript view ------------------------------------------------------
+// The pane is the source of truth for *what is happening now*; the transcript
+// is the readable record. Terminal stays the default because the JSONL lags a
+// live turn by a few seconds and shows no spinner.
+let session = null, es = null;
+
+async function loadSession(){
+  session = null;
+  $('#mTx').disabled = true;
+  if(!sel) return;
+  try{
+    const r = await fetch('/api/session?pane='+encodeURIComponent(sel));
+    const d = await r.json();
+    if(d && d.kind){
+      session = d;
+      $('#mTx').disabled = false;
+      $('#mTx').textContent = 'transcript · ' + d.kind;
+    }else{
+      $('#mTx').textContent = 'transcript';
+      if(mode==='tx') setMode('term');
+    }
+  }catch(e){ /* leave the button disabled */ }
+}
+
+function card(row){
+  const el = document.createElement('div');
+  el.className = 'm ' + row.cls;
+  const head = document.createElement('div');
+  head.className = 'h';
+  head.textContent = row.label + ' · ' + row.ts;
+  el.appendChild(head);
+  const pre = document.createElement('pre');
+  pre.innerHTML = linkify(row.text);
+  if(row.cls==='tool' || row.cls==='result'){
+    // Tool traffic outnumbers conversation several to one; collapsed keeps
+    // the actual exchange readable on a phone.
+    const d = document.createElement('details');
+    const s = document.createElement('summary');
+    s.textContent = (row.text.split('\n')[0] || '(empty)').slice(0,90);
+    d.appendChild(s); d.appendChild(pre); el.appendChild(d);
+  }else{
+    el.appendChild(pre);
+  }
+  return el;
+}
+
+function pinned(){
+  const t = $('#tx');
+  return t.scrollTop + t.clientHeight >= t.scrollHeight - 60;
+}
+
+function stopStream(){
+  if(es){ es.close(); es = null; }
+  $('#live').textContent = ''; $('#live').className = '';
+}
+
+function startStream(){
+  stopStream();
+  $('#txrows').innerHTML = ''; $('#txnote').textContent = '';
+  if(!sel || !session) return;
+  es = new EventSource('/api/stream?pane='+encodeURIComponent(sel));
+
+  es.addEventListener('init', e=>{
+    const d = JSON.parse(e.data);
+    if(d.total > d.shown)
+      $('#txnote').textContent = `showing the last ${d.shown} of ${d.total} entries`;
+  });
+  es.addEventListener('row', e=>{
+    // Only follow if already at the bottom, so scrolling back through
+    // history is not yanked away every time the agent does something.
+    const stick = pinned();
+    $('#txrows').appendChild(card(JSON.parse(e.data)));
+    if(stick) $('#tx').scrollTop = $('#tx').scrollHeight;
+  });
+  es.addEventListener('ready', ()=>{
+    $('#tx').scrollTop = $('#tx').scrollHeight;
+    $('#live').textContent = '● live'; $('#live').className = 'on';
+  });
+  es.onerror = ()=>{ $('#live').textContent = '○ reconnecting'; $('#live').className=''; };
+}
+
+// ---- sessions overview ----------------------------------------------------
+function ago(s){
+  if(s===null||s===undefined) return '';
+  if(s<60) return s+'s ago';
+  if(s<3600) return Math.floor(s/60)+'m ago';
+  return Math.floor(s/3600)+'h ago';
+}
+
+// Voice is a server-side capability the server probes itself (whisper
+// reachable, ffmpeg present). When it is off the talk button greys out up
+// front instead of failing after you have already spoken.
+let voiceOK = true;
+function setVoice(v){
+  v = !!v;
+  if(v === voiceOK) return;
+  voiceOK = v;
+  const t = $('#talk');
+  t.disabled = !v;
+  t.title = v ? '' : 'voice not configured';
+  if(!rec && !busy) t.textContent = v ? '🎤 talk' : '🎤 voice off';
+}
+
+async function loadOverview(){
+  let d;
+  try{ d = await (await fetch('/api/overview')).json(); }
+  catch(e){ return; }
+  if('voice' in d) setVoice(d.voice);
+  const box = $('#ovlist'); box.innerHTML = '';
+  d.panes.forEach(p=>{
+    const el = document.createElement('div');
+    el.className = 'card' + (p.id===sel ? ' cur' : '') +
+                   (p.state==='blocked' ? ' blocked' : '');
+    const agent = p.kind ? `<span class="badge">${esc(p.kind)}</span>` : '';
+    const label = {working:'● working', waiting:'◆ waiting on you',
+                   idle:'○ idle', blocked:'◆ needs you', gone:'○ gone'};
+    const st = p.state ? `<span class="st ${esc(p.state)}">${label[p.state]||esc(p.state)}</span>` : '';
+    el.innerHTML =
+      `<div class="top"><span class="who">${esc(p.session)}:${esc(p.window)}</span>`+
+      `${agent}<span class="cmd">${esc(p.cmd)}</span>`+
+      `<span class="when">${ago(p.age)}</span></div>`+
+      `<div class="top" style="margin-top:.25rem">${st}</div>`+
+      (p.last && !p.prompt ? `<div class="snip"></div>` : '');
+    if(p.last && !p.prompt) el.querySelector('.snip').innerHTML = linkify(p.last);
+
+    if(p.prompt){
+      const ask = document.createElement('div');
+      ask.className = 'ask';
+      const q = document.createElement('div');
+      q.className = 'q'; q.innerHTML = linkify(p.prompt.question);
+      ask.appendChild(q);
+      p.prompt.options.forEach(o=>{
+        const b = document.createElement('button');
+        b.innerHTML = `<span class="k">${o.key}</span>`;
+        b.appendChild(document.createTextNode(o.label));
+        // stopPropagation: the whole card is clickable, and answering must
+        // not also navigate you away from the list.
+        b.onclick = ev=>{ ev.stopPropagation(); answer(p, o); };
+        ask.appendChild(b);
+      });
+
+      // A digit only moves or toggles; confirming is a separate press. Some
+      // prompts are multi-select, where pairing the two would submit after
+      // the first checkbox.
+      const nav = document.createElement('div');
+      nav.className = 'nav';
+      [['↑','up'],['↓','down'],['⏎ enter','enter','go'],['esc','esc','cancel']]
+        .forEach(([txt,key,cls])=>{
+          const b = document.createElement('button');
+          b.textContent = txt;
+          if(cls) b.classList.add(cls);
+          b.onclick = ev=>{ ev.stopPropagation(); press(p, key); };
+          nav.appendChild(b);
+        });
+      ask.appendChild(nav);
+      const hint = document.createElement('div');
+      hint.className = 'hint';
+      hint.textContent = 'numbers select or toggle · enter submits';
+      ask.appendChild(hint);
+      el.appendChild(ask);
+    }
+
+    // A ticket link inside the card should open the board, not also select
+    // the pane underneath it.
+    el.querySelectorAll('a.tick').forEach(a=>
+      a.onclick = ev=> ev.stopPropagation());
+    el.onclick = ()=>{
+      sel = p.id; renderPanes(); loadOut();
+      loadSession().then(()=> setMode(p.kind ? 'tx' : 'term'));
+    };
+    box.appendChild(el);
+  });
+  if(!d.panes.length) box.textContent = 'no panes found';
+}
+
+async function press(pane, key){
+  try{
+    const r = await fetch('/api/answer', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pane: pane.id, key})});
+    const d = await r.json();
+    if(d.error){ msg(d.error, true); return false; }
+    // Redraw quickly so a toggled checkbox or moved cursor is visible; the
+    // TUI needs a moment to repaint before capture-pane sees it.
+    setTimeout(loadOverview, 400);
+    return true;
+  }catch(e){ msg('failed: '+e.message, true); return false; }
+}
+
+async function answer(pane, opt){
+  msg(`${pane.session}:${pane.window} → ${opt.label.slice(0,36)}…`);
+  if(!await press(pane, opt.key)) return;
+  // "tell it what to do differently" leaves the agent waiting for text, so
+  // jump into that pane ready to talk rather than staying on the list.
+  if(/differently|tell .* what|type something|chat about/i.test(opt.label)){
+    sel = pane.id; renderPanes(); loadOut();
+    await loadSession(); setMode('term');
+    msg('selected — press enter there, or talk');
+  }else{
+    msg('selected · press ⏎ enter to submit');
+  }
+}
+
+// ---- new agent -------------------------------------------------------------
+// Mirrors the ftz fish function: pick a directory from zoxide, derive the
+// session name from it, and reuse the session if it already exists -- a new
+// window rather than a second session for the same project.
+let agent = 'claude';
+
+async function loadProjects(){
+  const q = $('#pq').value.trim();
+  let d;
+  try{ d = await (await fetch('/api/projects?q='+encodeURIComponent(q))).json(); }
+  catch(e){ return; }
+  const box = $('#plist'); box.innerHTML = '';
+  d.projects.forEach(p=>{
+    const el = document.createElement('div');
+    el.className = 'proj';
+    el.innerHTML = `<span class="p"></span><span class="s">${
+      p.exists ? '↳ '+esc(p.session) : esc(p.session)}</span>`;
+    el.querySelector('.p').textContent = p.short;
+    el.onclick = ()=> spawn(p);
+    box.appendChild(el);
+  });
+  if(!d.projects.length) box.textContent = 'nothing matching';
+}
+
+async function spawn(p){
+  msg(`starting ${agent} in ${p.session}…`);
+  try{
+    const r = await fetch('/api/spawn', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dir:p.dir, agent})});
+    const d = await r.json();
+    if(d.error) return msg(d.error, true);
+    msg(`${agent} started · new ${d.created} in ${d.session}`);
+    togglePicker(false);
+    sel = d.pane;
+    await loadPanes(); renderPanes(); loadOut();
+    // A fresh agent has no transcript yet, so start on the terminal and let
+    // the transcript button enable itself once there is something to show.
+    await loadSession(); setMode('term');
+  }catch(e){ msg('spawn failed: '+e.message, true); }
+}
+
+function togglePicker(on){
+  $('#picker').classList.toggle('show', on);
+  $('#ovlist').style.display = on ? 'none' : '';
+  $('#newbtn').textContent = on ? '× cancel' : '+ new agent';
+  if(on){ $('#pq').value=''; loadProjects(); $('#pq').focus(); }
+}
+
+$('#newbtn').onclick = ()=> togglePicker(!$('#picker').classList.contains('show'));
+$('#pq').addEventListener('input', ()=>{
+  clearTimeout(window._pqT);
+  window._pqT = setTimeout(loadProjects, 150);   // debounce typing on a phone
+});
+document.querySelectorAll('#agents button').forEach(b=>{
+  b.onclick = ()=>{
+    agent = b.dataset.a;
+    document.querySelectorAll('#agents button').forEach(x=>
+      x.classList.toggle('sel', x===b));
+  };
+});
+
+let mode = 'ov';
+function setMode(m){
+  if(m==='tx' && !session) return;
+  mode = m;
+  $('#mOv').classList.toggle('sel', m==='ov');
+  $('#mTerm').classList.toggle('sel', m==='term');
+  $('#mTx').classList.toggle('sel', m==='tx');
+  $('#ov').classList.toggle('show', m==='ov');
+  $('#out').classList.toggle('hide', m!=='term');
+  $('#tx').classList.toggle('show', m==='tx');
+  if(m==='tx') startStream(); else stopStream();
+  if(m==='ov') loadOverview();
+}
+
+async function loadOut(){
+  if(!sel) return;
+  try{
+    const r = await fetch('/api/pane?id='+encodeURIComponent(sel));
+    const d = await r.json();
+    const out = $('#out');
+    const stuck = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+    out.innerHTML = linkify(d.text || '(empty)');
+    if(stuck) out.scrollTop = out.scrollHeight;
+  }catch(e){}
+}
+
+// ---- recording ------------------------------------------------------------
+async function startRec(){
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({audio:{
+      channelCount:1, echoCancellation:true, noiseSuppression:true}});
+  }catch(e){
+    return msg('microphone blocked — needs https and permission', true);
+  }
+  chunks = [];
+  // Keep a local handle: stop() is asynchronous, so onstop runs after
+  // stopRec() has returned. Reading the recorder off a global that has since
+  // been cleared throws inside the handler, and the clip is never sent.
+  const mr = new MediaRecorder(stream);
+  const mime = mr.mimeType || 'audio/webm';
+  rec = mr;
+  mr.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  mr.onstop = async () => {
+    stream.getTracks().forEach(t=>t.stop());
+    rec = null;
+    try{
+      await sendClip(new Blob(chunks, {type: mime}));
+    }catch(e){
+      msg('failed: ' + e.message, true);
+    }finally{
+      idle();                       // never leave the button stuck
+    }
+  };
+  mr.start();
+  $('#talk').className = 'rec';
+  $('#talk').textContent = '⏹ stop';
+  msg('recording…');
+}
+
+function idle(){
+  busy = false;
+  $('#talk').className = '';
+  $('#talk').textContent = '🎤 talk';
+}
+
+function stopRec(){
+  if(rec && rec.state !== 'inactive') rec.stop();   // onstop does the rest
+  $('#talk').className = 'busy';
+  $('#talk').textContent = 'thinking…';
+  busy = true;
+}
+
+async function sendClip(blob){
+  if(!blob.size) return msg('no audio captured', true);
+  const ext = (blob.type.includes('ogg')) ? 'ogg'
+            : (blob.type.includes('mp4')) ? 'mp4' : 'webm';
+  // Bound the wait: a request that never returns must not strand the UI.
+  const ctl = new AbortController();
+  const bail = setTimeout(()=>ctl.abort(), 90000);
+  try{
+    const r = await fetch(`/api/dictate?pane=${encodeURIComponent(sel||'')}&ext=${ext}`,
+                          {method:'POST', body:blob, signal:ctl.signal});
+    const d = await r.json();
+    if(d.error){ msg(d.error, true); }
+    else{
+      $('#draft').value = d.final;
+      $('#draft').classList.add('show');
+      $('#actions').classList.add('show');
+      msg(d.raw !== d.final ? 'cleaned up · review and send' : 'review and send');
+    }
+  }catch(e){
+    msg(e.name === 'AbortError' ? 'timed out' : 'failed: ' + e.message, true);
+  }finally{
+    clearTimeout(bail);
+  }
+}
+
+async function doSend(withEnter){
+  const text = $('#draft').value.trim();
+  if(!text || !sel) return;
+  await fetch('/api/send', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({pane:sel, text, enter:!!withEnter})});
+  clearDraft();
+  msg(withEnter ? 'sent and submitted' : 'sent — not submitted');
+  setTimeout(loadOut, 250);
+}
+
+function clearDraft(){
+  $('#draft').value=''; $('#draft').classList.remove('show');
+  $('#actions').classList.remove('show');
+}
+
+$('#talk').onclick = () => {
+  if(busy) return;
+  if(rec) stopRec(); else startRec();
+};
+
+// Enter and esc for the selected pane. Between these and the mic, most of
+// working with an agent is confirming, backing out, or saying what you want.
+async function sendKey(key){
+  if(!sel) return msg('no pane selected', true);
+  try{
+    const r = await fetch('/api/answer', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pane: sel, key})});
+    const d = await r.json();
+    if(d.error) return msg(d.error, true);
+    msg(key === 'enter' ? 'sent ⏎' : 'sent esc');
+    // The pane view is the one that shows the effect, so refresh whichever
+    // is on screen rather than waiting for the poll.
+    setTimeout(()=>{ if(mode==='term') loadOut(); else if(mode==='ov') loadOverview(); }, 350);
+  }catch(e){ msg('failed: '+e.message, true); }
+}
+$('#kEnter').onclick = ()=> sendKey('enter');
+$('#kEsc').onclick   = ()=> sendKey('esc');
+$('#send').onclick      = () => doSend(false);
+$('#sendEnter').onclick = () => doSend(true);
+$('#discard').onclick   = () => { clearDraft(); msg(''); };
+
+$('#mOv').onclick   = ()=> setMode('ov');
+$('#mTerm').onclick = ()=> setMode('term');
+$('#mTx').onclick   = ()=> setMode('tx');
+// Poll the overview only while it is on screen; it costs a transcript tail
+// per agent pane, which is wasted work behind another view.
+setInterval(()=>{ if(mode==='ov' && !document.hidden) loadOverview(); }, 5000);
+// A phone suspends background tabs and the stream dies quietly; reopen it on
+// return rather than showing a frozen transcript.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) stopStream();
+  else if(mode==='tx') startStream();
+});
+
+loadKeys();
+loadPanes().then(loadSession);
+loadOverview();
+setMode('ov');          // open on the sessions list, not a single pane
+loadOut();
+setInterval(loadPanes, 10000);
+// Only poll the pane while it is the visible view.
+pollTimer = setInterval(()=>{ if(!busy && !rec && mode==='term') loadOut(); }, 2000);
+setInterval(()=>{ if(mode!=='tx') loadSession(); }, 15000);
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden){ loadPanes(); if(mode==='term') loadOut(); }
+});
+</script>
+</body>
+</html>

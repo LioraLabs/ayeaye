@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""Voice remote for tmux: a phone-shaped web UI over capture-pane/send-keys.
+
+Serves a small page that lists your panes, shows what each is doing, and lets
+you talk into whichever one you pick. The browser does the recording, so a
+phone needs nothing installed -- no Termux, no daemon, no wake lock.
+
+Bound to loopback on purpose. Put it on the tailnet with:
+
+    tailscale serve --bg --https 443 http://127.0.0.1:8911
+
+which also gives it a real certificate, and browsers only allow microphone
+access from a secure origin.
+"""
+import glob
+import hmac
+import http.cookies
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import threading
+import sys
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.machinery import SourceFileLoader
+
+
+def _load_env_file():
+    """Fill os.environ from the install.sh config file.
+
+    One file serves both entry points: systemd user units read it through
+    EnvironmentFile=, and a bare `bin/voice-remote` picks it up here. A
+    variable already present in the environment always wins, so unit-level
+    settings and one-off overrides behave as expected. Values are literal:
+    no shell expansion, matching how systemd reads the same file.
+    """
+    path = os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                        or os.path.expanduser("~/.config"),
+                        "voice-remote", "env")
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition("=")
+        key = key.strip()
+        if sep and key and key not in os.environ:
+            os.environ[key] = val.strip().strip('"').strip("'")
+
+
+_load_env_file()
+
+# Reuse the pipeline rather than reimplementing it: same whisper server, same
+# rewrite model, same silence gate, same log. Imported after the env file is
+# loaded, because voice-dictate reads its configuration at import time.
+_vd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice-dictate")
+vd = SourceFileLoader("voice_dictate", _vd_path).load_module()
+
+# The UI ships in share/ next to bin/, so a fresh clone serves straight from
+# the repo. A ~/.local/share install (the old symlink layout) still wins when
+# it exists; VOICE_REMOTE_SHARE overrides both.
+_LOCAL_SHARE = os.path.expanduser("~/.local/share/voice-remote")
+_REPO_SHARE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "share")
+SHARE_DIR = (os.environ.get("VOICE_REMOTE_SHARE")
+             or (_LOCAL_SHARE
+                 if os.path.exists(os.path.join(_LOCAL_SHARE, "app.html"))
+                 else _REPO_SHARE))
+APP_HTML = os.path.join(SHARE_DIR, "app.html")
+BOARD_HTML = os.path.join(SHARE_DIR, "board.html")
+BIND = os.environ.get("VOICE_REMOTE_BIND", "127.0.0.1")
+PORT = int(os.environ.get("VOICE_REMOTE_PORT", "8911"))
+PANE_LINES = int(os.environ.get("VOICE_REMOTE_LINES", "24"))
+# Gap between typing text and pressing Enter. See /api/send.
+SEND_ENTER_DELAY = float(os.environ.get("VOICE_SEND_DELAY", "0.4"))
+
+# Push notifications. Empty disables the watcher entirely -- the app works
+# without it, this only saves you from having to look.
+NTFY_URL = os.environ.get("VOICE_NTFY_URL", "")
+NTFY_CLICK = os.environ.get("VOICE_NTFY_CLICK", "")   # opened when tapped
+NOTIFY_EVERY = int(os.environ.get("VOICE_NOTIFY_EVERY", "10"))
+# Which states are worth a notification. "blocked" is an agent stopped at a
+# prompt. "waiting" fires after every completed turn, which is constant for an
+# active agent, so it is off unless you ask for it.
+NOTIFY_STATES = set(filter(None, os.environ.get(
+    "VOICE_NOTIFY_STATES", "blocked").split(",")))
+
+
+# ---------------------------------------------------------------------- auth
+# Network placement (tailnet, loopback) is the front door, but it is not
+# sufficient on its own: every peer on the tailnet would otherwise hold what
+# amounts to shell access. So every /api/* request must present a shared
+# secret -- as an X-Voice-Token header, or as the voice_token cookie that
+# /login sets so a phone browser only ever types the token once.
+
+def _load_token():
+    """The shared secret: VOICE_REMOTE_TOKEN, else a state file, generated
+    0600 on first run so the app is never accidentally open."""
+    tok = os.environ.get("VOICE_REMOTE_TOKEN", "").strip()
+    if tok:
+        return tok
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    path = os.path.join(state, "voice-remote", "token")
+    try:
+        with open(path) as fh:
+            tok = fh.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(tok + "\n")
+    sys.stderr.write("generated auth token at %s\n" % path)
+    return tok
+
+
+TOKEN = _load_token()
+
+
+def _allowed_hosts():
+    """Host values a request may carry. Defeats DNS rebinding: a page on an
+    attacker's origin resolving their hostname to this address still sends
+    their Host header, which is not in this set.
+
+    Defaults cover direct access to the bind address; anything fronting this
+    (tailscale serve, a reverse proxy) presents its own Host and must be
+    listed in VOICE_REMOTE_ALLOWED_HOSTS.
+    """
+    hosts = set()
+    for h in (BIND, "localhost", "127.0.0.1"):
+        hosts.add(h.lower())
+        hosts.add("%s:%d" % (h.lower(), PORT))
+    for h in os.environ.get("VOICE_REMOTE_ALLOWED_HOSTS", "").split(","):
+        h = h.strip().lower().rstrip("/")
+        if h:
+            hosts.add(h)
+    return hosts
+
+
+ALLOWED_HOSTS = _allowed_hosts()
+
+# Request body caps. Dictation audio is real data (a couple of minutes of
+# webm); nothing else the API accepts has any business being large.
+MAX_BODY = 1 << 20            # 1 MB for JSON endpoints
+MAX_AUDIO_BODY = 32 << 20     # 32 MB for /api/dictate
+AUDIO_EXTS = {"webm", "ogg", "mp4", "wav", "m4a"}
+
+
+def tmux(*args):
+    try:
+        return subprocess.run(("tmux",) + args, capture_output=True,
+                              text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def list_panes():
+    fmt = ("#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}"
+           "\t#{pane_current_command}\t#{?pane_active,1,0}")
+    out = []
+    for line in tmux("list-panes", "-a", "-F", fmt).splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6:
+            continue
+        pid, sess, widx, wname, cmd, active = parts
+        if sess.startswith("_"):        # floating scratch panes; not targets
+            continue
+        out.append({"id": pid, "session": sess, "window": widx,
+                    "name": wname, "cmd": cmd, "active": active == "1"})
+    return out
+
+
+# Written by ~/.claude/statusline-command.sh. The pane is the only thing this
+# server can see, so the session announces itself there rather than us guessing
+# from cwd and mtime -- which is ambiguous the moment two agents share a repo.
+CLAUDE_MARKER = re.compile(r"⟪ cc:([0-9a-f]{8})⟫".replace(" ", ""))
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+
+
+def pane_session(pane_id):
+    """Which agent transcript belongs to this pane, if any."""
+    text = tmux("capture-pane", "-p", "-t", pane_id, "-S", "-200")
+
+    m = CLAUDE_MARKER.search(text)
+    if m:
+        hit = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", m.group(1) + "*.jsonl"))
+        if hit:
+            return {"kind": "claude", "id": m.group(1), "path": hit[0]}
+
+    # Codex has no statusline hook to carry a marker, so fall back to matching
+    # the pane's directory against the cwd recorded in each rollout's
+    # session_meta, newest first.
+    cmd = tmux("display-message", "-p", "-t", pane_id, "#{pane_current_command}").strip()
+    if cmd == "codex":
+        pane_pid = tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
+        return codex_session_for(pane_pid)
+    return None
+
+
+def _proc_start(pid):
+    """Wall-clock time the process began, from /proc/<pid>/stat field 22."""
+    with open("/proc/%s/stat" % pid) as fh:
+        fields = fh.read().rsplit(")", 1)[1].split()
+    with open("/proc/uptime") as fh:
+        uptime = float(fh.read().split()[0])
+    return (time.time() - uptime) + float(fields[19]) / os.sysconf("SC_CLK_TCK")
+
+
+def _descendant(pid, name, depth=3):
+    """Find a named descendant. tmux's pane_pid is the shell; the agent is a
+    child of it (and sometimes a grandchild via a wrapper)."""
+    frontier = [str(pid)]
+    for _ in range(depth):
+        nxt = []
+        for p in frontier:
+            out = subprocess.run(["pgrep", "-P", p], capture_output=True,
+                                 text=True).stdout.split()
+            for c in out:
+                try:
+                    with open("/proc/%s/comm" % c) as fh:
+                        if fh.read().strip() == name:
+                            return c
+                except OSError:
+                    continue
+                nxt.append(c)
+        frontier = nxt
+    return None
+
+
+def codex_session_for(pane_pid):
+    """Match a codex process to its rollout by start time and cwd.
+
+    Codex hooks would be the clean route, but SessionStart never fires in an
+    interactive session on 0.145.0 (openai/codex#17532) -- verified with a
+    valid regex matcher and trust granted, and SessionEnd is dead too. Nor
+    does codex reliably hold the rollout open, so /proc/<pid>/fd is no good.
+    What is reliable: a rollout is created within a second or two of the
+    process starting, and its filename carries that timestamp. Pair that with
+    cwd and two codex agents in one directory stay distinct -- and it works
+    however codex was launched, not just from this app.
+    """
+    pid = _descendant(pane_pid, "codex")
+    if not pid:
+        return None
+    try:
+        started = _proc_start(pid)
+        cwd = os.readlink("/proc/%s/cwd" % pid)
+    except OSError:
+        return None
+
+    best = None
+    for r in glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*",
+                                    "rollout-*.jsonl")):
+        stamp = os.path.basename(r)[8:27]          # rollout-YYYY-MM-DDTHH-MM-SS
+        try:
+            t = time.mktime(time.strptime(stamp, "%Y-%m-%dT%H-%M-%S"))
+        except ValueError:
+            continue
+        delta = t - started
+        # A rollout belongs to this process only if it appeared just after it
+        # started. Generous upper bound for a slow first turn; small negative
+        # tolerance for clock granularity.
+        if not (-5 <= delta <= 120):
+            continue
+        if best is not None and abs(delta) >= abs(best[0]):
+            continue
+        try:
+            with open(r) as fh:
+                meta = json.loads(fh.readline()).get("payload", {})
+        except Exception:
+            continue
+        if meta.get("cwd") == cwd:
+            best = (delta, r, meta.get("id") or "")
+    if not best:
+        return None                                # started, nothing written yet
+    return {"kind": "codex", "id": best[2][:8], "path": best[1]}
+
+
+# How many past entries to send when a client attaches. Everything after that
+# arrives live.
+BACKLOG = int(os.environ.get("VOICE_TX_ROWS", "200"))
+MAX_BLOCK = 4000
+
+
+def _clip(s):
+    # Coerce first: these fields come straight from two evolving JSONL formats
+    # and turn up as dicts and lists as well as strings.
+    if s is None:
+        s = ""
+    elif not isinstance(s, str):
+        try:
+            s = json.dumps(s)
+        except Exception:
+            s = str(s)
+    return s if len(s) <= MAX_BLOCK else s[:MAX_BLOCK] + "\n… (%d more chars)" % (
+        len(s) - MAX_BLOCK)
+
+
+def rows_codex(d):
+    """Rows for one parsed codex rollout line."""
+    p = d.get("payload") or {}
+    kind, ts = p.get("type"), (d.get("timestamp") or "")[11:19]
+    if kind == "agent_message" and p.get("message"):
+        return [("assistant", ts, "codex", p["message"])]
+    if kind == "message" and p.get("role") == "user":
+        txt = " ".join(c.get("text", "") for c in p.get("content") or []
+                       if isinstance(c, dict))
+        if txt.strip():
+            return [("user", ts, "you", txt)]
+    if kind in ("function_call", "custom_tool_call"):
+        return [("tool", ts, p.get("name", "tool"), p.get("arguments") or "")]
+    if kind in ("function_call_output", "custom_tool_call_output"):
+        o = p.get("output")
+        if isinstance(o, dict):
+            o = o.get("content") or json.dumps(o)
+        return [("result", ts, "result", o or "")]
+    return []
+
+
+def rows_claude(d):
+    """Rows for one parsed Claude transcript line.
+
+    Only user/assistant lines carry conversation; the rest (mode, ai-title,
+    file-history-snapshot, …) is bookkeeping. A `user` line holding
+    tool_result blocks is tool output echoed back, not something you typed.
+    """
+    t = d.get("type")
+    if t not in ("user", "assistant") or d.get("isMeta"):
+        return []
+    ts = (d.get("timestamp") or "")[11:19]
+    content = (d.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return [("user", ts, "you", content)] if content.strip() else []
+
+    out = []
+    for b in content or []:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text" and b.get("text", "").strip():
+            out.append(("assistant" if t == "assistant" else "user", ts,
+                        "claude" if t == "assistant" else "you", b["text"]))
+        elif bt == "tool_use":
+            arg = b.get("input")
+            out.append(("tool", ts, b.get("name", "tool"),
+                        arg if isinstance(arg, str) else json.dumps(arg)))
+        elif bt == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            out.append(("result", ts, "error" if b.get("is_error") else "result",
+                        c or ""))
+        # `thinking` blocks arrive redacted (signature, empty text) -- nothing
+        # worth showing.
+    return out
+
+
+def rows_for(raw, kind):
+    """Parse one JSONL line into zero or more display rows."""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return []
+    rows = rows_codex(d) if kind == "codex" else rows_claude(d)
+    return [{"cls": c, "ts": ts, "label": lb, "text": _clip(tx)}
+            for c, ts, lb, tx in rows]
+
+
+def stream_transcript(wfile, sess, stop_after=None):
+    """Server-sent events: backlog first, then whatever lands next.
+
+    Tails by byte offset rather than re-reading, and only advances past the
+    last complete newline -- an agent mid-write leaves a partial line, and
+    parsing that would drop the event when the rest arrives.
+    """
+    kind, path = sess["kind"], sess["path"]
+
+    def send(event, payload):
+        wfile.write(("event: %s\ndata: %s\n\n"
+                     % (event, json.dumps(payload))).encode())
+        wfile.flush()
+
+    with open(path, "rb") as fh:
+        data = fh.read()
+        offset = data.rfind(b"\n") + 1
+
+    backlog = []
+    for raw in data[:offset].splitlines():
+        backlog.extend(rows_for(raw.decode("utf-8", "replace"), kind))
+
+    send("init", {"kind": kind, "id": sess["id"],
+                  "total": len(backlog), "shown": min(len(backlog), BACKLOG)})
+    for row in backlog[-BACKLOG:]:
+        send("row", row)
+    send("ready", {})
+
+    idle = 0
+    while stop_after is None or idle < stop_after:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            break
+        if size > offset:
+            with open(path, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read(size - offset)
+            cut = chunk.rfind(b"\n") + 1
+            if cut:
+                for raw in chunk[:cut].splitlines():
+                    for row in rows_for(raw.decode("utf-8", "replace"), kind):
+                        send("row", row)
+                offset += cut
+            idle = 0
+        else:
+            idle += 1
+            # Comment frame: keeps the connection warm through the proxy and
+            # lets the browser notice a dead link rather than hanging forever.
+            wfile.write(b": ping\n\n")
+            wfile.flush()
+        time.sleep(1)
+
+
+IDLE_AFTER = int(os.environ.get("VOICE_IDLE_AFTER", "300"))   # seconds
+
+# A pending approval lives only in the TUI. Codex logs the exec_command it
+# wants to run but never an approval event, so the transcript looks like work
+# in progress while the agent is actually stopped dead waiting for you. The
+# pane is the only place this is visible.
+_OPT = re.compile(r"^\s*[›❯>]?\s*(\d+)\.\s+(.*\S)\s*$")
+_CONFIRM = re.compile(r"press enter to confirm|esc to cancel|\(esc\)"
+                      r"|enter to select|arrow keys", re.I)
+_RULE = re.compile(r"^[─━═\-_╌┈]{8,}$")
+
+
+def pane_prompt(pane_id, window=30):
+    """The question a pane is blocked on, or None.
+
+    Same shape for both agents: numbered options with a selection marker and
+    a confirm/escape hint below them.
+    """
+    lines = [l.rstrip() for l in
+             tmux("capture-pane", "-p", "-t", pane_id).splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()                        # trailing blanks hide the block
+    tail = lines[-window:]
+
+    idx = [i for i, l in enumerate(tail) if _OPT.match(l)]
+    if len(idx) < 2 or not any(_CONFIRM.search(l) for l in tail[idx[0]:]):
+        return None
+    # The prompt must still be the last thing on screen. Once the agent moves
+    # on, its output lands below the old options -- without this, answered
+    # prompts keep reporting "blocked" until they scroll away.
+    for l in tail[idx[-1] + 1:]:
+        if l.strip() and not _CONFIRM.search(l):
+            return None
+    options = [{"key": _OPT.match(tail[i]).group(1),
+                "label": _OPT.match(tail[i]).group(2)[:90]} for i in idx]
+
+    # Blank lines interleave the question block in both agents, so skip them
+    # rather than stopping. End at the bullet that starts the agent's turn,
+    # or at a rule -- Claude draws one between its prose and the prompt, and
+    # without that the walk-back runs on into the startup banner.
+    q = []
+    for l in reversed(tail[:idx[0]]):
+        s = l.strip()
+        if not s:
+            continue
+        if _RULE.match(s):
+            break
+        q.append(s.lstrip("•·●○◆▪ "))
+        if s[0] in "•·●○◆▪" or len(q) >= 8:
+            break
+    return {"question": " ".join(reversed(q))[:400], "options": options}
+
+
+# Named keys the remote may press. An allow-list, because this endpoint is
+# reachable over the network and must not become a general send-keys hole.
+NAV_KEYS = {"enter": "Enter", "esc": "Escape", "up": "Up", "down": "Down",
+            "left": "Left", "right": "Right", "tab": "Tab", "space": "Space"}
+
+
+def answer_prompt(pane_id, key):
+    """Press one key in a pane.
+
+    A digit is sent on its own and never with Enter. Claude's multi-select
+    uses digits to toggle checkboxes and Enter to submit, so pairing them
+    toggled and submitted in a single tap. Codex's approve prompt needs the
+    same two steps. Confirming is always explicit -- which is also what you
+    want from a remote that can approve `git restore`.
+    """
+    if key in NAV_KEYS:
+        tmux("send-keys", "-t", pane_id, NAV_KEYS[key])
+        return {"ok": True, "sent": key}
+    if key.isdigit() and 1 <= int(key) <= 9:
+        tmux("send-keys", "-t", pane_id, "-l", key)
+        return {"ok": True, "sent": key}
+    return {"error": "bad key"}
+
+
+def session_status(sess, tail_bytes=200_000):
+    """What is this agent doing right now?
+
+    Derived from the tail of the transcript rather than a hook, so it works
+    the same for claude and codex and needs nothing installed. The last row
+    type is the tell: an agent that just spoke has handed the turn back;
+    one whose last event is a tool call or its result is mid-turn.
+    """
+    try:
+        size = os.path.getsize(sess["path"])
+        age = time.time() - os.path.getmtime(sess["path"])
+    except OSError:
+        return {"state": "gone", "age": None, "last": ""}
+
+    with open(sess["path"], "rb") as fh:
+        if size > tail_bytes:
+            fh.seek(size - tail_bytes)
+            fh.readline()                      # discard the partial first line
+        chunk = fh.read()
+
+    rows = []
+    for raw in chunk.splitlines():
+        rows.extend(rows_for(raw.decode("utf-8", "replace"), sess["kind"]))
+
+    last = rows[-1] if rows else None
+    if age > IDLE_AFTER:
+        state = "idle"
+    elif last is None:
+        state = "idle"
+    elif last["cls"] == "assistant":
+        state = "waiting"                      # turn handed back to you
+    else:
+        state = "working"                      # mid tool call, or you just sent
+
+    # The most recent thing either of you actually said, which is more useful
+    # on a card than whatever tool happened to run last.
+    said = [r for r in rows if r["cls"] in ("assistant", "user")]
+    snippet = (said[-1]["text"] if said else "").strip().replace("\n", " ")
+    return {"state": state, "age": int(age), "last": snippet[:120]}
+
+
+def overview():
+    out = []
+    for p in list_panes():
+        # agent_id, not id: `id` is the pane id the UI selects with, and
+        # overwriting it with the session id makes every card unselectable.
+        row = dict(p, kind=None, agent_id=None, state=None, age=None,
+                   last="", prompt=None)
+        sess = pane_session(p["id"])
+        if sess:
+            row["kind"], row["agent_id"] = sess["kind"], sess["id"]
+            row.update(session_status(sess))
+        # Checked for every pane, not just resolved agents: anything can stop
+        # to ask. And it overrides the transcript-derived state, which would
+        # otherwise report "working" for a pane that is blocked -- the worst
+        # thing to get wrong on a dashboard whose job is "who needs me".
+        prompt = pane_prompt(p["id"])
+        if prompt:
+            row["prompt"], row["state"] = prompt, "blocked"
+        out.append(row)
+    # Blocked first, then agents by recency, plain shells last.
+    out.sort(key=lambda r: (r["state"] != "blocked", r["kind"] is None,
+                            r["age"] if r["age"] is not None else 1 << 30))
+    return out
+
+
+# Only these may be spawned. This endpoint starts processes, so the agent name
+# is matched against a list rather than interpolated from the request.
+AGENTS = {"claude": "claude", "codex": "codex"}
+
+
+def session_name_for(path):
+    """Mirror the ftz/ftn convention: basename with dots replaced, or the
+    session_name from .tmux.yaml when the project defines one."""
+    name = os.path.basename(path.rstrip("/")) or "root"
+    yaml_path = os.path.join(path, ".tmux.yaml")
+    try:
+        with open(yaml_path) as fh:
+            for line in fh:
+                if line.startswith("session_name:"):
+                    name = line.split(":", 1)[1].strip() or name
+                    break
+    except OSError:
+        pass
+    return name.replace(".", "_")
+
+
+def live_sessions():
+    return set(tmux("list-sessions", "-F", "#{session_name}").split())
+
+
+def projects(query="", limit=40):
+    """Candidate directories, newest-frecency first, straight from zoxide --
+    the same source ftz picks from."""
+    try:
+        out = subprocess.run(["zoxide", "query", "-l"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        out = ""
+    live, seen, rows = live_sessions(), set(), []
+    q = query.lower()
+    for d in out.splitlines():
+        d = d.rstrip("/")
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        if q and q not in d.lower():
+            continue
+        seen.add(d)
+        name = session_name_for(d)
+        rows.append({"dir": d, "short": d.replace(os.path.expanduser("~"), "~"),
+                     "session": name, "exists": name in live})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+# The board page reads the same cliban the terminal does, through its --json
+# output rather than the SQLite file underneath, so list/show semantics
+# (archival, ordering, relations) stay cliban's problem. Resolved at startup:
+# the systemd user PATH does not include ~/.cargo/bin.
+CLIBAN = (os.environ.get("VOICE_CLIBAN")
+          or shutil.which("cliban")
+          or os.path.expanduser("~/.cargo/bin/cliban"))
+# Both land in a subprocess argv; a shape check keeps these endpoints from
+# becoming a way to hand cliban arbitrary arguments.
+ISSUE_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+PROJECT_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+
+
+def cliban(*args):
+    """Run cliban, returning (stdout, error)."""
+    try:
+        p = subprocess.run((CLIBAN,) + args, capture_output=True,
+                           text=True, timeout=15)
+    except Exception as exc:
+        return "", str(exc)
+    if p.returncode != 0:
+        return "", (p.stderr.strip() or "cliban exited %d" % p.returncode)
+    return p.stdout, ""
+
+
+def cliban_rows(*args):
+    """NDJSON lines as a list of dicts."""
+    out, err = cliban(*args)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows, err
+
+
+def cliban_board():
+    """Everything the board renders, in one payload.
+
+    One fetch of all projects rather than per-project queries: the whole
+    board is a couple hundred KB without descriptions, and filtering
+    client-side means switching projects costs nothing on a phone.
+    """
+    projs, err = cliban_rows("project", "ls", "--json")
+    if err:
+        return {"error": err}
+    milestones, _ = cliban_rows("milestone", "ls", "--json",
+                                "--sort", "activity")
+    issues, _ = cliban_rows("issue", "ls", "--json", "--sort", "position")
+    return {"projects": projs, "milestones": milestones, "issues": issues}
+
+
+def spawn_agent(path, agent, prompt=""):
+    """Start an agent for a project, following the ftz session convention.
+
+    An existing session for the project gets a new window rather than a new
+    session, so everything for one project stays under one name.
+    """
+    cmd = AGENTS.get(agent)
+    if not cmd:
+        return {"error": "unknown agent"}
+    if not os.path.isdir(path):
+        return {"error": "no such directory"}
+    name = session_name_for(path)
+
+    if name in live_sessions():
+        # "=" forces an exact match; tmux would otherwise resolve a prefix.
+        pane = tmux("new-window", "-t", "=" + name, "-c", path,
+                    "-P", "-F", "#{pane_id}").strip()
+        created = "window"
+    else:
+        pane = tmux("new-session", "-d", "-s", name, "-c", path,
+                    "-P", "-F", "#{pane_id}").strip()
+        created = "session"
+    if not pane:
+        return {"error": "tmux would not create the %s" % created}
+
+    if prompt:
+        # Both agents take an opening prompt as an argument, which sidesteps
+        # guessing how long the TUI takes to boot before pasting into it.
+        # Collapsed to one line and shell-quoted: it is typed into the user's
+        # shell, and fish concatenates adjacent quoted strings the same way
+        # POSIX does, so shlex quoting survives there too.
+        cmd = cmd + " " + shlex.quote(" ".join(prompt.split()))
+    tmux("send-keys", "-t", pane, "-l", cmd)
+    tmux("send-keys", "-t", pane, "Enter")
+
+
+    return {"pane": pane, "session": name, "created": created, "agent": agent}
+
+
+
+
+def notify(title, body, tags=("warning",), priority=4, click=""):
+    """Publish to ntfy. Best effort -- a notification failure must never
+    interfere with the app itself.
+
+    Uses the JSON API rather than ntfy's header form: HTTP headers are
+    latin-1, so a non-ASCII character in a title arrives mangled. Agent
+    questions are full of them.
+    """
+    if not NTFY_URL:
+        return
+    base, _, topic = NTFY_URL.rstrip("/").rpartition("/")
+    payload = {"topic": topic, "title": title, "message": body,
+               "priority": priority, "tags": list(tags)}
+    if click:
+        payload["click"] = click
+    req = urllib.request.Request(
+        base + "/", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:
+        sys.stderr.write("notify failed: %s\n" % exc)
+
+
+def watch_and_notify():
+    """Fire once when an agent starts needing you, not repeatedly.
+
+    Keyed on the pane plus the question, so a fresh prompt in the same pane
+    notifies again while the same prompt sitting unanswered stays quiet.
+    """
+    seen = {}
+    while True:
+        time.sleep(NOTIFY_EVERY)
+        try:
+            rows = overview()
+        except Exception:
+            continue
+        current = {}
+        for r in rows:
+            if r.get("state") not in NOTIFY_STATES:
+                continue
+            prompt = r.get("prompt") or {}
+            question = prompt.get("question") or r.get("last") or ""
+            key = (r["id"], question[:120])
+            current[r["id"]] = key
+            if seen.get(r["id"]) == key:
+                continue                      # already told you about this one
+            where = "%s:%s" % (r["session"], r["window"])
+            agent = r.get("kind") or r.get("cmd") or "agent"
+            opts = prompt.get("options") or []
+            body = question[:300] or "is waiting for you"
+            if opts:
+                body += "\n\n" + "\n".join(
+                    "%s. %s" % (o["key"], o["label"][:60]) for o in opts[:4])
+            notify("%s · %s needs you" % (where, agent), body,
+                   click=NTFY_CLICK)
+        seen = current                        # drop panes that are no longer blocked
+
+
+# ------------------------------------------------------------- voice probe
+# Voice is a progressive enhancement, not a requirement. The floor is
+# text-only: pane list, transcripts, prompt answering and typed input all
+# work with no whisper, no ollama, no ffmpeg installed. The UI learns from
+# /api/overview whether voice is worth offering and greys out the talk
+# button when it is not.
+
+VOICE_PROBE_TTL = float(os.environ.get("VOICE_PROBE_TTL", "30"))
+_voice_probe = {"at": 0.0, "ok": False}
+
+
+def voice_available():
+    """Can /api/dictate plausibly succeed right now?
+
+    Decoding needs ffmpeg; transcription needs the whisper server the
+    dictation path uses (or its CLI fallback: whisper-cpp plus a model on
+    disk). ollama is deliberately not probed -- polish() already degrades
+    to the raw transcription without it. Cached for VOICE_PROBE_TTL seconds
+    so the overview poll never pays for a connect per request; a benign race
+    between threads costs at most one extra probe.
+    """
+    now = time.time()
+    if now - _voice_probe["at"] < VOICE_PROBE_TTL:
+        return _voice_probe["ok"]
+    ok = False
+    if shutil.which("ffmpeg"):
+        host, _, port = vd.WHISPER_SERVER.partition(":")
+        try:
+            with socket.create_connection((host, int(port or 8910)),
+                                          timeout=1):
+                ok = True
+        except OSError:
+            ok = bool(shutil.which("whisper-cpp")
+                      and os.path.exists(vd.WHISPER_MODEL))
+    _voice_probe["at"], _voice_probe["ok"] = now, ok
+    return ok
+
+
+def pane_text(pane_id, lines):
+    raw = tmux("capture-pane", "-p", "-t", pane_id, "-S", "-%d" % lines)
+    kept = [ln.rstrip() for ln in raw.splitlines()]
+    while kept and not kept[-1]:
+        kept.pop()
+    return "\n".join(kept[-lines:])
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        # One line per POST -- those are the requests that act on panes.
+        # GETs and the SSE stream stay quiet; the journal is noisy enough.
+        if self.command != "POST":
+            return
+        sys.stderr.write("%s POST %s from %s auth=%s\n" % (
+            time.strftime("%Y-%m-%dT%H:%M:%S"),
+            self.path.split("?")[0],
+            self.client_address[0],
+            getattr(self, "_auth", "-")))
+
+    # -- helpers ----------------------------------------------------------
+    def _send(self, code, body, ctype, headers=None):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _query(self):
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+    def _body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+
+    # -- request gates ----------------------------------------------------
+    @staticmethod
+    def _in_allowlist(host):
+        host = (host or "").strip().lower()
+        if host in ALLOWED_HOSTS:
+            return True
+        # Also match with the port stripped, so allowlisting a bare hostname
+        # covers it on any port ([::1]:8911 keeps its brackets).
+        bare = re.sub(r":\d+$", "", host)
+        return bare != host and bare in ALLOWED_HOSTS
+
+    def _host_ok(self):
+        return self._in_allowlist(self.headers.get("Host"))
+
+    def _origin_ok(self):
+        """CSRF gate for POSTs. A browser always labels a cross-site request:
+        either with Sec-Fetch-Site or with an Origin naming the other site."""
+        if self.headers.get("Sec-Fetch-Site", "").strip().lower() == "cross-site":
+            return False
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return True                    # non-browser client; auth still applies
+        if origin.lower() == "null":
+            return False
+        try:
+            netloc = urllib.parse.urlsplit(origin).netloc
+        except ValueError:
+            return False
+        return self._in_allowlist(netloc)
+
+    def _cookie_token(self):
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        tok = jar.get("voice_token")
+        return tok.value if tok else ""
+
+    def _authed(self):
+        tok = self.headers.get("X-Voice-Token", "") or self._cookie_token()
+        ok = bool(tok) and hmac.compare_digest(tok, TOKEN)
+        self._auth = "ok" if ok else "fail"
+        return ok
+
+    def _forbidden(self):
+        self.close_connection = True
+        self._json({"error": "forbidden"}, 403)
+
+    def _unauthorized(self):
+        self.close_connection = True
+        self._json({"error": "unauthorized"}, 401)
+
+    def _login(self):
+        """GET /login?token=… (or /?token=…): set the auth cookie and bounce
+        to /. The user bookmarks the URL once; every later visit is clean."""
+        tok = self._query().get("token", [""])[0]
+        if not (tok and hmac.compare_digest(tok, TOKEN)):
+            return self._unauthorized()
+        cookie = ("voice_token=%s; Path=/; Max-Age=31536000; "
+                  "HttpOnly; SameSite=Strict" % TOKEN)
+        self._send(303, b"", "text/plain",
+                   {"Location": "/", "Set-Cookie": cookie})
+
+    # -- routes -----------------------------------------------------------
+    def handle_one_request(self):
+        # Without this an unhandled error closes the socket with no response at
+        # all, which reads client-side as a hang rather than a failure.
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except Exception as exc:
+            try:
+                self._json({"error": "%s: %s" % (type(exc).__name__, exc)}, 500)
+            except Exception:
+                pass
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if not self._host_ok():
+            return self._forbidden()
+        # The pages themselves are served without auth (they contain no
+        # secrets and no data); every /api/* call they make is what is gated.
+        if path == "/login" or (path in ("/", "/index.html")
+                                and "token" in self._query()):
+            return self._login()
+        if path.startswith("/api/") and not self._authed():
+            return self._unauthorized()
+        if path in ("/", "/index.html"):
+            try:
+                with open(APP_HTML, "rb") as fh:
+                    return self._send(200, fh.read(), "text/html; charset=utf-8")
+            except OSError:
+                return self._send(500, "app.html missing at " + APP_HTML,
+                                  "text/plain")
+        if path in ("/board", "/board.html"):
+            try:
+                with open(BOARD_HTML, "rb") as fh:
+                    return self._send(200, fh.read(), "text/html; charset=utf-8")
+            except OSError:
+                return self._send(500, "board.html missing at " + BOARD_HTML,
+                                  "text/plain")
+        if path == "/api/cliban/projects":
+            # Just the keys, so the main page can linkify ticket references
+            # without pulling the whole board. Degrades to no links (empty
+            # list) rather than erroring when cliban is absent.
+            projs, err = cliban_rows("project", "ls", "--json")
+            return self._json({"keys": [p["key"] for p in projs
+                                        if p.get("key")]})
+
+        if path == "/api/cliban/board":
+            board = cliban_board()
+            return self._json(board, 500 if board.get("error") else 200)
+
+        if path == "/api/cliban/issue":
+            key = self._query().get("key", [""])[0]
+            if not ISSUE_KEY.match(key):
+                return self._json({"error": "bad key"}, 400)
+            out, err = cliban("issue", "show", key, "--json")
+            if err:
+                return self._json({"error": err}, 500)
+            try:
+                return self._json(json.loads(out))
+            except ValueError:
+                return self._json({"error": "unreadable cliban output"}, 500)
+
+        if path == "/api/panes":
+            return self._json({"host": os.uname().nodename, "panes": list_panes()})
+
+        if path == "/api/overview":
+            return self._json({"host": os.uname().nodename,
+                               "panes": overview(),
+                               "voice": voice_available()})
+
+        if path == "/api/projects":
+            q = self._query().get("q", [""])[0]
+            return self._json({"projects": projects(q)})
+        if path == "/api/pane":
+            pane = self._query().get("id", [""])[0]
+            if not pane:
+                return self._json({"error": "no pane"}, 400)
+            return self._json({"text": pane_text(pane, PANE_LINES)})
+
+        if path == "/api/session":
+            pane = self._query().get("pane", [""])[0]
+            sess = pane_session(pane) if pane else None
+            if not sess:
+                return self._json({"kind": None})
+            return self._json({"kind": sess["kind"], "id": sess["id"]})
+
+        if path == "/api/stream":
+            pane = self._query().get("pane", [""])[0]
+            sess = pane_session(pane) if pane else None
+            if not sess:
+                return self._json({"kind": None}, 404)
+            # No Content-Length: the body ends when the connection does, which
+            # is what an event stream wants.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")   # never buffer a stream
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                stream_transcript(self.wfile, sess)
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # client navigated away; normal
+            return
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        self._auth = "-"
+        if not self._host_ok() or not self._origin_ok():
+            return self._forbidden()
+        if not self._authed():
+            return self._unauthorized()
+        # Cap the body before reading it. Rejected early the unread bytes
+        # would be parsed as the next request, so drop the connection too.
+        limit = MAX_AUDIO_BODY if path == "/api/dictate" else MAX_BODY
+        if int(self.headers.get("Content-Length", 0) or 0) > limit:
+            self.close_connection = True
+            return self._json({"error": "body too large"}, 413)
+
+        if path == "/api/dictate":
+            # Text-only servers refuse audio up front with a clear 503
+            # rather than failing partway down the pipeline.
+            if not voice_available():
+                return self._json(
+                    {"error": "voice not configured on this server"}, 503)
+            pane = self._query().get("pane", [""])[0]
+            ext = self._query().get("ext", ["webm"])[0]
+            if ext not in AUDIO_EXTS:
+                return self._json({"error": "bad ext"}, 400)
+            audio = self._body()
+            if not audio:
+                return self._json({"error": "no audio"}, 400)
+            pcm = vd.to_wav(audio, ext)
+            if pcm is None:
+                vd.log_event(device="remote", outcome="decode_failed",
+                             bytes=len(audio), ext=ext)
+                return self._json({"error": "could not decode audio"}, 400)
+            rms = round(vd.rms_of_pcm(pcm), 1)
+            seconds = round((len(pcm) - 44) / 32000.0, 1)
+            if rms < vd.SILENCE_RMS:
+                vd.log_event(device="remote", outcome="silence",
+                             rms=rms, seconds=seconds)
+                return self._json({"error": "that sounded like silence",
+                                   "rms": rms}, 200)
+            raw = vd.transcribe_pcm(pcm)
+            if not raw:
+                vd.log_event(device="remote", outcome="empty",
+                             rms=rms, seconds=seconds)
+                return self._json({"error": "nothing recognised"}, 200)
+            names = vd.pane_vocabulary(pane) if pane else ""
+            final = vd.polish(raw, names)
+            vd.log_event(device="remote", outcome="ok", rms=rms,
+                         seconds=seconds, raw=raw, final=final,
+                         changed=(raw != final))
+            return self._json({"raw": raw, "final": final})
+
+        if path == "/api/answer":
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            pane, key = req.get("pane", ""), str(req.get("key", ""))
+            if not pane:
+                return self._json({"error": "no pane"}, 400)
+            res = answer_prompt(pane, key)
+            return self._json(res, 400 if res.get("error") else 200)
+
+        if path == "/api/spawn":
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            res = spawn_agent(req.get("dir", ""), req.get("agent", ""),
+                              str(req.get("prompt") or "")[:4000])
+            return self._json(res, 400 if res.get("error") else 200)
+
+        if path == "/api/send":
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            pane, text = req.get("pane", ""), req.get("text", "")
+            if not pane or not text:
+                return self._json({"error": "pane and text required"}, 400)
+            # -l is literal, so nothing in the text is read as a key name.
+            tmux("send-keys", "-t", pane, "-l", "--", text)
+            if req.get("enter"):
+                # Codex's composer swallows an Enter that arrives in the same
+                # input burst as the text -- it reads as a newline rather than
+                # submit, so the message just sits there. Claude tolerates it;
+                # a short gap makes both behave.
+                time.sleep(SEND_ENTER_DELAY)
+                tmux("send-keys", "-t", pane, "Enter")
+            return self._json({"ok": True})
+
+        return self._json({"error": "not found"}, 404)
+
+
+def main():
+    if not os.path.exists(APP_HTML):
+        sys.exit("missing UI at %s" % APP_HTML)
+    if NTFY_URL:
+        threading.Thread(target=watch_and_notify, daemon=True).start()
+        sys.stderr.write("notifying %s on %s\n"
+                         % (NTFY_URL, ",".join(sorted(NOTIFY_STATES))))
+    sys.stderr.write("voice-remote on %s:%d · token auth on, browsers "
+                     "log in once via /?token=<token>\n" % (BIND, PORT))
+    sys.stderr.write("voice: %s\n" % (
+        "available" if voice_available()
+        else "not configured; running text-only (re-probed every %ds)"
+             % int(VOICE_PROBE_TTL)))
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

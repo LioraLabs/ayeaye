@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Prints what to run on a client device to let it record for M-v.
+set -euo pipefail
+
+TOKEN_PATH="$HOME/.config/voice-dictate/token"
+mkdir -p "$(dirname "$TOKEN_PATH")"
+if [ ! -s "$TOKEN_PATH" ]; then
+    python3 -c 'import secrets;print(secrets.token_urlsafe(32))' > "$TOKEN_PATH"
+    chmod 600 "$TOKEN_PATH"
+    echo "generated a new token"
+fi
+TOKEN=$(cat "$TOKEN_PATH")
+# The tailscale name, not `hostname`: a box can answer to one name on the
+# tailnet and call itself another locally, and remote devices need the name
+# that actually resolves for them. VOICE_HOST overrides the autodetection.
+HERE="${VOICE_HOST:-}"
+if [ -z "$HERE" ]; then
+    HERE=$(tailscale status --json 2>/dev/null \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["Self"]["DNSName"].split(".")[0])' \
+        2>/dev/null) || HERE=""
+fi
+[ -n "$HERE" ] || HERE=$(hostname)
+
+case "${1:-}" in
+  android|--android) PLATFORM=android ;;
+  *)                 PLATFORM=desktop ;;
+esac
+
+if [ "$PLATFORM" = android ]; then
+cat <<EOF
+
+ANDROID SETUP
+=============
+
+1. Install BOTH from F-Droid, not the Play Store. The Play Store builds are
+   abandoned and the two apps must be signed by the same source or Termux
+   cannot talk to Termux:API at all.
+
+     - Termux
+     - Termux:API
+
+2. In Termux:
+
+     pkg update && pkg install python termux-api openssh
+
+3. Grant the microphone permission. Easiest way is to just run it once --
+   Android will prompt:
+
+     termux-microphone-record -f /tmp/t.m4a -l 2 && termux-microphone-record -q
+
+4. Copy this token and the agent over:
+
+     mkdir -p ~/.config/voice-dictate ~/.local/bin
+     printf '%s\n' '${TOKEN}' > ~/.config/voice-dictate/token
+     chmod 600 ~/.config/voice-dictate/token
+     scp ${HERE}:.local/bin/voice-agent ~/.local/bin/voice-agent
+     chmod +x ~/.local/bin/voice-agent
+
+5. Prove the microphone works before involving the network:
+
+     ~/.local/bin/voice-agent --selftest
+
+   Expect "OK: captured N bytes". If it fails it will tell you why.
+
+6. Run it, holding a wake lock so Android does not suspend the mic:
+
+     termux-wake-lock
+     ~/.local/bin/voice-agent
+
+   Leave that session open. Tailscale must also be connected on the phone.
+
+Then SSH into ${HERE} from the phone and hit M-v.
+
+EOF
+else
+cat <<EOF
+
+Run this on any desktop you SSH into ${HERE} from.
+Needs ffmpeg or sox for recording. (For a phone: voice-dictate-setup android)
+
+  mkdir -p ~/.config/voice-dictate ~/.local/bin
+  printf '%s\n' '${TOKEN}' > ~/.config/voice-dictate/token
+  chmod 600 ~/.config/voice-dictate/token
+  scp ${HERE}:.local/bin/voice-agent ~/.local/bin/voice-agent
+  chmod +x ~/.local/bin/voice-agent
+  voice-agent --selftest     # confirm the mic works
+  voice-agent                # then leave it running
+
+Keep it running:
+
+  macOS   leave it in a tmux window, or wrap it in a launchd plist
+  Linux   copy the systemd unit from ${HERE}:
+          ~/.config/systemd/user/voice-agent.service
+
+Then hit M-v in tmux on ${HERE}.
+
+EOF
+fi

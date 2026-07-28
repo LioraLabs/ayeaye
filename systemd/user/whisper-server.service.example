@@ -1,0 +1,26 @@
+[Unit]
+Description=whisper.cpp server (large-v3, resident on the 5090)
+Documentation=https://github.com/ggml-org/whisper.cpp
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Loopback only: this endpoint takes audio and needs no auth, so it must not
+# be reachable from the tailnet. Remote devices talk to voice-dictate's popup,
+# never to this.
+# EDIT THIS: the binary comes from a CUDA build of whisper.cpp, and the model
+# path is wherever you downloaded the ggml weights. See the README.
+ExecStart=%h/.local/bin/whisper-server \
+    --model %h/whisper-models/ggml-large-v3.bin \
+    --host 127.0.0.1 \
+    --port 8910 \
+    --threads 8 \
+    --language en
+Restart=on-failure
+RestartSec=5
+# The point of the service is the ~1.5s model load happening once, not per
+# clip, so never let it idle out.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

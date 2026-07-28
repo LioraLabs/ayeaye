@@ -1,0 +1,17 @@
+[Unit]
+Description=voice remote for tmux (phone web UI)
+After=network.target
+
+[Service]
+Type=simple
+# All configuration lives in the env file; edit it, then
+# `systemctl --user restart voice-remote`. Nothing is configured here.
+# install.sh fills the two @…@ paths and installs this as
+# ~/.config/systemd/user/voice-remote.service.
+EnvironmentFile=@ENV_FILE@
+ExecStart=@REPO@/bin/voice-remote
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

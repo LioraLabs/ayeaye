@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#16161d">
+<meta name="mobile-web-app-capable" content="yes">
+<title>cliban board</title>
+<style>
+  :root{
+    --bg:#16161d; --panel:#1f1f28; --line:#2a2a37; --fg:#dcd7ba;
+    --dim:#727169; --accent:#98bb6c; --rec:#e46876; --blue:#7e9cd8;
+    --amber:#dca561;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex;flex-direction:column;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right)
+            env(safe-area-inset-bottom) env(safe-area-inset-left);
+    overscroll-behavior:none;
+  }
+  header{
+    display:flex;align-items:center;gap:.5rem;padding:.7rem .9rem;
+    border-bottom:1px solid var(--line);flex:none;
+  }
+  header b{font-weight:600}
+  .spacer{flex:1}
+  .hbtn{
+    padding:.25rem .6rem;border:1px solid var(--line);border-radius:.4rem;
+    background:transparent;color:var(--dim);font:inherit;font-size:12.5px;
+    cursor:pointer;text-decoration:none;
+  }
+  .hbtn:active{background:var(--line)}
+
+  #projrow{display:flex;gap:.4rem;overflow-x:auto;padding:.6rem .9rem;flex:none;
+           border-bottom:1px solid var(--line);scrollbar-width:none}
+  #projrow::-webkit-scrollbar{display:none}
+  .chip{
+    flex:none;padding:.4rem .7rem;border:1px solid var(--line);
+    border-radius:.5rem;background:var(--panel);color:var(--dim);
+    font-size:13px;white-space:nowrap;cursor:pointer;
+  }
+  .chip.sel{border-color:var(--accent);color:var(--fg)}
+  .chip small{color:var(--dim);margin-left:.3rem}
+
+  #board{flex:1;overflow:auto;padding:.6rem .9rem 3rem;
+         -webkit-overflow-scrolling:touch}
+  .sect{display:flex;align-items:center;gap:.5rem;margin:1rem 0 .35rem;
+        color:var(--dim);font-size:12px;letter-spacing:.03em}
+  .sect:first-child{margin-top:.2rem}
+  .sect .n{color:var(--dim)}
+  .sect button{
+    margin-left:auto;padding:.15rem .5rem;border:1px solid var(--line);
+    border-radius:.35rem;background:transparent;color:var(--dim);font:inherit;
+    font-size:11px;cursor:pointer;
+  }
+  .sect button.on{border-color:var(--blue);color:var(--blue)}
+
+  .ms{
+    border:1px solid var(--line);border-radius:.6rem;background:var(--panel);
+    padding:.55rem .7rem;margin:.45rem 0;cursor:pointer;
+  }
+  .ms.sel{border-color:var(--blue)}
+  .ms .top{display:flex;align-items:center;gap:.5rem}
+  .ms .name{font-size:13.5px}
+  .ms .meta{margin-left:auto;color:var(--dim);font-size:11px;white-space:nowrap}
+  .ms .bar{height:3px;background:var(--line);border-radius:2px;margin-top:.5rem}
+  .ms .bar i{display:block;height:100%;background:var(--accent);border-radius:2px}
+  .ms.closed .name{color:var(--dim)}
+
+  .iss{
+    display:flex;align-items:baseline;gap:.5rem;padding:.5rem .2rem;
+    border-bottom:1px solid var(--line);cursor:pointer;
+  }
+  .iss .key{color:var(--dim);font-size:11.5px;flex:none}
+  .iss .title{font-size:13.5px;overflow-wrap:anywhere}
+  .iss.done .title{color:var(--dim)}
+  .iss .tags{margin-left:auto;flex:none;display:flex;gap:.3rem;align-items:baseline}
+  .badge{
+    font-size:10.5px;padding:.1rem .4rem;border-radius:.3rem;
+    border:1px solid var(--line);color:var(--dim);white-space:nowrap;
+  }
+  .pri{font-size:11px;flex:none}
+  .pri.urgent,.pri.high{color:var(--rec)}
+  .pri.medium{color:var(--amber)}
+  .pri.low{color:var(--blue)}
+  .note{color:var(--dim);font-size:12px;margin:.5rem 0}
+
+  /* ---- ticket overlay ---- */
+  #ticket{
+    position:fixed;inset:0;background:var(--bg);display:none;
+    flex-direction:column;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right)
+            env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  #ticket.show{display:flex}
+  #thead{display:flex;align-items:center;gap:.5rem;padding:.7rem .9rem;
+         border-bottom:1px solid var(--line);flex:none}
+  #trun{border-color:var(--accent);color:var(--accent)}
+  #tbody{flex:1;overflow:auto;padding:.8rem .9rem 3rem;
+         -webkit-overflow-scrolling:touch;overflow-wrap:anywhere}
+  #tbody .keyline{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
+  #tbody .key{color:var(--dim);font-size:12px}
+  #tbody h1.title{font-size:16px;margin:.5rem 0 .2rem;line-height:1.35}
+  .st{font-size:11px}
+  .st.backlog{color:var(--dim)}
+  .st.in-progress{color:var(--accent)}
+  .st.blocked{color:var(--amber)}
+  .st.in-review{color:var(--blue)}
+  .st.done{color:var(--accent)}
+  .rel{color:var(--blue);cursor:pointer}
+  .metarow{color:var(--dim);font-size:12px;margin:.15rem 0}
+  #tmsg{font-size:12.5px;color:var(--dim);min-height:1.2em;margin:.4rem 0}
+  #tmsg.err{color:var(--rec)}
+  #tmsg a{color:var(--accent)}
+
+  /* run picker (mirrors the main page's new-agent flow) */
+  #runbox{display:none;border:1px solid var(--line);border-radius:.6rem;
+          background:var(--panel);padding:.6rem;margin:.6rem 0}
+  #runbox.show{display:block}
+  #agents{display:flex;gap:.4rem;margin-bottom:.6rem}
+  #agents button{
+    flex:1;padding:.45rem;border:1px solid var(--line);border-radius:.45rem;
+    background:transparent;color:var(--dim);font:inherit;font-size:13px;
+    cursor:pointer;
+  }
+  #agents button.sel{border-color:var(--accent);color:var(--accent)}
+  #rq{
+    width:100%;padding:.6rem;border:1px solid var(--line);border-radius:.5rem;
+    background:var(--bg);color:var(--fg);font:inherit;font-size:14px;
+    margin-bottom:.4rem;
+  }
+  .proj{
+    padding:.5rem .4rem;border-bottom:1px solid var(--line);cursor:pointer;
+    display:flex;align-items:center;gap:.5rem;
+  }
+  .proj:last-child{border-bottom:0}
+  .proj .p{font-size:13px}
+  .proj .s{margin-left:auto;font-size:11px;color:var(--dim)}
+
+  /* ---- rendered markdown ---- */
+  .mdb{font-size:13px;line-height:1.55;margin-top:.8rem}
+  .mdb h1,.mdb h2,.mdb h3,.mdb h4,.mdb h5,.mdb h6{
+    margin:1.1em 0 .35em;line-height:1.3;font-weight:600}
+  .mdb h1{font-size:15px}
+  .mdb h2{font-size:14.5px;border-bottom:1px solid var(--line);
+          padding-bottom:.25em;color:var(--accent)}
+  .mdb h3{font-size:13.5px;color:var(--blue)}
+  .mdb h4,.mdb h5,.mdb h6{font-size:13px;color:var(--dim)}
+  .mdb p{margin:.55em 0;white-space:pre-wrap}
+  .mdb code{background:var(--bg);border:1px solid var(--line);
+            border-radius:.25em;padding:0 .25em;font:inherit;font-size:.95em}
+  .mdb pre{background:var(--bg);border:1px solid var(--line);
+           border-radius:.5rem;padding:.6rem;overflow-x:auto;
+           font-size:12px;line-height:1.45;margin:.6em 0}
+  .mdb pre code{background:none;border:0;padding:0;font-size:inherit;
+                white-space:pre}
+  .mdb ul,.mdb ol{margin:.5em 0;padding-left:1.4em}
+  .mdb li{margin:.2em 0}
+  .mdb blockquote{border-left:3px solid var(--line);margin:.6em 0;
+                  padding:.05em .8em;color:var(--dim)}
+  .mdb hr{border:0;border-top:1px solid var(--line);margin:1em 0}
+  .mdb a{color:var(--blue)}
+  .mdb table{border-collapse:collapse;font-size:12px;display:block;
+             overflow-x:auto;margin:.6em 0;max-width:100%}
+  .mdb th,.mdb td{border:1px solid var(--line);padding:.25rem .5rem;
+                  text-align:left;vertical-align:top}
+  .mdb th{color:var(--dim)}
+  .cb{color:var(--dim)}
+  .cb.x{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<header>
+  <b>cliban</b>
+  <span class="spacer"></span>
+  <button class="hbtn" id="refresh">↻ refresh</button>
+  <a class="hbtn" href="/">remote →</a>
+</header>
+
+<div id="projrow"></div>
+<div id="board"><div class="note">loading…</div></div>
+
+<div id="ticket">
+  <div id="thead">
+    <button class="hbtn" id="tback">← back</button>
+    <span class="spacer"></span>
+    <button class="hbtn" id="trun">▶ run</button>
+  </div>
+  <div id="tbody"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const KEY_RE = /^[A-Za-z][A-Za-z0-9]*-\d+$/;
+let data = null, loadedAt = 0;
+let proj = localStorage.clibanProj || 'all';
+let msSel = null;                 // {project, name} milestone filter
+let showClosedMs = false, showAllDone = false;
+let ticket = null, agent = 'claude';
+
+const projOf = key => key.split('-')[0];
+const escH = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                   .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// Ticket keys inside rendered markdown become links to their tickets --
+// specs reference each other constantly. Runs over finished HTML, skipping
+// existing anchors (a markdown link whose label is a key stays one link).
+let KEYS_RE = null;
+function linkKeys(html){
+  if(!KEYS_RE) return html;
+  let inA = 0;
+  return html.split(/(<[^>]*>)/).map(seg=>{
+    if(seg[0] === '<'){
+      if(/^<a[\s>]/i.test(seg)) inA++;
+      else if(/^<\/a>/i.test(seg)) inA = Math.max(0, inA-1);
+      return seg;
+    }
+    return inA ? seg
+               : seg.replace(KEYS_RE, m=>'<a href="#'+m+'">'+m+'</a>');
+  }).join('');
+}
+
+// ---- markdown --------------------------------------------------------------
+// A deliberately small renderer: headings, fences, lists (with checkboxes),
+// quotes, tables, rules, bold/italic/code/links. Everything is HTML-escaped
+// before any markup is added -- ticket bodies are agent-written and full of
+// angle brackets.
+function inline(s){
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (m,c)=>{
+    codes.push(c); return '\x00' + (codes.length-1) + '\x00'; });
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+       .replace(/(^|\W)\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
+       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+                '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\x00(\d+)\x00/g, (m,i)=>'<code>'+codes[i]+'</code>');
+}
+
+function md(src){
+  const lines = src.replace(/\r/g,'').split('\n');
+  const out = [];
+  let i = 0;
+  while(i < lines.length){
+    const l = lines[i];
+    let m;
+    if(/^```/.test(l)){
+      const buf = []; i++;
+      while(i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      out.push('<pre><code>'+escH(buf.join('\n'))+'</code></pre>');
+      continue;
+    }
+    if((m = /^(#{1,6})\s+(.*)$/.exec(l))){
+      const n = m[1].length;
+      out.push('<h'+n+'>'+inline(escH(m[2]))+'</h'+n+'>'); i++; continue;
+    }
+    if(/^\s*(---+|\*\*\*+|___+)\s*$/.test(l)){ out.push('<hr>'); i++; continue; }
+    if(/^\s*([-*+]|\d+\.)\s+/.test(l)){
+      const ordered = /^\s*\d+\./.test(l);
+      const items = [];
+      while(i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])){
+        let t = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/,'');
+        let cb = '';
+        const c = /^\[( |x|X)\]\s+(.*)$/.exec(t);
+        if(c){
+          cb = c[1].trim() ? '<span class="cb x">☑ </span>'
+                           : '<span class="cb">☐ </span>';
+          t = c[2];
+        }
+        items.push('<li>'+cb+inline(escH(t))+'</li>'); i++;
+      }
+      out.push((ordered?'<ol>':'<ul>')+items.join('')+(ordered?'</ol>':'</ul>'));
+      continue;
+    }
+    if(/^\s*>\s?/.test(l)){
+      const buf = [];
+      while(i < lines.length && /^\s*>\s?/.test(lines[i]))
+        buf.push(lines[i++].replace(/^\s*>\s?/,''));
+      out.push('<blockquote>'+md(buf.join('\n'))+'</blockquote>');
+      continue;
+    }
+    if(/^\s*\|.*\|\s*$/.test(l) && i+1 < lines.length &&
+       /^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1])){
+      const cells = r => r.trim().replace(/^\||\|$/g,'').split('|')
+                          .map(c=>inline(escH(c.trim())));
+      const head = cells(l); i += 2;
+      const rows = [];
+      while(i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]))
+        rows.push(cells(lines[i++]));
+      out.push('<table><thead><tr>'+
+        head.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+
+        rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+
+        '</tbody></table>');
+      continue;
+    }
+    if(!l.trim()){ i++; continue; }
+    const buf = [l]; i++;
+    while(i < lines.length && lines[i].trim() &&
+          !/^(#{1,6}\s|```|\s*([-*+]|\d+\.)\s|\s*>|\s*\|.*\|\s*$)/.test(lines[i]))
+      buf.push(lines[i++]);
+    out.push('<p>'+inline(escH(buf.join('\n')))+'</p>');
+  }
+  return out.join('\n');
+}
+
+// ---- board -----------------------------------------------------------------
+async function load(){
+  try{
+    const d = await (await fetch('/api/cliban/board')).json();
+    if(d.error){ $('#board').innerHTML =
+      '<div class="note">'+escH(d.error)+'</div>'; return; }
+    data = d; loadedAt = Date.now();
+    KEYS_RE = d.projects.length
+      ? new RegExp('\\b(?:'+d.projects.map(p=>p.key).join('|')+')-\\d+\\b','g')
+      : null;
+    render();
+  }catch(e){
+    $('#board').innerHTML = '<div class="note">cannot reach the server</div>';
+  }
+}
+
+function render(){
+  if(!data) return;
+  renderChips();
+  const box = $('#board'); box.innerHTML = '';
+  renderMilestones(box);
+  renderIssues(box);
+}
+
+function renderChips(){
+  const row = $('#projrow'); row.innerHTML = '';
+  const open = {};
+  data.issues.forEach(x=>{
+    if(x.status !== 'done')
+      open[projOf(x.key)] = (open[projOf(x.key)]||0)+1;
+  });
+  const mk = (key, label, count)=>{
+    const el = document.createElement('div');
+    el.className = 'chip' + (proj===key?' sel':'');
+    el.innerHTML = escH(label) +
+      (count ? '<small>'+count+'</small>' : '');
+    el.onclick = ()=>{
+      proj = key; localStorage.clibanProj = key; msSel = null;
+      showAllDone = false; render();
+    };
+    row.appendChild(el);
+  };
+  mk('all', 'all', data.issues.filter(x=>x.status!=='done').length);
+  data.projects.forEach(p=> mk(p.key, p.key, open[p.key]||0));
+}
+
+const inProj = key => proj==='all' || projOf(key)===proj;
+
+function renderMilestones(box){
+  let ms = data.milestones.filter(m=> proj==='all' || m.project===proj);
+  const closed = ms.filter(m=> m.status!=='open').length;
+  if(!showClosedMs) ms = ms.filter(m=> m.status==='open');
+  if(!ms.length && !closed) return;
+
+  const head = document.createElement('div');
+  head.className = 'sect';
+  head.innerHTML = 'milestones <span class="n">· '+ms.length+'</span>';
+  if(closed){
+    const b = document.createElement('button');
+    b.textContent = showClosedMs ? 'hide closed' : 'closed · '+closed;
+    b.className = showClosedMs ? 'on' : '';
+    b.onclick = ()=>{ showClosedMs = !showClosedMs; render(); };
+    head.appendChild(b);
+  }
+  box.appendChild(head);
+
+  ms.forEach(m=>{
+    const mine = data.issues.filter(x=>
+      x.milestone===m.name && projOf(x.key)===m.project);
+    const done = mine.filter(x=> x.status==='done').length;
+    const total = mine.length || m.issue_count || 0;
+    const sel = msSel && msSel.name===m.name && msSel.project===m.project;
+    const el = document.createElement('div');
+    el.className = 'ms' + (sel?' sel':'') + (m.status!=='open'?' closed':'');
+    const bits = [];
+    if(proj==='all') bits.push(m.project);
+    if(m.status!=='open') bits.push(m.status);
+    bits.push(done+'/'+total);
+    if(m.target_date) bits.push('→ '+m.target_date);
+    el.innerHTML =
+      '<div class="top"><span class="name"></span>'+
+      '<span class="meta">'+escH(bits.join(' · '))+'</span></div>'+
+      '<div class="bar"><i style="width:'+
+        (total ? Math.round(100*done/total) : 0)+'%"></i></div>';
+    el.querySelector('.name').textContent = m.name;
+    el.onclick = ()=>{
+      msSel = sel ? null : {project:m.project, name:m.name};
+      render();
+      // jump to the issue list, which is what filtering is for
+      if(!sel) $('#isshead').scrollIntoView({behavior:'smooth'});
+    };
+    box.appendChild(el);
+  });
+}
+
+const STATUSES = [
+  ['blocked','◆ blocked'], ['in-progress','● in progress'],
+  ['in-review','◇ in review'], ['backlog','○ backlog'], ['done','✓ done'],
+];
+
+function issueRow(x){
+  const el = document.createElement('div');
+  el.className = 'iss' + (x.status==='done'?' done':'');
+  const tags = [];
+  if(x.priority && x.priority!=='none')
+    tags.push('<span class="pri '+x.priority+'">'+
+      (x.priority==='urgent'?'!!':x.priority==='high'?'!':x.priority)+
+      '</span>');
+  (x.labels||[]).slice(0,2).forEach(l=>
+    tags.push('<span class="badge">'+escH(l)+'</span>'));
+  if(x.milestone && !msSel)
+    tags.push('<span class="badge">'+escH(x.milestone)+'</span>');
+  el.innerHTML = '<span class="key">'+escH(x.key)+'</span>'+
+    '<span class="title"></span>'+
+    '<span class="tags">'+tags.join('')+'</span>';
+  el.querySelector('.title').textContent = x.title;
+  el.onclick = ()=>{ location.hash = x.key; };
+  return el;
+}
+
+function renderIssues(box){
+  let iss = data.issues.filter(x=> inProj(x.key));
+  if(msSel) iss = iss.filter(x=>
+    x.milestone===msSel.name && projOf(x.key)===msSel.project);
+
+  const head = document.createElement('div');
+  head.className = 'sect'; head.id = 'isshead';
+  head.innerHTML = 'issues <span class="n">· '+iss.length+'</span>';
+  if(msSel){
+    const b = document.createElement('button');
+    b.className = 'on';
+    b.textContent = msSel.name+' ×';
+    b.onclick = ()=>{ msSel = null; render(); };
+    head.appendChild(b);
+  }
+  box.appendChild(head);
+
+  STATUSES.forEach(([st, label])=>{
+    let group = iss.filter(x=> x.status===st);
+    if(!group.length) return;
+    const h = document.createElement('div');
+    h.className = 'sect';
+    h.innerHTML = '<span class="st '+st+'">'+label+'</span>'+
+                  '<span class="n">· '+group.length+'</span>';
+    box.appendChild(h);
+    if(st==='done' && !showAllDone && group.length > 15){
+      group = group.slice()
+        .sort((a,b)=> (b.completed_at||'').localeCompare(a.completed_at||''))
+        .slice(0,15);
+    }
+    group.forEach(x=> box.appendChild(issueRow(x)));
+    if(st==='done' && !showAllDone &&
+       iss.filter(x=>x.status==='done').length > 15){
+      const b = document.createElement('div');
+      b.className = 'note'; b.style.cursor = 'pointer';
+      b.textContent = '… show all '+iss.filter(x=>x.status==='done').length+
+                      ' done';
+      b.onclick = ()=>{ showAllDone = true; render(); };
+      box.appendChild(b);
+    }
+  });
+  if(!iss.length){
+    const n = document.createElement('div');
+    n.className = 'note'; n.textContent = 'no issues here';
+    box.appendChild(n);
+  }
+}
+
+// ---- ticket ----------------------------------------------------------------
+function tmsg(t, err, html){
+  const m = $('#tmsg'); if(!m) return;
+  if(html) m.innerHTML = t; else m.textContent = t||'';
+  m.className = err ? 'err' : '';
+}
+
+async function showTicket(key){
+  $('#ticket').classList.add('show');
+  $('#tbody').innerHTML = '<div class="note">loading '+escH(key)+'…</div>';
+  ticket = null;
+  let d;
+  try{ d = await (await fetch('/api/cliban/issue?key='+
+                              encodeURIComponent(key))).json(); }
+  catch(e){ d = {error: e.message}; }
+  if(d.error){
+    $('#tbody').innerHTML = '<div class="note">'+escH(d.error)+'</div>';
+    return;
+  }
+  ticket = d;
+  const b = $('#tbody');
+  const meta = [];
+  if(d.milestone) meta.push('milestone: '+d.milestone);
+  if(d.due_date) meta.push('due: '+d.due_date);
+  if((d.labels||[]).length) meta.push('labels: '+d.labels.join(', '));
+  if(d.git_branch_name) meta.push('branch: '+d.git_branch_name);
+  b.innerHTML =
+    '<div class="keyline"><span class="key">'+escH(d.key)+'</span>'+
+    '<span class="st '+escH(d.status)+'">'+escH(d.status)+'</span>'+
+    (d.priority!=='none'
+      ? '<span class="pri '+escH(d.priority)+'">'+escH(d.priority)+'</span>' : '')+
+    '</div>'+
+    '<h1 class="title"></h1>'+
+    meta.map(t=>'<div class="metarow">'+escH(t)+'</div>').join('')+
+    ((d.relations||[]).length
+      ? '<div class="metarow">'+d.relations.map(r=>
+          escH(r.type)+' <span class="rel" data-k="'+escH(r.target)+'">'+
+          escH(r.target)+'</span>').join(' · ')+'</div>'
+      : '')+
+    '<div id="tmsg"></div>'+
+    '<div id="runbox">'+
+      '<div id="agents">'+
+        '<button data-a="claude" class="sel">claude</button>'+
+        '<button data-a="codex">codex</button>'+
+      '</div>'+
+      '<input id="rq" placeholder="project directory…" autocomplete="off" '+
+        'spellcheck="false">'+
+      '<div id="rlist"></div>'+
+    '</div>'+
+    '<div class="mdb">'+
+      (d.description ? linkKeys(md(d.description))
+                     : '<p style="color:var(--dim)">no description</p>')+
+    '</div>';
+  b.querySelector('h1.title').textContent = d.title;
+  b.querySelectorAll('.rel').forEach(el=>
+    el.onclick = ()=>{ location.hash = el.dataset.k; });
+  b.querySelectorAll('#agents button').forEach(el=>
+    el.onclick = ()=>{
+      agent = el.dataset.a;
+      b.querySelectorAll('#agents button').forEach(x=>
+        x.classList.toggle('sel', x===el));
+    });
+  $('#rq').addEventListener('input', ()=>{
+    clearTimeout(window._rqT);
+    window._rqT = setTimeout(loadRunDirs, 150);
+  });
+  b.scrollTop = 0;
+}
+
+function hideTicket(){
+  $('#ticket').classList.remove('show');
+  ticket = null;
+}
+
+// ---- run it ----------------------------------------------------------------
+// Spawning reuses the main page's flow: pick a directory from zoxide, the
+// server derives the tmux session. The only addition is an opening prompt
+// pointing the agent at this ticket.
+function runPrompt(t){
+  let p = 'Work on cliban issue '+t.key+': "'+t.title+'". '+
+    'Run `cliban issue show '+t.key+'` for the full spec and plan. '+
+    'Keep the ticket updated as you work: log progress with '+
+    '`cliban issue log '+t.key+' "<note>"`, tick finished plan steps with '+
+    '`cliban issue tick '+t.key+' <step>`, and move it with '+
+    '`cliban issue mv '+t.key+' <status>` as its status changes.';
+  if(t.git_branch_name)
+    p += ' If you work on a branch, name it '+t.git_branch_name+'.';
+  return p;
+}
+
+async function loadRunDirs(){
+  const q = $('#rq').value.trim();
+  let d;
+  try{ d = await (await fetch('/api/projects?q='+
+                              encodeURIComponent(q))).json(); }
+  catch(e){ return; }
+  const box = $('#rlist'); box.innerHTML = '';
+  d.projects.forEach(p=>{
+    const el = document.createElement('div');
+    el.className = 'proj';
+    el.innerHTML = '<span class="p"></span><span class="s">'+
+      (p.exists ? '↳ '+escH(p.session) : escH(p.session))+'</span>';
+    el.querySelector('.p').textContent = p.short;
+    el.onclick = ()=> runTicket(p);
+    box.appendChild(el);
+  });
+  if(!d.projects.length) box.textContent = 'nothing matching';
+}
+
+async function runTicket(p){
+  if(!ticket) return;
+  tmsg('starting '+agent+' in '+p.session+'…');
+  try{
+    const r = await fetch('/api/spawn', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dir:p.dir, agent, prompt: runPrompt(ticket)})});
+    const d = await r.json();
+    if(d.error) return tmsg(d.error, true);
+    $('#runbox').classList.remove('show');
+    $('#trun').textContent = '▶ run';
+    tmsg(escH(agent+' is on '+ticket.key+' · new '+d.created+' in '+
+              d.session+' · ')+'<a href="/">open remote →</a>', false, true);
+  }catch(e){ tmsg('spawn failed: '+e.message, true); }
+}
+
+$('#trun').onclick = ()=>{
+  const box = $('#runbox'); if(!box || !ticket) return;
+  const on = box.classList.toggle('show');
+  $('#trun').textContent = on ? '× cancel' : '▶ run';
+  if(on){ $('#rq').value = ''; loadRunDirs(); }
+};
+$('#tback').onclick = ()=>{
+  if(location.hash) history.back(); else hideTicket();
+};
+
+// The phone back button should close a ticket, so tickets live in the hash.
+function route(){
+  const key = location.hash.replace(/^#/,'');
+  if(KEY_RE.test(key)) showTicket(key); else hideTicket();
+}
+window.addEventListener('hashchange', route);
+
+$('#refresh').onclick = ()=>{ $('#refresh').textContent = '…'; load()
+  .then(()=> $('#refresh').textContent = '↻ refresh'); };
+document.addEventListener('visibilitychange', ()=>{
+  // Stale after a pocket trip; a board does not need live polling.
+  if(!document.hidden && Date.now()-loadedAt > 60000) load();
+});
+
+load().then(route);
+</script>
+</body>
+</html>
