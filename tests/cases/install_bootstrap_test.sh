@@ -567,7 +567,7 @@ test_the_unattended_marker_really_makes_the_wizard_stop_asking() {
   AYEAYE_BOOTSTRAP_UNATTENDED=1
   AYEAYE_BOOTSTRAPPED=1
   export AYEAYE_BOOTSTRAP_UNATTENDED AYEAYE_BOOTSTRAPPED
-  stdin_lines "0.0.0.0" "9999"
+  stdin_lines "9999" "somewhere.example" "https://ntfy.example/t"
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=8911" \

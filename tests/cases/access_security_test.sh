@@ -243,10 +243,10 @@ test_no_way_onto_a_network_can_be_reached_without_a_person() {
 }
 
 test_choosing_a_way_in_moves_ayeaye_back_off_the_network() {
-  # A person who typed an address of their own into install.sh's question and
-  # then chose one of these ways in has two things on the network: the front
-  # end, and ayeaye behind it. Choosing is what makes this step the owner of
-  # that address, and it puts the app back where it belongs.
+  # A machine whose settings already had ayeaye answering on the network, on
+  # which somebody then chooses one of these ways in, has two things on the
+  # network: the front end, and ayeaye behind it. Choosing is what makes this
+  # step the owner of that address, and it puts the app back where it belongs.
   wizard_env_merge "$ENV_FILE" "AYEAYE_BIND=0.0.0.0"
   assert_file_contains "$ENV_FILE" "AYEAYE_BIND=0.0.0.0"
   _set_up tailscale
@@ -256,8 +256,9 @@ test_choosing_a_way_in_moves_ayeaye_back_off_the_network() {
 
 test_an_address_this_step_did_not_choose_is_left_alone_and_said_out_loud() {
   # And the other side of it. Where the way in was deduced rather than chosen,
-  # the answer somebody typed is theirs - so it is not quietly overwritten,
-  # and it is not quietly accepted either.
+  # the address is somebody else's - answer.bind carries whatever the settings
+  # file already said, since nothing asks for one - so it is not quietly
+  # overwritten, and it is not quietly accepted either.
   local out
   WIZARD_INTERACTIVE=1
   wizard_remember answer.change_settings 1
@@ -272,7 +273,7 @@ test_an_address_this_step_did_not_choose_is_left_alone_and_said_out_loud() {
   out="$(cat "$TEST_TMPDIR/said")"
   assert_eq "proxy" "$(wizard_state_get answer.access.mode "")"
   assert_eq "0.0.0.0" "$(wizard_state_get answer.bind "")" \
-    "the answer they gave to a different question is still theirs"
+    "the address that was already in their settings is still theirs"
   assert_contains "$out" "answer on every address this computer"
 }
 

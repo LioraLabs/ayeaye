@@ -1265,11 +1265,19 @@ def voice_available():
     button greyed out on a computer that can talk.
 
     So the question asked is the only one that means anything: is the command
-    bin/voice-dictate is going to run actually there? vd.WHISPER_CLI is that
+    bin/voice-dictate is going to run actually there? vd.whisper_cli() is that
     command, resolved from VOICE_WHISPER_CLI or from the first of the names
     still in the world found on PATH. One name to keep in step instead of
     two, which is what went wrong the first time. shutil.which answers for an
     absolute path as readily as for a bare name, so a recorded path works.
+
+    Called rather than read. vd.WHISPER_CLI is resolved when the module is
+    imported, which for this process is once, at boot; a server that started on
+    a machine with no transcriber would hold that answer for as long as it ran,
+    and installing whisper.cpp would light the talk button up only after
+    somebody restarted ayeaye. Setup tells people the app picks this up by
+    itself, and this is the line that has to make that true - the whole point
+    of the cache above is that the answer is allowed to change.
     """
     now = time.time()
     if now - _voice_probe["at"] < VOICE_PROBE_TTL:
@@ -1282,7 +1290,7 @@ def voice_available():
                                           timeout=1):
                 ok = True
         except OSError:
-            ok = bool(shutil.which(vd.WHISPER_CLI)
+            ok = bool(shutil.which(vd.whisper_cli())
                       and os.path.exists(vd.WHISPER_MODEL))
     _voice_probe["at"], _voice_probe["ok"] = now, ok
     return ok

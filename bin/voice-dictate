@@ -113,9 +113,40 @@ WHISPER_THREADS = os.environ.get("VOICE_WHISPER_THREADS", "16")
 # what it found, so the name checked here is the name that is really on this
 # machine rather than the one that was current when this line was written.
 # VOICE_WHISPER_CLI overrides, and an absolute path works.
-WHISPER_CLI = os.environ.get("VOICE_WHISPER_CLI", "") or next(
-    (name for name in ("whisper-cli", "whisper-cpp", "whisper")
-     if shutil.which(name)), "whisper-cpp")
+WHISPER_CLI_NAMES = ("whisper-cli", "whisper-cpp", "whisper")
+
+
+def whisper_cli():
+    """The command-line transcriber on this machine, asked for now.
+
+    A function and not a constant, and the difference matters to exactly one
+    caller. bin/voice-dictate is a fresh process per dictation, so it could not
+    tell; bin/ayeaye imports this module once and then runs for weeks, and it
+    asks this question every time it decides whether the talk button is live.
+    Resolved at import, the answer on a machine that had no transcriber when
+    the server started would be the fallback name for ever - so installing
+    whisper.cpp would light the button up only after somebody thought to
+    restart ayeaye, which is precisely the thing setup promises they will not
+    have to do.
+
+    shutil.which is a PATH lookup and a stat; asking it once every
+    VOICE_PROBE_TTL seconds costs nothing worth measuring.
+    """
+    override = os.environ.get("VOICE_WHISPER_CLI", "")
+    if override:
+        return override
+    for name in WHISPER_CLI_NAMES:
+        if shutil.which(name):
+            return name
+    # Nothing here yet. The last name is returned rather than an empty string
+    # so that every caller still has something to put in an error message.
+    return "whisper-cpp"
+
+
+# Kept because it is what the transcription path below spells, and because a
+# module-level name is what a reader looks for. It is this process's answer,
+# which for a one-shot dictation is the only answer there is.
+WHISPER_CLI = whisper_cli()
 OLLAMA_MODEL = os.environ.get("VOICE_OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_HOST = os.environ.get("VOICE_OLLAMA_HOST", "localhost:11434")
 KEEP_ALIVE = os.environ.get("VOICE_KEEP_ALIVE", "1h")

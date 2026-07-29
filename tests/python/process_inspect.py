@@ -43,9 +43,20 @@ FIXTURES_DIR = os.environ.get("FIXTURES_DIR") or os.path.join(
 # Loaded, not imported: bin/ayeaye has no .py extension because it is a
 # command. A token is already in the environment so the load does not generate
 # one and write it to disk.
+#
+# exec_module rather than the load_module() that goes away in python 3.15, and
+# a named loader because a command has no .py extension for the machinery to
+# recognise from. Registered in sys.modules before it is executed, which is
+# what load_module() did and what SharedModuleTest below depends on.
 os.environ.setdefault("AYEAYE_TOKEN", "test-token")
-ayeaye = SourceFileLoader(
-    "ayeaye_under_test", os.path.join(REPO_ROOT, "bin", "ayeaye")).load_module()
+_AYEAYE_NAME = "ayeaye_under_test"
+_AYEAYE_PATH = os.path.join(REPO_ROOT, "bin", "ayeaye")
+_ayeaye_spec = spec_from_file_location(
+    _AYEAYE_NAME, _AYEAYE_PATH,
+    loader=SourceFileLoader(_AYEAYE_NAME, _AYEAYE_PATH))
+ayeaye = module_from_spec(_ayeaye_spec)
+sys.modules[_AYEAYE_NAME] = ayeaye
+_ayeaye_spec.loader.exec_module(ayeaye)
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 

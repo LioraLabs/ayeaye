@@ -53,8 +53,14 @@ test_no_systemctl_at_all_falls_back_to_the_manual_command() {
   assert_contains "$RUN_STDOUT" "no systemd user session detected"
   assert_contains "$RUN_STDOUT" "run the server with: $REPO_ROOT/bin/ayeaye"
   assert_contains "$RUN_STDOUT" "(it reads $XDG_CONFIG_HOME/ayeaye/env by itself)"
-  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: stderr of "
-  assert_contains "$RUN_STDOUT" "stderr of $REPO_ROOT/bin/ayeaye"
+  # Nothing installed a service, so there is no journal and no log file to
+  # name - only the terminal ayeaye gets started in. That is the property: a
+  # summary pointing at a journal here would be pointing at an empty one.
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: whatever the terminal you start ayeaye in shows"
+  assert_not_contains "$RUN_STDOUT" "journalctl" \
+    "no unit was installed, so nothing of ayeaye's is in the journal"
+  assert_contains "$RUN_STDOUT" "stop the ayeaye you started by hand" \
+    "and removing it is stopping that, not disabling a service nobody installed"
 }
 
 test_no_systemd_installs_and_starts_nothing() {
@@ -144,7 +150,7 @@ test_defaults_mode_never_starts_the_service() {
 test_confirming_the_prompt_enables_and_starts_the_unit() {
   _hard_deps_present
   _systemd_session
-  pty_answers "" "" "" ""          # the four configuration questions
+  pty_answers "" "" ""             # the three configuration questions
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -155,7 +161,7 @@ test_confirming_the_prompt_enables_and_starts_the_unit() {
 test_declining_the_prompt_leaves_the_service_alone() {
   _hard_deps_present
   _systemd_session
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "n"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -168,7 +174,7 @@ test_declining_the_prompt_leaves_the_service_alone() {
 test_the_start_prompt_defaults_to_yes() {
   _hard_deps_present
   _systemd_session
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" ""
   pty_install
   assert_contains "$PTY_TRANSCRIPT" "enable and start it now? [y]:"
@@ -181,6 +187,22 @@ test_the_summary_points_at_the_journal_when_a_unit_was_installed() {
   _systemd_session
   run_install --defaults
   assert_matches "$RUN_STDOUT" "logs[[:space:]]*: journalctl --user -u ayeaye -f"
+}
+
+test_the_closing_summary_removes_it_the_way_this_platform_removes_things() {
+  # The other half of the log line: a unit was installed here, so the way to
+  # get rid of it is the one this machine's service manager understands, and
+  # the file it left behind is named rather than left for somebody to find.
+  # service_launchd_test.sh pins the same property on the other platform.
+  _hard_deps_present
+  _systemd_session
+  run_install --defaults
+  assert_contains "$RUN_STDOUT" "to remove it:"
+  assert_contains "$RUN_STDOUT" "systemctl --user disable --now ayeaye.service"
+  assert_contains "$RUN_STDOUT" "$(_unit_file)"
+  assert_contains "$RUN_STDOUT" "$XDG_CONFIG_HOME/ayeaye/env"
+  assert_contains "$RUN_STDOUT" "$XDG_STATE_HOME/ayeaye"
+  assert_not_contains "$RUN_STDOUT" "launchctl" "there is no launchd here"
 }
 
 # ------------------------------------------------------------ linger hint
@@ -317,7 +339,7 @@ test_a_run_that_did_not_start_the_service_records_that_it_did_not() {
 test_a_run_that_started_the_service_records_that_it_did() {
   _hard_deps_present
   _systemd_session
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -332,7 +354,7 @@ test_a_run_that_installed_no_service_at_all_records_that_too() {
   # reporting on something nothing started.
   _hard_deps_present
   _systemd_session
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_file_contains "$(_state_file)" "step.service.unit.started=1"

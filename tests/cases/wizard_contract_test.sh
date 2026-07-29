@@ -127,6 +127,74 @@ test_the_download_lint_catches_a_redirect_and_not_a_probe() {
 judged whole lines by their least incriminating clause would be no rule at all"
 }
 
+# _model_pulls - the fetches that are not curl.
+#
+# Written as its own judge, like _judge_downloads, so that what it catches can
+# be pinned against lines that are not in the tree rather than against the
+# tree's current innocence.
+#
+# `ollama run` is on the list and it is half the reason this rule exists: it
+# reads as "start the model I already have" and it silently downloads several
+# gigabytes when that is not true. `ollama pull` at least looks like what it
+# does. `huggingface-cli download` and its short form are the same shape from a
+# different program, and there will be more of them.
+_model_pulls() {
+  grep -E '(ollama[[:space:]]+(pull|run)|huggingface-cli[[:space:]]+download|(^|[^A-Za-z0-9_-])hf[[:space:]]+download)' || true
+}
+
+test_nothing_fetches_a_model_without_asking_first() {
+  # The gap this closes: every other download rule in this file is spelled
+  # "curl", because for most of this project's life every download was one. A
+  # model pull is a program of somebody else's fetching gigabytes onto this
+  # machine, and it was invisible to all of them - lib/steps/40-voice.sh does
+  # ask, honestly and through wizard_consent, and nothing here could see that
+  # it did, or would have noticed if it stopped.
+  #
+  # What is checked is what a lint can actually see: a file that pulls a model
+  # has to be a file that asks. Ordering is beyond it, which is why this is a
+  # floor and not a proof.
+  local file base found offenders=""
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    base="${file##*/}"
+    [ "$base" = consent.sh ] && continue
+    found="$(grep -n -E '.' "$file" 2>/dev/null \
+      | grep -v -E '^[0-9]+:[[:space:]]*#' | _model_pulls)"
+    [ -n "$found" ] || continue
+    if ! grep -q -E 'wizard_(download|consent[[:space:]]+download)' "$file"; then
+      offenders="$offenders$base:$found
+"
+    fi
+  done <<EOF
+$(_wizard_sources)
+EOF
+  assert_eq "" "$offenders" \
+    "fetching a model is fetching bytes onto somebody's machine: ask through
+wizard_consent download, or wizard_download, in the same file that pulls it"
+}
+
+test_the_model_pull_lint_can_see_the_shapes_it_is_looking_for() {
+  local judged
+  judged="$(printf '%s\n' \
+    'made-up.sh:1:  ollama pull "$model"' \
+    'made-up.sh:2:  ollama run qwen2.5:7b-instruct' \
+    'made-up.sh:3:  huggingface-cli download ggerganov/whisper.cpp' \
+    'made-up.sh:4:  hf download ggerganov/whisper.cpp' \
+    'made-up.sh:5:  ollama list' \
+    'made-up.sh:6:  command -v ollama >/dev/null 2>&1' \
+    'made-up.sh:7:  printf "self download\n"' \
+    | _model_pulls)"
+  assert_contains "$judged" "made-up.sh:1" "a pull is a download"
+  assert_contains "$judged" "made-up.sh:2" \
+    "so is a run, which downloads whatever it does not already have"
+  assert_contains "$judged" "made-up.sh:3" "and so is the one from huggingface"
+  assert_contains "$judged" "made-up.sh:4" "under either of its two names"
+  assert_not_contains "$judged" "made-up.sh:5" "asking what is already here is not"
+  assert_not_contains "$judged" "made-up.sh:6" "and looking the program up is not"
+  assert_not_contains "$judged" "made-up.sh:7" \
+    "the word download in a sentence is not a program fetching anything"
+}
+
 test_the_one_download_outside_the_wrapper_is_the_bootstrap_and_there_is_one_of_it() {
   # install.sh downloads once before lib/consent.sh exists to ask on its
   # behalf: the release it is about to hand over to. That fetch is exempt from

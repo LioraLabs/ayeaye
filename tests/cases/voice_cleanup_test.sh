@@ -86,7 +86,6 @@ _weak_laptop() {
 }
 
 _config_prompts() {
-  pty_expect "bind address" ""
   pty_expect "port [" ""
   pty_expect "allowed hosts" ""
   pty_expect "ntfy topic URL" ""

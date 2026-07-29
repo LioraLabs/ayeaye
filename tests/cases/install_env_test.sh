@@ -4,7 +4,8 @@
 # the repo: $XDG_CONFIG_HOME/ayeaye/env, rendered from env.template, and
 # $XDG_STATE_HOME/ayeaye/token, which the bookmark URL is built from. These
 # pin what a run puts in them, what a re-run does to them, and the promise that
-# templating only ever touches the four prompted values.
+# templating only ever touches the four values setup decides: the three it asks
+# about, and the address, which lib/steps/50-access.sh settles rather than asks.
 #
 # Everything here uses --no-systemd: the unit is another case file's job.
 
@@ -17,13 +18,13 @@ _hard_deps_present() {
   stub_real python3
 }
 
-# The four configuration questions, answered by name rather than by position so
-# a misplaced answer cannot pass unnoticed.
+# The three configuration questions, answered by name rather than by position so
+# a misplaced answer cannot pass unnoticed. The address is no longer one of
+# them and cannot be typed at a prompt at all.
 _answer_config_prompts() {
-  pty_expect "bind address" "$1"
-  pty_expect "port [" "$2"
-  pty_expect "allowed hosts" "$3"
-  pty_expect "ntfy topic URL" "$4"
+  pty_expect "port [" "$1"
+  pty_expect "allowed hosts" "$2"
+  pty_expect "ntfy topic URL" "$3"
 }
 
 # Every @NAME@ still present in a file, deduplicated. Deliberately generic: a
@@ -79,14 +80,15 @@ test_no_placeholder_survives_into_the_written_config() {
     "every @NAME@ must be substituted, including any placeholder added to env.template after this test was written"
 }
 
-test_the_four_answers_land_in_their_own_keys() {
+test_the_answers_land_in_their_own_keys() {
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "one.example,two.example" "https://ntfy.example/topic"
+  stdin_lines "9911" "one.example,two.example" "https://ntfy.example/topic"
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
 
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
-  assert_file_contains "$env_file" "AYEAYE_BIND=10.1.2.3"
+  assert_file_contains "$env_file" "AYEAYE_BIND=127.0.0.1" \
+    "the address nobody was asked about is written all the same, on this computer"
   assert_file_contains "$env_file" "AYEAYE_PORT=9911"
   assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=one.example,two.example"
   assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/topic"
@@ -105,7 +107,7 @@ test_everything_the_installer_was_not_asked_about_survives_verbatim() {
 
   # One readability anchor for the commented-out defaults, which are the file's
   # documentation of every other setting. Nothing more: the cksum above already
-  # catches any byte the templater touches outside the four keys, and pinning
+  # catches any byte the templater touches outside those four keys, and pinning
   # the template's prose would make editing that prose an install.sh failure.
   assert_file_contains "$env_file" "#AYEAYE_TOKEN="
 }
@@ -125,7 +127,7 @@ test_the_temporary_file_is_not_left_next_to_the_config() {
 
 test_answers_typed_at_a_terminal_reach_the_same_keys() {
   _hard_deps_present
-  _answer_config_prompts "192.0.2.77" "8123" "typed.example" "https://ntfy.example/typed"
+  _answer_config_prompts "8123" "typed.example" "https://ntfy.example/typed"
   # Naming an https address of your own is now asked about once - it is what
   # lets something that is not this computer reach ayeaye - so the answer
   # to that question belongs here too.
@@ -134,7 +136,8 @@ test_answers_typed_at_a_terminal_reach_the_same_keys() {
   assert_status 0 "$PTY_STATUS"
 
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
-  assert_file_contains "$env_file" "AYEAYE_BIND=192.0.2.77"
+  assert_file_contains "$env_file" "AYEAYE_BIND=127.0.0.1" \
+    "saying yes to an https front puts that front on the network, not ayeaye itself"
   assert_file_contains "$env_file" "AYEAYE_PORT=8123"
   assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=typed.example"
   assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/typed"
@@ -145,7 +148,7 @@ test_answers_full_of_separators_reach_the_file_unmangled() {
   # URL with the slashes and ampersands that would need escaping if this were
   # sed rather than python.
   _hard_deps_present
-  stdin_lines "127.0.0.1" "8911" "a.example,b.example,c.example" \
+  stdin_lines "8911" "a.example,b.example,c.example" \
               "https://ntfy.example/a/b?x=1&y=2"
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
@@ -153,22 +156,22 @@ test_answers_full_of_separators_reach_the_file_unmangled() {
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
   assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=a.example,b.example,c.example"
   assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/a/b?x=1&y=2"
-  assert_matches "$RUN_STDOUT" "tier[[:space:]]*: text-only \\+notifications" \
+  assert_contains "$RUN_STDOUT" ", with notifications to your phone" \
     "the ntfy URL must also read back out of the file it was just written to"
 }
 
 test_an_answer_shaped_like_a_placeholder_is_written_literally() {
-  # This used to replace the four placeholders in sequence over the whole text,
-  # so a value substituted early was still eligible for the substitutions that
-  # followed it: answering "@PORT@" to the address question put the port number
-  # in AYEAYE_BIND. Templating is now one pass, and an answer is a value rather
-  # than another instruction.
+  # This used to replace the placeholders in sequence over the whole text, so a
+  # value substituted early was still eligible for the substitutions that
+  # followed it: answering "@PORT@" to one question put the port number in
+  # somebody else's key. Templating is now one pass, and an answer is a value
+  # rather than another instruction.
   _hard_deps_present
-  stdin_lines "@PORT@" "9911" "" ""
+  stdin_lines "9911" "@PORT@" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=@PORT@"
-  assert_file_not_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=9911" \
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_ALLOWED_HOSTS=@PORT@"
+  assert_file_not_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_ALLOWED_HOSTS=9911" \
     "an answer must never be substituted a second time"
 }
 
@@ -187,7 +190,7 @@ test_a_second_run_asks_before_rewriting_the_config_it_wrote() {
 
 test_declining_the_rewrite_leaves_the_file_byte_for_byte_identical() {
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "kept.example" "https://ntfy.example/kept"
+  stdin_lines "9911" "kept.example" "https://ntfy.example/kept"
   run_install --no-systemd
 
   local env_file="$XDG_CONFIG_HOME/ayeaye/env" before before_sum
@@ -208,12 +211,13 @@ test_accepting_the_rewrite_replaces_the_answers() {
   run_install --defaults --no-systemd
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=8911"
 
-  stdin_lines "y" "10.1.2.3" "9911" "second.example" "https://ntfy.example/second"
+  stdin_lines "y" "9911" "second.example" "https://ntfy.example/second"
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
 
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
-  assert_file_contains "$env_file" "AYEAYE_BIND=10.1.2.3"
+  assert_file_contains "$env_file" "AYEAYE_BIND=127.0.0.1" \
+    "all four substituted keys are rewritten, including the one nobody was asked about"
   assert_file_contains "$env_file" "AYEAYE_PORT=9911"
   assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=second.example"
   assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/second"
@@ -223,7 +227,7 @@ test_accepting_the_rewrite_replaces_the_answers() {
 
 test_a_defaults_rerun_keeps_the_existing_file_without_asking() {
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "" ""
+  stdin_lines "9911" "" ""
   run_install --no-systemd
 
   local env_file="$XDG_CONFIG_HOME/ayeaye/env" before_sum
@@ -235,7 +239,7 @@ test_a_defaults_rerun_keeps_the_existing_file_without_asking() {
   assert_not_contains "$RUN_OUTPUT" "rewrite it?" \
     "--defaults answers the rewrite question with the safe option instead of asking it"
   assert_eq "$before_sum" "$(_sum "$env_file")"
-  assert_contains "$RUN_STDOUT" "bookmark: http://10.1.2.3:9911/?token=" \
+  assert_contains "$RUN_STDOUT" "bookmark: http://127.0.0.1:9911/?token=" \
     "the summary of a kept config is read back out of the file, not out of the defaults"
 }
 
@@ -258,16 +262,16 @@ test_the_first_run_creates_a_private_non_empty_token() {
     "url-safe, because it goes straight into the bookmark query string"
 }
 
-test_the_bookmark_url_carries_that_exact_token_and_the_chosen_address() {
+test_the_bookmark_url_carries_that_exact_token_and_the_chosen_port() {
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "" ""
+  stdin_lines "9911" "" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
 
   local token
   token="$(cat "$XDG_STATE_HOME/ayeaye/token")"
   assert_ne "" "$token"
-  assert_contains "$RUN_STDOUT" "bookmark: http://10.1.2.3:9911/?token=$token" \
+  assert_contains "$RUN_STDOUT" "bookmark: http://127.0.0.1:9911/?token=$token" \
     "the printed URL must carry the token that was actually stored, not a second one"
 }
 

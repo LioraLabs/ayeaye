@@ -22,34 +22,37 @@ VOICE_NTFY_URL=https://ntfy.example/kept
 ENV
 }
 
-# The four configuration questions, answered by name rather than by position so
-# a misplaced answer cannot pass unnoticed.
+# The three configuration questions, answered by name rather than by position so
+# a misplaced answer cannot pass unnoticed. The address ayeaye answers on used
+# to be the first of them and is no longer asked at all: lib/steps/50-access.sh
+# owns it now, so there is nothing here to type at it.
 _answer_config_prompts() {
-  pty_expect "bind address" "$1"
-  pty_expect "port [" "$2"
-  pty_expect "allowed hosts" "$3"
-  pty_expect "ntfy topic URL" "$4"
+  pty_expect "port [" "$1"
+  pty_expect "allowed hosts" "$2"
+  pty_expect "ntfy topic URL" "$3"
 }
 
-test_the_four_questions_are_asked_in_order_with_their_defaults() {
+test_the_three_questions_are_asked_in_order_with_their_defaults() {
   _hard_deps_present
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "bind address [127.0.0.1]:"
   assert_contains "$PTY_TRANSCRIPT" "port [8911]:"
   assert_contains "$PTY_TRANSCRIPT" "allowed hosts"
   assert_contains "$PTY_TRANSCRIPT" "ntfy topic URL for push notifications (empty disables) [empty]:"
 
-  local bind_line port_line
-  bind_line="$(printf '%s\n' "$PTY_TRANSCRIPT" | grep -n "bind address" | head -1 | cut -d: -f1)"
+  local port_line hosts_line ntfy_line
   port_line="$(printf '%s\n' "$PTY_TRANSCRIPT" | grep -n "port \[8911\]" | head -1 | cut -d: -f1)"
-  [ "$bind_line" -lt "$port_line" ] || fail "bind must be asked before port:
+  hosts_line="$(printf '%s\n' "$PTY_TRANSCRIPT" | grep -n "allowed hosts" | head -1 | cut -d: -f1)"
+  ntfy_line="$(printf '%s\n' "$PTY_TRANSCRIPT" | grep -n "ntfy topic URL" | head -1 | cut -d: -f1)"
+  [ "$port_line" -lt "$hosts_line" ] || fail "port must be asked before allowed hosts:
+$PTY_TRANSCRIPT"
+  [ "$hosts_line" -lt "$ntfy_line" ] || fail "allowed hosts must be asked before ntfy:
 $PTY_TRANSCRIPT"
 }
 
 test_an_empty_answer_takes_the_offered_default() {
   _hard_deps_present
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=127.0.0.1"
@@ -60,42 +63,51 @@ test_an_empty_answer_takes_the_offered_default() {
 
 test_a_typed_answer_overrides_the_default() {
   _hard_deps_present
-  _answer_config_prompts "192.168.1.10" "9000" "box.example,other.example" "https://ntfy.sh/mine"
+  _answer_config_prompts "9000" "box.example,other.example" "https://ntfy.sh/mine"
   # Naming an https address of your own is now asked about once - it is what
   # lets something that is not this computer reach ayeaye - so the answer
   # to that question belongs here too.
   pty_expect "may box.example,other.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
-  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=192.168.1.10"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9000"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_ALLOWED_HOSTS=box.example,other.example"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "VOICE_NTFY_URL=https://ntfy.sh/mine"
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=127.0.0.1" \
+    "the address is not one of the questions, so no answer can move it off this computer"
 }
 
 test_answers_are_reflected_in_the_bookmark_url() {
+  # The address is no longer promptable, so the one in the settings file is
+  # what the closing lines have to be read out of. The port still is, and both
+  # halves of the bookmark block have to agree about it.
   _hard_deps_present
-  _answer_config_prompts "192.168.1.10" "9000" "box.example,other.example" ""
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye"
+  printf 'AYEAYE_BIND=192.168.1.10\n' > "$XDG_CONFIG_HOME/ayeaye/env"
+  pty_expect "rewrite it?" "y"
+  _answer_config_prompts "9000" "box.example,other.example" ""
   pty_expect "may box.example,other.example reach ayeaye?" "y"
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "bookmark: http://192.168.1.10:9000/?token="
-  assert_contains "$PTY_TRANSCRIPT" "https://box.example/?token=" \
+  assert_contains "$PTY_TRANSCRIPT" "bookmark: https://box.example/?token=" \
     "only the first allowed host is offered as the https front"
+  assert_contains "$PTY_TRANSCRIPT" \
+    "in a browser on this computer: http://192.168.1.10:9000/?token="
 }
 
-test_a_notification_url_shows_up_in_the_tier_line() {
+test_a_notification_url_shows_up_in_what_works() {
   _hard_deps_present
-  _answer_config_prompts "" "" "" "https://ntfy.sh/mine"
+  _answer_config_prompts "" "" "https://ntfy.sh/mine"
   pty_install --no-systemd
-  assert_matches "$PTY_TRANSCRIPT" "tier[[:space:]]*: text-only \\+notifications"
+  assert_matches "$PTY_TRANSCRIPT" \
+    "what works: .*, with notifications to your phone"
 }
 
 test_defaults_mode_asks_nothing_and_reads_no_stdin() {
   _hard_deps_present
-  stdin_lines "0.0.0.0" "9999" "should-not-be-read" "should-not-be-read"
+  stdin_lines "9999" "should-not-be-read" "should-not-be-read"
   run_install --defaults --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_not_contains "$RUN_OUTPUT" "bind address" "--defaults must not prompt"
+  assert_not_contains "$RUN_OUTPUT" "port [8911]:" "--defaults must not prompt"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=127.0.0.1"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=8911" \
     "queued input must be ignored entirely, not consumed as answers"
@@ -113,10 +125,9 @@ test_a_piped_run_without_answers_still_takes_every_default() {
 
 test_piped_answers_are_consumed_in_prompt_order() {
   _hard_deps_present
-  stdin_lines "0.0.0.0" "9999" "piped.example" ""
+  stdin_lines "9999" "piped.example" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=0.0.0.0"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9999"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_ALLOWED_HOSTS=piped.example"
 }
@@ -135,16 +146,16 @@ test_an_existing_config_is_announced_before_the_question() {
 test_confirm_reads_y_upper_y_yes_and_upper_yes_as_yes() {
   # Saying yes opens the questions; it is the answers that change anything.
   # Each question now offers what is already configured, so answering yes and
-  # then pressing return four times deliberately leaves the file as it was -
-  # this used to reset all four settings to the factory defaults, which is not
-  # what pressing return looks like it means. test_a_typed_answer_overrides_the_default
-  # is where changing them is pinned.
+  # then pressing return deliberately leaves the file as it was - this used to
+  # reset every setting to the factory defaults, which is not what pressing
+  # return looks like it means. test_a_typed_answer_overrides_the_default is
+  # where changing them is pinned.
   _hard_deps_present
   local answer
   for answer in y Y yes YES; do
     _existing_config
     pty_expect "rewrite it?" "$answer"
-    _answer_config_prompts "" "9000" "" ""
+    _answer_config_prompts "9000" "" ""
     # The config kept from before names an https address, which setup asks
     # about once before it lets anything through it.
     pty_expect "may kept.example reach ayeaye?" "y"
@@ -153,7 +164,7 @@ test_confirm_reads_y_upper_y_yes_and_upper_yes_as_yes() {
     assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9000" \
       "\"$answer\" must be taken as yes and let the answers through"
     assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=10.9.8.7" \
-      "and the questions answered with return keep what was already there"
+      "and the address nobody was asked about is still the one that was there"
   done
 }
 
@@ -161,10 +172,9 @@ test_the_questions_offer_back_what_is_already_configured() {
   _hard_deps_present
   _existing_config
   pty_expect "rewrite it?" "y"
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "may kept.example reach ayeaye?" "y"
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "bind address [10.9.8.7]:"
   assert_contains "$PTY_TRANSCRIPT" "port [7777]:"
   assert_contains "$PTY_TRANSCRIPT" "allowed hosts (your https front) [kept.example]:"
   assert_contains "$PTY_TRANSCRIPT" \
@@ -192,8 +202,8 @@ test_keeping_a_config_asks_nothing_further() {
   _existing_config
   pty_expect "rewrite it?" "n"
   pty_install --no-systemd
-  assert_not_contains "$PTY_TRANSCRIPT" "bind address" \
-    "declining the rewrite must skip the four configuration questions"
+  assert_not_contains "$PTY_TRANSCRIPT" "port [" \
+    "declining the rewrite must skip the three configuration questions"
 }
 
 test_a_kept_config_still_drives_the_summary() {
@@ -201,11 +211,13 @@ test_a_kept_config_still_drives_the_summary() {
   _existing_config
   pty_expect "rewrite it?" "n"
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "bookmark: http://10.9.8.7:7777/?token=" \
+  assert_contains "$PTY_TRANSCRIPT" "https://kept.example/?token=" \
     "the summary is read back out of the kept file, not out of the defaults"
-  assert_contains "$PTY_TRANSCRIPT" "https://kept.example/?token="
-  assert_contains "$PTY_TRANSCRIPT" "+notifications" \
-    "the kept ntfy URL counts towards the tier"
+  assert_contains "$PTY_TRANSCRIPT" "bookmark: http://10.9.8.7:7777/?token="
+  assert_contains "$PTY_TRANSCRIPT" "setup did not put it there and cannot see it" \
+    "a name in a kept settings file is not a way in this run set up"
+  assert_contains "$PTY_TRANSCRIPT" "with notifications to your phone" \
+    "the kept ntfy URL counts towards what works here"
 }
 
 test_defaults_mode_keeps_an_existing_config_without_asking() {

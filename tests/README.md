@@ -48,7 +48,7 @@ tool for any coverage that cannot run on the machine it finds itself on.
 ## Container checks
 
 `tests/containers.sh` is a separate, opt-in runner. It goes into real
-`debian`, `fedora`, `archlinux` and `opensuse/tumbleweed` images and does two
+`debian`, `fedora`, `archlinux` and `opensuse/tumbleweed` images and does four
 things there.
 
 ```sh
@@ -75,6 +75,19 @@ manager accepts, and that the name table names packages that exist. It runs
 inside a container that is thrown away when it exits, and the repository is
 still mounted read-only. `--quick` leaves it out; do not run it on a laptop.
 
+**`tests/lib/wizard_probe.sh` runs the whole thing.** It is the only probe
+that runs `./install.sh` itself, on a machine with no tmux, no python3, no
+service session, no coding agent and no cliban — which is what a first-time
+install actually looks like. Four passes: a first install, a rerun, a run in
+which an optional component cannot be finished, and a run that is picked up
+rather than started again. Then it asks the one question the closing checklist
+has to be able to answer — **does what it claims match what is on this
+machine** — and the runner asserts each claim against the container: a service
+manager the image does not have is never claimed, an agent it does not have is
+never claimed, and an optional component that failed is on the unfinished list
+rather than in the summary as working. It installs, so `--quick` leaves it out
+with the install probe.
+
 It is not part of `tests/run.sh` on purpose — the fast suite stays runnable
 with nothing but bash, coreutils and python3. With no container engine it says
 so and exits 0, because "could not check" is not "found a problem". The
@@ -94,6 +107,46 @@ these images, so nothing there proves a unit can be enabled or started; that
 is printed as a named `skip` for every image, and the summary counts skips
 separately. launchd is not covered at all — there is no Mac — so the agents
 are pinned by golden file and by `plistlib` and nothing else.
+
+Resumability is pinned through the state file an interrupted run leaves rather
+than by sending a signal: where a signal lands is not deterministic, and that
+is printed as a named skip too.
+
+## Real machines
+
+```sh
+tests/smoke.sh --list      # the six machines, and whether any has been done
+tests/smoke.sh --plan      # what it would do to THIS machine, without doing it
+AYEAYE_SMOKE_CONFIRM=yes-change-this-computer tests/smoke.sh --run
+```
+
+The milestone says one-command onboarding has to work on Ubuntu, Fedora, Arch,
+openSUSE, Intel macOS and Apple Silicon macOS. **None of the six has ever been
+run.** `tests/smoke-hosts` is the record and every line of it says `no`.
+
+`tests/smoke.sh` is the thing that would do it: it places the machine through
+the platform layer, refuses to go on if that machine is not one of the six,
+runs a first install, the health check, a rerun and a resumed run, and asserts
+the closing checklist against the machine it printed it on. Its answers go down
+a pipe rather than through `--defaults`, on purpose: an unattended run never
+answers "enable and start it now?", so nothing is ever started, and the eight
+health checks would never execute anywhere at all. **It changes the
+computer it runs on and does not undo any of it**, which is why running it
+needs a confirmation nobody types by accident. Put it on a fresh install or a
+virtual machine.
+
+A result is written by hand. `tests/smoke.sh` prints the line to paste into
+`tests/smoke-hosts` when it passes and never writes it itself: a verification
+is somebody saying they watched it happen, and a script that recorded its own
+success would be worth nothing.
+
+`tests/cases/smoke_hosts_test.sh` keeps the two files in step, pins the
+confirmation gate, and — the reason it exists — reports **one named skip per
+machine** in the ordinary suite. Six skips, each saying which platform has
+never executed a line of this code and why no container can cover it. A skip is
+not a pass; `tests/run.sh` counts them separately and prints the reason under
+each. Deleting those six would make the suite greener and the project less
+honest.
 
 ## Adding a test
 
@@ -281,7 +334,15 @@ command or file being canned:
 tests/fixtures/os-release/ubuntu-24.04
 tests/fixtures/uname/darwin-arm64
 tests/fixtures/tailscale/status-online
+tests/fixtures/pkg-commands/debian
 ```
+
+`pkg-commands/` is the odd one out and worth knowing about: its category is not
+a command whose output is being canned, but the command this project
+*generates*. One file per package family, holding the exact install command for
+a fixed list, so that "what would this run on Fedora" is one file to read
+rather than an assertion buried in a test. A family with no file fails the
+test, which is what stops a sixth family from arriving undocumented.
 
 Names carry no extension: the repository's `.gitignore` drops `*.log` and a
 file named `token`, and extensionless names sidestep all of it. The content is
@@ -317,7 +378,7 @@ to run the code under test.
 A pipe, for everything that is not about prompts:
 
 ```sh
-stdin_lines "0.0.0.0" "9000"        # optional; queued for the next run only
+stdin_lines "9000" "" ""            # optional; queued for the next run only
 run_script "$REPO_ROOT/install.sh" --defaults
 run_install --defaults              # the same thing, shorter
 
@@ -331,7 +392,7 @@ A real terminal, whenever a prompt, a default or the order of questions is the
 thing under test:
 
 ```sh
-pty_answers "" "9000" "" ""                       # answer each prompt in turn
+pty_answers "9000" "" ""                          # answer each prompt in turn
 pty_expect "enable and start it now?" "y"         # or wait for a specific one
 pty_install --no-systemd                          # or pty_run <script> [args...]
 
@@ -352,9 +413,14 @@ script that never exits, fails the test with the transcript so far instead of
 hanging the suite; `PTY_TIMEOUT` (default 20s) bounds it.
 
 `pty_answers` pairs each answer with `"]: "`, the terminator every prompt in
-this project ends with. Prefer `pty_expect` with a distinctive substring when
-the prompts are easy to confuse — an answer landing in the wrong prompt would
-still satisfy a bare "contains" check.
+this project ends with. The three answers above are the three configuration
+questions the wizard asks, in order — the port, the allowed hosts, and the ntfy
+topic URL — and the two empty ones take the offered default. The address ayeaye
+answers on is not among them: `lib/steps/50-access.sh` owns that, and a case
+file that expects a prompt for it will wait for a question nobody asks. Prefer
+`pty_expect` with a distinctive substring when the prompts are easy to confuse —
+an answer landing in the wrong prompt would still satisfy a bare "contains"
+check.
 
 ## Constraints
 

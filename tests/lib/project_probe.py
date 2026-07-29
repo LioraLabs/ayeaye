@@ -23,6 +23,7 @@ Sub-commands:
   recents dump                          the store, as bash can read it
   supersede --query-a A --query-b B     two searches racing, and who wins
   join --query Q                        the same query twice at once
+  session-name DIR                      the tmux session name for a directory
   spawn DIR                             start an agent, as /api/spawn does
 
 Every sub-command takes --slow to give each directory listing a fixed cost.
@@ -37,6 +38,7 @@ import sys
 import threading
 import time
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
 # Importing the code under test would otherwise leave a __pycache__ inside
 # the checkout, and a suite that writes into the tree it is testing has
@@ -48,9 +50,25 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 
 
 def load():
-    return SourceFileLoader(
-        "ayeaye_under_test", os.path.join(REPO_ROOT, "bin", "ayeaye")
-    ).load_module()
+    """Loaded, not imported: bin/ayeaye has no .py extension because it is a
+    command. The loader is named rather than inferred for exactly that reason
+    -- importlib picks one from the file extension, and there is none to pick
+    from -- and exec_module is used rather than the load_module() that warns
+    today and goes away in python 3.15. It is the same shape bin/ayeaye,
+    bin/voice-dictate and the python suites under tests/python all use.
+
+    The module is registered in sys.modules under its name before it is
+    executed, which is what load_module() did and what anything reaching for
+    it by name still expects.
+    """
+    name = "ayeaye_under_test"
+    path = os.path.join(REPO_ROOT, "bin", "ayeaye")
+    spec = spec_from_file_location(name, path,
+                                   loader=SourceFileLoader(name, path))
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 # Per-query listing counts. The walk runs on its own thread, so attributing a
@@ -250,6 +268,18 @@ def cmd_join(m, args):
          walks=walks)
 
 
+def cmd_session_name(m, args):
+    """The tmux session name a directory would get, on its own.
+
+    Worth a sub-command of its own rather than being read out of a spawn:
+    the rule has three parts -- the basename, the dot substitution, and the
+    .tmux.yaml override -- and a spawn only ever shows their combined answer
+    for a directory that also has to exist and a tmux that also has to
+    cooperate. Here the directory is the only input.
+    """
+    emit(name=m.session_name_for(args.dir))
+
+
 def cmd_spawn(m, args):
     """Start an agent the way the API does, so the pick history is exercised
     through the wiring that actually feeds it rather than around it."""
@@ -311,6 +341,10 @@ def main():
     p.add_argument("--query", default="")
     p.add_argument("--gap", type=float, default=0.3)
     p.set_defaults(fn=cmd_join)
+
+    p = sub.add_parser("session-name")
+    p.add_argument("dir")
+    p.set_defaults(fn=cmd_session_name)
 
     p = sub.add_parser("spawn")
     p.add_argument("dir")

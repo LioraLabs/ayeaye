@@ -734,10 +734,10 @@ _access_warn_open_bind() {
   wizard_say "has, which means anything that can reach this machine can reach"
   wizard_say "your agents. The key is then the only thing in the way, and none"
   wizard_say "of it is encrypted."
-  wizard_say "Nothing here has changed that, because you were asked for that"
-  wizard_say "address and that is what you answered. To undo it, put"
-  wizard_say "$ACCESS_LOOPBACK in the address question next time, or change"
-  wizard_say "AYEAYE_BIND in $(_access_env_file)."
+  wizard_say "Nothing here has changed it, because that address is already in"
+  wizard_say "your settings and it is not this step's to overwrite. To undo it,"
+  wizard_say "change AYEAYE_BIND to $ACCESS_LOOPBACK in"
+  wizard_say "$(_access_env_file), and run setup again."
   return 0
 }
 
@@ -996,9 +996,12 @@ _access_settle() {
 
   case "$mode" in
     local)
-      # Nothing. install.sh has already put "this computer only" in the plan
-      # from the address question, and saying it twice in the same list reads
-      # like two different things are about to happen.
+      # install.sh used to put this line in the plan itself, from an address
+      # question it no longer asks. It belongs here now: this is the step that
+      # decides how ayeaye is reached, in all four answers, and the plan should
+      # say what was decided rather than what somebody typed.
+      wizard_plan_add network \
+        "ayeaye will answer on $ACCESS_LOOPBACK:$(_access_app_port), this computer only"
       ;;
     tailscale)
       _access_have tailscale || wizard_plan_add package "tailscale, for a private https address"
@@ -1021,16 +1024,47 @@ _access_settle() {
 
 # ========================================================== 6. do the work
 
+# _access_note_installed <mode> <ready> - what is really in front of ayeaye now.
+#
+# Two keys and not one, because the closing screen has two different things to
+# say. `installed` is which way in this machine has; `ready` is whether it was
+# finished. A tailscale that is installed but not signed in is `tailscale` and
+# `0`: the address is the right one to write down and the wrong one to tell
+# somebody to open.
+#
+# Both live under step.install.access, which a deliberate rerun clears along
+# with every other step key - which is why the paths that change nothing
+# re-derive them from _access_previous_mode rather than assuming last run's
+# answer survived.
+_access_note_installed() {
+  wizard_remember step.install.access.installed "${1:-}"
+  wizard_remember step.install.access.ready "${2:-0}"
+  return 0
+}
+
+# _access_keep_what_is_there - for the paths that leave the way in alone. What
+# is on this machine is a fact about the machine, and a run that touched
+# nothing must still be able to say what that fact is.
+_access_keep_what_is_there() {
+  local previous
+  previous="$(_access_previous_mode)"
+  [ -n "$previous" ] || return 0
+  _access_note_installed "$previous" 1
+  return 0
+}
+
 _access_install_step() {
   local mode previous status
 
   if [ "$(wizard_state_get answer.change_settings 1)" = 0 ]; then
     wizard_say "leaving the way you reach ayeaye as it is."
+    _access_keep_what_is_there
     return "$WIZARD_STAGE_SKIP"
   fi
   mode="$(wizard_state_get answer.access.mode "")"
   if [ -z "$mode" ]; then
     wizard_say "leaving the way you reach ayeaye as it is."
+    _access_keep_what_is_there
     return "$WIZARD_STAGE_SKIP"
   fi
 
@@ -1068,8 +1102,10 @@ _access_install_step() {
       ;;
   esac
   status=$?
-  if [ "$status" = "$WIZARD_STAGE_OK" ] || [ "$status" = "$WIZARD_STAGE_PENDING" ]; then
-    wizard_remember step.install.access.installed "$mode"
+  if [ "$status" = "$WIZARD_STAGE_OK" ]; then
+    _access_note_installed "$mode" 1
+  elif [ "$status" = "$WIZARD_STAGE_PENDING" ]; then
+    _access_note_installed "$mode" 0
   fi
   return "$status"
 }

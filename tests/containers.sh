@@ -62,22 +62,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-# A filter that matches nothing is an error, not an empty pass - the same rule
-# tests/run.sh keeps, and for the same reason: a typo must not read as green.
-if [ -n "$FILTERS" ]; then
-  matched=0
-  for filter in $FILTERS; do
-    case "
-debian:12
-fedora:latest
-archlinux:latest
-opensuse/tumbleweed:latest" in
-      *"$filter"*) matched=$((matched + 1)) ;;
-      *) echo "no image matched the filter: $filter" >&2; exit 2 ;;
-    esac
-  done
-fi
-
 # ------------------------------------------------------------------- the plan
 #
 # One line per image: image, family, package manager, distro id. The id is
@@ -89,10 +73,27 @@ fi
 # have systemctl and none of them has a user session, which is exactly the
 # distinction the detection is supposed to make and exactly the one that a
 # check of "is systemctl installed" would get wrong.
+#
+# Declared above the filter check on purpose. There used to be a second copy of
+# this list inside that check, and a second copy of a list is a list that will
+# be wrong: adding an image here and forgetting there produced "no image
+# matched the filter" for an image that was in the plan all along.
 IMAGES="debian:12|debian|apt-get|debian
 fedora:latest|fedora|dnf|fedora
 archlinux:latest|arch|pacman|arch
 opensuse/tumbleweed:latest|suse|zypper|opensuse-tumbleweed"
+
+# A filter that matches nothing is an error, not an empty pass - the same rule
+# tests/run.sh keeps, and for the same reason: a typo must not read as green.
+if [ -n "$FILTERS" ]; then
+  for filter in $FILTERS; do
+    case "
+$IMAGES" in
+      *"$filter"*) ;;
+      *) echo "no image matched the filter: $filter" >&2; exit 2 ;;
+    esac
+  done
+fi
 
 selected() {
   [ -z "$FILTERS" ] && return 0
@@ -319,12 +320,101 @@ while IFS='|' read -r image family manager id; do
     skip "enabling and starting a user service: no session bus in a container"
   fi
 
+  # -------------------------------------------------- the whole wizard, for real
+  #
+  # The third probe, and the only one that runs ./install.sh itself. Everything
+  # above tests a layer; this tests the conversation - on a machine with no
+  # tmux, no python3, no service session, no coding agent and no cliban - and
+  # then asks the one question the closing checklist has to be able to answer:
+  # does what it claims match what is on this machine.
+  #
+  # Gated with the install probe, because it installs. --quick leaves both out.
+  if [ "$RUN_INSTALL" = 1 ]; then
+    printf '  -- the whole wizard inside %s\n' "$image"
+    WIZARD_OUT="$("$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
+                    bash tests/lib/wizard_probe.sh 2>&1)"
+    if [ "$?" != 0 ] || [ -z "$WIZARD_OUT" ]; then
+      printf '  FAIL     the wizard probe did not run:\n'
+      printf '%s\n' "$WIZARD_OUT" | sed 's/^/           /'
+      FAILED=$((FAILED + 1))
+      FAILED_IMAGES="$FAILED_IMAGES $image"
+    else
+      [ "$VERBOSE" = 1 ] && printf '%s\n' "$WIZARD_OUT" | sed 's/^/           /'
+      PROBE="$WIZARD_OUT"
+
+      # A first install on a bare machine.
+      check first_status 0
+      check tmux_here yes
+      check python3_here yes
+      check env_written yes
+      check token_written yes
+
+      # Nothing was installed before the plan was shown and agreed to.
+      check plan_before_install yes
+      check plan_named_packages yes
+
+      # The checklist against the machine it was printed on. None of these
+      # images has a user service session, so a run that says ayeaye starts at
+      # login, or tells the reader to remove a unit, has claimed something that
+      # is not there.
+      check claims_service no
+      check claims_systemctl_removal no
+      check agents_really_here no
+      check claims_agents no
+      check says_manual_start yes
+      check health_had_nothing_to_check yes
+      check claims_phone_address no
+      check says_no_way_in_yet yes
+      check voice_described_once yes
+      check old_voice_sweep_gone no
+
+      # A rerun changes nothing, keeps the key, and keeps a setting nobody
+      # asked about.
+      check second_status 0
+      check second_installed_nothing yes
+      check second_kept_the_key yes
+      check second_kept_unknown_setting yes
+      check second_left_settings_alone yes
+
+      # An optional component that cannot be finished: reported, not fatal,
+      # and never claimed.
+      case "$(value optional_case)" in
+        skipped-cliban-present)
+          skip "an optional component that cannot be installed: $image already has cliban"
+          ;;
+        *)
+          check third_status 0
+          check third_reports_unfinished yes
+          check third_names_the_board yes
+          check third_says_how_to_resume yes
+          check third_claims_board_works no
+          check third_kept_the_key yes
+          ;;
+      esac
+
+      # And a run that did not reach the end is picked up rather than redone.
+      check fourth_status 0
+      check fourth_resumed yes
+      check fourth_skipped_finished_work yes
+      check fourth_kept_the_key yes
+      skip "interrupting a run with a real signal: where it lands is not deterministic, so resume is pinned through the state file an interrupted run leaves"
+    fi
+  fi
+
   if [ "$RUN_SUITE" = 1 ]; then
     if "$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
          sh -c 'command -v find >/dev/null 2>&1' >/dev/null 2>&1; then
       printf '  -- unit suite inside %s\n' "$image"
-      if "$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
-           bash tests/run.sh platform_ 2>&1 | sed 's/^/     /'; then
+      # Into a variable and then printed, rather than piped into sed. A
+      # pipeline's status is the status of its last command, this script does
+      # not set pipefail, and sed always succeeds - so for as long as this was
+      # `… | sed`, an in-container suite that failed every test it ran was
+      # counted as a pass.
+      SUITE_OUT="$("$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
+           bash tests/run.sh platform_ 2>&1)"
+      SUITE_STATUS=$?
+      printf '%s\n' "$SUITE_OUT" | sed 's/^/     /'
+      if [ "$SUITE_STATUS" = 0 ]; then
         PASSED=$((PASSED + 1))
       else
         FAILED=$((FAILED + 1))

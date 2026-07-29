@@ -61,6 +61,61 @@ test_an_excluded_name_is_neither_returned_nor_entered() {
   assert_not_contains "$RUN_STDOUT" "site-packages"
 }
 
+test_a_mac_home_is_not_walked_into_by_way_of_its_platform_folders() {
+  # The exclusion list carries five names that only mean anything away from
+  # Linux, and they are the ones that decide whether this is usable on a Mac
+  # at all. ~/Library alone is tens of thousands of directories - every
+  # application's caches, containers, group containers and saved state - and
+  # a walk that entered it would spend its whole time budget there and hand
+  # back a picker with no projects in it, while the phone waited.
+  #
+  # Applications and System are the same problem one level up, and .app
+  # bundles are directories, so an unfiltered walk descends into every one of
+  # them. Volumes is worse than slow: it is where mounted disks and network
+  # shares appear, and walking it wakes a sleeping external drive or hangs on
+  # an unreachable SMB server. AppData is the Windows equivalent, reached
+  # through WSL or a mounted drive rather than through a Mac, and it is on
+  # the same list for the same reason.
+  mkdir -p "$TREE/Library/Caches/com.apple.Safari"
+  mkdir -p "$TREE/Library/Containers/com.apple.Notes/Data"
+  mkdir -p "$TREE/Applications/Xcode.app/Contents/MacOS"
+  mkdir -p "$TREE/System/Library/CoreServices"
+  mkdir -p "$TREE/Volumes/Backup/photos"
+  mkdir -p "$TREE/AppData/Local/Packages"
+  mkdir -p "$TREE/Projects/thing"
+  probe walk
+  assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
+  assert_contains "$RUN_STDOUT" "$TREE/Projects/thing" \
+    "the projects next door still have to be found"
+  assert_not_contains "$RUN_STDOUT" "Library"
+  assert_not_contains "$RUN_STDOUT" "Caches" \
+    "an excluded directory must not be descended into either"
+  assert_not_contains "$RUN_STDOUT" "Applications"
+  assert_not_contains "$RUN_STDOUT" "Xcode.app" \
+    "a .app bundle is a directory tree, and there are hundreds of them"
+  assert_not_contains "$RUN_STDOUT" "System"
+  assert_not_contains "$RUN_STDOUT" "Volumes"
+  assert_not_contains "$RUN_STDOUT" "Backup" \
+    "walking a mount point wakes the disk behind it, or hangs on the share"
+  assert_not_contains "$RUN_STDOUT" "AppData"
+}
+
+test_an_excluded_platform_name_is_matched_exactly_and_not_by_case() {
+  # The list is names, matched exactly - the comment on PROJECT_SKIP says so,
+  # and it is what makes the list safe to extend. A project really called
+  # "library" or "system" is an ordinary directory and has to survive, or
+  # excluding a platform folder would quietly cost people their own work.
+  mkdir -p "$TREE/library" "$TREE/system" "$TREE/applications"
+  mkdir -p "$TREE/mylibrary" "$TREE/Libraries"
+  probe walk
+  assert_contains "$RUN_STDOUT" "$TREE/library"
+  assert_contains "$RUN_STDOUT" "$TREE/system"
+  assert_contains "$RUN_STDOUT" "$TREE/applications"
+  assert_contains "$RUN_STDOUT" "$TREE/mylibrary" \
+    "a name containing an excluded one is not the excluded one"
+  assert_contains "$RUN_STDOUT" "$TREE/Libraries"
+}
+
 test_a_hidden_directory_is_tool_internals_not_a_project() {
   mkdir -p "$TREE/.cache/huggingface" "$TREE/.local/share/thing" "$TREE/work"
   probe walk

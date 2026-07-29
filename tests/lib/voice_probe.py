@@ -32,6 +32,7 @@ import os
 import shutil
 import sys
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
 # Importing the code under test would otherwise leave a __pycache__ inside the
 # checkout, and a suite that writes into the tree it is testing has already
@@ -63,9 +64,24 @@ def load_env(path):
 
 
 def load_app():
-    return SourceFileLoader(
-        "ayeaye_under_test", os.path.join(REPO_ROOT, "bin", "ayeaye")
-    ).load_module()
+    """Loaded, not imported: bin/ayeaye has no .py extension because it is a
+    command, so the loader is named rather than left for importlib to infer
+    from an extension that is not there. exec_module rather than the
+    load_module() that warns today and goes away in python 3.15 -- the same
+    shape bin/ayeaye itself uses to load its own siblings.
+
+    Registered in sys.modules under its name before it is executed, which is
+    what load_module() did and what the app's own sibling loader relies on to
+    decide whether a module has already been loaded in this process.
+    """
+    name = "ayeaye_under_test"
+    path = os.path.join(REPO_ROOT, "bin", "ayeaye")
+    spec = spec_from_file_location(name, path,
+                                   loader=SourceFileLoader(name, path))
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def main():
@@ -96,14 +112,23 @@ def main():
         "voice": "available" if app.voice_available() else "text-only",
         "ffmpeg": "yes" if shutil.which("ffmpeg") else "no",
         "server": app.vd.WHISPER_SERVER,
-        "gate_cli": "yes" if shutil.which(app.vd.WHISPER_CLI) else "no",
+        "gate_cli": "yes" if shutil.which(app.vd.whisper_cli()) else "no",
         "dictate_cli": app.vd.WHISPER_CLI,
         "dictate_cli_present": "yes" if shutil.which(app.vd.WHISPER_CLI) else "no",
+        # What the gate resolves *now*, as against what the module resolved
+        # when it was imported. They are the same in this probe, which loads
+        # the app and asks it one question in the same breath - and they are
+        # not the same in a server that has been running for a fortnight, which
+        # is the case the app has to get right and the reason the gate calls a
+        # function rather than reading a constant.
+        "live_cli": app.vd.whisper_cli(),
+        "imported_cli": app.vd.WHISPER_CLI,
         "model": app.vd.WHISPER_MODEL,
         "model_present": "yes" if os.path.exists(app.vd.WHISPER_MODEL) else "no",
     }
     for key in ("voice", "ffmpeg", "server", "gate_cli", "dictate_cli",
-                "dictate_cli_present", "model", "model_present"):
+                "dictate_cli_present", "live_cli", "imported_cli",
+                "model", "model_present"):
         print("%s=%s" % (key, out[key]))
     return 0
 

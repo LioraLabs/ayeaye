@@ -29,11 +29,23 @@ import os
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
 os.environ.setdefault("AYEAYE_TOKEN", "probe")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ayeaye = SourceFileLoader("ayeaye_probe",
-                          os.path.join(ROOT, "bin", "ayeaye")).load_module()
+
+# Loaded, not imported: bin/ayeaye has no .py extension because it is a
+# command, which is why the loader is named rather than inferred from one.
+# exec_module rather than the load_module() that warns today and goes away in
+# python 3.15, and registered under its name first because that is what
+# load_module() did and what anything looking the module up by name expects.
+_NAME = "ayeaye_probe"
+_PATH = os.path.join(ROOT, "bin", "ayeaye")
+_spec = spec_from_file_location(_NAME, _PATH,
+                                loader=SourceFileLoader(_NAME, _PATH))
+ayeaye = module_from_spec(_spec)
+sys.modules[_NAME] = ayeaye
+_spec.loader.exec_module(ayeaye)
 
 
 def clients(info):

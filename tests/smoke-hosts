@@ -1,0 +1,32 @@
+# The six machines the milestone says one-command onboarding has to work on,
+# and whether anybody has ever actually run it on one.
+#
+# This file is the record, and it is deliberately a separate file from the
+# script that does the running: a result belongs to a person who watched a real
+# machine do a real thing, and nothing automated may write it. tests/smoke.sh
+# prints the line to paste when a run finishes; a human pastes it.
+#
+# Columns, separated by |:
+#
+#   id        what tests/smoke.sh calls this profile
+#   os        the operating system family the platform layer must report
+#   arch      the architecture, or "any"
+#   what      what the machine has to be, in words
+#   verified  no, or the date and the version it was verified against
+#
+# verified=no means exactly that: **the code has never been run on this kind of
+# machine.** It is not "probably fine", it is not "covered by the containers",
+# and a test suite that reported it green would be lying. tests/cases/smoke_hosts_test.sh
+# is what makes the suite say "skipped, and here is why" for every one of these
+# instead.
+#
+# Two of the six cannot be covered by tests/containers.sh even in principle:
+# there is no Mac, so launchd, Homebrew, `ps`/`lsof` session matching and the
+# Apple Silicon acceleration path have never been executed anywhere.
+
+ubuntu|linux|any|Ubuntu 24.04 LTS or newer, a fresh install with no tmux and no python3|no
+fedora|linux|any|Fedora 40 or newer, a fresh install|no
+arch|linux|any|Arch Linux, a current install|no
+opensuse|linux|any|openSUSE Tumbleweed, a current install|no
+macos-intel|macos|x86_64|macOS 13 or newer on an Intel Mac, with Homebrew|no
+macos-arm|macos|arm64|macOS 13 or newer on Apple Silicon, with Homebrew|no

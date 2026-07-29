@@ -32,6 +32,81 @@ test_the_readme_no_longer_lists_the_picker_as_needing_anything() {
     "and it points at where the picker is tuned"
 }
 
+# ------------------------------------------------- the onboarding the milestone built
+
+test_the_readme_does_not_promise_a_release_that_does_not_exist() {
+  # The public one-liner fetches a pinned release and no release has been
+  # published, so the command in the README 404s. Whoever cuts the release
+  # deletes this caveat and this test together; until then, a README that
+  # printed the command with nothing beside it would be sending people at a
+  # wall.
+  local readme
+  readme="$(cat "$REPO_ROOT/README.md")"
+  assert_contains "$readme" "curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh"
+  assert_contains "$readme" "does not work yet" \
+    "the one-liner is quoted, so the caveat has to be quoted with it"
+  assert_contains "$readme" "clone and run"
+}
+
+test_the_readme_describes_the_four_ways_in_and_the_rule_under_them() {
+  local readme
+  readme="$(cat "$REPO_ROOT/README.md")"
+  assert_contains "$readme" "Tailscale"
+  assert_contains "$readme" "this computer only"
+  assert_contains "$readme" "your home network"
+  assert_contains "$readme" "an HTTPS address you already have"
+  assert_contains "$readme" "ayeaye itself never leaves this computer" \
+    "the one rule all four keep is the thing worth documenting about them"
+}
+
+test_the_readme_lists_the_flags_the_installer_really_takes() {
+  # Derived from the argument parser rather than from a memory of it: the flag
+  # set changed during this milestone, and a documented flag that no longer
+  # exists is worse than an undocumented one that does.
+  local flag readme missing=""
+  readme="$(cat "$REPO_ROOT/README.md")"
+  for flag in $(grep -o -- '--[a-z-]*)' "$REPO_ROOT/install.sh" \
+                | sed 's/)$//' | sort -u); do
+    case "$flag" in
+      --*) ;;
+      *) continue ;;
+    esac
+    case "$readme" in
+      *"$flag"*) ;;
+      *) missing="$missing $flag" ;;
+    esac
+  done
+  assert_eq "" "$missing" "install.sh accepts these and the README does not name them"
+}
+
+test_the_readme_says_how_to_remove_it_on_both_platforms() {
+  local readme
+  readme="$(cat "$REPO_ROOT/README.md")"
+  assert_contains "$readme" "systemctl --user disable --now ayeaye.service"
+  assert_contains "$readme" "launchctl bootout gui/"
+  assert_contains "$readme" "remove the certificate from every phone" \
+    "the one part of removal no computer can do for you"
+}
+
+test_nothing_shipped_still_points_at_a_directory_of_unit_templates() {
+  # The milestone deleted systemd/user/: a unit and a property list are two
+  # spellings of one description now, generated from lib/steps/70-service.sh.
+  # Anything still telling somebody to copy a template is pointing at a
+  # directory that is not there.
+  local hits
+  # shellcheck disable=SC2086
+  hits="$(grep -rl "systemd/user/@" "$REPO_ROOT" $SWEEP_EXCLUDES 2>/dev/null)"
+  assert_eq "" "$hits"
+  assert_file_missing "$REPO_ROOT/systemd/user" \
+    "the directory is gone, and the renderers replaced it"
+}
+
+test_the_readme_says_what_the_closing_check_does_not_prove() {
+  local readme
+  readme="$(cat "$REPO_ROOT/README.md")"
+  assert_contains "$readme" "What it cannot tell you"
+}
+
 test_every_project_search_setting_is_documented() {
   local name found="" missing=""
   for name in $(grep -o '_env("PROJECT_[A-Z_]*"' "$REPO_ROOT/bin/ayeaye" \

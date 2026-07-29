@@ -81,10 +81,9 @@ python3 -c 'import sys; open(sys.argv[1], "wb").truncate(int(sys.argv[2]))' \
 SH
 }
 
-# The prompts that come before and after this file's own, in the order the run
+# The three questions that come before this file's own, in the order the run
 # asks them. curl being present is what makes the agent question appear at all.
 _config_prompts() {
-  pty_expect "bind address" ""
   pty_expect "port [" ""
   pty_expect "allowed hosts" ""
   pty_expect "ntfy topic URL" ""

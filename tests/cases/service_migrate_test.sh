@@ -116,7 +116,7 @@ test_the_token_survives_a_move_to_a_platform_it_was_not_made_on() {
 test_a_rerun_that_keeps_the_settings_leaves_the_file_byte_for_byte() {
   _hard_deps_present
   _systemd_session
-  stdin_lines "10.9.8.7" "9099" "kept.example.org" "https://ntfy.example/kept"
+  stdin_lines "9099" "kept.example.org" "https://ntfy.example/kept"
   run_install
   local before
   before="$(_bytes "$(_env)")"

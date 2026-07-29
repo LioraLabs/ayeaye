@@ -104,7 +104,7 @@ test_a_run_with_nothing_to_install_asks_no_extra_question() {
   # Stage five only stops for consequential work. Everything here is the user's
   # own settings and the user's own service, so there is nothing to stop for.
   _hard_deps_present
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
   assert_not_contains "$PTY_TRANSCRIPT" "go ahead with all of that?"
@@ -113,13 +113,25 @@ test_a_run_with_nothing_to_install_asks_no_extra_question() {
 }
 
 test_the_last_stage_says_how_to_change_it_and_how_to_remove_it() {
+  # With a systemd session, because the removal instructions are built from the
+  # service manager that was really used rather than from the one this project
+  # was written on. A run told to skip the unit gets told to stop the ayeaye it
+  # started by hand, which is a different true answer and not this one.
   _hard_deps_present
-  run_install --defaults --no-systemd
+  stub_command systemctl --exit 1
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user daemon-reload' --exit 0
+  stub_when systemctl '--user enable --now *' --exit 0
+  run_install --defaults
   local out="$RUN_STDOUT"
   assert_contains "$out" "to change any of this later: run ./install.sh again."
-  assert_contains "$out" "to remove it: systemctl --user disable --now ayeaye"
+  assert_contains "$out" "to remove it:"
+  assert_contains "$out" "systemctl --user disable --now ayeaye"
   assert_contains "$out" "$XDG_CONFIG_HOME/systemd/user/ayeaye.service"
-  assert_contains "$out" "open the bookmark URL once on the phone"
+  assert_contains "$out" "$XDG_CONFIG_HOME/ayeaye/env" \
+    "and the settings file, which removing it also has to delete"
+  assert_contains "$out" "signing in, once per device:" \
+    "the address is worth nothing without the one thing you do with it first"
 }
 
 test_no_stage_asks_the_user_about_a_unit_file_or_a_umask() {
@@ -128,7 +140,7 @@ test_no_stage_asks_the_user_about_a_unit_file_or_a_umask() {
   # the person who wrote it.
   _hard_deps_present
   local word
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_install --no-systemd
   for word in "umask" "chmod" "stdin" "XDG_" "systemd unit" "daemon-reload"; do
     assert_not_contains "$PTY_TRANSCRIPT" "$word" \
@@ -171,20 +183,30 @@ test_defaults_installs_nothing_even_where_it_could() {
   assert_ne 0 "$RUN_STATUS" "it cannot claim success without the thing it needs"
   assert_stub_not_called apt-get "nothing may be installed unattended"
   assert_stub_not_called sudo
-  assert_contains "$RUN_STDOUT" "install the missing packages and re-run."
+  assert_contains "$RUN_STDOUT" "ayeaye still cannot run here: tmux is not on this computer." \
+    "it says what is missing rather than helping itself to it"
+  assert_contains "$RUN_STDOUT" "Install it however you normally would"
   assert_contains "$(cat "$(_ledger)")" "privileged	refused"
 }
 
-test_a_typed_address_that_is_not_this_computer_is_recorded_as_such() {
+test_no_answer_to_any_question_can_put_ayeaye_on_a_network() {
+  # There used to be an address question here, and typing 0.0.0.0 into it was
+  # by itself enough to put ayeaye in front of every device that can reach this
+  # machine. It is gone. lib/steps/50-access.sh owns how ayeaye is reached, it
+  # keeps the program itself on this computer in all four ways in, and puts the
+  # thing that is on the network in front of it - so there is no longer an
+  # answer anybody can type that moves the program.
   _hard_deps_present
-  stdin_lines "0.0.0.0" "8911" "" ""
-  run_install --no-systemd
-  assert_status 0 "$RUN_STATUS"
-  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=0.0.0.0"
-  assert_contains "$(cat "$(_ledger)")" "expose	granted" \
-    "the answer is the consent, and it still belongs in the audit trail"
-  assert_contains "$RUN_STDOUT" "which other computers can reach" \
-    "and the plan says so in words before it is written"
+  local word
+  pty_answers "" "" ""
+  pty_install --no-systemd
+  assert_status 0 "$PTY_STATUS"
+  for word in "bind address" "address to listen on" "0.0.0.0"; do
+    assert_not_contains "$PTY_TRANSCRIPT" "$word" \
+      "\"$word\" is not something a run may still be steered by"
+  done
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=127.0.0.1" \
+    "and what it settles on is this computer, with nobody having chosen it"
 }
 
 # ------------------------------------------------------------- consent
@@ -209,7 +231,7 @@ test_agreeing_to_replace_settings_backs_the_old_ones_up_first() {
   _hard_deps_present
   mkdir -p "$XDG_CONFIG_HOME/ayeaye"
   printf 'AYEAYE_PORT=7777\n' > "$XDG_CONFIG_HOME/ayeaye/env"
-  stdin_lines "y" "" "9000" "" ""
+  stdin_lines "y" "9000" "" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
   local backups
@@ -231,7 +253,7 @@ AYEAYE_NAME=the-workshop
 AYEAYE_LINES=48
 SOMETHING_NOBODY_HAS_HEARD_OF=1
 ENV
-  stdin_lines "y" "" "9000" "" ""
+  stdin_lines "y" "9000" "" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
@@ -265,7 +287,7 @@ test_a_blanket_yes_installs_but_still_will_not_touch_the_network() {
   stub_command_from_fixture uname uname/linux-x86_64
   PLATFORM_OS_RELEASE_FILES="$(fixture_file os-release/debian-12)"
   export PLATFORM_OS_RELEASE_FILES
-  stdin_lines "0.0.0.0" "8911" "" ""
+  stdin_lines "8911" "" ""
   run_install --yes --no-systemd
   # Which stub records it depends on who is running: as an ordinary user the
   # generated command starts with sudo, which is stubbed and records rather
@@ -301,12 +323,14 @@ test_a_run_records_the_stages_it_finished() {
 
 test_a_run_records_what_the_user_chose() {
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "one.example" "https://ntfy.example/t"
+  stdin_lines "9911" "one.example" "https://ntfy.example/t"
   run_install --no-systemd
-  assert_file_contains "$(_state)" "answer.bind=10.1.2.3"
   assert_file_contains "$(_state)" "answer.port=9911"
   assert_file_contains "$(_state)" "answer.hosts=one.example"
   assert_file_contains "$(_state)" "answer.ntfy=https://ntfy.example/t"
+  # The address is on record too, and it is the one thing here nobody was
+  # asked: it is derived, and what it derives to is this computer.
+  assert_file_contains "$(_state)" "answer.bind=127.0.0.1"
 }
 
 test_forgetting_everything_is_a_supported_thing_to_want() {
@@ -337,7 +361,7 @@ test_work_this_version_cannot_do_is_reported_as_not_done() {
   stub_when systemctl '--user daemon-reload' --exit 0
   stub_when systemctl '--user enable --now *' --exit 0
   assert_command_absent curl "the check this test is about has to be impossible"
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_status 0 "$PTY_STATUS" "unfinished optional work is not a failed install"

@@ -81,7 +81,6 @@ SH
 }
 
 _config_prompts() {
-  pty_expect "bind address" ""
   pty_expect "port [" ""
   pty_expect "allowed hosts" ""
   pty_expect "ntfy topic URL" ""
@@ -248,6 +247,40 @@ test_a_transcriber_that_is_not_on_the_path_at_all_satisfies_the_gate() {
   assert_contains "$RUN_STDOUT" "gate_cli=yes" \
     "an absolute path is a command shutil.which can answer for"
   assert_contains "$RUN_STDOUT" "voice=available"
+}
+
+test_a_transcriber_installed_after_the_app_started_is_noticed_without_a_restart() {
+  # Setup tells people ayeaye notices each of these the moment it is installed,
+  # and for the whisper *server* that has always been true - the probe opens a
+  # socket every VOICE_PROBE_TTL seconds and does not care what the program
+  # behind it is called. For the command-line route it was not: the name was
+  # resolved once, when bin/voice-dictate was imported, which for a server that
+  # has been up for a fortnight means the answer it got at boot. A machine with
+  # no transcriber at boot would keep its talk button greyed out until somebody
+  # thought to restart it, on a computer that could transcribe perfectly.
+  #
+  # live_cli is the whole assertion: what the gate resolves *now*, as against
+  # the imported_cli the module settled on when it was loaded.
+  _ready_machine
+  _install_choosing "y"
+  assert_file_contains "$(_state)" "step.install.voice=done"
+
+  # As it was at boot: nothing on PATH, and the settings file naming nothing.
+  stub_remove whisper-cpp
+  grep -v '^VOICE_WHISPER_CLI=' "$(_env)" > "$TEST_TMPDIR/env.new"
+  mv "$TEST_TMPDIR/env.new" "$(_env)"
+  probe
+  assert_contains "$RUN_STDOUT" "gate_cli=no" \
+    "with no transcriber anywhere, the gate is shut"
+
+  # And now one arrives, without anything being restarted.
+  stub_command whisper-cli
+  probe
+  assert_contains "$RUN_STDOUT" "live_cli=whisper-cli" \
+    "the gate asks the question again rather than remembering the answer"
+  assert_contains "$RUN_STDOUT" "gate_cli=yes"
+  assert_contains "$RUN_STDOUT" "voice=available" \
+    "which is what makes 'ayeaye notices it the moment it is installed' true"
 }
 
 # _voice_layer - the voice step's own functions, without an installer around

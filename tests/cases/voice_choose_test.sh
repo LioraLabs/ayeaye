@@ -88,9 +88,9 @@ _tiny_board() {
   _whisper_present
 }
 
-# The four questions install.sh asks before this file gets a turn.
+# The three questions install.sh asks before this file gets a turn. The address
+# ayeaye answers on is not one of them: lib/steps/50-access.sh owns that now.
 _answer_config_prompts() {
-  pty_expect "bind address" ""
   pty_expect "port [" ""
   pty_expect "allowed hosts" ""
   pty_expect "ntfy topic URL" ""

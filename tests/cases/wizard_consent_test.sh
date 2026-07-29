@@ -282,8 +282,8 @@ test_exposure_is_asked_about_through_the_same_primitive() {
 }
 
 test_a_decision_taken_elsewhere_still_reaches_the_ledger() {
-  wizard_consent_record expose granted "you chose to listen on 0.0.0.0"
-  assert_contains "$(wizard_consent_ledger)" "expose	granted	you chose to listen on 0.0.0.0"
+  wizard_consent_record expose granted "you chose to reach ayeaye over tailscale"
+  assert_contains "$(wizard_consent_ledger)" "expose	granted	you chose to reach ayeaye over tailscale"
 }
 
 test_installing_packages_goes_through_consent() {
@@ -340,7 +340,7 @@ test_only_consequential_work_needs_confirming() {
   wizard_plan_add network "reachable from this computer only"
   wizard_plan_is_consequential
   assert_status 1 "$?" \
-    "the address to listen on was typed one question ago; asking again is asking twice"
+    "how ayeaye is reached was settled by the step that asked about it; asking again is asking twice"
   wizard_plan_add package "ffmpeg"
   wizard_plan_is_consequential
   assert_status 0 "$?"

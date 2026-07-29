@@ -26,12 +26,17 @@ _env() { printf '%s' "$XDG_CONFIG_HOME/ayeaye/env"; }
 _ledger() { printf '%s' "$XDG_STATE_HOME/ayeaye/setup-consent.log"; }
 _state() { printf '%s' "$XDG_STATE_HOME/ayeaye/setup-state"; }
 
-# The four questions install.sh asks before this one.
+# The three questions install.sh asks before this one. The address ayeaye
+# answers on is no longer one of them: this step owns it.
+#
+# Each is matched by a substring of its own rather than by the generic prompt
+# terminator, because "which one?" - the way-in menu below - also ends in one
+# and an answer landing in the wrong question would still satisfy a bare
+# "contains" check.
 _answer_config_prompts() {
-  pty_expect "bind address" "$1"
-  pty_expect "port [" "$2"
-  pty_expect "allowed hosts" "$3"
-  pty_expect "ntfy topic URL" "$4"
+  pty_expect "port [" "$1"
+  pty_expect "allowed hosts" "$2"
+  pty_expect "ntfy topic URL" "$3"
 }
 
 # ------------------------------------------------------- nobody watching
@@ -74,7 +79,7 @@ test_a_machine_that_can_offer_nothing_says_so_instead_of_asking() {
   # Four answers of which three cannot be carried out is worse than one
   # paragraph. The same judgement lib/steps/60-packages.sh makes.
   _hard_deps_present
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
   assert_not_contains "$PTY_TRANSCRIPT" "which one?"
@@ -88,7 +93,7 @@ test_an_address_the_person_already_named_is_treated_as_their_answer() {
   # earlier has told setup what is in front of this computer. Asking again
   # would be asking the same thing twice.
   _hard_deps_present
-  _answer_config_prompts "" "" "ayeaye.example.com" ""
+  _answer_config_prompts "" "ayeaye.example.com" ""
   pty_expect "may ayeaye.example.com reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
@@ -106,7 +111,7 @@ test_an_address_the_person_already_named_is_treated_as_their_answer() {
 test_a_machine_with_tailscale_is_offered_all_four_ways() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "2"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
@@ -122,7 +127,7 @@ test_a_machine_with_tailscale_is_offered_all_four_ways() {
 test_the_menu_says_what_is_at_stake_before_it_asks() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "2"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" \
@@ -133,7 +138,7 @@ test_the_menu_says_what_is_at_stake_before_it_asks() {
 test_choosing_this_computer_only_says_it_is_not_phone_access() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "2"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" "it is not how"
@@ -147,7 +152,7 @@ test_choosing_tailscale_and_then_saying_no_leaves_nothing_open() {
   # answering no lands on this computer only, with nothing run.
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "1"
   pty_expect "may your own tailscale devices reach ayeaye?" "n"
   pty_install --no-systemd
@@ -161,7 +166,7 @@ test_choosing_tailscale_and_then_saying_no_leaves_nothing_open() {
 test_choosing_tailscale_and_saying_yes_sets_it_up() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "1"
   pty_expect "may your own tailscale devices reach ayeaye?" "y"
   pty_install --no-systemd
@@ -175,7 +180,7 @@ test_choosing_tailscale_and_saying_yes_sets_it_up() {
 test_an_answer_that_is_not_one_of_the_four_is_asked_again() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "banana"
   pty_expect "which one?" "2"
   pty_install --no-systemd
@@ -186,17 +191,31 @@ test_an_answer_that_is_not_one_of_the_four_is_asked_again() {
 # ------------------------------------------------------ a bind of one's own
 
 test_choosing_a_way_in_puts_ayeaye_back_on_this_computer() {
-  # An address typed into install.sh's own question a page earlier would leave
-  # two things on the network: the front end, and ayeaye behind it. The front
-  # end is the one that is supposed to be there.
+  # An address ayeaye was already answering on would leave two things on the
+  # network once a way in is set up: the front end, and ayeaye behind it. The
+  # front end is the one that is supposed to be there.
+  #
+  # Nobody can type that address at a prompt any more - install.sh does not ask
+  # for one - so it arrives the way it really would, out of a settings file an
+  # earlier run or a hand edit left behind.
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "192.168.1.10" "" "" ""
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye"
+  cat > "$(_env)" <<'ENV'
+AYEAYE_BIND=192.168.1.10
+AYEAYE_PORT=8911
+AYEAYE_ALLOWED_HOSTS=
+ENV
+  pty_expect "rewrite it?" "y"
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "1"
   pty_expect "may your own tailscale devices reach ayeaye?" "y"
   pty_install --no-systemd
+  assert_status 0 "$PTY_STATUS"
   assert_file_contains "$(_env)" "AYEAYE_BIND=127.0.0.1" \
-    "the app stays on loopback whatever was typed earlier"
+    "the app goes back to loopback whatever address it was on before"
+  assert_file_not_contains "$(_env)" "192.168.1.10" \
+    "and the address it was on is gone, not merely joined"
 }
 
 # ---------------------------------------------------------- keeping it all
@@ -220,7 +239,9 @@ ENV
 
 test_a_settings_file_open_to_the_network_is_warned_about_even_when_kept() {
   # Setup will not change a file the person just said to leave alone. It will
-  # say what is in it.
+  # say what is in it, and it will say what to do about it in terms of the file
+  # rather than of a question - because there is no longer a question that
+  # could have put that address there.
   _hard_deps_present
   mkdir -p "$XDG_CONFIG_HOME/ayeaye"
   cat > "$(_env)" <<'ENV'
@@ -231,6 +252,12 @@ ENV
   pty_expect "rewrite it?" "n"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" "answer on every address this"
+  assert_contains "$PTY_TRANSCRIPT" "because that address is already in" \
+    "where it came from: the file, not an answer anybody gave"
+  assert_contains "$PTY_TRANSCRIPT" "change AYEAYE_BIND to 127.0.0.1 in" \
+    "and the way out is an edit, since nothing here will make it"
+  assert_not_contains "$PTY_TRANSCRIPT" "address question" \
+    "there is no address question to be sent back to"
   assert_file_contains "$(_env)" "AYEAYE_BIND=0.0.0.0" \
     "a file the person kept is theirs, warning or no warning"
 }
@@ -240,7 +267,7 @@ ENV
 test_what_is_about_to_happen_is_said_before_it_happens() {
   _hard_deps_present
   _tailscale_online
-  _answer_config_prompts "" "" "" ""
+  _answer_config_prompts "" "" ""
   pty_expect "which one?" "1"
   pty_expect "may your own tailscale devices reach ayeaye?" "y"
   pty_install --no-systemd
