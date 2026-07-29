@@ -157,11 +157,13 @@ difference says `unset USER` and means it.
 
 **A test may write anywhere under `$TEST_TMPDIR` and nowhere else.** The runner
 enforces it: it takes a signature of every path an install writes or could
-plausibly write (`~/.config/ayeaye/env`, the systemd unit, the token, plus
+plausibly write (`~/.config/ayeaye/env`, the systemd unit, the token, the setup
+state file, the consent ledger, the setup log and the backup directory, plus
 `~/.local/bin/ayeaye`, a launchd plist and the shell rc files) before and after
 the run, and if any of them changed it declares the whole run void no matter
 what the assertions said. **When the wizard learns to write somewhere new, add
-it to `GUARDED_PATHS` in `tests/run.sh` in the same commit.**
+it to `GUARDED_PATHS` in `tests/run.sh` in the same commit** —
+`wizard_contract_test.sh` fails if a known setup path is missing from it.
 
 `KEEP_TMPDIR=1 tests/run.sh <filter>` leaves the sandbox in place and prints
 its path, which is how you look at what a failing test actually wrote.
@@ -356,7 +358,24 @@ still satisfy a bare "contains" check.
 | `tests/lib/project_probe.py` | drives `bin/ayeaye`'s project discovery from bash |
 | `tests/cases/harness_*_test.sh` | the harness testing itself |
 | `tests/cases/install_*_test.sh` | what `install.sh` does today |
+| `tests/cases/wizard_*_test.sh` | the setup layer: state, consent, lifecycle, flow, resume |
 | `tests/cases/projects_*_test.sh` | how the project picker finds and ranks projects |
+
+## Testing a setup step
+
+`lib/steps/README.md` is the contract for adding work to the wizard. Three
+things about testing one:
+
+- A step is registered, not called: `install.sh` sources every `lib/steps/*.sh`
+  in filename order, so a case file drives it by running the whole installer.
+- A step that could not do its work returns `$WIZARD_STAGE_PENDING`, which
+  keeps its stage out of `done` and puts it in the closing summary. Pin that,
+  not just the message: a seam that reports success is the failure mode the
+  whole lifecycle exists to prevent.
+- `wizard_contract_test.sh` reads the source rather than a run. It fails if
+  anything outside `lib/consent.sh` installs a package, reaches for `sudo`,
+  downloads a file or touches a firewall or a trust store. That is a lint, and
+  it is the only thing that can see a step routing around consent.
 
 ## Testing the Python
 
