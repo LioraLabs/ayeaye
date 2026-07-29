@@ -1,0 +1,14 @@
+    1     0 /sbin/launchd
+  512     1 /usr/libexec/UserEventAgent
+  690     1 /usr/bin/login
+  701   690 /bin/zsh
+  702   701 /opt/homebrew/bin/codex
+  800     1 /usr/bin/login
+  801   800 /bin/zsh
+  802   801 /opt/homebrew/bin/node
+  803   802 /opt/homebrew/lib/node_modules/@openai/codex/bin/codex
+  901     1 /bin/zsh
+  902   901 /usr/bin/vim
+  950     1 /bin/zsh
+  951   950 /Applications/My Editor.app/Contents/MacOS/My Editor
+  952   951 /opt/homebrew/bin/codex
