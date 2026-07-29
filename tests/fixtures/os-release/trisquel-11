@@ -1,0 +1,11 @@
+NAME="Trisquel GNU/Linux"
+VERSION="11.0, Aramo"
+ID=trisquel
+ID_LIKE=ubuntu
+PRETTY_NAME="Trisquel GNU/Linux 11.0, Aramo"
+VERSION_ID="11.0"
+HOME_URL="https://trisquel.info/"
+SUPPORT_URL="https://trisquel.info/en/help"
+BUG_REPORT_URL="https://trisquel.info/en/project/issues"
+VERSION_CODENAME=aramo
+UBUNTU_CODENAME=jammy

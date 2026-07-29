@@ -45,6 +45,31 @@ anything that runs the installer — report themselves as skipped rather than
 failing. `require_host_command python3` is what does that, and it is the right
 tool for any coverage that cannot run on the machine it finds itself on.
 
+## Container checks
+
+`tests/containers.sh` is a separate, opt-in runner. It sources the platform
+layer inside real `debian`, `fedora`, `archlinux` and `opensuse/tumbleweed`
+images and asserts that the family, package manager, distro id and package
+queries match a machine rather than a fixture. Nothing is installed: the
+repository is mounted read-only and the probe only asks questions.
+
+```sh
+tests/containers.sh              # all four images
+tests/containers.sh arch fedora  # by substring
+tests/containers.sh --list
+tests/containers.sh --suite      # also run the unit tests inside each image
+tests/containers.sh -v           # print every probed value
+```
+
+It is not part of `tests/run.sh` on purpose — the fast suite stays runnable
+with nothing but bash, coreutils and python3. With no container engine it says
+so and exits 0, because "could not check" is not "found a problem". The
+tumbleweed image ships neither `find` nor `python3`, so `--suite` skips it and
+reports why; the probe still runs there.
+
+`tests/lib/platform_probe.sh` is what it runs inside each image, and it is also
+the quickest way to see what the platform layer makes of your own machine.
+
 ## Adding a test
 
 Create `tests/cases/<area>_test.sh`. Every function named `test_*` in it is a
