@@ -273,7 +273,11 @@ curl -L -o ~/whisper-models/ggml-large-v3.bin \
 ```
 
 If `whisper-server` is unreachable, `voice-dictate` falls back to the
-`whisper-cpp` CLI with a smaller model: correct, just slower.
+whisper.cpp command line with a smaller model: correct, just slower. Which
+command that is comes from `VOICE_WHISPER_CLI`, or from the first of
+`whisper-cli`, `whisper-cpp` and `whisper` on `PATH` -- the project renamed
+its binaries and both names are still out there. `bin/ayeaye` greys out the
+talk button on the same question, so the two cannot disagree.
 
 ### Ollama
 
@@ -530,8 +534,10 @@ and a bad rewrite (`final`). Other outcomes: `silence`, `empty`,
   round-trip.
 - The transcript view shows the last `VOICE_TX_ROWS` entries. There is no
   pagination; scrolling back further means reading the JSONL directly.
-- Session mapping is the only platform-specific part of the server, and the
-  macOS half has been exercised only against canned `ps` and `lsof` output.
+- Looking at processes is the only platform-specific part, and all of it is in
+  `bin/process_inspect.py`: which agent is behind a pane, and which tmux client
+  is at a microphone. The macOS half has been exercised only against canned
+  `ps` and `lsof` output; `tests/macos_probe.py` is what to run on a real Mac.
 
 ## Layout
 
@@ -548,6 +554,7 @@ lib/steps/70-service.sh   what a service is, in both platforms' formats
 env.template              every setting, documented; install.sh fills it in
 bin/voice-dictate         pipeline: record → whisper → polish → send-keys
 bin/voice-agent           recorder daemon for remote tmux clients
+bin/process_inspect.py    processes, per platform: /proc, or ps and lsof
 bin/ayeaye          web app + API
 bin/voice-dictate-setup   prints per-device setup for voice-agent
 share/app.html            the entire front end, one file, no build step

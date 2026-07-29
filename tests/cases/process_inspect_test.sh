@@ -5,6 +5,12 @@
 # bridge that puts tests/python/process_inspect.py under `tests/run.sh`, one
 # bash test per group of behaviours. That python file names each behaviour
 # individually and its output is printed in full when anything here fails.
+#
+# The backend itself lives in bin/process_inspect.py, because bin/voice-dictate
+# has to ask the same platform questions about tmux clients;
+# tests/cases/dictate_client_test.sh is that half. Everything here still
+# reaches it through bin/ayeaye, which is where it used to live and where it
+# still reads as living.
 
 setup() {
   require_host_command python3
@@ -77,6 +83,49 @@ test_the_claude_marker_never_inspects_a_process() {
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
 }
 
+test_whether_a_pid_is_alive_is_answered_on_both_platforms() {
+  run_proc_tests \
+    LinuxProcTest.test_exists_is_true_for_a_pid_with_a_directory_under_proc \
+    LinuxProcTest.test_exists_is_false_for_a_pid_that_is_not_there \
+    DarwinProcTest.test_a_pid_ps_reports_back_exists \
+    DarwinProcTest.test_a_pid_ps_says_nothing_about_does_not_exist \
+    DarwinProcTest.test_a_pid_is_believed_when_ps_could_not_be_asked_at_all
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
+test_the_address_a_process_was_reached_from_is_read_on_both_platforms() {
+  # The same answer from two entirely different sources: a NUL-separated
+  # environ block on Linux, and the environment ps appends to a command line
+  # on macOS. Whichever one is wrong, the user is offered the wrong
+  # microphone and nothing says so.
+  run_proc_tests \
+    LinuxProcTest.test_the_ssh_peer_is_the_first_field_of_ssh_connection \
+    LinuxProcTest.test_a_process_with_no_ssh_connection_has_no_peer \
+    LinuxProcTest.test_a_variable_whose_name_merely_ends_in_it_is_not_it \
+    DarwinProcTest.test_the_ssh_peer_comes_out_of_the_process_environment \
+    DarwinProcTest.test_a_client_sitting_at_the_machine_has_no_peer \
+    DarwinProcTest.test_a_variable_whose_name_merely_ends_in_it_is_not_it \
+    DarwinProcTest.test_the_client_probes_ask_for_what_they_need
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
+test_a_missing_tool_or_a_refused_read_never_reaches_the_caller() {
+  run_proc_tests \
+    LinuxProcTest.test_a_peer_lookup_on_a_process_that_is_gone_is_not_an_error \
+    LinuxProcTest.test_a_peer_lookup_that_is_refused_is_not_an_error \
+    LinuxProcTest.test_an_undecodable_environment_does_not_cost_the_peer \
+    DarwinProcTest.test_an_ssh_connection_with_no_value_is_not_the_next_variable \
+    DarwinProcTest.test_a_peer_lookup_with_no_ps_at_all_is_not_an_error
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
+test_one_backend_serves_both_commands() {
+  # The failure this guards is not a crash. Two copies of a platform backend
+  # work on the day they are written, and then one gets a fix.
+  run_proc_tests SharedModuleTest
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
 test_the_whole_python_suite_passes() {
   run_proc_tests
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
@@ -90,6 +139,10 @@ test_ayeaye_imports_with_proc_taken_away() {
   run_script "$STUB_BIN/python3" -c \
     "import builtins, os, sys
 from importlib.machinery import SourceFileLoader
+
+# The tree under test is not a place to write to, and loading a .py sibling
+# out of bin/ would otherwise leave a __pycache__ in it.
+sys.dont_write_bytecode = True
 
 real_open, real_readlink, real_listdir = open, os.readlink, os.listdir
 denied = []

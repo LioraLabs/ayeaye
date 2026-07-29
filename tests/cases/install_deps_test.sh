@@ -118,6 +118,19 @@ test_whisper_cpp_counts_as_a_transcriber_too() {
     "but the tier *checklist* only ever looks for whisper-server"
 }
 
+test_whisper_cli_counts_as_a_transcriber_too() {
+  # The name whisper.cpp's current builds, Homebrew's formula and Arch's
+  # package all install. A run that told this machine it was text-only while
+  # the app's talk button worked would be the one-name-per-tool mistake in a
+  # third place.
+  _hard_deps_present
+  stub_command ffmpeg
+  stub_command whisper-cli
+  run_install --defaults --no-systemd
+  assert_contains "$RUN_STDOUT" "+voice"
+  assert_contains "$RUN_STDOUT" "talking to them out loud: yes"
+}
+
 test_ffmpeg_alone_is_not_a_voice_tier() {
   _hard_deps_present
   stub_command ffmpeg

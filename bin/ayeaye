@@ -30,6 +30,47 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
+
+
+def _load_sibling(name, filename):
+    """A python file next to this command, loaded as a module.
+
+    Loaded rather than imported because bin/ holds commands: they have no .py
+    extension, they are not on any import path, and there is no package here
+    and no intention of adding one. The same few lines appear in
+    bin/voice-dictate; that is the price of having no package, and it is
+    cheaper than the packaging that would remove it.
+
+    realpath, not abspath. These get symlinked onto PATH -- that is the
+    documented way to run them -- and abspath would resolve "next to" as next
+    to the symlink, where there is nothing. It would fail at import, before
+    anything could say so.
+
+    sys.modules is consulted first because this command loads bin/voice-dictate
+    and both of them load bin/process_inspect.py. Loading that twice would give
+    the two of them separate class objects and a PROCESS_INFO each -- the same
+    divergence the shared module exists to prevent, arriving one process later.
+
+    Registered before it is executed, which is what lets a module load its own
+    sibling, and removed again if the body raises -- otherwise the next caller
+    is handed a half-built module instead of an error.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), filename)
+    # The loader is named rather than inferred: importlib picks one from the
+    # file extension, and a command deliberately has none.
+    spec = spec_from_file_location(name, path,
+                                   loader=SourceFileLoader(name, path))
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
+    return module
 
 
 def _load_env_file():
@@ -81,8 +122,7 @@ def _state_dir():
 # Reuse the pipeline rather than reimplementing it: same whisper server, same
 # rewrite model, same silence gate, same log. Imported after the env file is
 # loaded, because voice-dictate reads its configuration at import time.
-_vd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice-dictate")
-vd = SourceFileLoader("voice_dictate", _vd_path).load_module()
+vd = _load_sibling("voice_dictate", "voice-dictate")
 
 # The UI ships in share/ next to bin/, so a fresh clone serves straight from
 # the repo. A ~/.local/share install (the old symlink layout) still wins when
@@ -237,195 +277,26 @@ def pane_session(pane_id):
 
 
 # ---------------------------------------------------------- process lookup
-# Everything below the pane is platform-specific: Linux answers out of /proc,
-# macOS has no /proc at all and answers out of ps and lsof. Only four
-# questions are ever asked -- who are this process's children, what is each
-# one called, when did it start, and where is it running -- so that is the
-# whole interface, and the walk that uses them is shared.
+# Which agent is behind a pane is a platform question, and it is answered in
+# bin/process_inspect.py rather than here, because bin/voice-dictate has to
+# ask the same one about tmux clients. See that file for why it is a separate
+# module and not a paragraph of this one.
 #
-# None means "could not find out", never an exception: this runs inside a
-# request handler, and a pane whose agent cannot be identified is an ordinary
-# state of the world, not an error.
+# PROCESS_INFO is the only one of these this file goes on to use. The rest are
+# aliases, and they are here for a reason worth stating rather than left as
+# tidy-looking dead weight: the suite that pins this backend addresses it
+# through this module, and keeping the names where they have always been is
+# what let the extraction land without a single assertion being edited. A
+# refactor whose tests had to be rewritten alongside it proves rather less.
+process_inspect = _load_sibling("ayeaye_process_inspect", "process_inspect.py")
 
-def _run_tool(argv, timeout=5):
-    """Standard output of an inspection tool, or None if it could not run.
-
-    A non-zero exit is not a failure here. pgrep exits 1 when nothing matched
-    and lsof exits 1 when it had a complaint about a file it could still
-    report on; in both cases the output is the answer.
-
-    errors="replace" is load-bearing. `ps` prints the path of every process on
-    the machine, no filesystem this runs on enforces valid UTF-8 in a name,
-    and a strict decode would turn one unrelated process into an empty tree
-    for every pane at once.
-    """
-    try:
-        return subprocess.run(argv, capture_output=True, text=True,
-                              errors="replace", timeout=timeout,
-                              env=dict(os.environ, LC_ALL="C")).stdout
-    except Exception:
-        return None
-
-
-class _ProcessInfo(object):
-    """The shared half: finding a named process below a pane's shell."""
-
-    def _snapshot(self):
-        """Whatever a backend wants to gather once per walk, or None."""
-        return None
-
-    def descendant(self, pid, name, depth=3):
-        """Find a named descendant. tmux's pane_pid is the shell; the agent is
-        a child of it (and sometimes a grandchild via a wrapper)."""
-        snap = self._snapshot()
-        frontier = [str(pid)]
-        for _ in range(depth):
-            nxt = []
-            for p in frontier:
-                for c in self.children(p, snap):
-                    comm = self.comm(c, snap)
-                    if comm is None:        # gone, or not ours to look at
-                        continue
-                    if comm == name:
-                        return c
-                    nxt.append(c)
-            frontier = nxt
-        return None
-
-
-class _LinuxProcessInfo(_ProcessInfo):
-    """/proc. `proc`, `run` and `clk_tck` are injectable for tests only."""
-
-    def __init__(self, proc="/proc", run=None, clk_tck=None):
-        self.proc = proc
-        self.run = run or _run_tool
-        self.clk_tck = clk_tck or os.sysconf("SC_CLK_TCK")
-
-    def children(self, pid, snap=None):
-        return (self.run(["pgrep", "-P", str(pid)]) or "").split()
-
-    def comm(self, pid, snap=None):
-        # errors="replace": comm is whatever bytes the exec'd path ended in,
-        # and an undecodable one is a process with an odd name, not a reason
-        # to fail a request.
-        try:
-            with open("%s/%s/comm" % (self.proc, pid), errors="replace") as fh:
-                return fh.read().strip()
-        except (OSError, ValueError):
-            return None
-
-    def start_time(self, pid):
-        """Wall-clock time the process began, from /proc/<pid>/stat field 22.
-
-        The comm sits in parentheses and may contain one itself, so the split
-        is from the right; what is left starts at field 3, putting starttime
-        at index 19. It counts clock ticks since boot, and boot is now minus
-        uptime.
-        """
-        try:
-            with open("%s/%s/stat" % (self.proc, pid)) as fh:
-                fields = fh.read().rsplit(")", 1)[1].split()
-            with open("%s/uptime" % self.proc) as fh:
-                uptime = float(fh.read().split()[0])
-            return (time.time() - uptime) + float(fields[19]) / self.clk_tck
-        except (OSError, ValueError, IndexError):
-            return None
-
-    def cwd(self, pid):
-        try:
-            return os.readlink("%s/%s/cwd" % (self.proc, pid))
-        except OSError:
-            return None
-
-
-# Three things about BSD ps that a Linux reflex gets wrong, all of which fail
-# silently -- an empty process tree looks exactly like a pane with no agent
-# under it:
-#
-#   -o pid=,ppid=,comm=   an `=` makes the REST of the argument the column
-#                         header, so this asks for one column named
-#                         ",ppid=,comm=". One keyword per -o is the form that
-#                         means the same thing to both ps implementations.
-#   -ww                   the last column is clipped to the output width,
-#                         which ps takes from $COLUMNS or from whichever of
-#                         its three streams is still a terminal. Under
-#                         capture_output that is stdin, so the answer depends
-#                         on how the server was started -- a clipped
-#                         interpreter path is exactly the part being matched,
-#                         and -ww is the only way to stop asking.
-#   comm                  the full executable path, where Linux gives a bare
-#                         name truncated to 15 characters; it may contain
-#                         spaces, and an agent name longer than 15 characters
-#                         would match here and not there.
-PS_SNAPSHOT = ["ps", "-axww", "-o", "pid=", "-o", "ppid=", "-o", "comm="]
-
-
-class _DarwinProcessInfo(_ProcessInfo):
-    """ps and lsof. `run` is injectable for tests only.
-
-    One `ps` snapshot serves a whole walk: three levels of ancestry would
-    otherwise cost a process per node, on the platform where spawning them is
-    slowest. It is taken per walk and carried on the stack, never on the
-    instance -- one of these is shared by every thread of a threading server,
-    and a half-replaced tree resolves a pane to the wrong agent or to none.
-    """
-
-    def __init__(self, run=None):
-        self.run = run or _run_tool
-
-    def _snapshot(self):
-        kids, comm = {}, {}
-        for line in (self.run(PS_SNAPSHOT) or "").splitlines():
-            parts = line.split(None, 2)
-            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                continue
-            pid, ppid = parts[0], parts[1]
-            comm[pid] = os.path.basename(parts[2].strip()) if len(parts) > 2 else ""
-            kids.setdefault(ppid, []).append(pid)
-        return kids, comm
-
-    def children(self, pid, snap=None):
-        kids, _ = snap or self._snapshot()
-        return list(kids.get(str(pid), ()))
-
-    def comm(self, pid, snap=None):
-        # "" for a row ps gave no name, which still has children worth
-        # walking. The Linux side returns None there and prunes the subtree,
-        # because that is what it did before this was an interface.
-        _, comm = snap or self._snapshot()
-        return comm.get(str(pid))
-
-    def start_time(self, pid):
-        """`ps -o lstart=` gives "Wed Mar  4 09:00:02 2026" -- local time
-        truncated to the second, so it can only ever be earlier than the true
-        start, which moves a rollout away from the window's lower edge rather
-        than off it. The strptime format is fixed: lstart is ctime(3) output,
-        which is C-locale regardless."""
-        out = self.run(["ps", "-ww", "-p", str(pid), "-o", "lstart="]) or ""
-        try:
-            return time.mktime(time.strptime(out.strip(),
-                                             "%a %b %d %H:%M:%S %Y"))
-        except (ValueError, OverflowError):
-            return None
-
-    def cwd(self, pid):
-        """`lsof -Fn` puts each field on its own line behind a one-letter tag,
-        which is the only form that survives a path with a space in it."""
-        out = self.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"]) or ""
-        for line in out.splitlines():
-            if line.startswith("n"):
-                return line[1:]
-        return None
-
-
-def _make_process_info(plat=None):
-    """Pick a backend. By platform at runtime, never by import-time failure:
-    the module has to load on a machine with no /proc and on one with no ps."""
-    plat = sys.platform if plat is None else plat
-    return _DarwinProcessInfo() if plat == "darwin" else _LinuxProcessInfo()
-
-
-PROCESS_INFO = _make_process_info()
+_run_tool = process_inspect._run_tool
+_ProcessInfo = process_inspect._ProcessInfo
+_LinuxProcessInfo = process_inspect._LinuxProcessInfo
+_DarwinProcessInfo = process_inspect._DarwinProcessInfo
+PS_SNAPSHOT = process_inspect.PS_SNAPSHOT
+_make_process_info = process_inspect._make_process_info
+PROCESS_INFO = process_inspect.PROCESS_INFO
 
 
 def codex_session_for(pane_pid, proc=None):
@@ -1380,11 +1251,25 @@ def voice_available():
     """Can /api/dictate plausibly succeed right now?
 
     Decoding needs ffmpeg; transcription needs the whisper server the
-    dictation path uses (or its CLI fallback: whisper-cpp plus a model on
-    disk). ollama is deliberately not probed -- polish() already degrades
+    dictation path uses, or its CLI fallback: the transcriber plus a model on
+    disk. ollama is deliberately not probed -- polish() already degrades
     to the raw transcription without it. Cached for VOICE_PROBE_TTL seconds
     so the overview poll never pays for a connect per request; a benign race
     between threads costs at most one extra probe.
+
+    The transcriber is not named here. It used to be, as the literal string
+    `whisper-cpp`, and whisper.cpp has since renamed its binaries: its own
+    builds, Homebrew's formula and Arch's package all install `whisper-cli`.
+    A machine with that name and no server transcribes perfectly through
+    bin/voice-dictate and was refused by this gate anyway, which is a talk
+    button greyed out on a computer that can talk.
+
+    So the question asked is the only one that means anything: is the command
+    bin/voice-dictate is going to run actually there? vd.WHISPER_CLI is that
+    command, resolved from VOICE_WHISPER_CLI or from the first of the names
+    still in the world found on PATH. One name to keep in step instead of
+    two, which is what went wrong the first time. shutil.which answers for an
+    absolute path as readily as for a bare name, so a recorded path works.
     """
     now = time.time()
     if now - _voice_probe["at"] < VOICE_PROBE_TTL:
@@ -1397,7 +1282,7 @@ def voice_available():
                                           timeout=1):
                 ok = True
         except OSError:
-            ok = bool(shutil.which("whisper-cpp")
+            ok = bool(shutil.which(vd.WHISPER_CLI)
                       and os.path.exists(vd.WHISPER_MODEL))
     _voice_probe["at"], _voice_probe["ok"] = now, ok
     return ok

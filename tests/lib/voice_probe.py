@@ -84,17 +84,19 @@ def main():
     # failing assertion says which half of the handshake broke rather than
     # only that it did.
     # Every input the verdict is built from, read out of the app itself
-    # wherever the app has it. `gate_cli` is the one exception and it is
-    # spelled out rather than borrowed: bin/ayeaye's probe looks for the
-    # literal name `whisper-cpp`, while the transcriber the app would really
-    # run is `dictate_cli`. Those two disagreeing is a real configuration -
-    # whisper.cpp renamed its binaries - and a probe that reported one number
-    # for both could not show it.
+    # wherever the app has it. `gate_cli` used to be spelled out rather than
+    # borrowed, because the two really did disagree: bin/ayeaye's probe looked
+    # for the literal name `whisper-cpp` while the transcriber the app would
+    # run is `dictate_cli`, and whisper.cpp renaming its binaries made that an
+    # ordinary configuration rather than a hypothetical one. The probe now
+    # asks the question the pipeline asks, so this reports the same thing -
+    # and it is kept rather than dropped, because a test showing the two
+    # agreeing is worth more than one fewer line of output.
     out = {
         "voice": "available" if app.voice_available() else "text-only",
         "ffmpeg": "yes" if shutil.which("ffmpeg") else "no",
         "server": app.vd.WHISPER_SERVER,
-        "gate_cli": "yes" if shutil.which("whisper-cpp") else "no",
+        "gate_cli": "yes" if shutil.which(app.vd.WHISPER_CLI) else "no",
         "dictate_cli": app.vd.WHISPER_CLI,
         "dictate_cli_present": "yes" if shutil.which(app.vd.WHISPER_CLI) else "no",
         "model": app.vd.WHISPER_MODEL,
