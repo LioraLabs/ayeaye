@@ -83,7 +83,7 @@ test_the_unit_names_the_program_and_the_settings_file_by_absolute_path() {
   unit="$(_unit_file)"
   assert_file_exists "$unit"
   assert_file_contains "$unit" "ExecStart=$REPO_ROOT/bin/ayeaye"
-  assert_file_contains "$unit" "EnvironmentFile=$XDG_CONFIG_HOME/ayeaye/env"
+  assert_file_contains "$unit" "EnvironmentFile=-$XDG_CONFIG_HOME/ayeaye/env"
   assert_file_not_contains "$unit" "@REPO@"
   assert_file_not_contains "$unit" "@ENV_FILE@"
   # Nothing else about the unit's contents is asserted here: the body comes

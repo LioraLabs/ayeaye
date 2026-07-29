@@ -121,8 +121,40 @@ test_both_formats_start_the_service_at_login() {
 test_the_settings_file_is_referenced_exactly_once_in_the_unit() {
   _load_service_lib
   local count
-  count="$(service_render_systemd ayeaye | grep -c "^EnvironmentFile=$ENV_FILE\$")"
+  count="$(service_render_systemd ayeaye | grep -c "^EnvironmentFile=-$ENV_FILE\$")"
   assert_eq "1" "$count" "one reference, and it is the whole of the wiring"
+}
+
+test_a_settings_file_that_is_not_there_yet_does_not_stop_the_service() {
+  _load_service_lib
+  # EnvironmentFile= without the "-" makes a missing file a fatal start error,
+  # and with Restart=on-failure that is a restart loop rather than a program
+  # running on its defaults.
+  assert_matches "$(service_render_systemd ayeaye)" "^EnvironmentFile=-/"
+}
+
+test_a_percent_sign_in_the_settings_path_is_escaped_for_systemd() {
+  # systemd runs specifier expansion over EnvironmentFile= as well as over
+  # ExecStart=, and an unknown specifier is not an error - it drops the whole
+  # directive with a warning nobody reads. The unit would start perfectly and
+  # run with none of the user's settings, which is the one outcome this
+  # design exists to make impossible.
+  _load_service_lib
+  ENV_FILE="$TEST_TMPDIR/100%/ayeaye/env"
+  local unit
+  unit="$(service_render_systemd ayeaye)"
+  assert_contains "$unit" "EnvironmentFile=-$TEST_TMPDIR/100%%/ayeaye/env"
+  assert_not_contains "$unit" "EnvironmentFile=-$TEST_TMPDIR/100%/ayeaye/env"
+}
+
+test_the_golden_comparison_is_byte_for_byte() {
+  # The comparisons above go through $( ), which strips trailing newlines from
+  # both sides and so cannot see one. This one does not.
+  _load_service_lib
+  _golden ayeaye-systemd > "$TEST_TMPDIR/golden"
+  service_render_systemd ayeaye > "$TEST_TMPDIR/rendered"
+  assert_eq "$(cksum < "$TEST_TMPDIR/golden")" "$(cksum < "$TEST_TMPDIR/rendered")" \
+    "including the trailing newline"
 }
 
 test_the_agent_points_at_where_the_settings_are_not_at_what_they_say() {
@@ -134,6 +166,23 @@ test_the_agent_points_at_where_the_settings_are_not_at_what_they_say() {
   assert_contains "$plist" "<key>XDG_CONFIG_HOME</key>"
   assert_contains "$plist" "<string>$XDG_CONFIG_HOME</string>"
   assert_contains "$plist" "<key>XDG_STATE_HOME</key>"
+}
+
+test_the_agent_can_find_tmux_where_a_mac_actually_keeps_it() {
+  # launchd hands a GUI agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing
+  # else. tmux on a Mac comes from Homebrew, under one prefix on Apple silicon
+  # and another on Intel, and neither is on that list. Without this the agent
+  # starts, answers, passes its health check, and shows an empty list of
+  # sessions forever - bin/ayeaye reads a tmux it cannot run as a tmux with
+  # nothing in it.
+  _load_service_lib
+  local plist
+  plist="$(service_render_launchd ayeaye)"
+  assert_contains "$plist" "<key>PATH</key>"
+  assert_contains "$plist" "/opt/homebrew/bin"
+  assert_contains "$plist" "/usr/local/bin"
+  assert_not_contains "$plist" "$STUB_BIN" \
+    "a copy of whatever PATH happened to be exported is not a description of a Mac"
 }
 
 test_no_setting_from_the_environment_file_is_copied_into_a_definition() {
@@ -195,20 +244,57 @@ test_a_repo_path_containing_a_space_survives_both_formats() {
     "an XML string element needs no quoting for a space"
 }
 
-test_a_repo_path_containing_a_quote_and_a_dollar_survives_both_formats() {
-  require_host_command python3
-  stub_real python3
-  local repo="$TEST_TMPDIR/od\"d \$path"
+test_a_repo_path_containing_a_dollar_or_a_percent_survives_the_unit() {
+  # systemd expands $NAME and its own %h-style specifiers inside ExecStart, so
+  # both have to be doubled for the path to arrive at execve intact.
+  local repo="$TEST_TMPDIR/100% \$path"
   mkdir -p "$repo"
   _load_service_lib "$repo"
-  local unit
-  unit="$(service_render_systemd ayeaye)"
-  # systemd expands $NAME inside ExecStart and reads \" as a literal quote, so
-  # both have to be escaped for the path to arrive at execve intact.
-  assert_contains "$unit" 'ExecStart="'"$TEST_TMPDIR"'/od\"d $$path/bin/ayeaye"'
-  # The plist is XML, and what it needs escaping for is different again.
+  assert_contains "$(service_render_systemd ayeaye)" \
+    'ExecStart="'"$TEST_TMPDIR"'/100%% $$path/bin/ayeaye"'
   assert_contains "$(service_render_launchd ayeaye)" \
-    "<string>$repo/bin/ayeaye</string>"
+    "<string>$repo/bin/ayeaye</string>" "neither is special in XML"
+}
+
+test_a_quote_or_a_backslash_in_the_path_is_something_systemd_cannot_express() {
+  # There is no escaping for these. systemd unquotes the executable word and
+  # then rejects the result if it holds a quote, a backslash or a control
+  # character - "Executable path contains special characters", which is a
+  # fatal unit error. A unit that installs cleanly and can never start is
+  # worse than an install that says what is wrong, so the step refuses.
+  _load_service_lib
+  _service_systemd_can_express "/home/me/repo"
+  assert_status 0 "$?"
+  _service_systemd_can_express "/home/o\"d/repo"
+  assert_status 1 "$?" "a double quote"
+  _service_systemd_can_express "/home/o'd/repo"
+  assert_status 1 "$?" "a single quote"
+  _service_systemd_can_express "/home/o\\\\d/repo"
+  assert_status 1 "$?" "a backslash"
+  _service_systemd_can_express "/home/ok" "/home/o
+d"
+  assert_status 1 "$?" "a newline, in any of the paths given"
+}
+
+test_launchd_can_express_what_systemd_cannot() {
+  # The Mac side has no such limit: XML says what it means about any of these,
+  # and plistlib gives the path back unchanged. Pinned so that the refusal
+  # above is understood as systemd's rule and not as a rule of this project.
+  require_host_command python3
+  stub_real python3
+  local repo="$TEST_TMPDIR/o\"d 'and' \\ odder"
+  mkdir -p "$repo"
+  _load_service_lib "$repo"
+  service_render_launchd ayeaye > "$TEST_TMPDIR/agent.plist"
+  local out
+  out="$(python3 - "$TEST_TMPDIR/agent.plist" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as fh:
+    print(plistlib.load(fh)["ProgramArguments"][0])
+PY
+)"
+  assert_status 0 "$?"
+  assert_eq "$repo/bin/ayeaye" "$out"
 }
 
 test_a_repo_path_containing_an_ampersand_is_escaped_for_xml() {
@@ -292,8 +378,10 @@ test_the_step_file_registers_where_it_says_it_does() {
   # is about to be installed before it is.
   _wizard_step_known configure service
   assert_status 0 "$?" "the plan entry has to be registered on the configure stage"
-  # And the work itself stays where install.sh already registered it, so the
-  # health check that runs after it keeps running after it.
-  _wizard_step_known service unit
-  assert_status 1 "$?" "the install step belongs to install.sh, not to this file"
+  # The work itself stays on the step install.sh already registered, which is
+  # what keeps the health check running after it rather than before it. That
+  # is pinned end to end in install_systemd_test.sh; what is checked here is
+  # that this file provides the function that step hands over to.
+  command -v service_step >/dev/null
+  assert_status 0 "$?"
 }
