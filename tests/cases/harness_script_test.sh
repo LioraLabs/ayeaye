@@ -172,6 +172,25 @@ SH
   assert_contains "$PTY_TRANSCRIPT" "a=y b=n"
 }
 
+test_an_expectation_never_rematches_output_that_is_already_spent() {
+  # Prompts share a terminator: "rewrite it? [n]: " and "port [8911]: " both
+  # end in "]: ". A rule that resumed searching just after the previous match
+  # would find the tail of the prompt it just answered and type the next answer
+  # before the next question existed.
+  _fake_script twice.sh <<'SH'
+#!/usr/bin/env bash
+read -r -p "rewrite it? [n]: " first
+read -r -p "port [8911]: " second
+printf 'first=%s second=%s\n' "$first" "$second"
+SH
+  pty_expect "rewrite it?" "yes"
+  pty_answers "9000"
+  pty_run "$SCRIPT"
+  assert_contains "$PTY_TRANSCRIPT" "first=yes second=9000"
+  assert_contains "$PTY_TRANSCRIPT" "port [8911]: 9000" \
+    "the second answer belongs to the second prompt"
+}
+
 test_the_pty_run_reports_the_scripts_exit_status() {
   _fake_script exiter.sh <<'SH'
 #!/usr/bin/env bash

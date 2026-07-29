@@ -116,11 +116,18 @@ def main():
             pattern, response = rules[index]
             found = transcript.find(pattern, searched)
             if found >= 0:
-                searched = found + len(pattern)
                 try:
                     os.write(fd, response + b"\n")
                 except OSError:
                     break
+                # Everything received so far is spent. Resuming the search at
+                # the end of the matched pattern would let the next rule match
+                # the tail of the prompt just answered - "port [8911]: " and
+                # "bind address [127.0.0.1]: " both end in "]: " - and fire an
+                # answer before the question was asked. The child cannot print
+                # its next prompt until it has read this answer, so nothing
+                # legitimate is skipped.
+                searched = len(transcript)
                 index += 1
 
     try:
