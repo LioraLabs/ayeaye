@@ -155,6 +155,59 @@ test_each_family_generates_its_own_install_command() {
     "$(platform_pkg_install_command tmux ffmpeg)"
 }
 
+test_a_set_containing_tar_generates_this_familys_whole_command() {
+  # The name table gained tar for the ticket that installs prebuilt releases.
+  # Asserting the mapped name on its own is not enough: what a caller runs is
+  # the whole command, and that is where a name the table has no opinion about
+  # either disappears or does not.
+  _on debian-12 apt-get
+  assert_eq "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux tar" \
+    "$(platform_pkg_install_command tmux tar)"
+
+  _on fedora-40 dnf
+  assert_eq "sudo dnf install -y tmux tar" \
+    "$(platform_pkg_install_command tmux tar)"
+
+  _on arch pacman
+  assert_eq "sudo pacman -S --needed --noconfirm tmux tar" \
+    "$(platform_pkg_install_command tmux tar)"
+
+  _on opensuse-tumbleweed zypper
+  assert_eq "sudo zypper --non-interactive install tmux tar" \
+    "$(platform_pkg_install_command tmux tar)"
+}
+
+test_a_name_with_no_package_on_this_family_still_reaches_the_command_line() {
+  # The sharp edge, pinned rather than left to be discovered.
+  #
+  # macOS has no formula called tar and needs none: it ships bsdtar, and
+  # Homebrew's nearest thing is gnu-tar, which installs as gtar. The table says
+  # so - platform_pkg_has_mapping is false - but platform_pkg_name is
+  # documented to hand an unrecognised name straight back, and the command
+  # builder uses platform_pkg_name. So the command really does say
+  # "brew install tar", for a formula that does not exist.
+  #
+  # That is deliberate and it is the documented contract: the builder answers
+  # "what would this family run", and *the caller* is what must not ask for a
+  # package this family does not have. lib/steps/60-packages.sh is the caller,
+  # and install_packages_test.sh's
+  # test_a_name_this_family_has_no_package_for_is_not_asked_of_it proves it
+  # checks platform_pkg_has_mapping first and never generates this.
+  _on_macos_with_brew
+  if platform_pkg_has_mapping tar; then
+    fail "there is no formula called tar, and the table must say so"
+  fi
+  assert_eq "tar" "$(platform_pkg_name tar)" \
+    "handed back unchanged, which is what platform_pkg_name promises"
+  assert_eq "brew install tmux tar" "$(platform_pkg_install_command tmux tar)" \
+    "the builder does not filter, and a caller that skips the mapping check
+gets a command Homebrew will reject"
+
+  # A family that does have it is unaffected by any of that.
+  _on debian-12 apt-get
+  platform_pkg_has_mapping tar || fail "every Linux family here has a tar package"
+}
+
 test_homebrew_is_never_run_with_sudo() {
   _on_macos_with_brew
   local cmd
