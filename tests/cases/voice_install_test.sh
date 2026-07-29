@@ -363,6 +363,9 @@ SH
   _curl_writes "$TINY_BYTES"
   _config_prompts
   pty_expect "which one?" "2"
+  # A machine that could run a front end is offered one; keep it on this
+  # computer, so this test stays about listening and not about networks.
+  pty_expect "which one? (1, 2, 3 or 4)" "2"
   _decline_everything_else
   pty_expect "go ahead with all of that?" "y"
   pty_expect "may I install ffmpeg on this computer?" "y"
@@ -387,6 +390,9 @@ test_nothing_is_downloaded_onto_a_computer_that_still_cannot_hear() {
   _curl_writes "$TINY_BYTES"
   _config_prompts
   pty_expect "which one?" "2"
+  # A machine that could run a front end is offered one; keep it on this
+  # computer, so this test stays about listening and not about networks.
+  pty_expect "which one? (1, 2, 3 or 4)" "2"
   _decline_everything_else
   pty_expect "go ahead with all of that?" "y"
   pty_expect "may I install ffmpeg on this computer?" "n"
