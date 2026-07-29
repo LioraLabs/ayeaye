@@ -162,8 +162,10 @@ test_failed_stub_assertions_show_what_was_recorded() {
 }
 
 test_stubs_do_not_leak_between_tests() {
-  # The counterpart of this test ran systemctl twice; a fresh sandbox means a
-  # fresh stub directory and a fresh log.
+  # Earlier tests in this very file stubbed systemctl and called it twice. This
+  # one asserts the guarantee that makes that irrelevant: a test is a process of
+  # its own, so it starts with an empty stub directory and an empty log, and it
+  # reads the same whether the file runs whole or filtered down to this test.
   assert_command_absent systemctl
   assert_eq "0" "$(stub_call_count systemctl)"
 }
