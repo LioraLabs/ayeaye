@@ -1175,6 +1175,22 @@ def spawn_agent(path, agent, prompt=""):
     return {"pane": pane, "session": name, "created": created, "agent": agent}
 
 
+def kill_pane(pane_id):
+    """Kill one listed pane, and nothing else.
+
+    Restricted to panes list_panes() reports for the same reason /api/answer
+    has an allow-list: this endpoint is reachable over the network, and
+    kill-pane with a free-form target is a remote off-switch for every tmux
+    the user runs -- including the floating scratch panes the listing hides.
+    tmux handles the cascade: the window dies with its last pane, the session
+    with its last window.
+    """
+    if not any(p["id"] == pane_id for p in list_panes()):
+        return {"error": "no such pane"}
+    tmux("kill-pane", "-t", pane_id)
+    return {"ok": True}
+
+
 
 
 def notify(title, body, tags=("warning",), priority=4, click=""):
@@ -1729,6 +1745,17 @@ class Handler(BaseHTTPRequestHandler):
             if not pane:
                 return self._json({"error": "no pane"}, 400)
             res = answer_prompt(pane, key)
+            return self._json(res, 400 if res.get("error") else 200)
+
+        if path == "/api/kill":
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            pane = req.get("pane", "")
+            if not pane:
+                return self._json({"error": "no pane"}, 400)
+            res = kill_pane(pane)
             return self._json(res, 400 if res.get("error") else 200)
 
         if path == "/api/spawn":

@@ -167,11 +167,24 @@
   #ov{flex:1;overflow:auto;padding:8px 14px 32px;display:none;
       -webkit-overflow-scrolling:touch}
   #ov.show{display:block}
+  /* Each card sits on a rail with a kill button hiding under its right edge;
+     swiping the card left uncovers it. The card slides with transform so the
+     reveal never reflows the list. */
+  .swipe{position:relative;margin:10px 0}
+  .swipe .kill{
+    position:absolute;top:0;right:0;bottom:0;width:84px;border:0;
+    border-radius:0 var(--r-l) var(--r-l) 0;background:var(--red);
+    color:#16161e;font-size:13px;font-weight:700;letter-spacing:.02em;
+  }
+  /* Keyboard path to the same action: tabbing onto the hidden button slides
+     the card aside just as a swipe would. */
+  .swipe:has(.kill:focus-visible) .card{transform:translateX(-84px)}
   .card{
-    border:1px solid var(--line);border-radius:var(--r-l);
-    background:var(--panel2);padding:12px 14px;margin:10px 0;cursor:pointer;
+    position:relative;border:1px solid var(--line);border-radius:var(--r-l);
+    background:var(--panel2);padding:12px 14px;margin:0;cursor:pointer;
+    touch-action:pan-y;
     transition:border-color .2s var(--ease),box-shadow .2s var(--ease),
-               background .2s var(--ease);
+               background .2s var(--ease),transform .18s var(--ease);
   }
   .card.cur{border-color:var(--line2);background:var(--panel)}
   .card.blocked{
@@ -339,16 +352,29 @@
   .row button.go{border-color:rgba(138,173,244,.5);color:var(--blue);
                  background:rgba(138,173,244,.08)}
   .keys{display:flex;gap:8px}
+  .keys.hide{display:none}
   .keys button:disabled{opacity:.4;cursor:default;transform:none}
-  #kEnter,#kEsc,#kType{
-    flex:0 0 56px;min-height:54px;padding:0;border:1px solid var(--line2);
+  #kEnter,#kEsc,#kType,#kNav{
+    flex:0 0 50px;min-height:54px;padding:0;border:1px solid var(--line2);
     border-radius:var(--r-l);background:var(--panel2);font-size:14px;
     font-weight:550;
   }
   #kEnter{color:var(--blue);border-color:rgba(138,173,244,.4)}
-  #kEsc,#kType{color:var(--muted)}
+  #kEsc,#kType,#kNav{color:var(--muted)}
   #kType{font-size:17px;line-height:1}
-  #kEnter:active,#kEsc:active,#kType:active{background:var(--line)}
+  #kNav{font-size:20px;line-height:1}
+  #kEnter:active,#kEsc:active,#kType:active,#kNav:active{background:var(--line)}
+  /* the expanded pad: every key an agent's menus ask for, talk row swapped out */
+  #navpad{display:none;flex-direction:column;gap:8px}
+  #navpad.show{display:flex}
+  #navpad .keys button{
+    flex:1;min-height:54px;padding:0;border:1px solid var(--line2);
+    border-radius:var(--r-l);background:var(--panel2);color:var(--muted);
+    font-size:15px;font-weight:550;
+  }
+  #navpad .keys button:active{background:var(--line)}
+  #navpad button[data-k="enter"]{color:var(--blue);border-color:rgba(138,173,244,.4)}
+  #navpad #kNavClose{flex:0 0 50px;font-size:20px;line-height:1}
   #talk{
     flex:1;display:flex;align-items:center;justify-content:center;gap:9px;
     min-height:54px;padding:12px;border:0;border-radius:var(--r-l);
@@ -416,11 +442,27 @@
     <button id="send">send</button>
     <button id="sendEnter" class="go">send ⏎</button>
   </div>
-  <div class="keys">
+  <div class="keys" id="keysMain">
     <button id="kEnter" aria-label="press enter in the pane">⏎</button>
     <button id="kEsc" aria-label="press escape in the pane">esc</button>
     <button id="kType" title="type a message" aria-label="type a message">⌨</button>
+    <button id="kNav" title="navigation keys" aria-label="show navigation keys" aria-expanded="false">+</button>
     <button id="talk"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><path d="M12 18v3"/></svg><span id="talklbl">talk</span></button>
+  </div>
+  <div id="navpad">
+    <div class="keys">
+      <button data-k="left" aria-label="press left arrow in the pane">←</button>
+      <button data-k="down" aria-label="press down arrow in the pane">↓</button>
+      <button data-k="up" aria-label="press up arrow in the pane">↑</button>
+      <button data-k="right" aria-label="press right arrow in the pane">→</button>
+      <button id="kNavClose" aria-label="hide navigation keys">−</button>
+    </div>
+    <div class="keys">
+      <button data-k="esc" aria-label="press escape in the pane">esc</button>
+      <button data-k="tab" aria-label="press tab in the pane">tab</button>
+      <button data-k="space" aria-label="press space in the pane">space</button>
+      <button data-k="enter" aria-label="press enter in the pane">⏎</button>
+    </div>
   </div>
 </footer>
 
@@ -570,6 +612,9 @@ async function loadPanes(){
     if(!d || !Array.isArray(d.panes)) return;
     $('#host').textContent = d.host; connUI(true, 'live');
     panes = d.panes;
+    // A selection that outlived its pane must not keep aiming the footer at
+    // a target tmux no longer has; fall through to the active pane instead.
+    if(sel && !panes.some(p=>p.id===sel)){ sel = null; msg('selected pane closed'); }
     if(!sel && panes.length) sel = (panes.find(p=>p.active)||panes[0]).id;
     renderPanes();
   }catch(e){
@@ -589,7 +634,9 @@ function paneLabel(p){
 // than letting them fail after the tap.
 function updateFooter(){
   const has = !!sel;
-  $('#kEnter').disabled = $('#kEsc').disabled = $('#kType').disabled = !has;
+  $('#kEnter').disabled = $('#kEsc').disabled = $('#kType').disabled =
+    $('#kNav').disabled = !has;
+  document.querySelectorAll('#navpad [data-k]').forEach(b=> b.disabled = !has);
   $('#talk').disabled = !has || !voiceOK;
 }
 
@@ -822,7 +869,21 @@ async function loadOverview(){
     // the pane underneath it.
     el.querySelectorAll('a.tick').forEach(a=>
       a.onclick = ev=> ev.stopPropagation());
+    const wrap = document.createElement('div');
+    wrap.className = 'swipe';
+    wrap.dataset.pane = p.id;
+    const kb = document.createElement('button');
+    kb.className = 'kill';
+    kb.textContent = 'kill';
+    kb.setAttribute('aria-label', 'kill ' + paneLabel(p));
+    kb.onclick = ()=> killPane(p.id, paneLabel(p));
+    wrap.appendChild(kb);
+    wrap.appendChild(el);
     el.onclick = ()=>{
+      if(swipeDrag) return;
+      // An uncovered kill button means the tap is about the reveal, not the
+      // pane: put the card back rather than navigating under the thumb.
+      if(swipeOpen){ closeSwipe(); return; }
       sel = p.id; msg(''); renderPanes(); loadOut();
       loadSession().then(()=> setMode(p.kind ? 'tx' : 'term'));
     };
@@ -831,7 +892,14 @@ async function loadOverview(){
         ev.preventDefault(); el.onclick();
       }
     };
-    box.appendChild(el);
+    attachSwipe(wrap, el, p.id);
+    // The overview refreshes every few seconds; a reveal the user opened
+    // must survive the redraw or it would snap shut mid-decision.
+    if(swipeOpen === p.id){
+      wrap.classList.add('open');
+      el.style.transform = 'translateX(-84px)';
+    }
+    box.appendChild(wrap);
   });
   if(!d.panes.length) box.innerHTML =
     '<div class="empty">'+
@@ -841,6 +909,97 @@ async function loadOverview(){
     '<path d="M7 9l3 2.5L7 14"/><path d="M12 15h5"/></svg>'+
     '<div class="t">no agents running</div>'+
     '<div class="s">start one with “new agent” above</div></div>';
+}
+
+// ---- swipe-to-kill ---------------------------------------------------------
+// One reveal at a time, remembered across redraws by pane id. swipeDrag is
+// true from the moment a press turns into a drag until just after the click
+// that follows it, so a drag never doubles as a tap on whatever it crossed.
+let swipeOpen = null, swipeDrag = false;
+
+function closeSwipe(){
+  swipeOpen = null;
+  document.querySelectorAll('#ovlist .swipe.open').forEach(w=>{
+    w.classList.remove('open');
+    w.querySelector('.card').style.transform = '';
+  });
+}
+
+// touch-action:pan-y settles the gesture argument: the browser keeps vertical
+// scrolling and cancels our pointer stream, so anything still alive here is
+// horizontal by decree, not by guesswork.
+function attachSwipe(wrap, card, id){
+  let down = false, x0 = 0, start = 0;
+  const place = px => { card.style.transform = px ? `translateX(${px}px)` : ''; };
+  const settle = open => {
+    card.style.transition = '';
+    if(open){ closeSwipe(); swipeOpen = id; wrap.classList.add('open'); place(-84); }
+    else { if(swipeOpen === id) swipeOpen = null; wrap.classList.remove('open'); place(0); }
+  };
+  card.addEventListener('pointerdown', ev=>{
+    if(ev.pointerType === 'mouse' && ev.button !== 0) return;
+    down = true; x0 = ev.clientX;
+    start = wrap.classList.contains('open') ? -84 : 0;
+    card.setPointerCapture(ev.pointerId);
+  });
+  card.addEventListener('pointermove', ev=>{
+    if(!down) return;
+    const dx = ev.clientX - x0;
+    if(!swipeDrag && Math.abs(dx) < 6) return;   // still could be a tap
+    swipeDrag = true;
+    card.style.transition = 'none';
+    place(Math.max(-96, Math.min(0, start + dx)));
+  });
+  card.addEventListener('pointerup', ev=>{
+    if(!down) return; down = false;
+    if(swipeDrag) settle(start + ev.clientX - x0 < -42);
+    // The click this press produces fires next; let it see the drag flag,
+    // then clear it for the taps that follow.
+    setTimeout(()=>{ swipeDrag = false; }, 0);
+  });
+  card.addEventListener('pointercancel', ()=>{
+    if(!down) return; down = false;
+    settle(wrap.classList.contains('open'));
+    swipeDrag = false;
+  });
+  // A drag that started on a prompt-option button must not also answer the
+  // prompt when the finger lifts over it.
+  wrap.addEventListener('click', ev=>{
+    if(swipeDrag){ ev.stopPropagation(); ev.preventDefault(); }
+  }, true);
+}
+
+async function killPane(id, label){
+  try{
+    const r = await fetch('/api/kill', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pane: id})});
+    const d = await r.json();
+    if(d.error) return msg(d.error, true);
+    closeSwipe();
+    // The dead pane may have been the footer's target.
+    if(sel === id){ sel = null; updateFooter(); renderPanes(); }
+    msg('killed ' + label);
+    loadPanes(); loadOverview();
+  }catch(e){ msg('failed: ' + e.message, true); }
+}
+
+// A dead card is the one thing the sessions page must not show. The full
+// overview costs a transcript tail per agent pane, so it keeps its slow
+// cadence -- but list-panes is a single tmux call, cheap enough to poll
+// hard. Prune corpses from the DOM the moment the pane list stops naming
+// them, and redraw properly only when the set actually changed.
+async function reconcileOv(){
+  await loadPanes();                 // one cheap fetch: strip, sel check, diff
+  const live = new Set(panes.map(p=>p.id));
+  let changed = false;
+  const shown = new Set();
+  document.querySelectorAll('#ovlist .swipe').forEach(w=>{
+    if(!live.has(w.dataset.pane)){ w.remove(); changed = true; }
+    else shown.add(w.dataset.pane);
+  });
+  if(!changed) changed = [...live].some(id=>!shown.has(id));
+  if(changed) loadOverview();
 }
 
 async function press(pane, key){
@@ -1222,7 +1381,7 @@ async function sendKey(key){
       body: JSON.stringify({pane: sel, key})});
     const d = await r.json();
     if(d.error) return msg(d.error, true);
-    msg(key === 'enter' ? 'sent ⏎' : 'sent esc');
+    msg('sent ' + (key === 'enter' ? '⏎' : key));
     // The pane view is the one that shows the effect, so refresh whichever
     // is on screen rather than waiting for the poll.
     setTimeout(()=>{ if(mode==='term') loadOut(); else if(mode==='ov') loadOverview(); }, 350);
@@ -1230,6 +1389,18 @@ async function sendKey(key){
 }
 $('#kEnter').onclick = ()=> sendKey('enter');
 $('#kEsc').onclick   = ()=> sendKey('esc');
+// Menu work is bursty: open the pad, pick the option, come back to talk.
+// The pad swaps in for the whole talk row rather than stacking on top of it.
+function setNav(on){
+  $('#navpad').classList.toggle('show', on);
+  $('#keysMain').classList.toggle('hide', on);
+  $('#kNav').setAttribute('aria-expanded', String(on));
+}
+$('#kNav').onclick      = ()=> setNav(true);
+$('#kNavClose').onclick = ()=> setNav(false);
+document.querySelectorAll('#navpad [data-k]').forEach(b=>{
+  b.onclick = ()=> sendKey(b.dataset.k);
+});
 // The same composer dictation lands in, opened empty -- sometimes you just
 // want to type. Tapping again with nothing written closes it.
 $('#kType').onclick  = ()=>{
@@ -1249,8 +1420,12 @@ $('#mOv').onclick   = ()=> setMode('ov');
 $('#mTerm').onclick = ()=> setMode('term');
 $('#mTx').onclick   = ()=> setMode('tx');
 // Poll the overview only while it is on screen; it costs a transcript tail
-// per agent pane, which is wasted work behind another view.
-setInterval(()=>{ if(mode==='ov' && !document.hidden) loadOverview(); }, 5000);
+// per agent pane, which is wasted work behind another view. Never mid-swipe:
+// a redraw would yank the card out from under the finger.
+setInterval(()=>{ if(mode==='ov' && !document.hidden && !swipeDrag) loadOverview(); }, 5000);
+// Between full redraws, the cheap liveness check keeps the list honest:
+// a session killed anywhere disappears within a couple of seconds.
+setInterval(()=>{ if(mode==='ov' && !document.hidden && !swipeDrag) reconcileOv(); }, 2000);
 // The prompt dock is one capture-pane per poll — cheap enough to keep the
 // transcript view honest about a waiting prompt within a few seconds.
 setInterval(()=>{ if(mode==='tx' && !document.hidden) pollPrompt(); }, 4000);
@@ -1274,7 +1449,14 @@ setInterval(()=>{ if(mode!=='tx') loadSession(); }, 15000);
 document.addEventListener('visibilitychange', ()=>{
   // Coming back after a long lock, the sweeper may have restored the window
   // already; autoFit re-acquires rather than assuming the lease survived.
-  if(!document.hidden){ loadPanes(); if(mode==='term'){ autoFit(); loadOut(); } }
+  // The sessions list redraws immediately too: it is the first thing on
+  // screen after an unlock, and waiting out the poll tick would greet the
+  // user with whatever was true before the phone went to sleep.
+  if(!document.hidden){
+    loadPanes();
+    if(mode==='ov') loadOverview();
+    if(mode==='term'){ autoFit(); loadOut(); }
+  }
 });
 </script>
 </body>
