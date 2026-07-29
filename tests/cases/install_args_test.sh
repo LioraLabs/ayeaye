@@ -10,9 +10,11 @@ test_help_prints_the_usage_banner_and_exits_zero() {
   run_install --help
   assert_status 0 "$RUN_STATUS"
   assert_contains "$RUN_STDOUT" "One-command setup for ayeaye"
-  assert_contains "$RUN_STDOUT" "./install.sh              interactive, sane defaults"
-  assert_contains "$RUN_STDOUT" "./install.sh --defaults   accept every default, no prompts"
-  assert_contains "$RUN_STDOUT" "./install.sh --no-systemd skip the unit; prints the manual run command"
+  # Every supported flag is documented, and what it does is described. The
+  # column alignment of the header comment is not the contract.
+  assert_matches "$RUN_STDOUT" '\./install\.sh +interactive, sane defaults'
+  assert_matches "$RUN_STDOUT" '\./install\.sh --defaults +accept every default, no prompts'
+  assert_matches "$RUN_STDOUT" '\./install\.sh --no-systemd +skip the unit'
   assert_eq "" "$RUN_STDERR" "help is not a diagnostic"
 }
 
@@ -55,7 +57,9 @@ test_help_touches_nothing() {
 test_an_unknown_option_exits_two_and_says_so_on_stderr() {
   run_install --frobnicate
   assert_status 2 "$RUN_STATUS"
-  assert_eq "unknown option: --frobnicate (try --help)" "$RUN_STDERR"
+  assert_contains "$RUN_STDERR" "unknown option: --frobnicate"
+  assert_contains "$RUN_STDERR" "--help" "and it points at the way to find the real options"
+  assert_eq "1" "$(grep -c . "$RUN_STDERR_FILE")" "one line, not a stack of them"
   assert_eq "" "$RUN_STDOUT" "the complaint belongs on stderr, not stdout"
 }
 

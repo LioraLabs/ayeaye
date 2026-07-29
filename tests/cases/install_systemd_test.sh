@@ -53,7 +53,8 @@ test_no_systemctl_at_all_falls_back_to_the_manual_command() {
   assert_contains "$RUN_STDOUT" "no systemd user session detected"
   assert_contains "$RUN_STDOUT" "run the server with: $REPO_ROOT/bin/ayeaye"
   assert_contains "$RUN_STDOUT" "(it reads $XDG_CONFIG_HOME/ayeaye/env by itself)"
-  assert_contains "$RUN_STDOUT" "logs    : stderr of $REPO_ROOT/bin/ayeaye"
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: stderr of "
+  assert_contains "$RUN_STDOUT" "stderr of $REPO_ROOT/bin/ayeaye"
 }
 
 test_no_systemd_skips_the_service_entirely() {
@@ -80,8 +81,9 @@ test_the_unit_is_written_from_the_template_with_both_paths_filled_in() {
   assert_file_contains "$unit" "EnvironmentFile=$XDG_CONFIG_HOME/ayeaye/env"
   assert_file_not_contains "$unit" "@REPO@"
   assert_file_not_contains "$unit" "@ENV_FILE@"
-  assert_file_contains "$unit" "WantedBy=default.target"
-  assert_file_contains "$unit" "Restart=on-failure"
+  # Nothing else about the unit's contents is asserted here: the rest comes from
+  # systemd/user/ayeaye.service.template, and editing that file is not an
+  # install.sh regression.
 }
 
 test_no_placeholder_survives_in_the_unit() {
@@ -89,6 +91,8 @@ test_no_placeholder_survives_in_the_unit() {
   _systemd_session
   run_install --defaults
   local leftovers
+  assert_file_exists "$(_unit_file)" \
+    "a run that installed no unit has no placeholders in it either"
   leftovers="$(grep -o '@[A-Z_]*@' "$(_unit_file)" || true)"
   assert_eq "" "$leftovers" "an unsubstituted placeholder would install a broken unit"
 }
@@ -170,7 +174,7 @@ test_the_summary_points_at_the_journal_when_a_unit_was_installed() {
   _hard_deps_present
   _systemd_session
   run_install --defaults
-  assert_contains "$RUN_STDOUT" "logs    : journalctl --user -u ayeaye -f"
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: journalctl --user -u ayeaye -f"
 }
 
 # ------------------------------------------------------------ linger hint
@@ -190,6 +194,10 @@ test_a_user_with_linger_is_not_nagged() {
   _systemd_session
   stub_command loginctl --stdout "yes"
   run_install --defaults
+  # Without the anchor this cannot tell "linger is already on" from "linger was
+  # never checked", which is the mistake a rewrite would actually make.
+  assert_stub_called_with loginctl "loginctl show-user" "anchor: linger really was checked"
+  assert_contains "$RUN_STDOUT" "installed $(_unit_file)"
   assert_not_contains "$RUN_STDOUT" "enable-linger"
 }
 
@@ -212,12 +220,17 @@ test_a_failing_loginctl_is_read_as_no_linger() {
 }
 
 test_an_unset_user_variable_kills_the_run_at_the_linger_hint() {
-  # Documented, not endorsed. install.sh runs under `set -u` and interpolates
-  # $USER into the linger recommendation, so on a host where USER is not
-  # exported - which is normal inside a container, and the case the container
-  # coverage in this milestone will hit - the run dies at the very last step,
-  # after the unit has already been written. The wizard rewrite should use
-  # `id -un` or a ${USER:-} fallback.
+  # Documented, not endorsed. install.sh runs under `set -u` and reads $USER
+  # twice at the end. The first read is inside `$( )`, so only that subshell
+  # dies - and its empty output then makes the `!= "yes"` test true, so a
+  # lingering user is silently misread as not lingering. The second read is in
+  # the `say` on the next line, with no subshell to contain it, and that one
+  # kills the run: after the unit has been written and the daemon reloaded.
+  # Stderr therefore carries the unbound-variable error twice.
+  #
+  # A host that does not export USER is normal inside a container, which is
+  # exactly where this milestone's container coverage will run. The wizard
+  # rewrite should use `id -un` or a ${USER:-} fallback.
   _hard_deps_present
   _systemd_session
   stub_command loginctl --stdout "no"
@@ -236,4 +249,39 @@ test_an_unset_user_variable_is_harmless_without_loginctl() {
   unset USER
   run_install --defaults
   assert_status 0 "$RUN_STATUS"
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: journalctl" \
+    "anchor: it ran all the way to the summary, not just far enough to not crash"
+}
+
+test_a_failing_daemon_reload_aborts_after_the_unit_is_written() {
+  # Documented, not endorsed: daemon-reload is unguarded under set -e, so a
+  # systemd that refuses it takes the whole install down at that point - the
+  # unit is on disk, the summary never prints, and systemctl's own error is
+  # what the user sees.
+  _hard_deps_present
+  stub_command systemctl --exit 1
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user daemon-reload' --exit 1 --stderr "Failed to reload daemon"
+  run_install --defaults
+  assert_ne 0 "$RUN_STATUS"
+  assert_file_exists "$(_unit_file)" "the unit was already written when it gave up"
+  assert_contains "$RUN_STDERR" "Failed to reload daemon"
+  assert_not_contains "$RUN_STDOUT" "bookmark:" "the summary is never reached"
+}
+
+test_the_repo_path_may_contain_a_space() {
+  # macOS paths routinely do, and the unit is rendered with sed, where an
+  # unquoted expansion would split the path.
+  _hard_deps_present
+  _systemd_session
+  local repo="$TEST_TMPDIR/my repo"
+  mkdir -p "$repo"
+  cp "$REPO_ROOT/install.sh" "$REPO_ROOT/env.template" "$repo/"
+  mkdir -p "$repo/systemd/user"
+  cp "$REPO_ROOT/systemd/user/ayeaye.service.template" "$repo/systemd/user/"
+
+  run_script "$repo/install.sh" --defaults
+  assert_status 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "repo: $repo"
+  assert_file_contains "$(_unit_file)" "ExecStart=$repo/bin/ayeaye"
 }

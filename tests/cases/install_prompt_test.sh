@@ -82,7 +82,7 @@ test_a_notification_url_shows_up_in_the_tier_line() {
   _hard_deps_present
   _answer_config_prompts "" "" "" "https://ntfy.sh/mine"
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "tier    : text-only +notifications"
+  assert_matches "$PTY_TRANSCRIPT" "tier[[:space:]]*: text-only \\+notifications"
 }
 
 test_defaults_mode_asks_nothing_and_reads_no_stdin() {

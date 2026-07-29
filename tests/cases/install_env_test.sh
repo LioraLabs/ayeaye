@@ -28,7 +28,12 @@ _answer_config_prompts() {
 
 # Every @NAME@ still present in a file, deduplicated. Deliberately generic: a
 # fifth placeholder added to env.template later is found without editing this.
+#
+# The existence check is the point of the helper as much as the scan is: a grep
+# over a file that does not exist finds no placeholders either, so without it a
+# run that wrote nothing at all would satisfy every caller.
 _placeholders_in() {
+  [ -f "$1" ] || fail "_placeholders_in: no such file: $1"
   grep -o -E '@[A-Za-z0-9_]+@' "$1" | sort -u
 }
 
@@ -64,6 +69,8 @@ test_no_placeholder_survives_into_the_written_config() {
   run_install --defaults --no-systemd
 
   local in_template left
+  assert_file_exists "$XDG_CONFIG_HOME/ayeaye/env" \
+    "a run that wrote no config would otherwise satisfy the scan below"
   in_template="$(_placeholders_in "$REPO_ROOT/env.template")"
   assert_ne "" "$in_template" \
     "the scan must find the template's own placeholders, or it can never fail"
@@ -96,13 +103,11 @@ test_everything_the_installer_was_not_asked_about_survives_verbatim() {
             "$(_untouched_part "$env_file" | cksum)" \
     "outside the four substituted lines the written file must be the template, byte for byte"
 
-  # The commented-out defaults are the file's documentation of every other
-  # setting; losing them would be silent.
+  # One readability anchor for the commented-out defaults, which are the file's
+  # documentation of every other setting. Nothing more: the cksum above already
+  # catches any byte the templater touches outside the four keys, and pinning
+  # the template's prose would make editing that prose an install.sh failure.
   assert_file_contains "$env_file" "#AYEAYE_TOKEN="
-  assert_file_contains "$env_file" "#AYEAYE_SHARE="
-  assert_file_contains "$env_file" "#AYEAYE_LINES=24"
-  assert_file_contains "$env_file" \
-    "# Values are literal. No shell expansion happens (systemd does none either),"
 }
 
 test_the_temporary_file_is_not_left_next_to_the_config() {
@@ -110,6 +115,9 @@ test_the_temporary_file_is_not_left_next_to_the_config() {
   run_install --defaults --no-systemd
 
   local leftovers
+  assert_status 0 "$RUN_STATUS"
+  assert_file_exists "$XDG_CONFIG_HOME/ayeaye/env" \
+    "a run that got nowhere leaves no temporary file either, and would pass below"
   leftovers="$(find "$XDG_CONFIG_HOME/ayeaye" -name '*env.tmp*')"
   assert_eq "" "$leftovers" \
     "the render target must be renamed into place, not left behind beside the config"
@@ -141,7 +149,7 @@ test_answers_full_of_separators_reach_the_file_unmangled() {
   local env_file="$XDG_CONFIG_HOME/ayeaye/env"
   assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=a.example,b.example,c.example"
   assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/a/b?x=1&y=2"
-  assert_contains "$RUN_STDOUT" "tier    : text-only +notifications" \
+  assert_matches "$RUN_STDOUT" "tier[[:space:]]*: text-only \\+notifications" \
     "the ntfy URL must also read back out of the file it was just written to"
 }
 
@@ -309,4 +317,92 @@ test_the_token_is_announced_on_the_run_that_creates_it_and_no_other() {
   run_install --defaults --no-systemd
   assert_not_contains "$RUN_OUTPUT" "generated auth token" \
     "the second run has nothing to generate, so it must stay quiet about it"
+}
+
+# ------------------------------------------------- where the files land
+
+test_without_xdg_variables_the_paths_fall_back_to_home() {
+  # The sandbox always exports the XDG variables, so nothing else in this suite
+  # exercises the fallbacks - and a cross-platform rewrite that hardcodes
+  # ~/.config, or moves to ~/Library on macOS, would pass the whole net.
+  _hard_deps_present
+  unset XDG_CONFIG_HOME XDG_STATE_HOME
+  run_install --defaults --no-systemd
+  assert_status 0 "$RUN_STATUS"
+  assert_file_contains "$HOME/.config/ayeaye/env" "AYEAYE_PORT=8911"
+  assert_file_exists "$HOME/.local/state/ayeaye/token"
+  assert_contains "$RUN_STDOUT" "$HOME/.config/ayeaye/env"
+}
+
+test_xdg_config_home_moves_the_config_and_the_unit_together() {
+  _hard_deps_present
+  stub_command systemctl --exit 1
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user daemon-reload' --exit 0
+  XDG_CONFIG_HOME="$TEST_TMPDIR/elsewhere"
+  export XDG_CONFIG_HOME
+  run_install --defaults
+  assert_status 0 "$RUN_STATUS"
+  assert_file_contains "$TEST_TMPDIR/elsewhere/ayeaye/env" "AYEAYE_PORT=8911"
+  assert_file_exists "$TEST_TMPDIR/elsewhere/systemd/user/ayeaye.service"
+}
+
+# ------------------------------------------- reading a kept config back
+
+test_a_kept_config_is_read_back_with_quotes_stripped() {
+  # The summary and the unit are built from what get_env reads, not from what
+  # was prompted, so its parsing is part of the contract for every re-run.
+  _hard_deps_present
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye"
+  cat > "$XDG_CONFIG_HOME/ayeaye/env" <<'ENV'
+AYEAYE_BIND="10.0.0.5"
+AYEAYE_PORT='9100'
+AYEAYE_ALLOWED_HOSTS="quoted.example"
+ENV
+  run_install --defaults --no-systemd
+  assert_status 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "bookmark: http://10.0.0.5:9100/?token=" \
+    "surrounding quotes are stripped, single as well as double"
+  assert_contains "$RUN_STDOUT" "https://quoted.example/?token="
+}
+
+test_a_duplicated_key_in_a_kept_config_is_read_last_wins() {
+  _hard_deps_present
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye"
+  cat > "$XDG_CONFIG_HOME/ayeaye/env" <<'ENV'
+AYEAYE_PORT=9100
+AYEAYE_PORT=9200
+ENV
+  run_install --defaults --no-systemd
+  assert_contains "$RUN_STDOUT" ":9200/?token=" \
+    "the last assignment wins, which is what an EnvironmentFile does too"
+  assert_not_contains "$RUN_STDOUT" ":9100/"
+}
+
+test_a_key_absent_from_a_kept_config_falls_back_to_its_default() {
+  _hard_deps_present
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye"
+  printf 'AYEAYE_ALLOWED_HOSTS=only.example\n' > "$XDG_CONFIG_HOME/ayeaye/env"
+  run_install --defaults --no-systemd
+  assert_contains "$RUN_STDOUT" "bookmark: http://127.0.0.1:8911/?token=" \
+    "bind and port fall back to the built-in defaults, not to empty"
+}
+
+# ------------------------------------------------------- failure paths
+
+test_a_missing_template_aborts_and_leaves_the_temporary_file_behind() {
+  # Documented, not endorsed: the render target is created inside the config
+  # directory and is only ever removed by the mv that follows it. Under set -e
+  # a failed render aborts in between, so env.tmp survives - and because the
+  # guard on the next run tests -s on the env file, nothing ever notices it or
+  # cleans it up.
+  _hard_deps_present
+  mkdir -p "$TEST_TMPDIR/repo-without-template"
+  cp "$REPO_ROOT/install.sh" "$TEST_TMPDIR/repo-without-template/install.sh"
+
+  run_script "$TEST_TMPDIR/repo-without-template/install.sh" --defaults --no-systemd
+  assert_ne 0 "$RUN_STATUS" "a template it cannot read must not be reported as success"
+  assert_file_missing "$XDG_CONFIG_HOME/ayeaye/env" "no config was written"
+  assert_file_exists "$XDG_CONFIG_HOME/ayeaye/env.tmp" \
+    "today the half-written render target is left in the config directory"
 }
