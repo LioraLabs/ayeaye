@@ -5,6 +5,7 @@
 # by a multi-stage wizard, so their current semantics are pinned here in full.
 
 _hard_deps_present() {
+  require_host_command python3
   stub_command tmux
   stub_real python3
 }

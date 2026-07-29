@@ -222,6 +222,7 @@ SH
 }
 
 test_an_expectation_that_never_arrives_fails_fast_with_the_transcript() {
+  require_host_command python3
   local output status
   _fake_script quiet.sh <<'SH'
 #!/usr/bin/env bash
@@ -237,6 +238,7 @@ SH
 }
 
 test_a_script_that_never_exits_is_cut_off_by_the_timeout() {
+  require_host_command python3
   local output started elapsed
   _fake_script hanger.sh <<'SH'
 #!/usr/bin/env bash

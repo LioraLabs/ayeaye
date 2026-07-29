@@ -64,6 +64,19 @@ stub_real() {
   _stub_rehash
 }
 
+# require_host_command <name>... - skip the test unless the host really has
+# every one of them. For coverage that cannot run here rather than coverage
+# that fails here: an image without python3 cannot exercise the installer, and
+# saying so is more honest than a wall of red.
+require_host_command() {
+  local name
+  _stub_rehash
+  for name in "$@"; do
+    PATH="$HARNESS_HOST_PATH" type -P "$name" >/dev/null 2>&1 && continue
+    skip "this host has no $name"
+  done
+}
+
 # stub_remove <command>... - make a command absent again, whether it was a
 # stub or a real one linked in by default.
 stub_remove() {

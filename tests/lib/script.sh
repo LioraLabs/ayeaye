@@ -114,7 +114,8 @@ pty_run() {
   local driver_status
 
   [ -n "$expect_file" ] || { expect_file="$TEST_TMPDIR/pty.empty.expect"; : > "$expect_file"; }
-  [ -n "${HARNESS_PYTHON:-}" ] || fail "pty_run needs python3 on the host"
+  [ -n "${HARNESS_PYTHON:-}" ] \
+    || skip "the interactive driver needs python3 and this host has none"
 
   "$HARNESS_PYTHON" "$HARNESS_LIB/pty_run.py" \
     --expect "$expect_file" \

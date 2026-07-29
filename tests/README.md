@@ -19,10 +19,31 @@ matched against that id, and several may be given. That is also how a subset is
 run inside a container:
 
 ```sh
-docker run --rm -v "$PWD:/repo" -w /repo debian:12 tests/run.sh linux_
+docker run --rm -v "$PWD:/repo:ro" -w /repo debian:12 bash tests/run.sh install_args
 ```
 
+Read-only is deliberate: a suite that needs to write into the checkout is a
+suite that is writing where it should not. A filter that matches nothing is an
+error, not an empty pass.
+
 The suite exits 0 only when every selected test passed or was skipped.
+
+Two images are worth running against, and both have caught bugs the development
+host could not:
+
+```sh
+# bash 3.2 with a busybox userland - what macOS portability actually means
+docker run --rm -v "$PWD:/repo:ro" -w /repo bash:3.2 \
+  bash tests/run.sh harness_ install_args
+
+# everything, on a machine that does not export USER and has no desktop
+docker run --rm -v "$PWD:/repo:ro" -w /repo python:3.12-slim bash tests/run.sh
+```
+
+The first image has no python3, so the tests that need one — the pty driver and
+anything that runs the installer — report themselves as skipped rather than
+failing. `require_host_command python3` is what does that, and it is the right
+tool for any coverage that cannot run on the machine it finds itself on.
 
 ## Adding a test
 

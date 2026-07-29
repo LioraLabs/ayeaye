@@ -9,6 +9,7 @@
 # the real one because the installer genuinely runs python for templating and
 # for the token; tmux is only ever looked up, never executed.
 _hard_deps_present() {
+  require_host_command python3
   stub_command tmux
   stub_real python3
 }

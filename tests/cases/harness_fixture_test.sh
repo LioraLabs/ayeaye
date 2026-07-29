@@ -92,6 +92,7 @@ test_the_platform_detection_corpus_is_present() {
 }
 
 test_the_tailscale_fixtures_are_shaped_the_way_the_installer_reads_them() {
+  require_host_command python3
   stub_real python3
   local dnsname status
   dnsname="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["Self"]["DNSName"])' \
