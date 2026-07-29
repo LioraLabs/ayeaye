@@ -152,9 +152,18 @@ _SERVICE_WHISPER_READY="${_SERVICE_WHISPER_READY:-}"
 # EnvironmentFile does not execute its input, and neither does this, so a
 # value means the same thing on both platforms.
 #
+# It reads that file the way lib/envfile.sh's wizard_env_get reads it, and
+# that is not decoration: the same file decides at install time whether there
+# is a model to point at, and at start time what the model is. Two readers
+# disagreeing would leave a machine where setup said the service was
+# configured and the service said it was not. So, both sides: leading blanks
+# ignored, trailing blanks trimmed, one layer of single *or* double quotes
+# removed. The quote characters are built with printf because a literal single
+# quote cannot appear inside the single-quoted string this script lives in.
+#
 # 78 is EX_CONFIG, which says to anybody reading the log that the service is
 # not broken, it is unconfigured.
-_SERVICE_WHISPER_SCRIPT='E="$1"; B="$2"; M=""; S=""; T=""; if [ -r "$E" ]; then while IFS= read -r L || [ -n "$L" ]; do case "$L" in VOICE_WHISPER_MODEL=*) M="${L#*=}" ;; VOICE_WHISPER_SERVER=*) S="${L#*=}" ;; VOICE_WHISPER_THREADS=*) T="${L#*=}" ;; esac; done < "$E"; fi; M="${M#\"}"; M="${M%\"}"; S="${S#\"}"; S="${S%\"}"; T="${T#\"}"; T="${T%\"}"; [ -n "$S" ] || S=127.0.0.1:8910; [ -n "$T" ] || T=8; if [ -z "$M" ]; then echo "set VOICE_WHISPER_MODEL in $E, then restart this service" >&2; exit 78; fi; exec "$B" --model "$M" --host "${S%%:*}" --port "${S##*:}" --threads "$T" --language en'
+_SERVICE_WHISPER_SCRIPT='D=$(printf "\42"); Q=$(printf "\47"); n() { v="$1"; while :; do case "$v" in *" "|*"	") v="${v%?}" ;; *) break ;; esac; done; case "$v" in "$D"*"$D") v="${v#$D}"; v="${v%$D}" ;; "$Q"*"$Q") v="${v#$Q}"; v="${v%$Q}" ;; esac; printf %s "$v"; }; E="$1"; B="$2"; M=""; S=""; T=""; if [ -r "$E" ]; then while IFS= read -r L || [ -n "$L" ]; do while :; do case "$L" in " "*|"	"*) L="${L#?}" ;; *) break ;; esac; done; case "$L" in VOICE_WHISPER_MODEL=*) M=$(n "${L#*=}") ;; VOICE_WHISPER_SERVER=*) S=$(n "${L#*=}") ;; VOICE_WHISPER_THREADS=*) T=$(n "${L#*=}") ;; esac; done < "$E"; fi; case "$S" in *:*) H="${S%%:*}"; P="${S##*:}" ;; *) H="$S"; P="" ;; esac; [ -n "$H" ] || H=127.0.0.1; [ -n "$P" ] || P=8910; [ -n "$T" ] || T=8; if [ -z "$M" ]; then echo "set VOICE_WHISPER_MODEL in $E, then restart this service" >&2; exit 78; fi; exec "$B" --model "$M" --host "$H" --port "$P" --threads "$T" --language en'
 
 # ------------------------------------------------------------------- quoting
 #
@@ -380,10 +389,9 @@ _service_plan_step() {
   fi
   kind="$(platform_service_manager)"
   case "$kind" in
-    systemd)
-      wizard_plan_add service "ayeaye will start when you log in, and restart if it stops"
-      ;;
-    launchd)
+    systemd|launchd)
+      # The same promise either side. What differs is the file it is kept in,
+      # and stage five has no business caring about that.
       wizard_plan_add service "ayeaye will start when you log in, and restart if it stops"
       ;;
     *)
@@ -403,19 +411,6 @@ wizard_step configure service _service_plan_step "How ayeaye will start"
 # a systemd user unit, a launchd agent, or written instructions for running it
 # by hand - and that last one is a supported way to use this program, not a
 # failure.
-
-# _service_same <a> <b> - status 0 when two files hold the same bytes.
-#
-# cksum rather than cmp: the test harness's PATH is exactly the stubs it was
-# given, cmp is not among the coreutils it links in by default, and a
-# comparison that silently answered "different" would rewrite a file on every
-# run and back it up every time.
-_service_same() {
-  local a b
-  a="$(cksum < "${1:-}" 2>/dev/null)" || return 1
-  b="$(cksum < "${2:-}" 2>/dev/null)" || return 1
-  [ "$a" = "$b" ]
-}
 
 # _service_write_definition <name> <systemd|launchd>
 #
@@ -510,7 +505,14 @@ _service_write_definition() {
 _service_migrate_siblings() {
   local kind="${1:-}" name path running
   for name in $(service_names); do
-    [ "$name" = ayeaye ] && continue
+    case "$name" in
+      # Both have an installer of their own, with conditions this loop knows
+      # nothing about - whether this machine still has whisper.cpp, whether a
+      # model is configured, whether the binary's path can be named in a unit.
+      # Regenerating them from here bypassed every one of those and could
+      # replace a working definition with one that restart-loops.
+      ayeaye|whisper-server) continue ;;
+    esac
     path="$(service_definition_path "$name" "$kind")" || continue
     [ -f "$path" ] || continue
     running=0
@@ -684,7 +686,7 @@ _service_linger_hint() {
 # ------------------------------------------------------------------- launchd
 
 _service_install_launchd() {
-  local path logs cmd changed registered=0
+  local path logs changed registered=0
   path="$(service_definition_path ayeaye launchd)"
   logs="$(_service_log_dir)"
 
@@ -866,9 +868,21 @@ service_step() {
 # enable it: whether a GPU-resident transcription server runs all the time is
 # a decision, not a detail.
 _service_install_whisper() {
-  local kind="${1:-}" bin model path cmd
+  local kind="${1:-}" bin model path
   bin="$(_service_whisper_bin)"
-  [ -n "$bin" ] || return 0
+  if [ -z "$bin" ]; then
+    # Nothing to install - but a definition from a previous run may still be
+    # here, naming a binary this computer no longer has. It is not this step's
+    # to delete, and it is very much this step's to mention: left alone and
+    # unmentioned, it fails at every login for a reason nobody would guess.
+    path="$(service_definition_path whisper-server "$kind")" || return 0
+    if [ -f "$path" ]; then
+      wizard_say "whisper is no longer installed on this computer, so the service"
+      wizard_say "that starts it cannot work. Nothing here has changed it; delete"
+      wizard_say "$path when you are sure you do not want it back."
+    fi
+    return 0
+  fi
 
   model="$(wizard_env_get "$(_service_env_file)" VOICE_WHISPER_MODEL "")"
   if [ -z "$model" ]; then
@@ -910,11 +924,14 @@ _service_enable_whisper() {
     fi
     return 0
   fi
+  if ! cmd="$(platform_service_command whisper-server enable "$path")"; then
+    return 0
+  fi
   if [ "${WIZARD_INTERACTIVE:-1}" = 1 ] \
      && wizard_confirm "keep the transcription model loaded and ready?" "y"; then
-    if cmd="$(platform_service_command whisper-server enable "$path")"; then
-      _service_run "$cmd" || wizard_say "whisper is installed but would not start."
-    fi
+    _service_run "$cmd" || wizard_say "whisper is installed but would not start."
+  else
+    wizard_say "start it later with: $cmd"
   fi
   return 0
 }

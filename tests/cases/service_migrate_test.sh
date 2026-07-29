@@ -328,3 +328,82 @@ test_a_voice_agent_that_is_not_running_is_updated_and_left_stopped() {
   assert_not_contains "$(stub_calls systemctl)" "start voice-agent" \
     "setup does not start somebody's voice agent for them"
 }
+
+# ------------------------------------- services with installers of their own
+
+test_a_whisper_unit_is_not_regenerated_by_the_migration_pass() {
+  # The migration pass exists for voice-agent, whose unit used to be copied by
+  # hand. Letting it reach whisper too bypassed every condition whisper is
+  # installed under - and on a machine where whisper.cpp had since been
+  # uninstalled it replaced a working definition with one naming a binary that
+  # was no longer there: exit 127, Restart=on-failure, a restart loop, and a
+  # run that said "brought your whisper-server definition up to date as well".
+  _hard_deps_present
+  _systemd_session
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+  local unit="$XDG_CONFIG_HOME/systemd/user/whisper-server.service"
+  printf '[Service]\nExecStart=/opt/whisper/whisper-server --model /m.bin\n' > "$unit"
+  local before
+  before="$(_bytes "$unit")"
+  assert_command_absent whisper-server
+  run_install --defaults
+  assert_status 0 "$RUN_STATUS"
+  assert_eq "$before" "$(_bytes "$unit")" \
+    "a definition for a service this computer can no longer run is left alone"
+  assert_not_contains "$RUN_STDOUT" "brought your whisper-server definition up to date"
+}
+
+test_a_leftover_whisper_unit_is_pointed_out_rather_than_left_silent() {
+  _hard_deps_present
+  _systemd_session
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+  printf '[Service]\nExecStart=/opt/whisper/whisper-server\n' \
+    > "$XDG_CONFIG_HOME/systemd/user/whisper-server.service"
+  run_install --defaults
+  assert_contains "$RUN_STDOUT" "whisper is no longer installed on this computer"
+  assert_contains "$RUN_STDOUT" "$XDG_CONFIG_HOME/systemd/user/whisper-server.service"
+}
+
+# ------------------------------------------------ the copy that could not be made
+
+test_a_definition_is_left_alone_when_no_copy_of_it_can_be_kept() {
+  # lib/consent.sh's contract: a backup that could not be made is a reason not
+  # to overwrite anything. Provoked by making the backup directory something
+  # that cannot be written into.
+  _hard_deps_present
+  _systemd_session
+  run_install --defaults
+  printf '[Service]\nExecStart=/my/own/thing\n' > "$(_unit)"
+  local before
+  before="$(_bytes "$(_unit)")"
+  rm -rf "$XDG_STATE_HOME/ayeaye/backups"
+  printf 'not a directory\n' > "$XDG_STATE_HOME/ayeaye/backups"
+  run_install --defaults
+  assert_contains "$RUN_STDOUT" "could not save a copy of $(_unit), so it has been left alone."
+  assert_eq "$before" "$(_bytes "$(_unit)")" \
+    "somebody's only copy of a hand edit is worth more than a tidy unit file"
+}
+
+test_replacing_a_definition_is_written_down_in_the_audit_trail() {
+  # The wizard keeps a ledger of everything it did that needed permission. A
+  # replacement settled by an answer given earlier still belongs in it, or the
+  # trail is a record of some of what happened.
+  _hard_deps_present
+  _systemd_session
+  run_install --defaults
+  local ledger="$XDG_STATE_HOME/ayeaye/setup-consent.log"
+  assert_file_not_contains "$ledger" "replaced the service definition" \
+    "nothing was replaced on a first install; there was nothing there"
+  printf '[Service]\nExecStart=/my/own/thing\n' > "$(_unit)"
+  run_install --defaults
+  assert_file_contains "$ledger" "replaced the service definition at $(_unit)"
+}
+
+test_a_definition_that_did_not_change_is_not_written_down_as_replaced() {
+  _hard_deps_present
+  _systemd_session
+  run_install --defaults
+  run_install --defaults
+  assert_file_not_contains "$XDG_STATE_HOME/ayeaye/setup-consent.log" \
+    "replaced the service definition"
+}

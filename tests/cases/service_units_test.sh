@@ -458,6 +458,41 @@ BIN
   assert_contains "$out" "[--threads] [8]"
 }
 
+test_the_whisper_service_reads_a_setting_the_way_the_rest_of_setup_does() {
+  # The same file decides at install time whether there is a model to point at
+  # and at start time what the model is. Two readers disagreeing would leave a
+  # machine where setup says the service is configured and the service says it
+  # is not - so these are the cases lib/envfile.sh's wizard_env_get handles,
+  # asserted against the program the definition actually runs.
+  _load_service_lib
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye" "$TEST_TMPDIR/whisper"
+  cat > "$TEST_TMPDIR/whisper/whisper-server" <<'BIN'
+#!/bin/sh
+printf 'ARGS:'; for a in "$@"; do printf ' [%s]' "$a"; done; echo
+BIN
+  chmod +x "$TEST_TMPDIR/whisper/whisper-server"
+
+  _whisper_with() {
+    printf '%s\n' "$@" > "$XDG_CONFIG_HOME/ayeaye/env"
+    sh -c "$_SERVICE_WHISPER_SCRIPT" ayeaye-whisper \
+      "$XDG_CONFIG_HOME/ayeaye/env" "$TEST_TMPDIR/whisper/whisper-server" 2>&1
+  }
+
+  assert_contains "$(_whisper_with 'VOICE_WHISPER_MODEL="/my model.bin"')" \
+    "[--model] [/my model.bin]" "double quotes are stripped"
+  assert_contains "$(_whisper_with "VOICE_WHISPER_MODEL='/my model.bin'")" \
+    "[--model] [/my model.bin]" "and so are single ones"
+  assert_contains "$(_whisper_with '   VOICE_WHISPER_MODEL=/m.bin')" \
+    "[--model] [/m.bin]" "a key may be indented, as it may be in the settings file"
+  assert_contains "$(_whisper_with '#VOICE_WHISPER_MODEL=/m.bin')" \
+    "set VOICE_WHISPER_MODEL in" "a commented line is documentation, not a setting"
+  assert_contains "$(_whisper_with 'VOICE_WHISPER_MODEL=/m.bin' 'VOICE_WHISPER_SERVER=1.2.3.4:9999 ')" \
+    "[--port] [9999]" "a trailing space is not part of a port number"
+  assert_contains "$(_whisper_with 'VOICE_WHISPER_MODEL=/m.bin' 'VOICE_WHISPER_SERVER=1.2.3.4')" \
+    "[--host] [1.2.3.4] [--port] [8910]" \
+    "an address with no port keeps the documented one, rather than using the host as a port"
+}
+
 test_a_whisper_service_with_no_model_says_so_and_does_not_start() {
   _load_service_lib
   local out status
