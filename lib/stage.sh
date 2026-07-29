@@ -84,6 +84,11 @@ WIZARD_STAGE_OK=0
 WIZARD_STAGE_PENDING=10
 WIZARD_STAGE_SKIP=11
 WIZARD_STAGE_FAIL=12
+# The person was asked for something ayeaye cannot work without, and said no.
+# That is an answer, not a fault: there is nothing to try again, nothing to
+# leave out, and nothing to come back to later. A step returns this to end the
+# run then and there, and the runner does not argue with it.
+WIZARD_STAGE_CANCEL=13
 
 # How many times the wizard will try again by itself before it stops asking.
 # Without it an answer of "again" to something that can never work is a loop
@@ -101,6 +106,10 @@ WIZARD_RESUMING="${WIZARD_RESUMING:-0}"
 
 _WIZARD_STAGE_TAB='	'
 _WIZARD_RECOVER="${_WIZARD_RECOVER:-}"
+# Set when a step ended the run by returning WIZARD_STAGE_CANCEL. The closing
+# screen reads it to tell a person setup stopped because of their answer, not
+# because something broke.
+_WIZARD_CANCELLED="${_WIZARD_CANCELLED:-0}"
 _WIZARD_STORE_WARNED=0
 
 # wizard_remember <key> <value> - persist, and never let the store take the run
@@ -222,6 +231,7 @@ _wizard_status_word() {
     0)  printf 'done' ;;
     10) printf 'pending' ;;
     11) printf 'skipped' ;;
+    13) printf 'cancelled' ;;
     *)  printf 'failed' ;;
   esac
 }
@@ -292,10 +302,16 @@ wizard_reset_progress() {
 # is therefore a deliberate rerun - reconfiguration or repair - and starts from
 # the top with the previous answers offered back as defaults. A run that did
 # not get that far was interrupted, and is picked up where it stopped.
+# wizard_cancelled - status only. True when the run stopped because a person
+# declined something ayeaye cannot work without.
+wizard_cancelled() { [ "$_WIZARD_CANCELLED" = 1 ]; }
+
 wizard_begin_run() {
   local count
   wizard_state_load
   WIZARD_RESUMING=0
+  # A fresh pass has not been cancelled, whatever the last one did.
+  _WIZARD_CANCELLED=0
   if wizard_state_is_new; then
     wizard_remember run.version 1
     wizard_remember run.count 1
@@ -427,6 +443,16 @@ _wizard_run_step() {
     else
       wizard_remember "step.$stage.$step" "$word"
     fi
+    # An answer, not a fault. Offering "try again" here would ask the same
+    # question a second time and read a decision as a mistake; offering "leave
+    # it out" would promise a setup that cannot exist. The step has already
+    # said what is missing and why, so say nothing more and stop.
+    if [ "$word" = cancelled ]; then
+      _WIZARD_STEP_OUTCOME="cancelled"
+      _WIZARD_CANCELLED=1
+      return 1
+    fi
+
     if [ "$word" != failed ]; then
       _WIZARD_STEP_OUTCOME="$word"
       return 0
@@ -500,6 +526,15 @@ wizard_run_stages() {
           # stays recorded as failed so the closing summary can say so.
           stage_word="failed"
           [ "$stopped" = 1 ] && _WIZARD_RUN_FAILED=1
+          ;;
+        cancelled)
+          # The stage did not finish, so it is not done - recording it done
+          # would let a resumed run walk straight past the thing that stopped
+          # this one. The step keeps the precise word; the stage says only that
+          # it did not complete, and the run ends non-zero, because a setup
+          # that stopped is not a setup that worked.
+          stage_word="failed"
+          _WIZARD_RUN_FAILED=1
           ;;
       esac
       [ "$stopped" = 1 ] && break

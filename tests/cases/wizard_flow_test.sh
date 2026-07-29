@@ -183,9 +183,12 @@ test_defaults_installs_nothing_even_where_it_could() {
   assert_ne 0 "$RUN_STATUS" "it cannot claim success without the thing it needs"
   assert_stub_not_called apt-get "nothing may be installed unattended"
   assert_stub_not_called sudo
-  assert_contains "$RUN_STDOUT" "ayeaye still cannot run here: tmux is not on this computer." \
+  assert_contains "$RUN_STDOUT" "Setup stops here." \
+    "refusing the one thing it cannot work without ends the run"
+  assert_contains "$RUN_STDOUT" "tmux is what ayeaye runs the coding" \
     "it says what is missing rather than helping itself to it"
-  assert_contains "$RUN_STDOUT" "Install it however you normally would"
+  assert_contains "$RUN_STDOUT" "If you would rather install it yourself:"
+  assert_contains "$RUN_STDOUT" "Then run ./install.sh again. Nothing you answered is lost."
   assert_contains "$(cat "$(_ledger)")" "privileged	refused"
 }
 
@@ -370,4 +373,41 @@ test_work_this_version_cannot_do_is_reported_as_not_done() {
   assert_file_contains "$(_state)" "stage.service=pending" \
     "a stage holding work it could not do is never recorded as done"
   assert_file_not_contains "$(_state)" "stage.service=done"
+}
+
+test_saying_no_to_the_one_thing_it_needs_stops_setup_there() {
+  # The most common thing a person does is press return at every question. On a
+  # machine without tmux that means declining the one program ayeaye runs the
+  # agents inside. Setup used to ask three times and then leave the run open;
+  # there is no working setup down that road, so it stops instead.
+  require_host_command python3
+  stub_real python3
+  stub_command apt-get
+  stub_command sudo
+  stub_command id --stdout "1000"
+  stub_command_from_fixture uname uname/linux-x86_64
+  PLATFORM_OS_RELEASE_FILES="$(fixture_file os-release/debian-12)"
+  export PLATFORM_OS_RELEASE_FILES
+
+  pty_expect "port [" ""
+  pty_expect "allowed hosts" ""
+  pty_expect "ntfy topic URL" ""
+  pty_expect "which one? (1, 2, 3 or 4)" "2"
+  pty_expect "install Claude Code?" "n"
+  pty_expect "install OpenAI Codex?" "n"
+  pty_expect "install cliban as well?" "n"
+  pty_expect "go ahead with all of that?" "y"
+  pty_expect "may I install tmux on this computer?" "n"
+  pty_install --no-systemd
+
+  assert_ne 0 "$PTY_STATUS" "a setup that stopped is not a setup that worked"
+  assert_contains "$PTY_TRANSCRIPT" "Setup stops here."
+  assert_contains "$PTY_TRANSCRIPT" "Then run ./install.sh again. Nothing you answered is lost."
+  assert_not_contains "$PTY_TRANSCRIPT" "try again, or stop here?" \
+    "the same question a second time reads a decision as a mistake"
+  assert_not_contains "$PTY_TRANSCRIPT" "pick this up later" \
+    "there is nothing to come back to until tmux is there"
+  assert_stub_not_called apt-get "refused means nothing was installed"
+  assert_file_contains "$(_state)" "step.install.needs=cancelled"
+  assert_file_contains "$(_ledger)" "privileged	refused"
 }

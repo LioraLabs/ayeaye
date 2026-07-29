@@ -43,6 +43,9 @@ _run() {
   wizard_run_stages > "$TEST_TMPDIR/out" 2>"$TEST_TMPDIR/err" < "${1:-/dev/null}"
   RUN_STAGES_STATUS=$?
   STAGES_OUT="$(cat "$TEST_TMPDIR/out")"
+  # bash writes a `read -p` prompt to stderr, so anything asserting that a
+  # question was or was not asked must look here, not in STAGES_OUT.
+  STAGES_ERR="$(cat "$TEST_TMPDIR/err")"
   return 0
 }
 
@@ -50,6 +53,7 @@ _ok_step()      { _trace "$WIZARD_STEP_ID"; return "$WIZARD_STAGE_OK"; }
 _pending_step()  { _trace "$WIZARD_STEP_ID"; return "$WIZARD_STAGE_PENDING"; }
 _skip_step()     { _trace "$WIZARD_STEP_ID"; return "$WIZARD_STAGE_SKIP"; }
 _fail_step()     { _trace "$WIZARD_STEP_ID"; return "$WIZARD_STAGE_FAIL"; }
+_cancel_step()   { _trace "$WIZARD_STEP_ID"; return "$WIZARD_STAGE_CANCEL"; }
 
 # Fails the first time it is asked and works the second, so retry can be told
 # apart from "it never really failed".
@@ -322,4 +326,78 @@ test_required_work_is_not_offered_as_skippable() {
   _run "$(_answers stop)"
   assert_not_contains "$STAGES_OUT" "skip" \
     "offering to skip something the install cannot do without would be a lie"
+}
+
+# --------------------------------------------------------------- cancellation
+#
+# A step returns WIZARD_STAGE_CANCEL when a person was asked for something
+# ayeaye cannot work without and said no. That is an answer, not a fault, so
+# the runner must not treat it like one: no retry, no skip, no "come back to
+# this later", and no claim of success.
+
+test_a_cancelled_step_is_never_offered_another_try() {
+  WIZARD_INTERACTIVE=1
+  wizard_stage only "only"
+  wizard_step only a _cancel_step "a"
+  # If the runner offered the failure menu it would consume this and carry on.
+  # Three answers of "again" are on offer. A retryable failure would eat one
+  # and run the step a second time; a cancellation must ignore them all.
+  # (Prompt text itself is invisible here - bash writes a read -p prompt only
+  # to a terminal, which is what the pty driver exists for.)
+  _run "$(_answers again again again)"
+  assert_eq "1" "$(_trace_lines | wc -l | tr -d ' ')" \
+    "the step ran exactly once, so nothing offered it another go"
+  assert_not_contains "$STAGES_OUT" "this part did not work" \
+    "nothing broke, so nothing may say it did"
+}
+
+test_a_cancelled_step_stops_the_run_where_it_stands() {
+  WIZARD_INTERACTIVE=1
+  wizard_stage first  "first"
+  wizard_stage second "second"
+  wizard_step first  a _cancel_step "a"
+  wizard_step second b _ok_step     "b"
+  _run
+  assert_not_contains "$(_trace_lines)" "second.b" \
+    "work after the cancellation must not run"
+}
+
+test_a_cancelled_run_does_not_report_success() {
+  WIZARD_INTERACTIVE=1
+  wizard_stage only "only"
+  wizard_step only a _cancel_step "a"
+  _run
+  assert_ne 0 "$RUN_STAGES_STATUS" \
+    "a setup that stopped is not a setup that worked"
+  wizard_cancelled && : || fail "the run should know it was cancelled"
+}
+
+test_a_cancelled_stage_is_not_recorded_done() {
+  WIZARD_INTERACTIVE=1
+  wizard_stage only "only"
+  wizard_step only a _cancel_step "a"
+  _run
+  assert_eq "cancelled" "$(wizard_step_status only a)" \
+    "the step keeps the precise word"
+  assert_ne "done" "$(wizard_stage_status only)" \
+    "recording it done would let a resumed run walk straight past it"
+}
+
+test_an_ordinary_failure_is_still_worth_retrying() {
+  # The distinction the cancel status exists to draw: something that tried and
+  # could not is not the same as somebody saying no, and only one of them is
+  # worth asking about again.
+  WIZARD_INTERACTIVE=1
+  # _flaky_step latches in TEST_TMPDIR, which is shared by every test in this
+  # file, and an earlier test has already tripped it. Without this the step
+  # succeeds first time and there is no failure to retry.
+  wizard_stage only "only"
+  wizard_step only a _flaky_step "a"
+  _run "$(_answers again)"
+  assert_eq "2" "$(_trace_lines | wc -l | tr -d ' ')" \
+    "a fault is worth asking about, so the step got a second go"
+  assert_eq "done" "$(wizard_step_status only a)" \
+    "and the second attempt is what makes it done"
+  assert_contains "$STAGES_OUT" "this part did not work" \
+    "a fault says so, unlike a decision"
 }

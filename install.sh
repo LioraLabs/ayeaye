@@ -882,7 +882,25 @@ step_install_needs() {
   case "$status" in
     0) ;;
     "$WIZARD_REFUSED")
+      # Said no to the one thing there is no working setup without. There is
+      # nothing to try again and nothing to leave out, so setup stops here
+      # rather than asking a second time or half-finishing.
+      wizard_blank
       wizard_say "nothing was installed, and this computer is exactly as it was."
+      wizard_blank
+      wizard_say "Setup stops here.$missing is what ayeaye runs the coding"
+      wizard_say "agents inside, so there is no version of this that works"
+      wizard_say "without it - which is why setup is not going to ask again"
+      wizard_say "or set up half of it."
+      wizard_blank
+      wizard_say "If you would rather install it yourself:"
+      # shellcheck disable=SC2086
+      wizard_detail "$(platform_pkg_install_command $missing 2>/dev/null || true)"
+      # shellcheck disable=SC2086
+      platform_pkg_manual_hint $missing
+      wizard_blank
+      wizard_say "Then run ./install.sh again. Nothing you answered is lost."
+      return "$WIZARD_STAGE_CANCEL"
       ;;
     *)
       wizard_say "that software could not be installed automatically."
