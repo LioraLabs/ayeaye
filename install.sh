@@ -15,7 +15,43 @@
 # bash 3.2: no associative arrays, no ${var,,}, no mapfile, no local -n.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ---------------------------------------------------------------- the release
+#
+# The version of ayeaye this script installs is named here and nowhere else.
+# It is a pinned tag rather than a branch, so that two people running the same
+# command on the same afternoon get the same software, and so that the person
+# running it can see which ayeaye they are about to get: it is printed by
+# --help, and printed again before anything is downloaded.
+#
+# Cutting a release sets these two lines and nothing else:
+#
+#   AYEAYE_VERSION  the tag that was published.
+#   AYEAYE_SHA256   the sha256 of the artifact uploaded to it, when the
+#                   release process knows it at the time it writes this file.
+#                   Left empty, the checksum is taken from the SHA256SUMS
+#                   published beside the artifact instead. With neither, the
+#                   run says out loud that nothing was compared, rather than
+#                   letting silence imply that it was.
+AYEAYE_VERSION="v0.1.0"
+AYEAYE_SHA256=""
+
+# The published one-liner, quoted in --help and in README.md. It fetches this
+# script, and this script pins the release above.
+AYEAYE_INSTALL_URL="https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh"
+
+# Where releases come from, where an unpacked one lives, and which terminal to
+# ask questions on. Overridable so that an internal mirror, a scratch
+# directory, or a terminal that is not /dev/tty can be pointed at without
+# editing this file - which is also how the tests serve a release without
+# touching the internet.
+AYEAYE_RELEASE_BASE="${AYEAYE_RELEASE_BASE:-https://github.com/LioraLabs/ayeaye/releases/download}"
+AYEAYE_DATA_DIR="${AYEAYE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye}"
+AYEAYE_BOOTSTRAP_TTY="${AYEAYE_BOOTSTRAP_TTY:-/dev/tty}"
+
+# REPO - the copy of ayeaye this run configures - cannot be worked out here any
+# more. Whether there is one is the question the bootstrap below answers, and
+# it is assigned at the end of that block, just above the line that sources
+# lib/wizard.sh. Nothing above that point may use it.
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye"
 ENV_FILE="$CONF_DIR/env"
@@ -27,6 +63,13 @@ DEFAULTS=0
 NO_SYSTEMD=0
 FRESH=0
 WIZARD_INTERACTIVE=1
+# Set by the bootstrap below when it hands over to this script on a machine
+# that turned out to have no terminal to ask questions on. Its own variable
+# rather than WIZARD_INTERACTIVE, and only believed when it arrives together
+# with the marker the handover sets, so that neither of them left in somebody's
+# shell can quietly turn an attended run into an unattended one.
+[ -z "${AYEAYE_BOOTSTRAP_UNATTENDED:-}" ] || [ -z "${AYEAYE_BOOTSTRAPPED:-}" ] \
+  || WIZARD_INTERACTIVE=0
 WIZARD_DETAILS=0
 WIZARD_AUTO_CONSENT=""
 
@@ -59,6 +102,18 @@ Nothing is installed, downloaded, opened to the network or trusted without a
 question first, and answering no to any of them leaves this computer exactly
 as it was.
 USAGE
+  cat <<BOOTSTRAP
+
+On a computer that has no copy of ayeaye yet, the same setup can be run
+straight from the internet:
+
+  curl -fsSL $AYEAYE_INSTALL_URL | bash
+
+That asks before it downloads anything, fetches ayeaye $AYEAYE_VERSION into
+  $AYEAYE_DATA_DIR
+and then does exactly what running it from a copy does. Add arguments to it
+with -s --, for example: | bash -s -- --yes
+BOOTSTRAP
 }
 
 for arg in "$@"; do
@@ -72,6 +127,432 @@ for arg in "$@"; do
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# ================================================ is ayeaye here, or not yet?
+#
+# There are two ways this file gets run and they need different things. From a
+# copy of ayeaye - a clone, or a release already unpacked - everything it needs
+# is next to it, and it configures that copy without fetching a byte. Piped
+# from the internet there is nothing next to it at all, and the first job is to
+# fetch the pinned release and hand over to the copy that comes out of it.
+#
+# Which of the two is decided by looking rather than by guessing. Under
+# `curl … | bash` the script has no directory: "$(dirname "${BASH_SOURCE[0]}")"
+# resolves to wherever the person happened to be standing, which is a real
+# directory that will happily be treated as a broken checkout. So the question
+# asked is not "where did this file come from" but "is ayeaye actually there".
+#
+# Everything here runs before lib/ exists, which is why it says things in its
+# own words instead of through lib/ui.sh and asks in its own words instead of
+# through lib/consent.sh. It is the one place in this repository allowed to
+# do either, it is confined to what a bootstrap cannot avoid, and
+# tests/cases/wizard_contract_test.sh is what keeps it confined: the fetch
+# below is exempted from the tree-wide download lint by name, and the lint
+# fails if a second one appears.
+
+_boot_say()   { printf '%s\n' "$*"; }
+_boot_blank() { printf '\n'; }
+# Something went wrong, as opposed to somebody said no. On stderr, so that it
+# is still seen by a person who sent the rest of this to a file.
+_boot_err()   { printf '%s\n' "$*" >&2; }
+
+# _bootstrap_payload <dir> - can setup run from this directory? Exactly the
+# two files it cannot start without, so an empty directory - which is what the
+# working directory is, to a script arriving down a pipe - is never mistaken
+# for a copy of ayeaye. A freshly unpacked release is held to more than this;
+# see _bootstrap_unpack.
+_bootstrap_payload() {
+  [ -n "${1:-}" ] || return 1
+  [ -f "$1/install.sh" ] || return 1
+  [ -f "$1/lib/wizard.sh" ] || return 1
+  return 0
+}
+
+# _bootstrap_here - the directory this script was read from, when it really was
+# read from one. Empty under a pipe, where BASH_SOURCE holds the name of the
+# shell rather than a path. Always 0: "no directory" is an answer, not a fault.
+_bootstrap_here() {
+  local self="${BASH_SOURCE[0]:-}" dir
+  case "$self" in
+    ""|bash|-bash|sh|-sh|dash|zsh|main|/dev/stdin|/dev/fd/*|/proc/self/fd/*) return 0 ;;
+  esac
+  [ -f "$self" ] || return 0
+  case "$self" in
+    */*) dir="${self%/*}" ;;
+    *)   dir="." ;;
+  esac
+  # CDPATH would make cd print somewhere else entirely, and this runs on
+  # whatever shell environment the machine happens to have.
+  dir="$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd)" || return 0
+  printf '%s' "$dir"
+  return 0
+}
+
+# _bootstrap_tty - is there a terminal to ask questions on? Opening it is the
+# only honest test: /dev/tty exists on a machine with no controlling terminal
+# and fails at the moment it is read.
+_bootstrap_tty() {
+  [ -n "$AYEAYE_BOOTSTRAP_TTY" ] || return 1
+  # In a subshell: a redirection that fails is reported by the shell that
+  # performs it, before the 2>/dev/null on the same command can apply, and a
+  # headless machine is not a thing to print an error about.
+  ( : <"$AYEAYE_BOOTSTRAP_TTY" ) 2>/dev/null || return 1
+  return 0
+}
+
+# _bootstrap_may_fetch - permission to use the network, in the same shape
+# lib/consent.sh gives it once lib/ is here: --yes is a yes given in advance,
+# a run that may not ask is a no, and anything that is not a yes is a no.
+_bootstrap_may_fetch() {
+  local auto reply
+  for auto in ${WIZARD_AUTO_CONSENT:-}; do
+    if [ "$auto" = download ]; then
+      _boot_say "fetching it, because --yes already said yes to downloading."
+      return 0
+    fi
+  done
+  if [ "$WIZARD_INTERACTIVE" = 0 ] || ! _bootstrap_tty; then
+    _boot_say "this run has no way to ask, and downloading is not something to"
+    _boot_say "decide on somebody else's behalf."
+    _boot_say "run it again with --yes to answer this one in advance."
+    return 1
+  fi
+  reply=""
+  read -r -p "may I download ayeaye $AYEAYE_VERSION? [n]: " reply \
+    <"$AYEAYE_BOOTSTRAP_TTY" || reply=""
+  case "$reply" in
+    y|Y|yes|YES|Yes) return 0 ;;
+  esac
+  return 1
+}
+
+# _bootstrap_fetch <url> <destination> - the only download in this file, and
+# the reason it is the only one: a second would need its own exemption from
+# the lint, and the lint is what keeps this honest.
+#
+# Resumable, because a bootstrap interrupted halfway down a release should
+# carry on rather than start again: what arrived is left in <destination>.part
+# and the next run asks the server to continue from there. A partial file the
+# server will not resume is worth nothing, so it is thrown away and the whole
+# thing is asked for once. Nothing here trusts those bytes - what they add up
+# to is checked, below, before anything is unpacked or run.
+_bootstrap_fetch() {
+  local url="${1:-}" dest="${2:-}" dir resume status attempt opts
+  [ -n "$url" ] && [ -n "$dest" ] || return 2
+  dir="${dest%/*}"
+  [ "$dir" = "$dest" ] || mkdir -p "$dir" 2>/dev/null || return 1
+  if ! command -v curl >/dev/null 2>&1; then
+    _boot_err "this computer has no way to download files (curl is missing)."
+    _boot_err "install curl and run setup again, or fetch it yourself:"
+    _boot_err "  $url"
+    return 1
+  fi
+  # -L follows redirects, and a redirect to plain http would quietly undo the
+  # only protection an unchecksummed release has. Said out loud to curl for an
+  # https URL; a mirror somebody deliberately pointed at over http is their
+  # decision and is left alone. The timeouts are what turn a black-holed
+  # connection into the resumable failure the rest of this is built around,
+  # rather than an installer that never comes back.
+  opts="--connect-timeout 20 --max-time 1800"
+  case "$url" in
+    https://*) opts="$opts --proto =https --proto-redir =https" ;;
+  esac
+  attempt=1
+  while [ "$attempt" -le 2 ]; do
+    resume=""
+    [ -s "$dest.part" ] && resume="-C -"
+    status=0
+    # shellcheck disable=SC2086
+    curl -fsSL --retry 2 $opts $resume -o "$dest.part" "$url" || status=$?  # bootstrap-fetch
+    if [ "$status" = 0 ]; then
+      mv -f "$dest.part" "$dest" 2>/dev/null || return 1
+      return 0
+    fi
+    # A whole download that failed leaves its bytes where the next run can
+    # carry on from them. A resume that failed means those bytes are the
+    # problem: throw them away and ask once for the whole thing.
+    [ -n "$resume" ] || break
+    rm -f "$dest.part" 2>/dev/null || true
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# _bootstrap_digest <file> - the sha256 of a file, using whatever this machine
+# has. 1 when it has none of them, which is a thing to say out loud rather
+# than a thing to fail over.
+_bootstrap_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
+# _bootstrap_verify <artifact> <sums-url> <name> - 0 to carry on, 1 to stop.
+#
+# Says which of the three things happened, every time, because silence here
+# reads as "verified" and is the one thing this must never mean:
+#
+#   the checksum matched
+#   there was no checksum, or no way to work one out, and here is which
+#   the checksum did not match - which stops the run
+#
+# The strongest of the three is AYEAYE_SHA256, written into this file by the
+# release process: it arrives with the script over the same connection the
+# person already chose to trust, and cannot be swapped out by whoever is in a
+# position to swap out the artifact.
+_bootstrap_verify() {
+  local artifact="$1" sums_url="$2" name="$3" expected="" actual sums
+  if [ -n "$AYEAYE_SHA256" ]; then
+    expected="$AYEAYE_SHA256"
+  else
+    sums="$AYEAYE_DATA_DIR/downloads/SHA256SUMS-$AYEAYE_VERSION"
+    # Never resumed: a checksum file half of one run and half of another reads
+    # as a release that says nothing about this artifact, which is the one
+    # answer here that must never be arrived at by accident.
+    rm -f "$sums.part" "$sums" 2>/dev/null || true
+    if _bootstrap_fetch "$sums_url" "$sums" >/dev/null 2>&1 && [ -f "$sums" ]; then
+      expected="$(awk -v want="$name" \
+        '{ n = $2; sub(/^\*/, "", n); if (n == want) { print $1; exit } }' "$sums")"
+      if [ -z "$expected" ]; then
+        _boot_say "not checked: the checksums published with ayeaye $AYEAYE_VERSION say"
+        _boot_say "nothing about $name, so there was nothing to compare this against."
+      fi
+    else
+      _boot_say "not checked: no checksums could be fetched for ayeaye $AYEAYE_VERSION -"
+      _boot_say "either the release published none, or they did not arrive. The only"
+      _boot_say "thing protecting this download was the encrypted connection to the"
+      _boot_say "server."
+    fi
+  fi
+  [ -n "$expected" ] || return 0
+
+  actual="$(_bootstrap_digest "$artifact")" || actual=""
+  if [ -z "$actual" ]; then
+    _boot_say "not checked: this computer has no sha256sum, shasum or openssl, so the"
+    _boot_say "checksum published with the release could not be compared."
+    return 0
+  fi
+  if [ "$actual" != "$expected" ]; then
+    rm -f "$artifact" 2>/dev/null || true
+    _boot_err ""
+    _boot_err "STOP. What was downloaded is not what ayeaye $AYEAYE_VERSION published."
+    _boot_err "  expected $expected"
+    _boot_err "  received $actual"
+    _boot_err ""
+    _boot_err "Nothing has been installed, and the file has been deleted. This can be"
+    _boot_err "an interrupted download, and it can be somebody in the way of this one."
+    _boot_err "Try again, and if it happens twice do not run it."
+    return 1
+  fi
+  if [ -n "$AYEAYE_SHA256" ]; then
+    _boot_say "checked: what arrived matches the checksum written into setup itself,"
+    _boot_say "which came from somewhere else than the file it just checked."
+  else
+    # Worth having and worth being exact about: it catches a download that
+    # broke in transit, and it does not catch somebody who is able to replace
+    # the artifact, because they could replace this alongside it.
+    _boot_say "checked: what arrived matches the checksum ayeaye $AYEAYE_VERSION publishes"
+    _boot_say "beside it, which came down the same connection."
+  fi
+  return 0
+}
+
+# _bootstrap_unpack <artifact> <destination> - through a scratch directory and
+# a rename, so that an unpacking interrupted halfway never leaves something
+# behind that looks like a working copy.
+#
+# The archive is read before it is written out. An entry naming an absolute
+# path or climbing out with ".." would land wherever it liked and is refused:
+# the checksum is what makes a release trustworthy and there are releases that
+# publish none, so this does not depend on having had one. It reads entry names
+# and not symlink targets - a link pointing out of the tree is left to tar,
+# which refuses to follow one on the way in.
+_bootstrap_unpack() {
+  local artifact="$1" dest="$2" work top entry count escaping
+  command -v tar >/dev/null 2>&1 || {
+    _boot_err "this computer has no tar, so the release cannot be unpacked."
+    return 1
+  }
+  # Read into a variable rather than tested with grep -q: a grep that stops at
+  # the first match kills tar with a broken pipe, and under `set -o pipefail`
+  # that is the status the test would have seen.
+  escaping="$(tar -tzf "$artifact" 2>/dev/null | grep -e '^/' -e '^\.\./' -e '/\.\./' || true)"
+  if [ -n "$escaping" ]; then
+    _boot_err "this release contains files that would be written outside the place"
+    _boot_err "setup unpacks into, which a release does not do. Refusing it."
+    return 1
+  fi
+  # Anything left behind by a run that was interrupted mid-unpack. Its own
+  # scratch directory is removed on every path out of here, but a ctrl-c is
+  # not a path out of here.
+  rm -rf "$AYEAYE_DATA_DIR"/releases/.unpacking.* 2>/dev/null || true
+  work="$AYEAYE_DATA_DIR/releases/.unpacking.$$"
+  mkdir -p "$work" 2>/dev/null || return 1
+  tar -xzf "$artifact" -C "$work" 2>/dev/null || { rm -rf "$work"; return 1; }
+  # A release archive holds one directory. Anything else is unpacked as it is,
+  # and judged by the same question everything else is judged by.
+  count=0
+  top="$work"
+  for entry in "$work"/*; do
+    [ -e "$entry" ] || continue
+    top="$entry"
+    count=$((count + 1))
+  done
+  [ "$count" = 1 ] && [ -d "$top" ] || top="$work"
+  # More is asked of a fresh release than of a directory somebody is already
+  # standing in: this one has to be whole, not merely startable.
+  if ! _bootstrap_payload "$top" || [ ! -f "$top/bin/ayeaye" ]; then
+    rm -rf "$work"
+    return 1
+  fi
+  # The copy that is already there is moved aside rather than deleted, and only
+  # let go of once its replacement is in place: a rename that fails must not be
+  # how somebody ends up with no ayeaye at all.
+  if [ -e "$dest" ]; then
+    rm -rf "$dest.previous" 2>/dev/null || true
+    mv "$dest" "$dest.previous" 2>/dev/null || true
+  fi
+  if ! mv "$top" "$dest" 2>/dev/null; then
+    if [ -e "$dest.previous" ]; then
+      mv "$dest.previous" "$dest" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+    return 1
+  fi
+  rm -rf "$dest.previous" "$work" 2>/dev/null || true
+  return 0
+}
+
+# _bootstrap_handover <payload> <argument>… - run the copy that is now on this
+# computer, with the arguments the person actually typed.
+#
+# Standard input is the whole trap. Under `curl … | bash` it is the script
+# itself, and a wizard that read it would swallow its own source and then take
+# every default without anybody having been asked anything - a run that
+# installs nothing, exposes nothing and looks exactly like success. So the
+# terminal is reopened for the copy being handed to, and when there is no
+# terminal at all the run is made explicitly unattended and says so.
+_bootstrap_handover() {
+  local payload="$1"
+  shift
+  AYEAYE_BOOTSTRAPPED=1
+  export AYEAYE_BOOTSTRAPPED
+  if _bootstrap_tty; then
+    exec "${BASH:-bash}" "$payload/install.sh" "$@" <"$AYEAYE_BOOTSTRAP_TTY"
+  fi
+  _boot_say "there is no terminal here to ask questions on, so the rest of setup"
+  _boot_say "takes the default answer to every one of them."
+  _boot_blank
+  # /dev/null, not the pipe this script arrived down: whatever of it is still
+  # unread is the text of this file, and the first thing downstream to read
+  # standard input would get a mouthful of shell script.
+  AYEAYE_BOOTSTRAP_UNATTENDED=1
+  export AYEAYE_BOOTSTRAP_UNATTENDED
+  exec "${BASH:-bash}" "$payload/install.sh" "$@" </dev/null
+}
+
+# _bootstrap <argument>… - fetch the pinned release and hand over to it. Never
+# returns: it execs the unpacked copy, or it exits.
+_bootstrap() {
+  local payload artifact name url sums_url
+
+  # A copy that unpacked itself and still cannot find its own files would
+  # otherwise download it all again, for ever.
+  if [ -n "${AYEAYE_BOOTSTRAPPED:-}" ]; then
+    _boot_err "setup unpacked ayeaye $AYEAYE_VERSION but the copy is not complete."
+    _boot_err "delete $AYEAYE_DATA_DIR and run it again."
+    exit 1
+  fi
+
+  name="ayeaye-$AYEAYE_VERSION.tar.gz"
+  payload="$AYEAYE_DATA_DIR/releases/$AYEAYE_VERSION"
+  artifact="$AYEAYE_DATA_DIR/downloads/$name"
+  url="$AYEAYE_RELEASE_BASE/$AYEAYE_VERSION/$name"
+  sums_url="$AYEAYE_RELEASE_BASE/$AYEAYE_VERSION/SHA256SUMS"
+
+  # Already unpacked by an earlier run: nothing to fetch, and so nothing to
+  # ask about either.
+  if _bootstrap_payload "$payload"; then
+    _boot_say "ayeaye $AYEAYE_VERSION is already on this computer, at"
+    _boot_say "  $payload"
+    _boot_blank
+    _bootstrap_handover "$payload" "$@"
+  fi
+
+  _boot_say "ayeaye setup"
+  _boot_blank
+  _boot_say "This computer does not have ayeaye on it yet, so the first thing"
+  _boot_say "setup has to do is fetch it."
+  _boot_blank
+  _boot_say "  version: ayeaye $AYEAYE_VERSION"
+  _boot_say "  from:    $url"
+  _boot_say "  into:    $payload"
+  _boot_blank
+  _boot_say "Nothing else is installed or changed by this step, and the questions"
+  _boot_say "about the rest of setup come after it."
+  _boot_blank
+
+  # An artifact an earlier run already fetched is not fetched again, but it is
+  # not trusted either: it is checked below exactly as a fresh one is.
+  if [ -f "$artifact" ]; then
+    _boot_say "an earlier run already downloaded this release, so setup checks what"
+    _boot_say "it has instead of fetching it again."
+    _boot_blank
+  fi
+
+  # The one question this file asks. It is asked whenever anything at all will
+  # come off the network - the release, or the checksums for one that is
+  # already here - and everything past it is fetching, checking and unpacking.
+  # Every other question in setup belongs to the wizard.
+  if [ ! -f "$artifact" ] || [ -z "$AYEAYE_SHA256" ]; then
+    if ! _bootstrap_may_fetch; then
+      _boot_blank
+      _boot_say "nothing was downloaded, and this computer is exactly as it was."
+      _boot_say "to do it by hand instead:"
+      _boot_say "  git clone https://github.com/LioraLabs/ayeaye"
+      _boot_say "  cd ayeaye && ./install.sh"
+      exit 3
+    fi
+  fi
+
+  if [ ! -f "$artifact" ]; then
+    if ! _bootstrap_fetch "$url" "$artifact"; then
+      _boot_err ""
+      _boot_err "the download did not work, so nothing has been changed here."
+      _boot_err "check the connection and run it again - what did arrive is kept,"
+      _boot_err "and the next run carries on from where this one stopped."
+      exit 1
+    fi
+  fi
+
+  _bootstrap_verify "$artifact" "$sums_url" "$name" || exit 1
+
+  if ! _bootstrap_unpack "$artifact" "$payload"; then
+    # Deleted rather than kept: it is the reason this failed, and keeping it
+    # would make every later run fail in exactly the same way without ever
+    # fetching a good one.
+    rm -f "$artifact" 2>/dev/null || true
+    _boot_err ""
+    _boot_err "the release could not be unpacked, so nothing has been changed here."
+    _boot_err "what was downloaded has been deleted; running setup again fetches it"
+    _boot_err "afresh."
+    exit 1
+  fi
+  _boot_say "unpacked into $payload"
+  _boot_blank
+  _bootstrap_handover "$payload" "$@"
+}
+
+REPO="$(_bootstrap_here)"
+if ! _bootstrap_payload "$REPO"; then
+  _bootstrap "$@"
+fi
 
 # shellcheck source=lib/wizard.sh
 . "$REPO/lib/wizard.sh"
