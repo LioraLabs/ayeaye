@@ -17,6 +17,7 @@ Sub-commands:
   maketree ROOT --width W --depth D     build a synthetic tree, print its size
   walk [--query Q] [--limit N] ...      one walk, its bound and its cost
   projects [--query Q] [--limit N]      the picker's answer, in order
+  cached [--query Q]                    the same query twice, and what it cost
   shape                                 the keys of one result row
   recents note PATH...                  record picks
   recents dump                          the store, as bash can read it
@@ -141,6 +142,16 @@ def cmd_projects(m, args):
             print(json.dumps(row, sort_keys=True))
 
 
+def cmd_cached(m, args):
+    """The same query twice, so the second one's cost is visible."""
+    before = count()
+    first = m.projects(args.query, args.limit)
+    middle = count()
+    second = m.projects(args.query, args.limit)
+    emit(first_count=len(first), second_count=len(second),
+         first_listings=middle - before, second_listings=count() - middle)
+
+
 def cmd_shape(m, args):
     rows = m.projects(args.query, args.limit)
     if not rows:
@@ -216,6 +227,11 @@ def main():
     p.add_argument("--limit", type=int, default=40)
     p.add_argument("--field", default=None)
     p.set_defaults(fn=cmd_projects)
+
+    p = sub.add_parser("cached")
+    p.add_argument("--query", default="")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(fn=cmd_cached)
 
     p = sub.add_parser("shape")
     p.add_argument("--query", default="")

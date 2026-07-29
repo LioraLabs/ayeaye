@@ -852,29 +852,139 @@ def note_project_pick(path):
             pass
 
 
-def projects(query="", limit=40):
-    """Candidate directories, newest-frecency first, straight from zoxide --
-    the same source ftz picks from."""
-    try:
-        out = subprocess.run(["zoxide", "query", "-l"], capture_output=True,
-                             text=True, timeout=5).stdout
-    except Exception:
-        out = ""
-    live, seen, rows = live_sessions(), set(), []
-    q = query.lower()
-    for d in out.splitlines():
-        d = d.rstrip("/")
-        if not d or d in seen or not os.path.isdir(d):
+class _Search(object):
+    """One walk, running on a thread of its own.
+
+    Cancelling it stops the thread that is walking, not merely the one that
+    is waiting -- a query the user has already typed past must stop costing
+    syscalls, or every keystroke leaves another walk grinding away behind it.
+    """
+
+    def __init__(self, query, cap):
+        self.query, self.cap = query, cap
+        self.cancel = threading.Event()
+        self.done = threading.Event()
+        self.rows, self.stopped = [], "pending"
+
+    def run(self):
+        try:
+            self.rows, self.stopped = walk_projects(
+                self.query, self.cap,
+                deadline=time.monotonic() + PROJECT_BUDGET,
+                cancel=self.cancel)
+        except Exception:
+            self.rows, self.stopped = [], "error"
+        finally:
+            self.done.set()
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+        return self
+
+
+_search_lock = threading.Lock()
+_search_gen = 0             # every call takes a number; the newest one wins
+_search_current = None
+_search_cache = {}          # (query, cap) -> (time, rows), for a walk that finished
+
+
+def project_rows(found, q, limit):
+    """Rank candidates and shape them into what the picker renders.
+
+    Git repositories first and everything else after: "does it contain a
+    .git" is the strongest signal available that a directory is a project
+    rather than a folder something was once unzipped into. Inside each tier
+    the pick history decides, then a match on the name over one buried in the
+    path, then the shallower path, then the path itself -- so two identical
+    queries produce an identical list, which matters when the answer is
+    repainted on every keystroke.
+    """
+    now = time.time()
+    recents = _recents_load()
+    home = os.path.expanduser("~")
+    found = list(found)
+    seen = set(path for path, _git, _level in found)
+    # Somewhere you have started an agent is a candidate even when the walk
+    # cannot reach it: outside the roots, or below the depth bound.
+    for path in recents:
+        if path in seen or (q and q not in path.lower()):
             continue
-        if q and q not in d.lower():
+        if not os.path.isdir(path):
             continue
-        seen.add(d)
-        name = session_name_for(d)
-        rows.append({"dir": d, "short": d.replace(os.path.expanduser("~"), "~"),
-                     "session": name, "exists": name in live})
+        seen.add(path)
+        found.append((path, os.path.exists(os.path.join(path, ".git")), 0))
+
+    def rank(row):
+        path, is_git, level = row
+        return (not is_git,
+                -_recent_score(recents.get(path), now),
+                0 if q in os.path.basename(path).lower() else 1,
+                level, path)
+
+    live, rows = live_sessions(), []
+    for path, is_git, _level in sorted(found, key=rank):
+        name = session_name_for(path)
+        rows.append({"dir": path,
+                     "short": "~" + path[len(home):] if path.startswith(home)
+                              else path,
+                     "session": name, "exists": name in live, "git": is_git})
         if len(rows) >= limit:
             break
     return rows
+
+
+def projects(query="", limit=40):
+    """Candidate project directories for the picker, best match first.
+
+    The walk never runs on the calling thread. This is called from the HTTP
+    handler while someone types, and a filesystem walk on a request thread
+    would put the pane polls and the transcript stream behind it on the same
+    connection. So the search runs elsewhere, this waits PROJECT_WAIT for it,
+    and answers with whatever has arrived by then -- partial and immediate
+    beats complete and late when the next keystroke is 150ms away.
+
+    A new query supersedes the one before it: the older call abandons its
+    wait at once and returns nothing rather than racing the newer answer to
+    the browser, and its walk is cancelled instead of left running.
+    """
+    global _search_gen, _search_current
+    q = query.strip().lower()
+    # Ranking wants more candidates than it returns, because the first
+    # `limit` directories a breadth-first walk meets are not the best
+    # `limit`. This is still an early stop, just not a myopic one.
+    cap = max(limit * 8, 200)
+
+    with _search_lock:
+        _search_gen += 1
+        gen = _search_gen
+        hit = _search_cache.get((q, cap))
+        if hit and time.monotonic() - hit[0] < PROJECT_TTL:
+            search, found = None, hit[1]
+        else:
+            if _search_current is not None:
+                _search_current.cancel.set()
+            search = _search_current = _Search(q, cap)
+
+    if search is not None:
+        search.start()
+        # Waiting in slices, so that being superseded cuts the wait short
+        # rather than merely changing the answer at the end of it.
+        deadline = time.monotonic() + PROJECT_WAIT
+        while not search.done.wait(0.02):
+            if search.cancel.is_set() or time.monotonic() >= deadline:
+                break
+        with _search_lock:
+            if gen != _search_gen:
+                return []
+            found = list(search.rows)
+            # Only a search that ran to one of its own bounds is worth
+            # keeping; a cancelled or timed-out one saw an arbitrary slice.
+            if search.done.is_set() and search.stopped in ("", "depth", "limit"):
+                if len(_search_cache) > 64:
+                    _search_cache.clear()
+                _search_cache[(q, cap)] = (time.monotonic(), found)
+
+    return project_rows(found, q, limit)
 
 
 # The board page reads the same cliban the terminal does, through its --json
