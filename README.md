@@ -110,6 +110,33 @@ Three processes:
 - **`whisper-server`**: `whisper.cpp` with a model resident in VRAM.
   Optional: without it the app runs text-only ([Setup](#setup)).
 
+## Install
+
+One command, on a machine that has no copy of ayeaye on it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | bash
+```
+
+It fetches a **pinned release** — the version is printed before anything is
+downloaded and is visible in `--help` — into `~/.local/share/ayeaye`, checks
+what arrived against the checksum published with that release, and then runs
+exactly the setup described below from the copy it unpacked. It asks before
+it downloads anything, and answering no leaves the machine as it was. When a
+release publishes no checksum, or the machine has no `sha256sum`, it says so
+in as many words rather than implying that something was verified.
+
+Arguments go after `-s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | bash -s -- --yes
+```
+
+An interrupted bootstrap is resumable: a part-finished download carries on
+from where it stopped, and a release already unpacked is used as it is,
+without touching the network at all. Running it from a clone downloads
+nothing whatsoever — see [Setup](#setup).
+
 ## Setup
 
 Setup comes in three tiers. Tier 1 is the floor: one command, and everything

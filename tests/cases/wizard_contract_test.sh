@@ -46,6 +46,20 @@ $(_wizard_sources)
 EOF
 }
 
+# _judge_downloads - offender lines in, the ones that really keep bytes out.
+#
+# A GET is not a download; keeping what comes back is. The harmless redirects
+# are cut out of each line before it is judged rather than excused after it, so
+# that "curl -o file url >/dev/null" is still the download it obviously is.
+_judge_downloads() {
+  sed -e 's/2>&1//g' \
+      -e 's/[0-9]\{0,1\}>[[:space:]]*\/dev\/null//g' \
+      -e 's/-o[[:space:]][[:space:]]*\/dev\/null//g' \
+      -e 's/--output[[:space:]][[:space:]]*\/dev\/null//g' \
+    | grep -E 'curl[^|]*(-o|-O|--output|--remote-name|>)' \
+    | grep -v -E '#[[:space:]]*bootstrap-fetch$' || true
+}
+
 # --------------------------------------------------- nothing acts on its own
 
 test_nothing_installs_a_package_except_the_wrapper() {
@@ -75,13 +89,66 @@ test_nothing_reaches_for_sudo_by_hand() {
 
 test_nothing_downloads_a_file_except_the_wrapper() {
   # A GET is not a download; keeping what comes back is. That is the line this
-  # draws: curl with an output flag, and "-o /dev/null" - which is how a probe
-  # asks for a status code and throws the body away - is on the safe side of it.
+  # draws: curl with an output flag or with a redirect that keeps the body,
+  # while "-o /dev/null" and "> /dev/null" - which is how a probe asks for a
+  # status code and throws the body away - are on the safe side of it.
+  #
+  # The harmless redirects are cut out of each line before it is judged rather
+  # than excused after it, so that "curl -o file url >/dev/null" is still the
+  # download it obviously is.
   local offenders
-  offenders="$(_offenders 'curl[^|]*(-o|-O|--output|--remote-name)' consent.sh \
-    | grep -v -E '(-o|--output)[[:space:]]+/dev/null' || true)"
+  offenders="$(_offenders 'curl' consent.sh | _judge_downloads)"
   assert_eq "" "$offenders" \
     "fetching bytes onto this machine goes through wizard_download, which asks"
+}
+
+test_the_download_lint_catches_a_redirect_and_not_a_probe() {
+  # The rule above is only worth what it can see, and until this ticket it
+  # could not see `curl … > file` at all. Fed lines that are not in the tree,
+  # so that the judgement is pinned rather than the tree's current innocence.
+  local judged
+  judged="$(printf '%s\n' \
+    'made-up.sh:1:  curl -fsSL "$url" > "$dest"' \
+    'made-up.sh:2:  curl -fsSL --retry 2 -o "$dest" "$url"' \
+    'made-up.sh:3:  curl -sS -o /dev/null -w "%{http_code}" "$url" 2>&1' \
+    'made-up.sh:4:  curl -fsSL "$url" > /dev/null' \
+    'made-up.sh:5:  command -v curl >/dev/null 2>&1' \
+    'made-up.sh:6:  curl -fsSL "$url" -o "$dest"  # bootstrap-fetch' \
+    'made-up.sh:7:  command -v curl >/dev/null 2>&1 && curl -fsSL "$url" -o "$dest"' \
+    | _judge_downloads)"
+  assert_contains "$judged" "made-up.sh:1" "a redirect that keeps the body is a download"
+  assert_contains "$judged" "made-up.sh:2" "so is an output flag"
+  assert_not_contains "$judged" "made-up.sh:3" "throwing the body away is a probe"
+  assert_not_contains "$judged" "made-up.sh:4" "so is a redirect to /dev/null"
+  assert_not_contains "$judged" "made-up.sh:5" "and looking curl up is not using it"
+  assert_not_contains "$judged" "made-up.sh:6" "the bootstrap carries its exemption"
+  assert_contains "$judged" "made-up.sh:7" \
+    "looking curl up on the same line as using it excuses nothing - a rule that
+judged whole lines by their least incriminating clause would be no rule at all"
+}
+
+test_the_one_download_outside_the_wrapper_is_the_bootstrap_and_there_is_one_of_it() {
+  # install.sh downloads once before lib/consent.sh exists to ask on its
+  # behalf: the release it is about to hand over to. That fetch is exempt from
+  # the rule above by a marker on its own line, which makes the exemption
+  # something a reviewer can see rather than something a pattern happens to
+  # miss. These two assertions are what stop the marker spreading.
+  local marked count fetch_line source_line
+  marked="$(_offenders '#[[:space:]]*bootstrap-fetch$')"
+  count="$(printf '%s\n' "$marked" | grep -c 'bootstrap-fetch' || true)"
+  assert_eq "1" "$count" "exactly one line in this repository may carry the marker"
+  assert_matches "$marked" '^install\.sh:' "and it is the bootstrap in install.sh"
+
+  # And it is in the half of install.sh that runs before the wizard layer is
+  # loaded. Below that line there is a wrapper to use, and no excuse.
+  fetch_line="$(grep -n -E '#[[:space:]]*bootstrap-fetch$' "$REPO_ROOT/install.sh" \
+    | head -1 | cut -d: -f1)"
+  source_line="$(grep -n 'lib/wizard\.sh"$' "$REPO_ROOT/install.sh" | head -1 | cut -d: -f1)"
+  assert_ne "" "$source_line" "install.sh must still source the wizard layer"
+  if [ "$fetch_line" -ge "$source_line" ]; then
+    fail "the bootstrap fetch (line $fetch_line) is below the point where
+lib/consent.sh becomes available (line $source_line), and must use wizard_download"
+  fi
 }
 
 test_nothing_changes_a_firewall_or_a_trust_store_by_hand() {
@@ -151,6 +218,7 @@ test_every_path_the_wizard_writes_is_guarded_by_the_suite() {
   guard="$(cat "$REPO_ROOT/tests/run.sh")"
   for path in "ayeaye/setup-state" "ayeaye/setup-consent.log" "ayeaye/setup.log" \
               "ayeaye/backups" "ayeaye/env" "ayeaye/token" \
+              "share}/ayeaye" \
               "systemd/user/ayeaye.service"; do
     assert_contains "$guard" "$path" \
       "$path is written by setup and must be on GUARDED_PATHS"

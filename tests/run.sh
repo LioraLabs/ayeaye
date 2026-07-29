@@ -77,6 +77,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-state
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-consent.log
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup.log
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/backups
+${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye
 $HOME/.local/bin/ayeaye
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
 $HOME/.bashrc
