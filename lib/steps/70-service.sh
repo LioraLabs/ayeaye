@@ -273,7 +273,7 @@ EOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>$SERVICE_LAUNCHD_PATH</string>
+    <string>$(_service_xml "$SERVICE_LAUNCHD_PATH")</string>
     <key>XDG_CONFIG_HOME</key>
     <string>$(_service_xml "$(_service_conf_home)")</string>
     <key>XDG_STATE_HOME</key>
@@ -371,7 +371,10 @@ _service_same() {
 # unchecked redirection into a directory that cannot be written would leave
 # this saying "installed" about a file that was never created.
 _service_write_definition() {
-  local name="${1:-}" kind="${2:-}" path dir tmp backup rendered
+  # backup and rendered are given values rather than merely declared: install.sh
+  # runs under `set -u`, where reading a declared-but-unset local ends the
+  # whole run rather than the step.
+  local name="${1:-}" kind="${2:-}" path dir tmp backup="" rendered=""
   SERVICE_WROTE=0
   if ! path="$(service_definition_path "$name" "$kind")"; then
     wizard_say "setup does not know how to write down a service called \"$name\"."
@@ -387,23 +390,26 @@ _service_write_definition() {
     return 1
   fi
 
+  # Compared before anything is created, and in memory. Leaving an unchanged
+  # file alone is not an optimisation, it is the difference between repairing
+  # a service and disturbing one: no new timestamp, and no backup of a file
+  # identical to its replacement. Doing the comparison without a temporary
+  # file also means a directory somebody has made read-only, holding a
+  # definition that is already correct, is not reported as a failure.
+  if [ -f "$path" ] \
+     && [ "$(printf '%s\n' "$rendered" | cksum)" = "$(cksum < "$path" 2>/dev/null)" ]; then
+    return 0
+  fi
+
   if ! mkdir -p "$dir" 2>/dev/null; then
-    wizard_say "cannot create $dir, so ayeaye cannot be started for you."
+    wizard_say "cannot create $dir, so $name cannot be started for you."
     return 1
   fi
   tmp="$path.tmp.$$"
   if ! printf '%s\n' "$rendered" > "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
-    wizard_say "cannot write into $dir, so ayeaye cannot be started for you."
+    wizard_say "cannot write into $dir, so $name cannot be started for you."
     return 1
-  fi
-
-  # Already exactly right. Leaving the file alone is not an optimisation, it
-  # is the difference between repairing a service and disturbing one: no new
-  # timestamp, and no backup of a file that is identical to its replacement.
-  if [ -f "$path" ] && _service_same "$path" "$tmp"; then
-    rm -f "$tmp" 2>/dev/null
-    return 0
   fi
 
   # A definition that is there and different is somebody's - an older version
@@ -411,25 +417,28 @@ _service_write_definition() {
   # and this run is going to replace it, which is a decision taken when they
   # asked for ayeaye to be set up rather than one worth stopping for; but the
   # bytes are cheap to keep, and a copy that could not be made is a reason to
-  # leave the file alone rather than a detail. The ledger records the
-  # replacement either way, so the audit trail is complete.
+  # leave the file alone rather than a detail.
   if [ -f "$path" ]; then
-    wizard_consent_record replace granted "replacing the service definition at $path"
-    if backup="$(wizard_backup "$path")"; then
-      wizard_say "saved a copy of the previous $name definition at $backup"
-    else
+    if ! backup="$(wizard_backup "$path")"; then
       rm -f "$tmp" 2>/dev/null
       wizard_say "could not save a copy of $path, so it has been left alone."
       return 1
     fi
+    wizard_say "saved a copy of the previous $name definition at $backup"
   fi
 
   chmod 644 "$tmp" 2>/dev/null
   if ! mv -f "$tmp" "$path" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
-    wizard_say "cannot write into $dir, so ayeaye cannot be started for you."
+    wizard_say "cannot write into $dir, so $name cannot be started for you."
     return 1
   fi
+  # Recorded after the fact, not before it: a ledger saying a file was
+  # replaced when it was not is worse than a ledger that is a line shorter.
+  # This is the documented way to put a decision in the trail that was settled
+  # by an answer given earlier - asking to set ayeaye up - rather than now.
+  [ -n "$backup" ] && \
+    wizard_consent_record replace granted "replaced the service definition at $path"
   SERVICE_WROTE=1
   return 0
 }
@@ -444,13 +453,22 @@ _service_write_definition() {
 # from. What it will not do is install a service nobody asked for: a
 # definition that is not already there is not written.
 _service_migrate_siblings() {
-  local kind="${1:-}" name path
+  local kind="${1:-}" name path running
   for name in $(service_names); do
     [ "$name" = ayeaye ] && continue
     path="$(service_definition_path "$name" "$kind")" || continue
     [ -f "$path" ] || continue
+    running=0
+    _service_is_running "$name" && running=1
     if _service_write_definition "$name" "$kind" && [ "$SERVICE_WROTE" = 1 ]; then
       wizard_say "brought your $name definition up to date as well"
+      # And made it take effect, for the same reason ayeaye's does: a running
+      # process does not re-read the file it was started from, so a rewritten
+      # definition nobody restarts is a definition that describes something
+      # other than what is running.
+      if [ "$running" = 1 ] && _service_restart "$name" "$kind"; then
+        wizard_say "and restarted it, since it was running"
+      fi
     fi
   done
   # Never the reason a run fails: this is somebody else's service and setup is
@@ -459,12 +477,34 @@ _service_migrate_siblings() {
   return 0
 }
 
-# _service_is_running <name> - status 0 when the service manager says it is
-# already up. Quiet: this is a probe, and its output is noise.
+# _service_is_running <name> - status 0 when the service manager says the
+# service is up, or - on launchd, which has no finer answer - that it is
+# registered. Quiet: this is a probe, and its output is noise.
 _service_is_running() {
   local cmd
   cmd="$(platform_service_command "${1:-}" status)" || return 1
   eval "$cmd" >/dev/null 2>&1
+}
+
+# _service_restart <name> <kind> - make a rewritten definition take effect.
+#
+# Two platforms, two spellings of one idea. systemd stops and starts, which
+# lib/service.sh defines as the pair that leaves enablement alone. launchd has
+# no restart at all: a property list is re-read by being handed to launchd
+# again, and a label it already knows has to be booted out first or the
+# bootstrap fails outright.
+_service_restart() {
+  local name="${1:-}" kind="${2:-}" cmd path
+  if [ "$kind" = launchd ]; then
+    _service_unregister_launchd "$name"
+    path="$(service_definition_path "$name" launchd)" || return 1
+    cmd="$(platform_service_command "$name" enable "$path")" || return 1
+    _service_run "$cmd"
+    return $?
+  fi
+  cmd="$(platform_service_command "$name" stop)" && _service_run "$cmd"
+  cmd="$(platform_service_command "$name" start)" || return 1
+  _service_run "$cmd"
 }
 
 # _service_run <question-free command> - run a command this layer built, with
@@ -530,8 +570,7 @@ _service_install_systemd() {
   # whole of what "repair" means here, and it is the same code as an install.
   if [ "$running" = 1 ]; then
     if [ "$changed" = 1 ]; then
-      cmd="$(platform_service_command ayeaye stop)" && _service_run "$cmd"
-      if cmd="$(platform_service_command ayeaye start)" && _service_run "$cmd"; then
+      if _service_restart ayeaye systemd; then
         wizard_say "ayeaye was already running, so it has been restarted on the new"
         wizard_say "definition."
       else
@@ -539,9 +578,26 @@ _service_install_systemd() {
         return "$WIZARD_STAGE_FAIL"
       fi
     else
-      wizard_say "ayeaye is already set up to start when you log in, and running."
+      wizard_say "ayeaye was already running, and its definition has not changed."
     fi
     wizard_remember step.service.unit.started 1
+
+    # Running is not the same as starting at login, and stop-then-start is
+    # deliberately the pair that leaves enablement alone. A unit somebody
+    # started by hand is running and not enabled, and this stage has already
+    # promised that ayeaye will come back when they log in - so make that
+    # true rather than assume it. `enable --now` on a unit that is already
+    # both is a no-op, which is why it is safe to run unconditionally.
+    if cmd="$(platform_service_command ayeaye enable)"; then
+      if ! _service_run "$cmd"; then
+        wizard_say "ayeaye is running, but this computer would not agree to start it"
+        wizard_say "again when you log in. It will need starting by hand until that"
+        wizard_say "is sorted out."
+        wizard_say "to read its log: journalctl --user -u ayeaye -f"
+        _service_linger_hint
+        return "$WIZARD_STAGE_PENDING"
+      fi
+    fi
   else
     _service_enable systemd || return $?
   fi
@@ -601,16 +657,19 @@ _service_install_launchd() {
   # cannot" to reload.
   if [ "$registered" = 1 ]; then
     if [ "$changed" = 1 ]; then
-      _service_unregister_launchd ayeaye
-      if cmd="$(platform_service_command ayeaye enable "$path")" && _service_run "$cmd"; then
-        wizard_say "ayeaye was already running, so it has been restarted on the new"
-        wizard_say "definition."
+      if _service_restart ayeaye launchd; then
+        wizard_say "ayeaye was already set up to start when you log in, so it has"
+        wizard_say "been restarted on the new definition."
       else
-        wizard_say "ayeaye was already running and would not start again."
+        wizard_say "ayeaye was already registered and would not start again."
         return "$WIZARD_STAGE_FAIL"
       fi
     else
-      wizard_say "ayeaye is already set up to start when you log in, and running."
+      # "Registered", and deliberately not "running": launchctl print answers
+      # for a job that is loaded, which includes one that has crashed or
+      # exited, and there is no cheap way from here to tell those apart.
+      # Claiming it is up is the health check's business, one step later.
+      wizard_say "ayeaye is already set up to start when you log in."
     fi
     wizard_remember step.service.unit.started 1
   else
@@ -641,17 +700,16 @@ _service_unregister_launchd() {
 # ------------------------------------------------------- starting it, or not
 
 _service_enable() {
-  local kind="${1:-}" cmd path uid
+  local kind="${1:-}" cmd path uid=""
   path="$(service_definition_path ayeaye "$kind")"
 
-  if [ "$WIZARD_INTERACTIVE" = 1 ] && wizard_confirm "enable and start it now?" "y"; then
+  if [ "${WIZARD_INTERACTIVE:-1}" = 1 ] && wizard_confirm "enable and start it now?" "y"; then
     [ "$kind" = launchd ] && _service_unregister_launchd ayeaye
     if ! cmd="$(platform_service_command ayeaye enable "$path")"; then
       wizard_say "this computer cannot be asked to start ayeaye for you."
       return "$WIZARD_STAGE_FAIL"
     fi
     if _service_run "$cmd"; then
-      STARTED=1
       wizard_remember step.service.unit.started 1
       if [ "$kind" = systemd ]; then
         wizard_say "started. status: systemctl --user status ayeaye"
@@ -703,6 +761,12 @@ _service_manual_fallback() {
 # business, nothing outstanding, and a run that ends successfully.
 service_step() {
   local kind
+  # Nothing has been started yet, and saying so first makes that structural
+  # rather than a property of having remembered to say it on every one of the
+  # paths below - including the ones that give up partway. A run that fails
+  # after the service was stopped must not leave a "1" from last week for the
+  # health check to believe.
+  wizard_remember step.service.unit.started 0
   kind="$(platform_service_manager)"
 
   if [ "${NO_SYSTEMD:-0}" = 1 ]; then

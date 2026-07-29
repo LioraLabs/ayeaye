@@ -240,7 +240,7 @@ test_a_running_service_is_restarted_only_when_its_definition_changed() {
   run_install --defaults
   assert_not_contains "$(stub_calls systemctl)" "--user stop"
   assert_not_contains "$(stub_calls systemctl)" "--user start"
-  assert_contains "$RUN_STDOUT" "ayeaye is already set up to start when you log in, and running."
+  assert_contains "$RUN_STDOUT" "ayeaye was already running, and its definition has not changed."
 }
 
 test_a_running_service_picks_up_a_definition_that_did_change() {
@@ -267,4 +267,64 @@ test_a_repair_asks_nothing_about_starting_something_already_started() {
   run_install --defaults
   assert_not_contains "$RUN_OUTPUT" "enable and start it now?" \
     "it is already running; asking would be asking about nothing"
+}
+
+test_a_service_running_but_not_enabled_is_still_enabled() {
+  # `systemctl status` answers for a unit somebody started by hand, which is
+  # running and will not come back at the next login. stop-then-start is
+  # deliberately the pair that leaves enablement alone, so a repair built only
+  # out of those would leave that machine exactly as it found it while stage
+  # four had already promised ayeaye would start at login.
+  _hard_deps_present
+  _already_running
+  run_install --defaults
+  assert_status 0 "$RUN_STATUS"
+  assert_stub_called_with systemctl "systemctl --user enable --now ayeaye.service" \
+    "running is not the same as starting when you log in"
+  assert_file_contains "$XDG_STATE_HOME/ayeaye/setup-state" "step.service.unit.started=1"
+}
+
+test_a_running_service_that_cannot_be_enabled_says_so_and_is_not_called_done() {
+  _hard_deps_present
+  stub_command systemctl --exit 1 --stderr "unknown systemctl invocation"
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user daemon-reload' --exit 0
+  stub_when systemctl '--user status *' --exit 0 --stdout "active (running)"
+  stub_when systemctl '--user stop *' --exit 0
+  stub_when systemctl '--user start *' --exit 0
+  stub_when systemctl '--user enable --now *' --exit 1 --stderr "Failed to enable unit"
+  run_install --defaults
+  assert_status 0 "$RUN_STATUS" "the service is running; this is not a failed install"
+  assert_contains "$RUN_STDOUT" "would not agree to start it"
+  assert_contains "$RUN_STDOUT" "not finished, and worth coming back to:"
+  assert_file_contains "$XDG_STATE_HOME/ayeaye/setup-state" "stage.service=pending"
+}
+
+test_a_running_voice_agent_is_restarted_when_its_definition_changes() {
+  # The same "a running process does not re-read the file it was started
+  # from" property as for ayeaye. Rewriting somebody's voice-agent unit and
+  # leaving the old process running would make the file on disk a description
+  # of something that is not happening.
+  _hard_deps_present
+  _already_running
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+  printf '[Service]\nExecStart=/where/it/used/to/be/bin/voice-agent\n' \
+    > "$XDG_CONFIG_HOME/systemd/user/voice-agent.service"
+  run_install --defaults
+  assert_stub_called_with systemctl "systemctl --user stop voice-agent.service"
+  assert_stub_called_with systemctl "systemctl --user start voice-agent.service"
+  assert_contains "$RUN_STDOUT" "and restarted it, since it was running"
+}
+
+test_a_voice_agent_that_is_not_running_is_updated_and_left_stopped() {
+  _hard_deps_present
+  _systemd_session
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+  printf '[Service]\nExecStart=/where/it/used/to/be/bin/voice-agent\n' \
+    > "$XDG_CONFIG_HOME/systemd/user/voice-agent.service"
+  run_install --defaults
+  assert_contains "$RUN_STDOUT" "brought your voice-agent definition up to date as well"
+  assert_not_contains "$RUN_STDOUT" "and restarted it"
+  assert_not_contains "$(stub_calls systemctl)" "start voice-agent" \
+    "setup does not start somebody's voice agent for them"
 }

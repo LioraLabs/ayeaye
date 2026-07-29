@@ -42,7 +42,17 @@ case "$*" in
     [ -f "$HOME/launchctl-registered" ] || exit 1
     printf 'state = running\n'
     ;;
-  bootstrap*) : > "$HOME/launchctl-registered" ;;
+  bootstrap*)
+    # Real launchd refuses to bootstrap a label it already knows, and the
+    # refusal is what makes the bootout-before-bootstrap ordering load
+    # bearing. A stub that always succeeded would let that ordering be
+    # reversed with every test still green.
+    if [ -f "$HOME/launchctl-registered" ]; then
+      printf 'Bootstrap failed: 5: Input/output error\n' >&2
+      exit 5
+    fi
+    : > "$HOME/launchctl-registered"
+    ;;
   bootout*)   rm -f "$HOME/launchctl-registered" ;;
 esac
 exit 0
@@ -182,12 +192,41 @@ test_a_changed_agent_is_booted_out_before_it_is_bootstrapped_again() {
   _already_registered
   run_install --defaults
   assert_status 0 "$RUN_STATUS"
-  local calls
+  local calls first
   calls="$(stub_calls launchctl)"
   assert_contains "$calls" "bootout gui/$(_uid)/dev.ayeaye"
   assert_contains "$calls" "bootstrap gui/$(_uid) $(_plist)"
-  assert_contains "$RUN_STDOUT" "ayeaye was already running, so it has been restarted"
+  # Asserting that both ran is not enough, and asserting it was how this test
+  # passed while the two were the wrong way round. It is the order that is
+  # load bearing: bootstrapping first is what fails on a real Mac.
+  first="$(printf '%s\n' "$calls" | grep -E 'bootout|bootstrap' | head -1)"
+  assert_contains "$first" "bootout" \
+    "the first of the two has to be the bootout"
+  assert_contains "$RUN_STDOUT" "been restarted on the new definition."
   assert_file_contains "$(_state)" "step.service.unit.started=1"
+}
+
+test_a_bootstrap_that_fails_is_reported_and_not_called_a_restart() {
+  # The other half of the ordering: if the bootstrap does fail, the step must
+  # say so rather than print "restarted" over the top of it. Without this,
+  # getting the order wrong would be invisible even to the test above.
+  _hard_deps_present
+  _mac_with_launchd
+  _already_registered
+  stub_script launchctl <<'SH'
+case "$*" in
+  print*)    printf 'state = running\n' ;;
+  bootstrap*) printf 'Bootstrap failed: 5: Input/output error\n' >&2; exit 5 ;;
+esac
+exit 0
+SH
+  run_install --defaults
+  assert_ne 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "ayeaye was already registered and would not start again."
+  assert_contains "$RUN_STDERR" "Bootstrap failed" "launchd's own words reach the reader"
+  assert_not_contains "$RUN_STDOUT" "been restarted on the new definition."
+  assert_file_contains "$(_state)" "step.service.unit.started=0" \
+    "nothing was started, and the health check must not be told otherwise"
 }
 
 test_an_unchanged_agent_that_is_already_running_is_left_entirely_alone() {
@@ -202,7 +241,7 @@ test_an_unchanged_agent_that_is_already_running_is_left_entirely_alone() {
   assert_status 0 "$RUN_STATUS"
   assert_not_contains "$(stub_calls launchctl)" "bootout"
   assert_not_contains "$(stub_calls launchctl)" "bootstrap"
-  assert_contains "$RUN_STDOUT" "ayeaye is already set up to start when you log in, and running."
+  assert_contains "$RUN_STDOUT" "ayeaye is already set up to start when you log in."
 }
 
 test_a_hand_edited_agent_is_kept_before_it_is_replaced() {
