@@ -37,15 +37,12 @@ _PLATFORM_PRIVILEGE="${_PLATFORM_PRIVILEGE:-}"
 
 # ------------------------------------------------------------------ privilege
 
-# Filled by platform_detect. `id -u` rather than $EUID because a test has to
-# be able to answer it, and because $EUID is bash-only.
+# Filled by platform_detect, from the uid it has already worked out. `id -u`
+# rather than $EUID because a test has to be able to answer it, and because
+# $EUID is bash-only.
 _platform_detect_privilege() {
-  local uid=""
   _PLATFORM_PRIVILEGE="none"
-  if command -v id >/dev/null 2>&1; then
-    uid="$(id -u 2>/dev/null)" || uid=""
-  fi
-  if [ "$uid" = "0" ]; then
+  if [ "$_PLATFORM_UID" = "0" ]; then
     _PLATFORM_PRIVILEGE="root"
   elif command -v sudo >/dev/null 2>&1; then
     _PLATFORM_PRIVILEGE="sudo"

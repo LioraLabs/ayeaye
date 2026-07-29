@@ -25,6 +25,7 @@
 #                             empty on a rolling release
 #   platform_pretty           the human name: "Ubuntu 24.04.1 LTS", "macOS 15.1"
 #   platform_arch             x86_64 | arm64 | the raw uname -m | unknown
+#   platform_uid              the effective user id, or empty if id is absent
 #   platform_pkg_manager      apt-get | dnf | yum | pacman | zypper | brew | none
 #   platform_service_manager  systemd | launchd | none
 #   platform_brew_prefix      /opt/homebrew, /usr/local, or empty
@@ -93,6 +94,7 @@ _PLATFORM_PKG_MANAGER="${_PLATFORM_PKG_MANAGER:-}"
 _PLATFORM_SERVICE_MANAGER="${_PLATFORM_SERVICE_MANAGER:-}"
 _PLATFORM_BREW_PREFIX="${_PLATFORM_BREW_PREFIX:-}"
 _PLATFORM_IMMUTABLE="${_PLATFORM_IMMUTABLE:-0}"
+_PLATFORM_UID="${_PLATFORM_UID:-}"
 
 # Scratch for the two string helpers below, which return through it rather
 # than through stdout. Initialised so that `set -u` has nothing to complain
@@ -298,6 +300,7 @@ platform_reset() {
   _PLATFORM_SERVICE_MANAGER=""
   _PLATFORM_BREW_PREFIX=""
   _PLATFORM_IMMUTABLE=0
+  _PLATFORM_UID=""
   _PLATFORM_PRIVILEGE=""
 }
 
@@ -313,6 +316,13 @@ platform_detect() {
     machine="$(uname -m 2>/dev/null)" || machine=""
   fi
   file="$(_platform_os_release_path)"
+
+  # The uid, once. launchd addresses a domain by it and the package adapter
+  # decides about sudo by it, so it belongs here rather than in either.
+  _PLATFORM_UID=""
+  if command -v id >/dev/null 2>&1; then
+    _PLATFORM_UID="$(id -u 2>/dev/null)" || _PLATFORM_UID=""
+  fi
 
   case "$machine" in
     x86_64|amd64|x64)  _PLATFORM_ARCH="x86_64" ;;
@@ -490,6 +500,7 @@ platform_id()              { platform_detect; printf '%s' "$_PLATFORM_ID"; }
 platform_version()         { platform_detect; printf '%s' "$_PLATFORM_VERSION"; }
 platform_pretty()          { platform_detect; printf '%s' "$_PLATFORM_PRETTY"; }
 platform_arch()            { platform_detect; printf '%s' "$_PLATFORM_ARCH"; }
+platform_uid()             { platform_detect; printf '%s' "$_PLATFORM_UID"; }
 platform_pkg_manager()     { platform_detect; printf '%s' "$_PLATFORM_PKG_MANAGER"; }
 platform_service_manager() { platform_detect; printf '%s' "$_PLATFORM_SERVICE_MANAGER"; }
 platform_brew_prefix()     { platform_detect; printf '%s' "$_PLATFORM_BREW_PREFIX"; }
