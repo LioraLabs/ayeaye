@@ -72,6 +72,7 @@ fi
 GUARDED_PATHS="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/env
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye.service
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-agent.service
+${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/whisper-server.service
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/projects.json
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-state
@@ -81,6 +82,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/backups
 $HOME/.local/bin/ayeaye
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
 $HOME/Library/LaunchAgents/dev.voice-agent.plist
+$HOME/Library/LaunchAgents/dev.whisper-server.plist
 $HOME/Library/Logs/ayeaye
 $HOME/.bashrc
 $HOME/.zshrc

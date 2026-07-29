@@ -44,6 +44,9 @@ _load_service_lib() {
   WIZARD_STATE_DIR="$XDG_STATE_HOME/ayeaye"
   UNIT_DIR="$XDG_CONFIG_HOME/systemd/user"
   NO_SYSTEMD=0
+  # A real whisper binary is not needed to say what a definition would
+  # contain, and pinning the path is what makes the golden file stable.
+  SERVICE_WHISPER_BIN="$TEST_TMPDIR/whisper/whisper-server"
   . "$REPO_ROOT/lib/wizard.sh"
   local stage
   for stage in welcome detect report configure plan install service finish; do
@@ -61,6 +64,7 @@ _golden() {
   text="${text//@CONF@/$XDG_CONFIG_HOME}"
   text="${text//@STATE@/$XDG_STATE_HOME}"
   text="${text//@LOGS@/$HOME/Library/Logs/ayeaye}"
+  text="${text//@WHISPER@/$SERVICE_WHISPER_BIN}"
   printf '%s\n' "$text"
 }
 
@@ -192,13 +196,16 @@ test_no_setting_from_the_environment_file_is_copied_into_a_definition() {
   _env_with_findable_settings
   _load_service_lib
   local text name fmt
-  for name in ayeaye voice-agent; do
+  for name in ayeaye voice-agent whisper-server; do
     for fmt in systemd launchd; do
       text="$(service_render_$fmt "$name")"
       assert_not_contains "$text" "10.11.12.13" "$name/$fmt leaked AYEAYE_BIND"
       assert_not_contains "$text" "54321" "$name/$fmt leaked AYEAYE_PORT"
       assert_not_contains "$text" "findable.example.org" "$name/$fmt leaked AYEAYE_ALLOWED_HOSTS"
       assert_not_contains "$text" "ntfy.example.org" "$name/$fmt leaked VOICE_NTFY_URL"
+      assert_not_contains "$text" "59999" "$name/$fmt leaked VOICE_WHISPER_SERVER"
+      assert_not_contains "$text" "findable-model" "$name/$fmt leaked VOICE_WHISPER_MODEL"
+      assert_not_contains "$text" "threads 99" "$name/$fmt leaked VOICE_WHISPER_THREADS"
     done
   done
 }
@@ -206,7 +213,7 @@ test_no_setting_from_the_environment_file_is_copied_into_a_definition() {
 test_no_placeholder_survives_either_renderer() {
   _load_service_lib
   local leftovers name fmt
-  for name in ayeaye voice-agent; do
+  for name in ayeaye voice-agent whisper-server; do
     for fmt in systemd launchd; do
       leftovers="$(service_render_$fmt "$name" | grep -o '@[A-Za-z_]*@' | sort -u)"
       assert_eq "" "$leftovers" "$name/$fmt still has an unsubstituted placeholder"
@@ -384,4 +391,80 @@ test_the_step_file_registers_where_it_says_it_does() {
   # that this file provides the function that step hands over to.
   command -v service_step >/dev/null
   assert_status 0 "$?"
+}
+
+# ------------------------------------------------------------------ whisper
+
+test_the_whisper_unit_is_what_the_golden_file_says() {
+  _load_service_lib
+  assert_eq "$(_golden whisper-systemd)" "$(service_render_systemd whisper-server)"
+}
+
+test_the_whisper_agent_is_what_the_golden_file_says() {
+  _load_service_lib
+  assert_eq "$(_golden whisper-launchd)" "$(service_render_launchd whisper-server)"
+}
+
+test_the_program_the_whisper_service_runs_is_valid_posix_shell() {
+  require_host_command sh
+  _load_service_lib
+  printf '%s\n' "$_SERVICE_WHISPER_SCRIPT" > "$TEST_TMPDIR/whisper.sh"
+  sh -n "$TEST_TMPDIR/whisper.sh"
+  assert_status 0 "$?" "the whole service is one line of shell; it has to parse"
+}
+
+test_the_whisper_service_takes_its_settings_from_the_settings_file() {
+  # The property the design turns on, exercised rather than asserted about:
+  # run the program the definition names, with a real settings file and a
+  # stand-in for whisper-server, and look at the arguments that arrive.
+  _load_service_lib
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye" "$TEST_TMPDIR/whisper"
+  cat > "$XDG_CONFIG_HOME/ayeaye/env" <<'ENV'
+# a comment, which is not a setting
+VOICE_WHISPER_SERVER=10.0.0.5:9110
+VOICE_WHISPER_MODEL="/models/ggml-large-v3.bin"
+VOICE_WHISPER_THREADS=16
+ENV
+  cat > "$TEST_TMPDIR/whisper/whisper-server" <<'BIN'
+#!/bin/sh
+printf 'ARGS:'; for a in "$@"; do printf ' [%s]' "$a"; done; echo
+BIN
+  chmod +x "$TEST_TMPDIR/whisper/whisper-server"
+  local out
+  out="$(sh -c "$_SERVICE_WHISPER_SCRIPT" ayeaye-whisper \
+    "$XDG_CONFIG_HOME/ayeaye/env" "$TEST_TMPDIR/whisper/whisper-server" 2>&1)"
+  assert_contains "$out" "[--model] [/models/ggml-large-v3.bin]" \
+    "the quotes around a value are stripped, as systemd would strip them"
+  assert_contains "$out" "[--host] [10.0.0.5] [--port] [9110]" \
+    "one setting holds host and port, and the service has to split it"
+  assert_contains "$out" "[--threads] [16]"
+  assert_contains "$out" "[--language] [en]"
+}
+
+test_the_whisper_service_falls_back_rather_than_starting_wrong() {
+  _load_service_lib
+  mkdir -p "$XDG_CONFIG_HOME/ayeaye" "$TEST_TMPDIR/whisper"
+  printf 'VOICE_WHISPER_MODEL=/m.bin\n' > "$XDG_CONFIG_HOME/ayeaye/env"
+  cat > "$TEST_TMPDIR/whisper/whisper-server" <<'BIN'
+#!/bin/sh
+printf 'ARGS:'; for a in "$@"; do printf ' [%s]' "$a"; done; echo
+BIN
+  chmod +x "$TEST_TMPDIR/whisper/whisper-server"
+  local out
+  out="$(sh -c "$_SERVICE_WHISPER_SCRIPT" ayeaye-whisper \
+    "$XDG_CONFIG_HOME/ayeaye/env" "$TEST_TMPDIR/whisper/whisper-server" 2>&1)"
+  assert_contains "$out" "[--host] [127.0.0.1] [--port] [8910]" \
+    "the documented defaults, and the same ones the app probes"
+  assert_contains "$out" "[--threads] [8]"
+}
+
+test_a_whisper_service_with_no_model_says_so_and_does_not_start() {
+  _load_service_lib
+  local out status
+  out="$(sh -c "$_SERVICE_WHISPER_SCRIPT" ayeaye-whisper \
+    "$TEST_TMPDIR/no-such-env" "$TEST_TMPDIR/whisper-server" 2>&1)"
+  status=$?
+  assert_status 78 "$status" \
+    "EX_CONFIG: it is unconfigured, which is not the same as broken"
+  assert_contains "$out" "set VOICE_WHISPER_MODEL in"
 }

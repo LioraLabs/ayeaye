@@ -89,6 +89,29 @@ _service_spec() {
         *)     return 2 ;;
       esac
       ;;
+    whisper-server)
+      case "$field" in
+        title) printf 'whisper.cpp server, kept resident for dictation' ;;
+        after) printf '' ;;
+        argv)
+          # Not the binary directly. whisper-server takes its model, its
+          # address and its thread count as command-line arguments, and
+          # baking this machine's values into the definition would put the
+          # settings in two places - the one thing every service here is
+          # arranged to avoid. So the program is a short shell that reads the
+          # settings file at the moment the service starts, and the port is
+          # changed by editing that file and restarting, exactly as it is for
+          # ayeaye.
+          printf '%s\n' "$SERVICE_SH"
+          printf -- '-c\n'
+          printf '%s\n' "$_SERVICE_WHISPER_SCRIPT"
+          printf 'ayeaye-whisper\n'
+          printf '%s\n' "$(_service_env_file)"
+          printf '%s\n' "$(_service_whisper_bin)"
+          ;;
+        *)     return 2 ;;
+      esac
+      ;;
     *)
       return 2
       ;;
@@ -98,8 +121,40 @@ _service_spec() {
 
 # service_names - every service this file knows how to write down.
 service_names() {
-  printf 'ayeaye\nvoice-agent\n'
+  printf 'ayeaye\nvoice-agent\nwhisper-server\n'
 }
+
+# Where whisper.cpp's server is on this machine, if it is anywhere.
+# Overridable so a test can pin what a definition would say without needing a
+# real binary.
+_service_whisper_bin() {
+  if [ -n "${SERVICE_WHISPER_BIN:-}" ]; then
+    printf '%s' "$SERVICE_WHISPER_BIN"
+  else
+    command -v whisper-server 2>/dev/null || true
+  fi
+}
+
+SERVICE_SH="${SERVICE_SH:-/bin/sh}"
+
+# Set by the step: 1 when a whisper definition was just written, 0 when one was
+# already correct, empty when there is none. Given a value at file scope so
+# that reading it is safe under `set -u` whatever path the step took.
+_SERVICE_WHISPER_READY="${_SERVICE_WHISPER_READY:-}"
+
+# The program the whisper service really runs: read the settings file, then
+# become whisper-server with what it said.
+#
+# Written out here rather than shipped as a script of its own, because a
+# generated definition that depends on a second generated file has twice as
+# many ways to be half-installed. Read with a `case` loop rather than by
+# sourcing, because sourcing would execute whatever is in the file: systemd's
+# EnvironmentFile does not execute its input, and neither does this, so a
+# value means the same thing on both platforms.
+#
+# 78 is EX_CONFIG, which says to anybody reading the log that the service is
+# not broken, it is unconfigured.
+_SERVICE_WHISPER_SCRIPT='E="$1"; B="$2"; M=""; S=""; T=""; if [ -r "$E" ]; then while IFS= read -r L || [ -n "$L" ]; do case "$L" in VOICE_WHISPER_MODEL=*) M="${L#*=}" ;; VOICE_WHISPER_SERVER=*) S="${L#*=}" ;; VOICE_WHISPER_THREADS=*) T="${L#*=}" ;; esac; done < "$E"; fi; M="${M#\"}"; M="${M%\"}"; S="${S#\"}"; S="${S%\"}"; T="${T#\"}"; T="${T%\"}"; [ -n "$S" ] || S=127.0.0.1:8910; [ -n "$T" ] || T=8; if [ -z "$M" ]; then echo "set VOICE_WHISPER_MODEL in $E, then restart this service" >&2; exit 78; fi; exec "$B" --model "$M" --host "${S%%:*}" --port "${S##*:}" --threads "$T" --language en'
 
 # ------------------------------------------------------------------- quoting
 #
@@ -602,6 +657,7 @@ _service_install_systemd() {
     _service_enable systemd || return $?
   fi
 
+  _service_enable_whisper systemd
   wizard_say "to read its log: journalctl --user -u ayeaye -f"
   _service_linger_hint
   return "$WIZARD_STAGE_OK"
@@ -676,6 +732,7 @@ _service_install_launchd() {
     _service_enable launchd || return $?
   fi
 
+  _service_enable_whisper launchd
   wizard_say "to read its log: tail -f $logs/ayeaye.log"
   wizard_say "to remove it later: launchctl bootout gui/$(platform_uid)/$(_service_label ayeaye),"
   wizard_say "then delete $path"
@@ -767,6 +824,7 @@ service_step() {
   # after the service was stopped must not leave a "1" from last week for the
   # health check to believe.
   wizard_remember step.service.unit.started 0
+  _SERVICE_WHISPER_READY=""
   kind="$(platform_service_manager)"
 
   if [ "${NO_SYSTEMD:-0}" = 1 ]; then
@@ -796,8 +854,67 @@ service_step() {
   esac
 }
 
-# A seam for the ticket that owns voice: nothing is generated for whisper
-# until that lands, and saying nothing is better than saying something wrong.
+# _service_install_whisper <kind> - the transcription service, when there is
+# one to install.
+#
+# Only when this machine really has whisper.cpp's server and the settings file
+# really names a model. A definition pointing at a binary that is not there
+# would fail at every login and leave a red line in somebody's status output
+# forever, which is a worse answer than not writing one.
+#
+# It is never enabled without being asked, and an unattended run does not
+# enable it: whether a GPU-resident transcription server runs all the time is
+# a decision, not a detail.
 _service_install_whisper() {
+  local kind="${1:-}" bin model path cmd
+  bin="$(_service_whisper_bin)"
+  [ -n "$bin" ] || return 0
+
+  model="$(wizard_env_get "$(_service_env_file)" VOICE_WHISPER_MODEL "")"
+  if [ -z "$model" ]; then
+    wizard_say "this computer has whisper, but your settings do not say where the"
+    wizard_say "model is, so it has not been set up to start on its own. Put its"
+    wizard_say "location in VOICE_WHISPER_MODEL in $(_service_env_file), then run"
+    wizard_say "this again."
+    return 0
+  fi
+
+  if [ "$kind" = systemd ] && ! _service_systemd_can_express "$bin"; then
+    wizard_detail "whisper-server is at a path systemd cannot name: $bin"
+    return 0
+  fi
+
+  _service_write_definition whisper-server "$kind" || return 0
+  path="$(service_definition_path whisper-server "$kind")"
+  wizard_say "installed $path"
+  wizard_say "(it reads the model, the address and the thread count from your"
+  wizard_say "settings when it starts, so changing them means editing that file"
+  wizard_say "and restarting it)"
+
+  _SERVICE_WHISPER_READY="$SERVICE_WROTE"
+  return 0
+}
+
+# _service_enable_whisper <kind> - asked after ayeaye's own question, not
+# before it. Whichever order the files are written in, the main thing setup
+# was asked for is the thing a person should be asked about first.
+_service_enable_whisper() {
+  local kind="${1:-}" path cmd
+  [ -n "${_SERVICE_WHISPER_READY:-}" ] || return 0
+  path="$(service_definition_path whisper-server "$kind")" || return 0
+  [ -f "$path" ] || return 0
+
+  if _service_is_running whisper-server; then
+    if [ "$_SERVICE_WHISPER_READY" = 1 ] && _service_restart whisper-server "$kind"; then
+      wizard_say "and restarted whisper, since it was running"
+    fi
+    return 0
+  fi
+  if [ "${WIZARD_INTERACTIVE:-1}" = 1 ] \
+     && wizard_confirm "keep the transcription model loaded and ready?" "y"; then
+    if cmd="$(platform_service_command whisper-server enable "$path")"; then
+      _service_run "$cmd" || wizard_say "whisper is installed but would not start."
+    fi
+  fi
   return 0
 }
