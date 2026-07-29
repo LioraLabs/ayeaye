@@ -328,5 +328,38 @@ still satisfy a bare "contains" check.
 | `tests/lib/fixture.sh` | fixture lookup |
 | `tests/lib/script.sh` | `run_script`, and the bash side of the pty driver |
 | `tests/lib/pty_run.py` | the pty driver itself |
+| `tests/lib/project_probe.py` | drives `bin/ayeaye`'s project discovery from bash |
 | `tests/cases/harness_*_test.sh` | the harness testing itself |
 | `tests/cases/install_*_test.sh` | what `install.sh` does today |
+| `tests/cases/projects_*_test.sh` | how the project picker finds and ranks projects |
+
+## Testing the Python
+
+`bin/ayeaye` is Python and this suite is bash, so something has to sit
+between them: `tests/lib/project_probe.py`. It imports the code under test,
+runs one thing, and prints `key=value` lines for a case file to assert on.
+
+The reason it exists rather than a separate Python test runner is that the
+properties worth pinning are invisible from outside an HTTP request. Which
+bound ended a search, how many directories it really listed, whether a
+superseded search delivered anything — none of that is in the JSON a client
+sees, and a test that cannot see them can only assert that something
+plausible came back. A probe keeps one command running everything while
+still reaching inside.
+
+A case file drives it through `run_script`, which needs the interpreter the
+sandbox deliberately withholds:
+
+```sh
+setup() {
+  require_host_command python3     # skip where there is none, e.g. bash:3.2
+  stub_real python3
+}
+
+probe() { run_script "$TESTS_DIR/lib/project_probe.py" "$@"; }
+```
+
+Build the trees such a test walks inside `$TEST_TMPDIR` or the sandbox
+`$HOME`, never the real one — `probe maketree "$HOME/tree" --width 6 --depth 5`
+makes nine thousand directories in about a second, which is enough for a
+bound to be worth asserting on.

@@ -170,7 +170,10 @@ it is off.
 In this tier the pane list, transcripts, prompt answering, spawning agents
 and typed input all work with no ffmpeg, no whisper.cpp and no ollama
 installed. The talk button greys out with "voice not configured".
-Optional: `zoxide`, for the project picker when spawning new agents.
+The project picker needs nothing installed either: it searches below your
+home directory itself, offers Git repositories first, and learns from the
+directories you actually start agents in. Tune it, if you ever need to,
+with the `AYEAYE_PROJECT_*` settings in `~/.config/ayeaye/env`.
 
 ### Tier 2: push notifications
 
@@ -380,8 +383,8 @@ away legitimately short commands like "run the tests".
 `/board` is a read-mostly view over cliban: projects, milestones with
 progress, and issues grouped by status. Tap a
 ticket and its markdown body renders in place; tap **run** and the ticket is
-handed to a fresh agent: pick a directory (same zoxide picker as the main
-page) and the agent starts with an opening prompt pointing it at the issue:
+handed to a fresh agent: pick a directory (the same project picker as the
+main page) and the agent starts with an opening prompt pointing it at the issue:
 `cliban issue show` for the spec, `log`/`tick`/`mv` to keep the ticket
 honest while it works.
 

@@ -875,16 +875,24 @@ async function answer(pane, opt){
 }
 
 // ---- new agent -------------------------------------------------------------
-// Mirrors the ftz fish function: pick a directory from zoxide, derive the
-// session name from it, and reuse the session if it already exists -- a new
-// window rather than a second session for the same project.
+// Mirrors the ftz fish function: pick a directory the server found, derive
+// the session name from it, and reuse the session if it already exists -- a
+// new window rather than a second session for the same project.
 let agent = 'claude';
+
+// Every keystroke starts a search and the server abandons the one before it,
+// so replies can arrive out of order. Only the newest request may draw: a
+// late reply to a query the user has already typed past would otherwise
+// repaint the list with an answer to a question nobody is asking.
+let pqSeq = 0;
 
 async function loadProjects(){
   const q = $('#pq').value.trim();
+  const seq = ++pqSeq;
   let d;
   try{ d = await (await fetch('/api/projects?q='+encodeURIComponent(q))).json(); }
   catch(e){ return; }
+  if(seq !== pqSeq) return;
   const box = $('#plist'); box.innerHTML = '';
   if(!d || !Array.isArray(d.projects)) return;
   d.projects.forEach(p=>{

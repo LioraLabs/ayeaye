@@ -628,11 +628,12 @@ def live_sessions():
 
 
 # --------------------------------------------------------- finding projects
-# The picker used to read zoxide's database, which meant a first-time user had
-# to install and then train a second tool before "+ new agent" did anything at
-# all. It walks the filesystem itself now. The whole design problem is that
-# this happens while someone types on a phone, so every part of the walk is
-# bounded and the bounds are the interesting behaviour.
+# The candidate list used to come from a separate directory-frecency tool,
+# which a first-time user had neither installed nor trained -- so "+ new
+# agent" did nothing at all until they had learned about and populated a
+# second program. It walks the filesystem itself now. The whole design
+# problem is that this happens while someone types on a phone, so every part
+# of the walk is bounded and the bounds are the interesting behaviour.
 
 # Where to look. Colon separated, ~ expanded. A root is scanned whatever it is
 # called, which is also the escape hatch for a directory the exclusions below
@@ -770,11 +771,11 @@ def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
 
 
 # ------------------------------------------------------------- pick history
-# What zoxide was really providing was not a directory list -- the filesystem
-# already has one -- but a record of which directories you actually use. So
-# AyeAye keeps that record itself, in its own state directory, updated
-# whenever an agent is started somewhere. No second tool, and nothing to
-# train: the picker gets better because you used it.
+# What the old frecency tool was really providing was not a directory list --
+# the filesystem already has one -- but a record of which directories you
+# actually use. So AyeAye keeps that record itself, in its own state
+# directory, updated whenever an agent is started somewhere. No second tool
+# and nothing to train: the picker gets better because you used it.
 _RECENTS_FILE = os.path.join(_state_dir(), "projects.json")
 _RECENTS_MAX = 200             # a ranking signal, not a history file
 _RECENTS_HALF_LIFE = 14.0      # days before a pick counts for half

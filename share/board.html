@@ -714,9 +714,9 @@ function hideTicket(){
 }
 
 // ---- run it ----------------------------------------------------------------
-// Spawning reuses the main page's flow: pick a directory from zoxide, the
-// server derives the tmux session. The only addition is an opening prompt
-// pointing the agent at this ticket.
+// Spawning reuses the main page's flow: pick a directory the server found,
+// the server derives the tmux session. The only addition is an opening
+// prompt pointing the agent at this ticket.
 function runPrompt(t){
   let p = 'Work on cliban issue '+t.key+': "'+t.title+'". '+
     'Run `cliban issue show '+t.key+'` for the full spec and plan. '+
