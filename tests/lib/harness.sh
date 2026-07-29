@@ -19,6 +19,10 @@
 
 # shellcheck source=tests/lib/assert.sh
 . "$HARNESS_LIB/assert.sh"
+# shellcheck source=tests/lib/fixture.sh
+. "$HARNESS_LIB/fixture.sh"
+# shellcheck source=tests/lib/stub.sh
+. "$HARNESS_LIB/stub.sh"
 
 # Build the sandbox and redirect the environment into it. Called by the runner.
 harness_begin() {
@@ -53,6 +57,15 @@ harness_begin() {
   TERM=dumb
   export LC_ALL LANG TERM
   unset CDPATH
+
+  # Harness infrastructure that happens to need an interpreter resolves it
+  # from the host before PATH is narrowed, so that the code under test can
+  # still be told python3 does not exist.
+  HARNESS_PYTHON="$(command -v python3 2>/dev/null || true)"
+  export HARNESS_PYTHON
+
+  # PATH becomes exactly $STUB_BIN from here on; see lib/stub.sh.
+  stub_begin
 }
 
 # harness_scrub_env <prefix>... - unset every environment variable whose name
