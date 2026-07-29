@@ -656,6 +656,23 @@ step_detect_needs() {
 
 # ====================================================== 3. what it can do
 
+# _have_transcriber - is there anything on this computer that turns speech
+# into words?
+#
+# One question, asked from one list. whisper.cpp renamed its binaries and both
+# names are still in the world, so a check that spells one of them refuses a
+# machine that transcribes perfectly - which is exactly how bin/ayeaye's talk
+# button and bin/voice-dictate's pipeline came to disagree about the same
+# program. The list lives in lib/steps/20-hardware.sh and is borrowed here
+# rather than repeated, with a fallback for a file sourced on its own.
+_have_transcriber() {
+  local name
+  for name in ${_HW_WHISPER_COMMANDS:-whisper-server whisper-cli whisper-cpp whisper}; do
+    command -v "$name" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 step_report() {
   local dep voice_missing="" transcriber=0
   if ! command -v tailscale >/dev/null 2>&1; then
@@ -672,17 +689,15 @@ step_report() {
   wizard_blank
   wizard_say "What that means for you:"
   wizard_say "  - reading and typing to your agents from the phone: yes, always."
-  if command -v ffmpeg >/dev/null 2>&1; then
-    if command -v whisper-server >/dev/null 2>&1 \
-       || command -v whisper-cpp >/dev/null 2>&1; then
-      transcriber=1
-    fi
+  if command -v ffmpeg >/dev/null 2>&1 && _have_transcriber; then
+    transcriber=1
   fi
   if [ "$transcriber" = 1 ]; then
     wizard_say "  - talking to them out loud: yes, this computer can transcribe."
   else
-    wizard_say "  - talking to them out loud: not yet. ayeaye works without it and"
-    wizard_say "    picks it up by itself once the pieces are installed - no re-run."
+    wizard_say "  - talking to them out loud: not yet. ayeaye works without it, and"
+    wizard_say "    finds a listening server the moment one starts answering. A"
+    wizard_say "    command-line one it reads when it starts, so restart it after."
   fi
   wizard_blank
   wizard_say "Recommended here: text on the phone now, over an https address only"
@@ -954,9 +969,7 @@ step_summary() {
     SERVICE_KIND="$(platform_service_manager)"
   fi
   [ -n "$NTFY" ] && tier="$tier +notifications"
-  if command -v ffmpeg >/dev/null 2>&1 \
-     && { command -v whisper-server >/dev/null 2>&1 \
-          || command -v whisper-cpp >/dev/null 2>&1; }; then
+  if command -v ffmpeg >/dev/null 2>&1 && _have_transcriber; then
     tier="$tier +voice"
   fi
   token="$(cat "$TOKEN_FILE" 2>/dev/null || true)"

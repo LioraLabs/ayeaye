@@ -36,8 +36,13 @@
 # -------------------------------------------- what the app actually probes
 #
 # `bin/ayeaye`'s voice_available() asks for ffmpeg, and then for either the
-# whisper server answering on VOICE_WHISPER_SERVER or the `whisper-cpp`
-# command with the file named by VOICE_WHISPER_MODEL present on disk. Until
+# whisper server answering on VOICE_WHISPER_SERVER or the transcriber
+# bin/voice-dictate would run - VOICE_WHISPER_CLI, or the first of
+# whisper-cli, whisper-cpp and whisper on PATH - with the file named by
+# VOICE_WHISPER_MODEL present on disk. It used to name `whisper-cpp` and
+# nothing else, which refused a machine carrying the name whisper.cpp's
+# current builds install; both halves of that mistake are closed now, and
+# _voice_talk_button_missing asks exactly what the probe asks. Until
 # this file existed nothing in setup ever wrote VOICE_WHISPER_MODEL, which had
 # two consequences nobody had noticed: lib/steps/70-service.sh declines to
 # install the whisper service unless that setting names a model, so it
@@ -1186,34 +1191,72 @@ _voice_settings() {
   return 1
 }
 
-# _voice_talk_button_works - status 0 when the app will really turn talking
-# on after this run, 1 when it will not, whatever else went right.
+# _voice_talk_button_missing <model> - which of the things the app's probe
+# looks for will not be there after this run: `ffmpeg`, `transcriber`,
+# `model`, or nothing at all. A word rather than a sentence, because the
+# caller has to branch on it and matching prose is how that breaks.
 #
 # This is the handshake, checked rather than assumed, and it is checked
 # against what bin/ayeaye actually asks for rather than against what this file
 # has just done. voice_available() wants ffmpeg, and then either a whisper
 # server answering on VOICE_WHISPER_SERVER - which the service stage installs
 # once the settings name a model, which is what this step has just written -
-# or the command spelled exactly `whisper-cpp` on PATH.
+# or the transcriber bin/voice-dictate would run, with that model on disk.
 #
-# That second spelling is the one this cannot satisfy from here. whisper.cpp
-# renamed its binaries and the current builds, Homebrew's formula and Arch's
-# package all install `whisper-cli`; a computer with that name and no server
-# transcribes perfectly through bin/voice-dictate and is still refused by the
-# probe. Saying so is the only honest thing available: the file that holds the
-# probe belongs to another ticket, and reporting the work finished when the
-# talk button will be grey is the one thing a step must never do.
-_voice_talk_button_works() {
-  _voice_have ffmpeg || return 1
-  _voice_have whisper-cpp && return 0
-  # A server the service stage can install and start counts: the probe's first
-  # route is a socket, and it does not care what the program is called.
+# It used to ask for the command spelled exactly `whisper-cpp`, because that
+# is the name the probe used to spell, and this file could not satisfy it:
+# whisper.cpp renamed its binaries and the current builds, Homebrew's formula
+# and Arch's package all install `whisper-cli`, so a computer that transcribed
+# perfectly was told the talk button would stay grey. The probe asks for the
+# transcriber by whatever name this machine has it under now, and so does
+# this. One question, asked in one place, answered the same way twice.
+#
+# The check is kept rather than deleted with the mismatch it was written for,
+# for two reasons. `transcriber` is still reachable: _voice_programs is
+# satisfied by the whisper the detect stage recorded, which on a resumed run
+# is a fact about the machine as it was, and a transcriber can have been
+# removed since. And the whole of it is what stands between the installer and
+# the app if the probe is ever narrowed again - a step that reports success
+# while the button greys out is what this file exists to prevent. The other
+# two words are defence in depth: `ffmpeg` is pre-empted by _voice_programs
+# and `model` by _voice_fetch, and neither is free to stop being true quietly.
+_voice_talk_button_missing() {
+  local model="${1:-}" cli
+  _voice_have ffmpeg || { printf 'ffmpeg'; return 0; }
+
+  # A whisper server counts on its own: the probe's first route is a socket,
+  # which does not care what the program behind it is called and does not read
+  # the model file.
+  #
+  # Being exact about what that claims, because it is the one thing here that
+  # is a forecast rather than an observation: the probe wants an answer on the
+  # port, and this sees a program on the disk. Between the two sits the
+  # service stage, which is about to offer to install and start it, and a
+  # person who can decline. Setup counts the program because that is the
+  # signal the whole installer counts - install.sh's own tier line does the
+  # same, and _voice_programs is satisfied by the same fact - and because the
+  # alternative reads worse than it sounds: telling somebody who has
+  # whisper-server that they need "a program that turns speech into words"
+  # would be a false sentence about a true problem. Distinguishing installed
+  # from running is a change to what the installer means by voice, not to
+  # what this function checks.
   _voice_have whisper-server && return 0
-  return 1
+
+  # VOICE_WHISPER_CLI first, because that is what the app reads first, and
+  # because somebody who built whisper.cpp themselves points it at a path that
+  # was never on PATH. Telling that machine it has no transcriber would be the
+  # same false refusal as the one this ticket removed, wearing a hat.
+  cli="$(wizard_env_get "$(_voice_env_file)" VOICE_WHISPER_CLI "")"
+  if [ -z "$cli" ] || [ ! -x "$cli" ]; then
+    cli="$(_voice_whisper_cli)" || cli=""
+  fi
+  [ -n "$cli" ] || { printf 'transcriber'; return 0; }
+  [ -f "$(_voice_model_path "$model")" ] || { printf 'model'; return 0; }
+  return 0
 }
 
 _voice_install_step() {
-  local model status
+  local model status missing what fix
 
   model="$(wizard_state_get answer.voice.model "")"
   if [ -z "$model" ]; then
@@ -1258,16 +1301,32 @@ _voice_install_step() {
   status=$?
   [ "$status" = 1 ] && return "$WIZARD_STAGE_PENDING"
 
-  if ! _voice_talk_button_works; then
+  missing="$(_voice_talk_button_missing "$model")"
+  if [ -n "$missing" ]; then
+    # One sentence for what is absent and one for how to end up with it. They
+    # are separate because the remedies are genuinely different: two of these
+    # are programs to install and the third is a file to download.
+    case "$missing" in
+      ffmpeg)
+        what="ffmpeg, which is what turns what you say into sound it can read"
+        fix="Installing it and running this setup again is all it takes." ;;
+      transcriber)
+        what="a program that turns speech into words"
+        fix="Install one - whisper.cpp is at $_VOICE_WHISPER_HOME - and run this setup again." ;;
+      model)
+        what="the listening model, at $(_voice_model_path "$model")"
+        fix="Running this setup again will fetch it, with your say-so." ;;
+      *)
+        what="$missing"
+        fix="Running this setup again once it is here is all it takes." ;;
+    esac
     wizard_blank
-    wizard_say "The listening model is here and your settings point at it, but"
-    wizard_say "ayeaye will still show the talk button greyed out for now: it"
-    wizard_say "looks for the listening program under one particular name, and"
-    wizard_say "this computer has it under another."
-    wizard_say "The fix is to let setup start the listening program in the"
-    wizard_say "background - answer yes to that in a moment - or run this again"
-    wizard_say "once whisper.cpp's server is installed."
-    wizard_detail "voice: bin/ayeaye's probe wants whisper-cpp on PATH or a whisper server; this machine has $(_voice_whisper_cli || printf none)"
+    wizard_say "Your settings are written, but ayeaye will still show the talk"
+    wizard_say "button greyed out for now. When it starts it looks for"
+    wizard_say "$what,"
+    wizard_say "and that is not on this computer."
+    wizard_say "$fix"
+    wizard_detail "voice: bin/ayeaye's probe will not find: $missing"
     return "$WIZARD_STAGE_PENDING"
   fi
   return "$WIZARD_STAGE_OK"

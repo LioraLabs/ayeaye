@@ -28,6 +28,12 @@ import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
+
+# Importing the code under test would otherwise leave a __pycache__ inside
+# the checkout, and a suite that writes into the tree it is testing has
+# already broken the promise it makes about where it may write.
+sys.dont_write_bytecode = True
 
 REPO_ROOT = os.environ.get("REPO_ROOT") or os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,6 +93,20 @@ def write_proc(root, pid, name="bash", ppid=1, start_ticks=0, cwd=None):
 def write_uptime(root, seconds):
     with open(os.path.join(root, "uptime"), "w") as fh:
         fh.write("%s 9876.54\n" % seconds)
+
+
+def write_environ(root, pid, **env):
+    """/proc/<pid>/environ: NUL-separated, NUL-terminated, no newline.
+
+    The separator is the whole point. A value may contain spaces -- an
+    SSH_CONNECTION always does -- so anything that split this on whitespace
+    would read the port as a variable.
+    """
+    d = write_proc(root, pid)
+    blob = b"".join(("%s=%s\0" % (k, v)).encode() for k, v in env.items())
+    with open(os.path.join(d, "environ"), "wb") as fh:
+        fh.write(blob)
+    return d
 
 
 def pgrep_runner(tree):
@@ -218,6 +238,58 @@ class LinuxProcTest(TempTree):
         write_proc(self.tmp, 100, name="bash")
         self.assertIsNone(
             self.linux(run=lambda argv, **kw: None).descendant(100, "codex"))
+
+    # ------------------------------------------- the two client questions
+
+    def test_exists_is_true_for_a_pid_with_a_directory_under_proc(self):
+        write_proc(self.tmp, 42)
+        self.assertTrue(self.linux().exists(42))
+        self.assertTrue(self.linux().exists("42"))
+
+    def test_exists_is_false_for_a_pid_that_is_not_there(self):
+        write_proc(self.tmp, 42)
+        self.assertFalse(self.linux().exists(4242))
+
+    def test_the_ssh_peer_is_the_first_field_of_ssh_connection(self):
+        write_environ(self.tmp, 42, SSH_CONNECTION="10.1.2.3 54321 10.0.0.1 22")
+        self.assertEqual("10.1.2.3", self.linux().ssh_peer_ip(42))
+
+    def test_a_process_with_no_ssh_connection_has_no_peer(self):
+        write_environ(self.tmp, 42, TERM="xterm-256color")
+        self.assertIsNone(self.linux().ssh_peer_ip(42))
+
+    def test_an_ssh_connection_with_no_fields_has_no_peer(self):
+        write_environ(self.tmp, 42, SSH_CONNECTION="")
+        self.assertIsNone(self.linux().ssh_peer_ip(42))
+
+    def test_a_variable_whose_name_merely_ends_in_it_is_not_it(self):
+        # environ is NUL-separated and every entry is matched whole, so
+        # OLD_SSH_CONNECTION must not answer for SSH_CONNECTION.
+        write_environ(self.tmp, 42, OLD_SSH_CONNECTION="10.9.9.9 1 2 3")
+        self.assertIsNone(self.linux().ssh_peer_ip(42))
+
+    def test_a_peer_lookup_on_a_process_that_is_gone_is_not_an_error(self):
+        self.assertIsNone(self.linux().ssh_peer_ip(4242))
+
+    def test_a_peer_lookup_that_is_refused_is_not_an_error(self):
+        # /proc/<pid>/environ belongs to its owner and nobody else. A tmux
+        # client is the same user, but a pid tmux handed over can have been
+        # reused by anything at all by the time it is looked at.
+        if os.geteuid() == 0:
+            self.skipTest("root reads it regardless")
+        d = write_environ(self.tmp, 42, SSH_CONNECTION="10.1.2.3 1 2 3")
+        path = os.path.join(d, "environ")
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        self.assertIsNone(self.linux().ssh_peer_ip(42))
+
+    def test_an_undecodable_environment_does_not_cost_the_peer(self):
+        # environ is bytes and nothing promises they are UTF-8. One odd
+        # variable elsewhere must not lose the address.
+        d = write_proc(self.tmp, 42)
+        with open(os.path.join(d, "environ"), "wb") as fh:
+            fh.write(b"ODD=\xff\xfe\x00SSH_CONNECTION=10.1.2.3 1 2 3\x00")
+        self.assertEqual("10.1.2.3", self.linux().ssh_peer_ip(42))
 
     def test_the_live_proc_parsing_matches_the_reference_implementation(self):
         """The pin that a fake tree cannot give: real /proc, real numbers.
@@ -557,6 +629,81 @@ class DarwinProcTest(TempTree):
         info = self.darwin({"lsof": fixture("lsof/darwin-cwd-spaces")})
         self.assertEqual("/Users/someone/My Projects/thing", info.cwd(702))
 
+    # ------------------------------------------- the two client questions
+
+    def test_a_pid_ps_reports_back_exists(self):
+        info = self.darwin({"ps -p 802 -o pid=": fixture("ps/darwin-pid-alive")})
+        self.assertTrue(info.exists(802))
+        self.assertTrue(info.exists("802"))
+
+    def test_a_pid_ps_says_nothing_about_does_not_exist(self):
+        self.assertFalse(self.darwin({"ps -p": ""}).exists(802))
+        self.assertFalse(self.darwin({"ps -p": "\n \n"}).exists(802))
+
+    def test_a_pid_is_believed_when_ps_could_not_be_asked_at_all(self):
+        # Not "gone": "could not tell", and the two get opposite answers. The
+        # only caller is checking a pid tmux handed it, and its alternative is
+        # the first client in a list -- the guess this module exists to stop.
+        # Nothing learned means the fact already in hand stands.
+        self.assertTrue(self.darwin({}).exists(802))
+
+    def test_the_ssh_peer_comes_out_of_the_process_environment(self):
+        info = self.darwin({"ps -ww -E": fixture("ps/darwin-ssh-environ")})
+        self.assertEqual("100.101.102.103", info.ssh_peer_ip(802))
+
+    def test_a_client_sitting_at_the_machine_has_no_peer(self):
+        info = self.darwin({"ps -ww -E": fixture("ps/darwin-local-environ")})
+        self.assertIsNone(info.ssh_peer_ip(801))
+
+    def test_a_variable_whose_name_merely_ends_in_it_is_not_it(self):
+        # macOS has no NUL-separated environ to match entries against: `ps -E`
+        # appends the block to the command line, space separated. The fixture
+        # carries an OLD_SSH_CONNECTION with a different address ahead of the
+        # real one, and the wrong one is the one a loose pattern returns.
+        info = self.darwin({"ps -ww -E": fixture("ps/darwin-ssh-environ")})
+        self.assertEqual("100.101.102.103", info.ssh_peer_ip(802))
+
+    def test_an_ssh_connection_with_no_value_is_not_the_next_variable(self):
+        # `ps -E` is space separated, so an SSH_CONNECTION with nothing in it
+        # is followed immediately by the next variable. \S+ cannot cross the
+        # space; anything hungrier hands back "SSH_TTY=/dev/ttys004" as an
+        # address, and the caller would dial it.
+        info = self.darwin({"ps -ww -E": fixture("ps/darwin-ssh-empty")})
+        self.assertIsNone(info.ssh_peer_ip(801))
+
+    def test_a_peer_lookup_with_no_ps_at_all_is_not_an_error(self):
+        self.assertIsNone(self.darwin({}).ssh_peer_ip(802))
+        self.assertIsNone(self.darwin({"ps -ww -E": ""}).ssh_peer_ip(802))
+
+    def test_the_client_probes_ask_for_what_they_need(self):
+        # Same reason as the other two per-process probes: the canned runner
+        # matches on a prefix, so nothing here would notice a wrong flag.
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return ""
+
+        info = ayeaye._DarwinProcessInfo(run=run)
+        info.exists(802)
+        info.ssh_peer_ip(802)
+        self.assertEqual(["ps", "-p", "802", "-o", "pid="], seen[0])
+        # -E is what appends the environment; without it this reads a command
+        # line and finds nothing, on every Mac, silently. -ww because the
+        # environment is far past any terminal width.
+        self.assertEqual(["ps", "-ww", "-E", "-p", "802", "-o", "command="],
+                         seen[1])
+
+    def test_neither_client_probe_can_be_answered_from_a_walk_snapshot(self):
+        # Both are per-process and neither may quietly reuse the ps -axww
+        # snapshot: that one carries no environment and no proof of liveness.
+        seen = []
+        info = ayeaye._DarwinProcessInfo(
+            run=lambda argv, **kw: seen.append(argv))
+        info.exists(802)
+        info.ssh_peer_ip(802)
+        self.assertEqual([], [a for a in seen if "-axww" in a])
+
 
 class BothBackendsTest(unittest.TestCase):
     """The one cross-platform check this host can actually execute.
@@ -658,6 +805,8 @@ class SelectionTest(unittest.TestCase):
             info.descendant(801, "codex")
             info.start_time(801)
             info.cwd(801)
+            info.exists(801)
+            info.ssh_peer_ip(801)
         finally:
             builtins.open, os.readlink = real_open, real_readlink
         self.assertEqual([], [p for p in opened if p.startswith("/proc")])
@@ -687,6 +836,63 @@ class SelectionTest(unittest.TestCase):
         self.assertIsNotNone(out, "one bad byte must not lose the output")
         self.assertTrue(out.startswith("be"), out)
         self.assertTrue(out.rstrip().endswith("fore"), out)
+
+
+class SharedModuleTest(unittest.TestCase):
+    """One implementation, not two that look alike.
+
+    A second copy of a platform backend does not announce itself. It works on
+    the day it is written and then one of the two gets a fix, and the failure
+    that follows is a wrong answer rather than an error. The only assertion
+    that can see that coming is object identity: the classes the two commands
+    hold have to be the same objects, from the same file, loaded once.
+    """
+
+    def setUp(self):
+        # exec_module rather than the load_module() that goes away in python
+        # 3.15, and a named loader because a command has no .py extension.
+        path = os.path.join(REPO_ROOT, "bin", "voice-dictate")
+        name = "voice_dictate_shared_check"
+        spec = spec_from_file_location(name, path,
+                                       loader=SourceFileLoader(name, path))
+        self.vd = module_from_spec(spec)
+        sys.modules[name] = self.vd
+        self.addCleanup(sys.modules.pop, name, None)
+        spec.loader.exec_module(self.vd)
+
+    def test_both_commands_hold_the_same_backend_classes(self):
+        for name in ("_run_tool", "_ProcessInfo", "_LinuxProcessInfo",
+                     "_DarwinProcessInfo", "_make_process_info", "PS_SNAPSHOT"):
+            self.assertIs(getattr(ayeaye.process_inspect, name),
+                          getattr(self.vd.process_inspect, name), name)
+
+    def test_the_module_is_loaded_once_per_process(self):
+        self.assertIs(ayeaye.process_inspect, self.vd.process_inspect)
+        self.assertIs(ayeaye.PROCESS_INFO, self.vd.PROCESS_INFO)
+
+    def test_the_interface_is_the_whole_of_what_either_command_asks(self):
+        for backend in (ayeaye._LinuxProcessInfo, ayeaye._DarwinProcessInfo):
+            for method in ("children", "comm", "start_time", "cwd",
+                           "exists", "ssh_peer_ip", "descendant"):
+                self.assertTrue(callable(getattr(backend, method, None)),
+                                "%s.%s" % (backend.__name__, method))
+
+    def test_the_backend_lives_in_one_file_and_neither_command_repeats_it(self):
+        """The extraction, read off disk rather than out of memory.
+
+        Identity above proves the two agree today. This proves there is
+        nowhere for a second one to come back: neither command may define a
+        backend class of its own.
+        """
+        for command in ("ayeaye", "voice-dictate"):
+            with open(os.path.join(REPO_ROOT, "bin", command)) as fh:
+                body = fh.read()
+            for cls in ("class _LinuxProcessInfo", "class _DarwinProcessInfo"):
+                self.assertNotIn(cls, body, "bin/%s" % command)
+
+    def test_the_module_is_beside_the_commands_that_load_it(self):
+        self.assertTrue(os.path.exists(
+            os.path.join(REPO_ROOT, "bin", "process_inspect.py")))
 
 
 class ClaudeMarkerTest(TempTree):
