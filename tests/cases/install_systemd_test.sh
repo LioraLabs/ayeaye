@@ -57,14 +57,19 @@ test_no_systemctl_at_all_falls_back_to_the_manual_command() {
   assert_contains "$RUN_STDOUT" "stderr of $REPO_ROOT/bin/ayeaye"
 }
 
-test_no_systemd_skips_the_service_entirely() {
+test_no_systemd_installs_and_starts_nothing() {
+  # --no-systemd used to mean "do not even ask", because asking and acting were
+  # the same piece of code. The platform layer now answers "what is the service
+  # manager here" for the machine report whatever the flag says, and the flag
+  # means what its name says: nothing is installed and nothing is started.
   _hard_deps_present
   _systemd_session
   run_install --defaults --no-systemd
   assert_status 0 "$RUN_STATUS"
   assert_contains "$RUN_STDOUT" "skipping systemd (--no-systemd)"
-  assert_stub_not_called systemctl "--no-systemd must not even probe"
-  assert_file_missing "$(_unit_file)"
+  assert_file_missing "$(_unit_file)" "no unit may be written"
+  assert_not_contains "$(stub_calls systemctl)" "daemon-reload" "nothing is loaded"
+  assert_not_contains "$(stub_calls systemctl)" "enable" "and nothing is started"
   assert_contains "$RUN_STDOUT" "run the server with: $REPO_ROOT/bin/ayeaye"
 }
 
@@ -219,26 +224,23 @@ test_a_failing_loginctl_is_read_as_no_linger() {
   assert_not_contains "$RUN_STDERR" "Failed to get user" "the probe's noise stays hidden"
 }
 
-test_an_unset_user_variable_kills_the_run_at_the_linger_hint() {
-  # Documented, not endorsed. install.sh runs under `set -u` and reads $USER
-  # twice at the end. The first read is inside `$( )`, so only that subshell
-  # dies - and its empty output then makes the `!= "yes"` test true, so a
-  # lingering user is silently misread as not lingering. The second read is in
-  # the `say` on the next line, with no subshell to contain it, and that one
-  # kills the run: after the unit has been written and the daemon reloaded.
-  # Stderr therefore carries the unbound-variable error twice.
-  #
-  # A host that does not export USER is normal inside a container, which is
-  # exactly where this milestone's container coverage will run. The wizard
-  # rewrite should use `id -un` or a ${USER:-} fallback.
+test_an_unset_user_variable_is_survived_at_the_linger_hint() {
+  # This used to end the run. install.sh runs under `set -u` and read $USER
+  # bare, twice, at the very end: a host that does not export it - which is
+  # every container - lost the whole summary after the unit was already
+  # installed. It now reads ${USER:-} and falls back to `id -un`, so the hint
+  # still names a real user.
   _hard_deps_present
   _systemd_session
   stub_command loginctl --stdout "no"
   unset USER
   run_install --defaults
-  assert_ne 0 "$RUN_STATUS" "today this aborts rather than degrading"
-  assert_contains "$RUN_STDERR" "USER: unbound variable"
-  assert_file_exists "$(_unit_file)" "and it aborts after the unit is already installed"
+  assert_status 0 "$RUN_STATUS" "a host without USER exported is an ordinary host"
+  assert_not_contains "$RUN_STDERR" "unbound variable"
+  assert_matches "$RUN_STDOUT" "recommended: loginctl enable-linger .+" \
+    "and the hint still names somebody to enable it for"
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: journalctl" \
+    "anchor: it ran all the way to the summary"
 }
 
 test_an_unset_user_variable_is_harmless_without_loginctl() {
@@ -253,11 +255,13 @@ test_an_unset_user_variable_is_harmless_without_loginctl() {
     "anchor: it ran all the way to the summary, not just far enough to not crash"
 }
 
-test_a_failing_daemon_reload_aborts_after_the_unit_is_written() {
-  # Documented, not endorsed: daemon-reload is unguarded under set -e, so a
-  # systemd that refuses it takes the whole install down at that point - the
-  # unit is on disk, the summary never prints, and systemctl's own error is
-  # what the user sees.
+test_a_failing_daemon_reload_stops_the_run_after_the_unit_is_written() {
+  # A systemd that refuses to reload cannot be asked to start anything, so the
+  # run stops there rather than promising a service it could not install. The
+  # unit is on disk and the state file records how far it got, so running setup
+  # again picks up from exactly here - which wizard_resume_test.sh pins.
+  # systemctl's own words still reach stderr, because at the moment something
+  # fails they are worth more to the reader than any paraphrase.
   _hard_deps_present
   stub_command systemctl --exit 1
   stub_when systemctl '--user show-environment' --exit 0
@@ -277,6 +281,7 @@ test_the_repo_path_may_contain_a_space() {
   local repo="$TEST_TMPDIR/my repo"
   mkdir -p "$repo"
   cp "$REPO_ROOT/install.sh" "$REPO_ROOT/env.template" "$repo/"
+  cp -R "$REPO_ROOT/lib" "$repo/lib"
   mkdir -p "$repo/systemd/user"
   cp "$REPO_ROOT/systemd/user/ayeaye.service.template" "$repo/systemd/user/"
 

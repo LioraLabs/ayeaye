@@ -128,18 +128,38 @@ test_an_existing_config_is_announced_before_the_question() {
 }
 
 test_confirm_reads_y_upper_y_yes_and_upper_yes_as_yes() {
+  # Saying yes opens the questions; it is the answers that change anything.
+  # Each question now offers what is already configured, so answering yes and
+  # then pressing return four times deliberately leaves the file as it was -
+  # this used to reset all four settings to the factory defaults, which is not
+  # what pressing return looks like it means. test_a_typed_answer_overrides_the_default
+  # is where changing them is pinned.
   _hard_deps_present
   local answer
   for answer in y Y yes YES; do
     _existing_config
     pty_expect "rewrite it?" "$answer"
-    _answer_config_prompts "" "" "" ""
+    _answer_config_prompts "" "9000" "" ""
     pty_install --no-systemd
     assert_status 0 "$PTY_STATUS"
-    assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=8911" \
-      "\"$answer\" must be taken as yes and rewrite the config"
-    assert_file_not_contains "$XDG_CONFIG_HOME/ayeaye/env" "7777"
+    assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9000" \
+      "\"$answer\" must be taken as yes and let the answers through"
+    assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=10.9.8.7" \
+      "and the questions answered with return keep what was already there"
   done
+}
+
+test_the_questions_offer_back_what_is_already_configured() {
+  _hard_deps_present
+  _existing_config
+  pty_expect "rewrite it?" "y"
+  _answer_config_prompts "" "" "" ""
+  pty_install --no-systemd
+  assert_contains "$PTY_TRANSCRIPT" "bind address [10.9.8.7]:"
+  assert_contains "$PTY_TRANSCRIPT" "port [7777]:"
+  assert_contains "$PTY_TRANSCRIPT" "allowed hosts (your https front) [kept.example]:"
+  assert_contains "$PTY_TRANSCRIPT" \
+    "ntfy topic URL for push notifications (empty disables) [https://ntfy.example/kept]:"
 }
 
 test_confirm_reads_anything_else_as_no() {

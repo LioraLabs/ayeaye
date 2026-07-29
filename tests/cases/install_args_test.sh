@@ -34,15 +34,28 @@ test_the_help_banner_is_stripped_of_its_comment_markers() {
   esac
 }
 
-test_help_stops_short_of_the_full_what_it_does_list() {
-  # Documented, not endorsed: --help lifts a fixed line range out of the
-  # script's own header, and the header has since grown past it. Steps 3 and 4
-  # of "what it does" are in the file but never printed.
+test_help_prints_the_what_it_does_list_to_the_end() {
+  # This used to lift a fixed line range out of the script's own header, and
+  # the header had grown past it: the list said "what it does" and then stopped
+  # in the middle of itself. The list is now text of its own, and what is
+  # pinned is that every step of it arrives - the last one especially, because
+  # that is the step a line-range bug loses.
   run_install --help
-  assert_contains "$RUN_STDOUT" "1. checks hard deps"
-  assert_contains "$RUN_STDOUT" "2. writes"
-  assert_not_contains "$RUN_STDOUT" "3. ensures the auth token exists" \
-    "today's help output is truncated mid-list; a rewrite should fix it deliberately"
+  local n
+  for n in 1 2 3 4 5 6 7 8; do
+    assert_matches "$RUN_STDOUT" "^ +$n\\. " "step $n of the list must be printed"
+  done
+  assert_contains "$RUN_STDOUT" "prints the address to open on your phone" \
+    "the last line of the list is the one a truncated help drops"
+}
+
+test_help_says_what_setup_will_never_do_without_asking() {
+  # The security promise belongs where somebody can read it before running
+  # anything, not only after they already have.
+  run_install --help
+  assert_contains "$RUN_STDOUT" \
+    "Nothing is installed, downloaded, opened to the network or trusted without a"
+  assert_contains "$RUN_STDOUT" "question first"
 }
 
 test_help_touches_nothing() {

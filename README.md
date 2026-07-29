@@ -134,12 +134,22 @@ cd ~/dev/ayeaye
 ./install.sh
 ```
 
-The installer checks dependencies, writes one config file at
-`~/.config/ayeaye/env`, creates the auth token, installs a systemd
-user unit that runs `bin/ayeaye` straight from the clone, and prints
-a bookmark URL: `http://<host>:<port>/?token=<token>`. Open that URL once
-on the phone; it sets the auth cookie and you never type the token again.
+Setup is an eight-stage conversation: it explains what it may change, works
+out what this machine is and what it already has, says in plain words what
+ayeaye can do here, asks how you want to reach it, lists everything it is
+about to install or change **before** it does any of it, writes one config
+file at `~/.config/ayeaye/env`, creates the auth token, installs a systemd
+user unit that runs `bin/ayeaye` straight from the clone, and prints a
+bookmark URL: `http://<host>:<port>/?token=<token>`. Open that URL once on
+the phone; it sets the auth cookie and you never type the token again.
 That's it.
+
+Nothing privileged runs, nothing is downloaded, no firewall is opened, no
+certificate is trusted and no file you already have is replaced without a
+question first — and answering no to any of them leaves the machine exactly
+as it was. Every one of those decisions is recorded at
+`~/.local/state/ayeaye/setup-consent.log`, so "did that script do anything to
+my machine" has one place to look.
 
 Put it on the tailnet with a real certificate:
 
@@ -150,10 +160,25 @@ tailscale serve --bg http://127.0.0.1:8911
 See [Exposure](#exposure) for why HTTPS matters and for the reverse-proxy
 alternative.
 
-Installer flags: `--defaults` accepts every default without prompting, and
-`--no-systemd` skips the unit and prints the manual run command instead
-(`bin/ayeaye` reads the config file by itself). Re-running is safe:
-an existing config file is never overwritten without asking.
+Installer flags: `--defaults` accepts every default without prompting and
+grants no permission of any kind, so it can never expose ayeaye to a network;
+`--yes` answers the install and configuration questions — whether or not
+anybody is watching — but still refuses anything touching the network, the
+firewall or the certificate store; `--no-systemd` skips
+the unit and prints the manual run command instead (`bin/ayeaye` reads the
+config file by itself); `--details` shows the raw commands; `--fresh` forgets
+what earlier runs recorded.
+
+Re-running is safe, and it is how anything gets changed. An existing config
+file is never overwritten without asking, and when you do agree to a change
+only the settings you were asked about are rewritten — everything else in the
+file, including comments and settings the wizard has never heard of, survives
+byte for byte, and the previous version is copied to
+`~/.local/state/ayeaye/backups/` first. The auth token is never regenerated,
+so a bookmark already on your phone keeps working.
+
+A run that is interrupted picks up where it stopped rather than starting over:
+what it finished is recorded at `~/.local/state/ayeaye/setup-state`.
 
 Check it:
 
@@ -474,7 +499,14 @@ and a bad rewrite (`final`). Other outcomes: `silence`, `empty`,
 ## Layout
 
 ```
-install.sh                one-command setup; idempotent
+install.sh                one-command setup: the eight-stage wizard
+lib/platform.sh           what this machine is, and who to ask to change it
+lib/state.sh              what a setup run remembers between invocations
+lib/ui.sh                 how setup talks, and how it listens
+lib/consent.sh            permission, and the only wrappers allowed to act
+lib/envfile.sh            the settings file: render once, merge ever after
+lib/stage.sh              the eight-stage lifecycle and its steps
+lib/steps/                work registered onto a stage; see its README
 env.template              every setting, documented; install.sh fills it in
 bin/voice-dictate         pipeline: record → whisper → polish → send-keys
 bin/voice-agent           recorder daemon for remote tmux clients
