@@ -1,0 +1,17 @@
+{
+  "name": "Aye, Aye",
+  "short_name": "Aye, Aye",
+  "description": "Remote for the coding agents in your tmux sessions.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#16161e",
+  "theme_color": "#16161e",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -99,6 +99,8 @@ SHARE_DIR = (_env("SHARE", None)
                  else _REPO_SHARE))
 APP_HTML = os.path.join(SHARE_DIR, "app.html")
 BOARD_HTML = os.path.join(SHARE_DIR, "board.html")
+MANIFEST = os.path.join(SHARE_DIR, "manifest.webmanifest")
+ICON_SVG = os.path.join(SHARE_DIR, "icon.svg")
 BIND = _env("BIND", "127.0.0.1")
 PORT = int(_env("PORT", "8911"))
 PANE_LINES = int(_env("LINES", "24"))
@@ -1116,6 +1118,21 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 return self._send(500, "board.html missing at " + BOARD_HTML,
                                   "text/plain")
+        # Static, data-free, and needed before login: the manifest makes
+        # "add to home screen" install a named, icon'd app.
+        if path == "/manifest.webmanifest":
+            try:
+                with open(MANIFEST, "rb") as fh:
+                    return self._send(200, fh.read(),
+                                      "application/manifest+json")
+            except OSError:
+                return self._json({"error": "not found"}, 404)
+        if path == "/icon.svg":
+            try:
+                with open(ICON_SVG, "rb") as fh:
+                    return self._send(200, fh.read(), "image/svg+xml")
+            except OSError:
+                return self._json({"error": "not found"}, 404)
         if path == "/api/cliban/projects":
             # Just the keys, so the main page can linkify ticket references
             # without pulling the whole board. Degrades to no links (empty
@@ -1157,6 +1174,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no pane"}, 400)
             fit_touch(pane)
             return self._json(pane_view(pane, PANE_LINES))
+
+        if path == "/api/prompt":
+            # One capture-pane, nothing else: cheap enough for the transcript
+            # view to poll so a permission prompt is answerable from there
+            # without paying for a full overview scan.
+            pane = self._query().get("pane", [""])[0]
+            if not pane:
+                return self._json({"error": "no pane"}, 400)
+            return self._json({"prompt": pane_prompt(pane)})
 
         if path == "/api/session":
             pane = self._query().get("pane", [""])[0]
