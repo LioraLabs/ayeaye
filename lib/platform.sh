@@ -28,7 +28,9 @@
 #   platform_uid              the effective user id, or empty if id is absent
 #   platform_pkg_manager      apt-get | dnf | yum | pacman | zypper | brew | none
 #   platform_service_manager  systemd | launchd | none
-#   platform_brew_prefix      /opt/homebrew, /usr/local, or empty
+#   platform_brew_prefix      the prefix Homebrew is installed under, or empty
+#   platform_brew_bin         how to invoke brew: "brew" when it is on PATH,
+#                             an absolute path when it is only in its prefix
 #   platform_has_brew         status 0 when Homebrew is installed
 #   platform_is_immutable     status 0 on an image-based system whose package
 #                             manager cannot install into the running system
@@ -67,7 +69,8 @@
 #                              it a fixture without the real machine ever
 #                              leaking in.
 #   PLATFORM_BREW_PREFIXES     space-separated prefixes to look for Homebrew in
-#                              when it is not on PATH.
+#                              when it is not on PATH. Defaults to
+#                              "/opt/homebrew /usr/local /home/linuxbrew/.linuxbrew".
 #
 # Neither list can contain a path with a space in it. Both are configuration,
 # not user input, and treating them as lists is worth more than that case.
@@ -94,6 +97,7 @@ _PLATFORM_PKG_MANAGER="${_PLATFORM_PKG_MANAGER:-}"
 _PLATFORM_PKG_TOOL="${_PLATFORM_PKG_TOOL:-}"
 _PLATFORM_SERVICE_MANAGER="${_PLATFORM_SERVICE_MANAGER:-}"
 _PLATFORM_BREW_PREFIX="${_PLATFORM_BREW_PREFIX:-}"
+_PLATFORM_BREW_BIN="${_PLATFORM_BREW_BIN:-}"
 _PLATFORM_IMMUTABLE="${_PLATFORM_IMMUTABLE:-0}"
 _PLATFORM_UID="${_PLATFORM_UID:-}"
 
@@ -192,6 +196,7 @@ _platform_os_release_value() {
   # - leaves $line unset, and reading an unset name under `set -u` is fatal.
   local line=""
   local value=""
+  local rest=""
   local found=1
   [ -n "$file" ] && [ -f "$file" ] && [ -r "$file" ] || return 1
   # `|| [ -n "$line" ]` so a final line without a newline is still read.
@@ -204,10 +209,26 @@ _platform_os_release_value() {
       *) continue ;;
     esac
     _platform_trim "$value"; value="$_PLATFORM_S"
+    # A value ends where the shell would say it ends: a quoted one at its
+    # closing quote, whatever follows it, and an unquoted one at a comment.
+    # Doing the quotes first and the comment second would leave the quotes on
+    # for ID="debian" # like this, which demotes a supported machine to
+    # unknown.
     case "$value" in
-      '"'*'"') value="${value#\"}"; value="${value%\"}" ;;
-      "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
-      # An unquoted value ends at a comment, the way the shell would read it.
+      '"'*)
+        rest="${value#\"}"
+        case "$rest" in
+          *'"'*) value="${rest%%\"*}" ;;
+          *)     value="$rest" ;;
+        esac
+        ;;
+      "'"*)
+        rest="${value#\'}"
+        case "$rest" in
+          *"'"*) value="${rest%%\'*}" ;;
+          *)     value="$rest" ;;
+        esac
+        ;;
       *" #"*) _platform_trim "${value%% #*}"; value="$_PLATFORM_S" ;;
     esac
     found=0
@@ -328,6 +349,7 @@ platform_reset() {
   _PLATFORM_PKG_TOOL=""
   _PLATFORM_SERVICE_MANAGER=""
   _PLATFORM_BREW_PREFIX=""
+  _PLATFORM_BREW_BIN=""
   _PLATFORM_IMMUTABLE=0
   _PLATFORM_UID=""
   _PLATFORM_PRIVILEGE=""
@@ -450,6 +472,7 @@ EOF
 _platform_detect_brew() {
   local brew_bin prefix
   _PLATFORM_BREW_PREFIX=""
+  _PLATFORM_BREW_BIN=""
   if brew_bin="$(command -v brew 2>/dev/null)" && [ -n "$brew_bin" ]; then
     # A shell function or alias named brew answers `command -v` with something
     # that is not a path at all.
@@ -459,6 +482,8 @@ _platform_detect_brew() {
         prefix="${prefix%/bin}"
         [ -n "$prefix" ] || prefix="/"
         _PLATFORM_BREW_PREFIX="$prefix"
+        # On PATH, so the generated commands can say plainly "brew".
+        _PLATFORM_BREW_BIN="brew"
         return 0
         ;;
     esac
@@ -466,6 +491,10 @@ _platform_detect_brew() {
   for prefix in ${PLATFORM_BREW_PREFIXES-}; do
     if [ -x "$prefix/bin/brew" ]; then
       _PLATFORM_BREW_PREFIX="$prefix"
+      # Found in its prefix and *not* on PATH - which is the whole reason this
+      # loop exists, and it means a generated command saying "brew" would die
+      # with command-not-found. Say where it is.
+      _PLATFORM_BREW_BIN="$prefix/bin/brew"
       return 0
     fi
   done
@@ -537,6 +566,7 @@ platform_uid()             { platform_detect; printf '%s' "$_PLATFORM_UID"; }
 platform_pkg_manager()     { platform_detect; printf '%s' "$_PLATFORM_PKG_MANAGER"; }
 platform_service_manager() { platform_detect; printf '%s' "$_PLATFORM_SERVICE_MANAGER"; }
 platform_brew_prefix()     { platform_detect; printf '%s' "$_PLATFORM_BREW_PREFIX"; }
+platform_brew_bin()        { platform_detect; printf '%s' "$_PLATFORM_BREW_BIN"; }
 
 # platform_has_brew - status only, for `if platform_has_brew; then`.
 platform_has_brew() {

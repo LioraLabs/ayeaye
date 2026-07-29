@@ -47,10 +47,13 @@
 #       machine, and reporting it to a user as "your platform is unsupported"
 #       would send them looking in the wrong place.
 #
-# **A consumer running under `set -e` must not write
-# `cmd="$(platform_service_command …)"` bare** - a command substitution that
-# returns non-zero is fatal there. Put it in an `if`, or add `|| true`.
-# platform_service_blocker always succeeds and is safe to assign bare.
+# **A consumer running under `set -e` must not assign any `platform_service_…`
+# result bare** - `unit="$(platform_service_unit ayeaye)"` and
+# `cmd="$(platform_service_command …)"` are both fatal there when they return
+# non-zero, which they do on any machine with no service manager. Put them in
+# an `if`, or add `|| true` and test for the empty string.
+# platform_service_blocker is the one function here that always succeeds, and
+# is safe to assign bare.
 #
 # Everything generated here is user-scoped and none of it takes sudo. This
 # project installs a per-user service; a root-owned one would keep running
@@ -58,10 +61,15 @@
 #
 # bash 3.2: no associative arrays, no ${var,,}, no mapfile.
 
-# The reverse-DNS prefix for a launchd label. It matches the plist name this
-# project already uses, which the test suite's guarded-path list knows as
-# ~/Library/LaunchAgents/dev.ayeaye.plist.
-_PLATFORM_LAUNCHD_PREFIX="${_PLATFORM_LAUNCHD_PREFIX:-dev}"
+# ----------------------------------------------------------------- tunables
+#
+#   PLATFORM_LAUNCHD_PREFIX  the reverse-DNS prefix for a launchd label,
+#                            "dev" by default. It matches the plist name this
+#                            project already uses, which the test suite's
+#                            guarded-path list knows as
+#                            ~/Library/LaunchAgents/dev.ayeaye.plist. Changing
+#                            it changes every label this adapter generates.
+PLATFORM_LAUNCHD_PREFIX="${PLATFORM_LAUNCHD_PREFIX:-dev}"
 
 platform_service_blocker() {
   platform_detect
@@ -86,7 +94,7 @@ platform_service_unit() {
 
   # Strip whichever platform's clothes it arrived in.
   case "$name" in
-    "$_PLATFORM_LAUNCHD_PREFIX".*) name="${name#"$_PLATFORM_LAUNCHD_PREFIX".}" ;;
+    "$PLATFORM_LAUNCHD_PREFIX".*) name="${name#"$PLATFORM_LAUNCHD_PREFIX".}" ;;
   esac
   case "$name" in
     *.service) name="${name%.service}" ;;
@@ -100,7 +108,7 @@ platform_service_unit() {
       esac
       ;;
     launchd)
-      printf '%s.%s' "$_PLATFORM_LAUNCHD_PREFIX" "$name"
+      printf '%s.%s' "$PLATFORM_LAUNCHD_PREFIX" "$name"
       ;;
     *)
       return 1 ;;

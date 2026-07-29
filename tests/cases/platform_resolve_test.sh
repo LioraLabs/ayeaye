@@ -156,6 +156,25 @@ test_homebrew_is_found_in_its_standard_prefix_before_it_reaches_path() {
   platform_has_brew || fail "brew is installed, just not on PATH yet"
   assert_eq "$TEST_TMPDIR/opt/homebrew" "$(platform_brew_prefix)"
   assert_eq "brew" "$(platform_pkg_manager)"
+
+  # And every generated command has to name it by that path. Saying "brew"
+  # here would produce a command that dies with command-not-found - in exactly
+  # the situation this whole search exists to serve.
+  assert_eq "$TEST_TMPDIR/opt/homebrew/bin/brew" "$(platform_brew_bin)"
+  assert_eq "$TEST_TMPDIR/opt/homebrew/bin/brew install tmux" \
+    "$(platform_pkg_install_command tmux)"
+  assert_eq "$TEST_TMPDIR/opt/homebrew/bin/brew update" "$(platform_pkg_refresh_command)"
+  assert_contains "$(platform_pkg_query_command tmux)" \
+    "$TEST_TMPDIR/opt/homebrew/bin/brew list --versions"
+}
+
+test_a_brew_already_on_path_is_named_plainly() {
+  _stub_macos
+  stub_command brew
+  _platform_from none
+  assert_eq "brew" "$(platform_brew_bin)" \
+    "a path would still work, but the command a person is shown should read well"
+  assert_eq "brew install tmux" "$(platform_pkg_install_command tmux)"
 }
 
 test_the_intel_and_apple_silicon_prefixes_are_both_searched() {

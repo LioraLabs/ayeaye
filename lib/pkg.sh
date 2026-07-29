@@ -26,7 +26,10 @@
 #                                     difference matters.
 #   platform_pkg_query_command <l>    what "is this installed?" would run
 #   platform_pkg_refresh_command      "update the package lists"
-#   platform_pkg_install_command <l>… "install these"
+#   platform_pkg_install_command <l>… "install these". Homebrew is named by
+#                                     platform_brew_bin, so a brew that is
+#                                     installed but not yet on PATH still
+#                                     produces a command that runs.
 #   platform_pkg_manual_hint <l>…     what to tell a human, several lines.
 #                                     Always 0.
 #   platform_sudo_prefix              "sudo" or "". Always 0.
@@ -248,7 +251,8 @@ platform_pkg_query_command() {
     pacman)
       printf 'pacman -Q %s' "$name" ;;
     brew)
-      printf 'brew list --versions %s' "$name" ;;
+      _platform_quote "$_PLATFORM_BREW_BIN"
+      printf '%s list --versions %s' "$_PLATFORM_S" "$name" ;;
     *)
       return 1 ;;
   esac
@@ -281,7 +285,7 @@ platform_pkg_refresh_command() {
     yum)     _platform_pkg_cmd yum makecache ;;
     pacman)  _platform_pkg_cmd pacman -Sy ;;
     zypper)  _platform_pkg_cmd zypper --non-interactive refresh ;;
-    brew)    printf 'brew update' ;;
+    brew)    _platform_quote "$_PLATFORM_BREW_BIN"; printf '%s update' "$_PLATFORM_S" ;;
     *)       return 1 ;;
   esac
 }
@@ -308,7 +312,8 @@ platform_pkg_install_command() {
     yum)     printf '%s %s' "$(_platform_pkg_cmd yum install -y)" "$names" ;;
     pacman)  printf '%s %s' "$(_platform_pkg_cmd pacman -S --needed --noconfirm)" "$names" ;;
     zypper)  printf '%s %s' "$(_platform_pkg_cmd zypper --non-interactive install)" "$names" ;;
-    brew)    printf 'brew install %s' "$names" ;;
+    brew)    _platform_quote "$_PLATFORM_BREW_BIN"
+             printf '%s install %s' "$_PLATFORM_S" "$names" ;;
     *)       return 1 ;;
   esac
 }

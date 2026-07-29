@@ -32,7 +32,7 @@ LIST_ONLY=0
 RUN_SUITE=0
 FILTERS=""
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -40,12 +40,30 @@ while [ "$#" -gt 0 ]; do
     -v|--verbose) VERBOSE=1 ;;
     -l|--list)    LIST_ONLY=1 ;;
     --suite)      RUN_SUITE=1 ;;
-    --engine)     ENGINE="$2"; shift ;;
+    --engine)
+      [ "$#" -gt 1 ] || { echo "--engine needs the name of a container engine" >&2; exit 2; }
+      ENGINE="$2"; shift ;;
     -*)           echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     *)            FILTERS="$FILTERS $1" ;;
   esac
   shift
 done
+
+# A filter that matches nothing is an error, not an empty pass - the same rule
+# tests/run.sh keeps, and for the same reason: a typo must not read as green.
+if [ -n "$FILTERS" ]; then
+  matched=0
+  for filter in $FILTERS; do
+    case "
+debian:12
+fedora:latest
+archlinux:latest
+opensuse/tumbleweed:latest" in
+      *"$filter"*) matched=$((matched + 1)) ;;
+      *) echo "no image matched the filter: $filter" >&2; exit 2 ;;
+    esac
+  done
+fi
 
 # ------------------------------------------------------------------- the plan
 #

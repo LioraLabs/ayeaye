@@ -448,6 +448,33 @@ test_a_trailing_comment_is_not_part_of_an_unquoted_value() {
   assert_eq "arch" "$(platform_family)"
 }
 
+test_a_quoted_value_ends_at_its_closing_quote_comment_or_not() {
+  # Stripping the comment and the quotes in the wrong order leaves the quotes
+  # on, which turns a fully supported machine into an unknown one.
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID="debian" # the only one that matters' \
+                 'VERSION_ID="12" # stable' \
+                 'PRETTY_NAME="Debian GNU/Linux 12" # codename bookworm' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "debian" "$(platform_id)"
+  assert_eq "debian" "$(platform_family)"
+  assert_eq "12" "$(platform_version)" "a consumer comparing versions gets a number"
+  assert_eq "Debian GNU/Linux 12" "$(platform_pretty)"
+}
+
+test_a_quoted_value_containing_a_hash_keeps_it() {
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID=debian' 'PRETTY_NAME="Debian #1"' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "Debian #1" "$(platform_pretty)" "inside the quotes a hash is just a hash"
+}
+
 test_an_id_in_capitals_is_matched_all_the_same() {
   # Deepin has shipped ID=Deepin. An id is compared, not displayed.
   _stub_uname Linux x86_64

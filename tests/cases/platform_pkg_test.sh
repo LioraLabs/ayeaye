@@ -223,6 +223,20 @@ test_a_package_name_with_a_space_or_a_semicolon_in_it_stays_one_argument() {
   assert_stub_call_count sudo 1
 }
 
+test_the_executing_form_works_on_more_than_debian() {
+  # The string form is pinned for all five managers; the executing form has to
+  # be exercised on more than one of them or the eval is only known to work
+  # where sudo happens to be the first word.
+  _on arch pacman
+  platform_pkg_install tmux python3
+  assert_stub_called_with sudo "sudo pacman -S --needed --noconfirm tmux python"
+
+  _on_macos_with_brew
+  platform_pkg_install tmux
+  assert_stub_called_with brew "brew install tmux"
+  assert_stub_not_called sudo "and brew was still not given sudo"
+}
+
 test_the_call_being_wrong_is_told_apart_from_the_platform_being_unable() {
   _on debian-12 apt-get
   local status

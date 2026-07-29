@@ -89,6 +89,23 @@ test_a_unit_that_is_not_a_service_keeps_its_own_kind() {
   assert_eq "ayeaye.timer" "$(platform_service_unit ayeaye.timer)"
 }
 
+test_the_launchd_prefix_is_a_tunable_and_really_is_used() {
+  PLATFORM_LAUNCHD_PREFIX="com.example"
+  export PLATFORM_LAUNCHD_PREFIX
+  _on_launchd
+  assert_eq "com.example.ayeaye" "$(platform_service_unit ayeaye)"
+  assert_eq "launchctl kickstart gui/501/com.example.ayeaye" \
+    "$(platform_service_command ayeaye start)"
+  assert_eq "com.example.ayeaye" "$(platform_service_unit com.example.ayeaye)" \
+    "and a name already carrying the new prefix is left alone"
+}
+
+test_the_detected_uid_is_the_one_the_commands_address() {
+  _on_launchd
+  assert_eq "501" "$(platform_uid)"
+  assert_contains "$(platform_service_command ayeaye status)" "gui/501/"
+}
+
 test_naming_a_unit_where_there_is_no_service_manager_says_nothing() {
   _on_nothing
   local out status
