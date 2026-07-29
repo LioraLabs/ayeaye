@@ -78,7 +78,13 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-consent.log
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup.log
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/backups
 ${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye
+${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye/statusline-command.sh
+${CLIBAN_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/cliban/cliban.db}
+$HOME/.claude/settings.json
 $HOME/.local/bin/ayeaye
+${XDG_BIN_HOME:-$HOME/.local/bin}/claude
+${XDG_BIN_HOME:-$HOME/.local/bin}/codex
+${XDG_BIN_HOME:-$HOME/.local/bin}/cliban
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
 $HOME/.bashrc
 $HOME/.zshrc

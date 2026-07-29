@@ -47,28 +47,40 @@ tool for any coverage that cannot run on the machine it finds itself on.
 
 ## Container checks
 
-`tests/containers.sh` is a separate, opt-in runner. It sources the platform
-layer inside real `debian`, `fedora`, `archlinux` and `opensuse/tumbleweed`
-images and asserts that the family, package manager, distro id and package
-queries match a machine rather than a fixture. Nothing is installed: the
-repository is mounted read-only and the probe only asks questions.
+`tests/containers.sh` is a separate, opt-in runner. It goes into real
+`debian`, `fedora`, `archlinux` and `opensuse/tumbleweed` images and does two
+things there.
 
 ```sh
-tests/containers.sh              # all four images
+tests/containers.sh              # all four images: what it says, and what it does
 tests/containers.sh arch fedora  # by substring
 tests/containers.sh --list
+tests/containers.sh --quick      # only the questions; install nothing
 tests/containers.sh --suite      # also run the unit tests inside each image
 tests/containers.sh -v           # print every probed value
 ```
+
+**`tests/lib/platform_probe.sh` only asks questions.** It sources the platform
+layer and asserts that the family, package manager, distro id and package
+queries match a machine rather than a fixture. Nothing is installed: the
+repository is mounted read-only and the commands the layer would run are
+asserted as strings.
+
+**`tests/lib/install_probe.sh` really installs.** It calls
+`wizard_install_packages` — the same door `install.sh` goes through — for
+tmux, python3, curl and tar, and then checks that each program is on `PATH`
+*and* that the package database agrees. That is the coverage a stub cannot
+give: that the command generated for a family is one that family's package
+manager accepts, and that the name table names packages that exist. It runs
+inside a container that is thrown away when it exits, and the repository is
+still mounted read-only. `--quick` leaves it out; do not run it on a laptop.
 
 It is not part of `tests/run.sh` on purpose — the fast suite stays runnable
 with nothing but bash, coreutils and python3. With no container engine it says
 so and exits 0, because "could not check" is not "found a problem". The
 tumbleweed image ships neither `find` nor `python3`, so `--suite` skips it and
-reports why; the probe still runs there.
-
-`tests/lib/platform_probe.sh` is what it runs inside each image, and it is also
-the quickest way to see what the platform layer makes of your own machine.
+reports why; both probes still run there, and the install probe is in fact how
+python3 gets there.
 
 ## Adding a test
 
@@ -360,6 +372,10 @@ still satisfy a bare "contains" check.
 | `tests/cases/install_*_test.sh` | what `install.sh` does today |
 | `tests/cases/wizard_*_test.sh` | the setup layer: state, consent, lifecycle, flow, resume |
 | `tests/cases/projects_*_test.sh` | how the project picker finds and ranks projects |
+| `tests/cases/install_packages_test.sh` | the requirements, and the exact install command per family |
+| `tests/cases/install_agents_test.sh` | finding, fetching and checking Claude Code and Codex |
+| `tests/cases/install_marker_test.sh` | the Claude Code status line, and the settings merge |
+| `tests/cases/install_cliban_test.sh` | cliban, and what it means for a component to be optional |
 
 ## Testing a setup step
 
