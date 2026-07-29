@@ -769,6 +769,89 @@ def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
     return rows, stopped
 
 
+# ------------------------------------------------------------- pick history
+# What zoxide was really providing was not a directory list -- the filesystem
+# already has one -- but a record of which directories you actually use. So
+# AyeAye keeps that record itself, in its own state directory, updated
+# whenever an agent is started somewhere. No second tool, and nothing to
+# train: the picker gets better because you used it.
+_RECENTS_FILE = os.path.join(_state_dir(), "projects.json")
+_RECENTS_MAX = 200             # a ranking signal, not a history file
+_RECENTS_HALF_LIFE = 14.0      # days before a pick counts for half
+_recents_lock = threading.Lock()
+
+
+def _recents_load():
+    """{path: (count, last_used)}.
+
+    Anything wrong with the file -- absent, unreadable, truncated by a crash,
+    hand-edited into nonsense -- means no ranking signal rather than an
+    error. A picker without history is still a working picker, and this is
+    called on the request path.
+    """
+    try:
+        with open(_RECENTS_FILE) as fh:
+            picks = json.load(fh).get("picks")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(picks, dict):
+        return {}
+    out = {}
+    for path, rec in picks.items():
+        try:
+            out[path] = (int(rec["n"]), float(rec["t"]))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    return out
+
+
+def _recent_score(rec, now):
+    """Frecency: how often, discounted by how long ago.
+
+    Halving every fortnight is what makes this a record of what you are
+    working on rather than what you once worked on -- a directory opened
+    three times this week beats one opened ten times last spring.
+    """
+    if not rec:
+        return 0.0
+    count, last = rec
+    age_days = max(0.0, (now - last) / 86400.0)
+    return count * (0.5 ** (age_days / _RECENTS_HALF_LIFE))
+
+
+def _recents_key(path):
+    return os.path.abspath(os.path.expanduser(path)).rstrip("/") or "/"
+
+
+def note_project_pick(path):
+    """Record that an agent was started here.
+
+    Best effort in every direction: a store that cannot be written costs
+    ranking quality and nothing else, so no failure here may reach the
+    response. The write is atomic, because a store half-replaced by a crash
+    would read as corrupt and silently throw the history away.
+    """
+    key = _recents_key(path)
+    now = time.time()
+    with _recents_lock:
+        picks = _recents_load()
+        picks[key] = (picks.get(key, (0, 0.0))[0] + 1, now)
+        if len(picks) > _RECENTS_MAX:
+            ranked = sorted(picks.items(),
+                            key=lambda kv: -_recent_score(kv[1], now))
+            picks = dict(ranked[:_RECENTS_MAX])
+        blob = {"version": 1,
+                "picks": {p: {"n": n, "t": t} for p, (n, t) in picks.items()}}
+        tmp = _RECENTS_FILE + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(_RECENTS_FILE), exist_ok=True)
+            with open(tmp, "w") as fh:
+                json.dump(blob, fh)
+            os.replace(tmp, _RECENTS_FILE)
+        except OSError:
+            pass
+
+
 def projects(query="", limit=40):
     """Candidate directories, newest-frecency first, straight from zoxide --
     the same source ftz picks from."""
@@ -885,6 +968,9 @@ def spawn_agent(path, agent, prompt=""):
     tmux("send-keys", "-t", pane, "-l", cmd)
     tmux("send-keys", "-t", pane, "Enter")
 
+    # Starting an agent somewhere is the strongest possible signal that this
+    # is one of your projects, so it is what teaches the picker.
+    note_project_pick(path)
 
     return {"pane": pane, "session": name, "created": created, "agent": agent}
 

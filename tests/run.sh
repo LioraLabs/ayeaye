@@ -72,6 +72,7 @@ fi
 GUARDED_PATHS="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/env
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye.service
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token
+${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/projects.json
 $HOME/.local/bin/ayeaye
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
 $HOME/.bashrc

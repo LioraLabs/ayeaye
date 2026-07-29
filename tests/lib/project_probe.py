@@ -154,10 +154,15 @@ def cmd_recents(m, args):
         for path in args.paths:
             m.note_project_pick(path)
         return
+    if args.action == "score":
+        now = time.time()
+        record = (args.count, now - args.age_days * 86400.0)
+        emit(score="%.6f" % m._recent_score(record, now))
+        return
     store = m._recents_load()
-    emit(entries=len(store))
+    emit(entries=len(store), file=m._RECENTS_FILE)
     for path in sorted(store):
-        n, t = store[path]
+        n, _t = store[path]
         print("pick\t%s\t%d" % (path, n))
 
 
@@ -218,8 +223,10 @@ def main():
     p.set_defaults(fn=cmd_shape)
 
     p = sub.add_parser("recents")
-    p.add_argument("action", choices=("note", "dump"))
+    p.add_argument("action", choices=("note", "dump", "score"))
     p.add_argument("paths", nargs="*")
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--age-days", type=float, default=0.0)
     p.set_defaults(fn=cmd_recents)
 
     p = sub.add_parser("supersede")
