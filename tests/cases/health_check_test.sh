@@ -141,7 +141,14 @@ test_skipped_and_passed_are_two_different_marks_on_the_screen() {
   # difference on its own, without the sentence beside it being read.
   assert_matches "$HEALTH_OUTPUT" "^  ok +ayeaye answers on"
   assert_matches "$HEALTH_OUTPUT" "^  skipped +an https address"
-  assert_not_contains "$HEALTH_OUTPUT" "  ok       an https address"
+  # And the four marks really are four. Counting them is what would catch a
+  # rendering that quietly collapsed two of them into one.
+  local marks
+  marks="$(printf '%s\n' "$HEALTH_OUTPUT" | sed -n 's/^  \([A-Za-z]*\)  *[a-z].*/\1/p' \
+    | sort -u | tr '\n' ' ')"
+  assert_contains "$marks" "ok"
+  assert_contains "$marks" "skipped"
+  assert_not_contains "$marks" "FAILED" "nothing failed in this run"
 }
 
 test_the_marks_are_explained_before_any_of_them_is_used() {
@@ -151,6 +158,15 @@ test_the_marks_are_explained_before_any_of_them_is_used() {
   assert_contains "$HEALTH_OUTPUT" "ok       it works"
   assert_contains "$HEALTH_OUTPUT" "skipped  you did not ask"
   assert_contains "$HEALTH_OUTPUT" "unknown  setup could not tell"
+  # "Before" is the half of the name that was not being checked: a legend that
+  # arrives underneath the checklist explains nothing to somebody reading down
+  # the screen.
+  local legend first
+  legend="$(printf '%s\n' "$HEALTH_OUTPUT" | grep -n "ok       it works" | head -1 | cut -d: -f1)"
+  first="$(printf '%s\n' "$HEALTH_OUTPUT" | grep -n "^  ok  *ayeaye answers on" | head -1 | cut -d: -f1)"
+  assert_ne "" "$legend"
+  assert_ne "" "$first"
+  [ "$legend" -lt "$first" ] || fail "the legend came after the checklist it explains"
 }
 
 # ============================================ the unauthenticated-rejection assertion
@@ -179,7 +195,7 @@ test_an_open_api_is_said_out_loud_and_not_only_marked() {
   _config
   _run_health
   assert_contains "$HEALTH_OUTPUT" "STOP."
-  assert_contains "$HEALTH_OUTPUT" "can be"
+  assert_contains "$HEALTH_OUTPUT" "driven by anybody who can reach that address"
   assert_contains "$HEALTH_OUTPUT" "Do not open this from your phone until"
 }
 
@@ -380,6 +396,30 @@ test_a_chosen_front_end_that_cannot_be_reached_is_not_reported_as_working() {
 }
 
 # ================================================================ the service
+
+test_a_service_this_machine_says_is_running_passes() {
+  _serve
+  _config
+  # A systemd user session, and a status command that answers yes.
+  stub_command systemctl --exit 1
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user status *' --exit 0
+  _run_health
+  assert_eq pass "$(_verdict service)"
+  assert_contains "$HEALTH_OUTPUT" "ayeaye starts when you log in, and is running now"
+}
+
+test_a_service_this_machine_says_is_not_running_fails() {
+  _serve
+  _config
+  stub_command systemctl --exit 1
+  stub_when systemctl '--user show-environment' --exit 0
+  # --user status is left on the failing default: the unit is not active.
+  _run_health
+  assert_eq fail "$(_verdict service)"
+  assert_status 10 "$HEALTH_STATUS" \
+    "a service that is not up is unfinished work, not a security failure"
+}
 
 test_a_machine_with_no_service_manager_is_not_failed_for_it() {
   _serve

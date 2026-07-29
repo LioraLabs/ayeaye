@@ -127,7 +127,10 @@ run.** `tests/smoke-hosts` is the record and every line of it says `no`.
 `tests/smoke.sh` is the thing that would do it: it places the machine through
 the platform layer, refuses to go on if that machine is not one of the six,
 runs a first install, the health check, a rerun and a resumed run, and asserts
-the closing checklist against the machine it printed it on. **It changes the
+the closing checklist against the machine it printed it on. Its answers go down
+a pipe rather than through `--defaults`, on purpose: an unattended run never
+answers "enable and start it now?", so nothing is ever started, and the eight
+health checks would never execute anywhere at all. **It changes the
 computer it runs on and does not undo any of it**, which is why running it
 needs a confirmation nobody types by accident. Put it on a fresh install or a
 virtual machine.

@@ -1034,40 +1034,82 @@ _summary_service_kind() {
 # _summary_voice - the listening tier, in the words the hardware step measured
 # it in, plus notifications when they are configured.
 #
-# hw_voice_tier and nothing of its own. This line used to be computed here from
-# a probe of its own and printed the word "text-only" whatever the machine was,
-# which meant a computer that had just downloaded a listening model was told it
-# was text-only in the same run.
+# What was **set up**, not what this computer could have managed. There are two
+# ways to get this wrong and the milestone managed both of them. The first was
+# a probe of its own that printed "text-only" whatever had happened, so a
+# machine that had just downloaded a listening model was told it could not
+# listen. The second, which is worse, is reading the hardware tier: that is a
+# measurement of the machine and has nothing to do with whether anybody chose
+# to set voice up, so a run that installed nothing and asked for nothing would
+# announce "talking and typing" on a computer where the talk button is grey.
+#
+# So the sources are, in order: what the health check found, which is the only
+# one that watched the app answer; then whether a listening model was chosen at
+# all; and the hardware tier last and only to explain why it was never offered.
 _summary_voice() {
-  local tier="unknown"
+  local health model tier=""
+  health="$(wizard_state_get step.service.health.voice "")"
+  model="$(wizard_state_get answer.voice.model "")"
   command -v hw_voice_tier >/dev/null 2>&1 && tier="$(hw_voice_tier)"
-  case "$tier" in
-    maximum)     printf 'talking and typing, with room for the best of it' ;;
-    recommended) printf 'talking and typing' ;;
-    lightweight) printf 'typing, and a little talking' ;;
-    text-only)   printf 'typing (this computer has no room to listen)' ;;
-    *)           printf 'typing' ;;
-  esac
+
+  if [ "$health" = pass ]; then
+    printf 'typing, and talking out loud'
+  elif [ -n "$model" ]; then
+    # Set up, and not seen working. The health check either could not reach the
+    # app or found the talk button still grey, and both of those are on the
+    # unfinished list with their own line further down.
+    printf 'typing; talking out loud is set up but was not confirmed'
+  elif [ "$tier" = text-only ]; then
+    printf 'typing (this computer has no room to listen)'
+  else
+    printf 'typing (talking out loud was not set up; ./install.sh again offers it)'
+  fi
   [ -n "$NTFY" ] && printf ', with notifications to your phone'
   return 0
 }
 
-# _summary_phone_url <token> - the address to open on a phone. Status 1 when
-# there is nothing a phone can open, which is what "this computer only" means
-# and is worth saying out loud rather than printing a loopback address somebody
-# will try from the sofa.
+# _summary_phone_url <token> - the address to open on a phone.
 #
-# The https front's own name is the first entry in the list of addresses ayeaye
-# was told to accept, because that list is written by the step that set the
-# front end up and its first entry is the name that front end answers to. For
-# the home-network mode that entry carries the port as well, which is why the
-# port is never added here.
+#   0  here it is
+#   1  there is no way in to a phone, which is what "this computer only" means
+#   2  a way in was chosen and is not finished, so the address is not one to
+#      hand somebody yet
+#
+# The list of addresses ayeaye accepts is **not** enough to answer this on its
+# own, and reading it as though it were is how this screen came to invent a
+# phone address on a run that had set nothing up: install.sh's own allowed-hosts
+# question offers a tailscale name it noticed as its default, and pressing
+# return puts that name in the list without a front end existing anywhere. The
+# fact that means what this needs is what the access step actually installed,
+# and whether that step finished.
+#
+# For the home-network mode the allow-list entry carries the port as well, which
+# is why the port is never added here.
 _summary_phone_url() {
-  local token="${1:-}" host
+  local token="${1:-}" host mode
   host="${HOSTS%%,*}"
+  mode="$(wizard_state_get step.install.access.installed "")"
+  case "$mode" in
+    tailscale|lan|proxy)
+      [ -n "$host" ] || return 1
+      printf 'https://%s/?token=%s' "$host" "$token"
+      # The address is right either way - it is the one the front end will
+      # answer on - but a front end that is not finished is not one to send
+      # somebody to from the sofa, so the caller says which of the two it has.
+      [ "$(wizard_state_get step.install.access.ready 0)" = 1 ] || return 2
+      return 0
+      ;;
+  esac
+  # Nothing was set up, and there is still a name in the allow list. It got
+  # there one of two ways and this screen cannot tell them apart: somebody
+  # typed it, or install.sh offered a tailscale name it had noticed as the
+  # default and they pressed return. So the address is printed - losing it
+  # would be unhelpful to the first of those - and it is not led with, and it
+  # is not called theirs to open, because for the second it is a front end that
+  # does not exist.
   [ -n "$host" ] || return 1
   printf 'https://%s/?token=%s' "$host" "$token"
-  return 0
+  return 3
 }
 
 # _summary_health_trouble - the capabilities the health step checked and could
@@ -1111,12 +1153,16 @@ _summary_health_trouble() {
 _summary_resume() {
   local trouble
   case "${1:-}.${2:-}" in
-    install.needs)
-      printf 'install it with your system'"'"'s usual software installer, then run ./install.sh again' ;;
     install.voice)
       printf 'run ./install.sh again and choose a listening option; what was already downloaded is kept' ;;
     install.access)
-      printf 'run ./install.sh again from a terminal - setting up a way in is never done unattended' ;;
+      # Deliberately vague, and it is the one place in this table where vague is
+      # the honest answer. There are six ways this step can end unfinished -
+      # tailscale absent, tailscale not signed in, serve refused, no address on
+      # the network yet, a proxy waiting for its configuration, nobody watching
+      # - and it says which, in words, at the moment it happens. Naming one of
+      # the six here would contradict that paragraph five times out of six.
+      printf 'the way in step said above what it is waiting for; do that, then run ./install.sh again' ;;
     install.agents|install.board)
       printf 'run ./install.sh again, or install it yourself and setup will find it' ;;
     install.marker)
@@ -1179,9 +1225,35 @@ $files"
       wizard_say "  computer starts it for you"
       ;;
   esac
+
+  # Whatever the way in left behind. The certificate authority's directory is
+  # the one that has to be named out loud rather than left inside "and the rest
+  # of the settings": it holds the private key this computer signs with, and a
+  # removal that left it there would leave a machine able to mint certificates
+  # for a network it is no longer on.
+  case "$mode" in
+    lan)
+      if command -v _access_caddyfile >/dev/null 2>&1; then
+        files="$files
+$(_access_caddyfile)
+$(_access_ca_dir)
+$(_access_caddy_data)"
+      fi
+      ;;
+    proxy)
+      if command -v _access_proxy_caddy_file >/dev/null 2>&1; then
+        files="$files
+$(_access_proxy_caddy_file)
+$(_access_proxy_nginx_file)"
+      fi
+      ;;
+  esac
+
   wizard_say "  then delete"
   printf '%s\n' "$files" | sed 's/^/    /'
   if [ "$mode" = lan ]; then
+    wizard_say "  The last of those holds the key this computer signs certificates"
+    wizard_say "  with, so it is the one that matters most."
     wizard_say "  and remove the certificate from every phone you put it on."
     wizard_say "  Only you can do that; nothing here can reach your phone."
   fi
@@ -1198,16 +1270,35 @@ step_summary() {
   wizard_say "config  : $ENV_FILE"
 
   # ------------------------------------------------------ opening it on a phone
-  if url="$(_summary_phone_url "$token")"; then
-    wizard_say "bookmark: $url"
-    wizard_say "          open that one on your phone."
-    wizard_say "          in a browser on this computer: http://$BIND:$PORT/?token=$token"
-  else
-    wizard_say "bookmark: http://$BIND:$PORT/?token=$token"
-    wizard_say "          a browser on this computer, and nothing else - your phone"
-    wizard_say "          cannot reach ayeaye yet. Run ./install.sh again and pick a"
-    wizard_say "          way in when you want it to."
-  fi
+  url="$(_summary_phone_url "$token")"
+  case "$?" in
+    0)
+      wizard_say "bookmark: $url"
+      wizard_say "          open that one on your phone."
+      wizard_say "          in a browser on this computer: http://$BIND:$PORT/?token=$token"
+      ;;
+    2)
+      wizard_say "bookmark: $url"
+      wizard_say "          that is the address, once the way in you chose is"
+      wizard_say "          finished. It is not finished yet, and what it is waiting"
+      wizard_say "          for is below."
+      wizard_say "          in a browser on this computer: http://$BIND:$PORT/?token=$token"
+      ;;
+    3)
+      wizard_say "bookmark: http://$BIND:$PORT/?token=$token"
+      wizard_say "          a browser on this computer. Your settings name"
+      wizard_say "          ${HOSTS%%,*} as an https address for this machine, and"
+      wizard_say "          setup did not put it there and cannot see it from here."
+      wizard_say "          If you have it answering, what to open on your phone is"
+      wizard_say "          $url"
+      ;;
+    *)
+      wizard_say "bookmark: http://$BIND:$PORT/?token=$token"
+      wizard_say "          a browser on this computer, and nothing else - your phone"
+      wizard_say "          cannot reach ayeaye yet. Run ./install.sh again and pick a"
+      wizard_say "          way in when you want it to."
+      ;;
+  esac
   wizard_blank
   wizard_say "signing in, once per device:"
   wizard_say "  open that address once. It puts a key in the browser and sends you"

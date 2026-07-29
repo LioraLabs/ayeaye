@@ -371,9 +371,9 @@ AYEAYE_ALLOWED_HOSTS="quoted.example"
 ENV
   run_install --defaults --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_contains "$RUN_STDOUT" "in a browser on this computer: http://10.0.0.5:9100/?token=" \
+  assert_contains "$RUN_STDOUT" "bookmark: http://10.0.0.5:9100/?token=" \
     "surrounding quotes are stripped, single as well as double"
-  assert_contains "$RUN_STDOUT" "bookmark: https://quoted.example/?token="
+  assert_contains "$RUN_STDOUT" "https://quoted.example/?token="
 }
 
 test_a_duplicated_key_in_a_kept_config_is_read_last_wins() {
@@ -394,7 +394,7 @@ test_a_key_absent_from_a_kept_config_falls_back_to_its_default() {
   mkdir -p "$XDG_CONFIG_HOME/ayeaye"
   printf 'AYEAYE_ALLOWED_HOSTS=only.example\n' > "$XDG_CONFIG_HOME/ayeaye/env"
   run_install --defaults --no-systemd
-  assert_contains "$RUN_STDOUT" "in a browser on this computer: http://127.0.0.1:8911/?token=" \
+  assert_contains "$RUN_STDOUT" "bookmark: http://127.0.0.1:8911/?token=" \
     "bind and port fall back to the built-in defaults, not to empty"
 }
 

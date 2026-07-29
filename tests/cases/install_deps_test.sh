@@ -138,25 +138,35 @@ test_an_absent_toolbox_does_not_fail_the_install() {
     "none of it is a reason for the install to stop"
 }
 
-test_the_summary_line_follows_the_measured_tier_not_a_probe() {
-  # The closing "what works:" line used to be computed from a sweep of its own,
-  # which meant a computer that had just downloaded a listening model was told
-  # it was text-only in the same run. It is read from what the hardware step
-  # measured now, so putting a transcriber on PATH cannot move it.
+test_the_summary_line_says_what_was_set_up_and_not_what_the_machine_could_do() {
+  # Two ways to get this line wrong, and the milestone managed both.
+  #
+  # It used to be computed from a sweep of its own, so a computer that had just
+  # downloaded a listening model was told it was text-only. Reading the
+  # hardware tier instead fixes that and breaks it worse in the other
+  # direction: the tier is a measurement of the machine, so a run that
+  # installed nothing and was asked for nothing would announce that talking
+  # works on a computer where the talk button is grey.
+  #
+  # What is asserted here is the property that survives both: on a run where
+  # nothing about voice was chosen, the line must not claim talking - however
+  # roomy the machine is, and whatever happens to be on PATH.
   _hard_deps_present
   run_install --defaults --no-systemd
-  assert_matches "$RUN_STDOUT" "what works: (talking and typing|typing)"
+  assert_contains "$RUN_STDOUT" "what works: typing"
+  assert_not_contains "$RUN_STDOUT" "what works: typing, and talking out loud" \
+    "nothing was set up, so nothing may be claimed"
+  assert_contains "$RUN_STDOUT" "talking out loud was not set up"
 
-  local before after
-  before="$(printf '%s\n' "$RUN_STDOUT" | grep '^what works: ' | head -1)"
-  assert_ne "" "$before" "anchor: the line was printed at all"
-
+  # And still not, with a whole transcription toolbox on PATH. The line is
+  # about this run, not about this computer.
   stub_command ffmpeg
   stub_command whisper-server
+  stub_command ollama
   run_install --defaults --no-systemd
-  after="$(printf '%s\n' "$RUN_STDOUT" | grep '^what works: ' | head -1)"
-  assert_eq "$before" "$after" \
-    "the line describes what this computer has room for, not what is on PATH"
+  assert_contains "$RUN_STDOUT" "what works: typing"
+  assert_not_contains "$RUN_STDOUT" "what works: typing, and talking out loud" \
+    "a program on PATH is not a capability somebody asked for"
 }
 
 test_whisper_cpp_counts_as_a_transcriber_too() {
@@ -202,7 +212,16 @@ test_a_running_tailscale_supplies_the_allowed_host_default() {
     "AYEAYE_ALLOWED_HOSTS=my-box.tail1a2b3c.ts.net" \
     "the node name becomes the allowed host, with its trailing dot stripped"
   assert_not_contains "$RUN_STDOUT" "my-box.tail1a2b3c.ts.net./" "the trailing dot must be gone"
-  assert_contains "$RUN_STDOUT" "https://my-box.tail1a2b3c.ts.net/?token="
+  # And offering it is where it stops. The name is a *default* for a question,
+  # so an unattended run puts it in the settings file without anybody having
+  # chosen anything and without a front end existing - which is precisely how
+  # the closing screen came to hand somebody a phone address on a run that had
+  # set nothing up at all.
+  assert_not_contains "$RUN_STDOUT" "bookmark: https://my-box.tail1a2b3c.ts.net" \
+    "an address in the allow list is not a way in that was set up"
+  assert_not_contains "$RUN_STDOUT" "open that one on your phone." \
+    "and nobody is told to open an address nothing is serving"
+  assert_contains "$RUN_STDOUT" "setup did not put it there and cannot see it"
 }
 
 test_a_logged_out_tailscale_falls_back_to_no_allowed_hosts() {

@@ -165,7 +165,7 @@ _health_url()   { printf 'http://%s:%s' "$(_health_bind)" "$(_health_port)"; }
 # that has no user service manager, or a run that was told not to install one:
 # ayeaye started by hand is a supported way to use it.
 _health_check_service() {
-  local kind cmd
+  local kind cmd claim
   if [ "${NO_SYSTEMD:-0}" = 1 ]; then
     _health_report service skip "ayeaye starting when you log in"
     return 0
@@ -178,15 +178,28 @@ _health_check_service() {
       return 0
       ;;
   esac
+  # What the answer is actually worth differs by platform, so the sentence
+  # does too. `systemctl --user status` succeeds only for a unit that is
+  # active. `launchctl print` succeeds for a job launchd has loaded, which
+  # includes one that started, crashed and has not been retried - the whole
+  # reason lib/steps/70-service.sh can use it to ask "is this label already
+  # registered". Claiming "and is running now" from that would be claiming
+  # more than the command answered. Whether ayeaye is really up is the next
+  # check's business, and it asks over http.
+  if [ "$kind" = launchd ]; then
+    claim="ayeaye is registered to start when you log in"
+  else
+    claim="ayeaye starts when you log in, and is running now"
+  fi
   if ! cmd="$(platform_service_command ayeaye status)"; then
-    _health_report service unknown "ayeaye starting when you log in"
+    _health_report service unknown "$claim"
     return 0
   fi
   wizard_detail "running: $cmd"
   if eval "$cmd" >/dev/null 2>&1; then
-    _health_report service pass "ayeaye starts when you log in, and is running now"
+    _health_report service pass "$claim"
   else
-    _health_report service fail "ayeaye starts when you log in, and is running now"
+    _health_report service fail "$claim"
   fi
   return 0
 }

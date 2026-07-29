@@ -44,15 +44,36 @@ test_the_bookmark_instruction_explains_why_the_token_is_in_the_url() {
 }
 
 test_a_configured_https_front_becomes_the_phone_bookmark() {
-  # The phone cannot open a loopback address, so where there is an https front
-  # that is the address the closing screen leads with - and the local one is
-  # still named, marked as being for a browser on this computer.
+  # The phone cannot open a loopback address, so where a way in has really been
+  # set up that is the address the closing screen leads with - and the local one
+  # is still named, marked as being for a browser on this computer.
+  #
+  # The fourth answer is the one that matters: naming an https address is not
+  # the same as agreeing that it may reach ayeaye, and until that question is
+  # answered nothing has been set up for a phone at all.
   _hard_deps_present
-  stdin_lines "" "front.example" ""
+  stdin_lines "" "front.example" "" "y"
   run_install --no-systemd
   assert_contains "$RUN_STDOUT" "bookmark: https://front.example/?token="
-  assert_contains "$RUN_STDOUT" "open that one on your phone."
   assert_contains "$RUN_STDOUT" "in a browser on this computer: http://127.0.0.1:8911/?token="
+}
+
+test_naming_an_address_is_not_the_same_as_setting_one_up() {
+  # The defect this pins: install.sh offers a tailscale name it noticed as the
+  # default for the allowed-hosts question, so pressing return puts a name in
+  # the settings file with no front end anywhere. A closing screen that read
+  # that list as "here is your phone address" would invent one, on a run that
+  # set nothing up and said so two screens earlier.
+  _hard_deps_present
+  stdin_lines "" "front.example" "" "n"
+  run_install --no-systemd
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_ALLOWED_HOSTS=front.example" \
+    "the name they typed is still theirs and is still written down"
+  assert_not_contains "$RUN_STDOUT" "bookmark: https://front.example" \
+    "but nothing was set up, so there is no address to lead with"
+  assert_not_contains "$RUN_STDOUT" "open that one on your phone." \
+    "and nobody is told to open one"
+  assert_contains "$RUN_STDOUT" "setup did not put it there and cannot see it"
 }
 
 test_the_two_halves_of_the_bookmark_block_agree_about_the_port() {
@@ -60,7 +81,7 @@ test_the_two_halves_of_the_bookmark_block_agree_about_the_port() {
   # so for any port but the default the two contradicted each other and one of
   # them was wrong. They agree now.
   _hard_deps_present
-  stdin_lines "9000" "front.example" ""
+  stdin_lines "9000" "front.example" "" "y"
   run_install --no-systemd
   assert_contains "$RUN_STDOUT" "bookmark: https://front.example/?token="
   assert_contains "$RUN_STDOUT" "in a browser on this computer: http://127.0.0.1:9000/?token="
@@ -80,7 +101,7 @@ test_no_allowed_host_means_no_https_front_is_offered() {
 
 test_the_first_allowed_host_becomes_the_https_front() {
   _hard_deps_present
-  stdin_lines "" "front.example,second.example" ""
+  stdin_lines "" "front.example,second.example" "" "y"
   run_install --no-systemd
   assert_contains "$RUN_STDOUT" "bookmark: https://front.example/?token="
   assert_not_contains "$RUN_STDOUT" "https://second.example" \
@@ -106,9 +127,9 @@ test_the_run_says_that_software_added_later_needs_no_re_run() {
 }
 
 test_the_closing_screen_says_what_works_here() {
-  # One line, in the words the hardware step measured this machine in, and it
-  # is the first thing on the last screen.
+  # One line, describing what this run set up, and it is the first thing on
+  # the last screen. Typing always works; anything more had to be chosen.
   _hard_deps_present
   run_install --defaults --no-systemd
-  assert_matches "$RUN_STDOUT" "what works: (talking and typing|typing)"
+  assert_contains "$RUN_STDOUT" "what works: typing"
 }

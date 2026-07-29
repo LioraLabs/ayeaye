@@ -133,7 +133,26 @@ test_a_run_with_no_way_in_says_the_phone_cannot_reach_it_yet() {
   assert_not_contains "$RUN_STDOUT" "open that one on your phone."
 }
 
-test_a_run_with_an_https_front_gives_the_phone_that_address() {
+test_a_way_in_that_was_really_set_up_gives_the_phone_that_address() {
+  # The address a phone is handed comes from what the way-in step actually
+  # installed, not from the list of addresses ayeaye accepts. Here one really
+  # is set up: the run is asked, it says yes, and the proxy mode writes the
+  # configuration and the allow list together.
+  _hard_deps_present
+  stdin_lines "" "box.example.ts.net" "" "y"
+  run_install --no-systemd
+  assert_status 0 "$RUN_STATUS"
+  assert_matches "$RUN_STDOUT" "bookmark: https://box\.example\.ts\.net/\?token="
+  assert_matches "$RUN_STDOUT" "in a browser on this computer: http://127\.0\.0\.1:8911/\?token="
+}
+
+test_an_address_in_the_settings_is_not_a_way_in_that_was_set_up() {
+  # The defect: install.sh offers a tailscale name it noticed as the default
+  # for the allowed-hosts question, so a settings file can name an https
+  # address that nothing is serving - and the closing screen used to read that
+  # list as "here is the address for your phone" and invent one. It is still
+  # printed, because losing somebody's own address would be unhelpful, and it
+  # is neither led with nor called theirs to open.
   _hard_deps_present
   mkdir -p "$XDG_CONFIG_HOME/ayeaye"
   cat > "$(_env_file)" <<'ENV'
@@ -143,9 +162,27 @@ AYEAYE_ALLOWED_HOSTS=box.example.ts.net
 ENV
   run_install --defaults --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_matches "$RUN_STDOUT" "bookmark: https://box\.example\.ts\.net/\?token="
-  assert_contains "$RUN_STDOUT" "open that one on your phone."
-  assert_matches "$RUN_STDOUT" "in a browser on this computer: http://127\.0\.0\.1:8911/\?token="
+  assert_matches "$RUN_STDOUT" "bookmark: http://127\.0\.0\.1:8911/\?token="
+  assert_not_contains "$RUN_STDOUT" "bookmark: https://box.example.ts.net" \
+    "nothing was set up, so nothing may be led with"
+  assert_not_contains "$RUN_STDOUT" "open that one on your phone." \
+    "and nobody is told to open it"
+  assert_contains "$RUN_STDOUT" "setup did not put it there and cannot see it" \
+    "the address is still shown, with what is and is not known about it"
+}
+
+test_a_way_in_that_is_not_finished_is_not_handed_to_a_phone_as_working() {
+  # The proxy mode writes the configuration and then cannot reach the address,
+  # because the person still has to add that configuration to their proxy. The
+  # address is right; it is not yet an address to open from the sofa.
+  _hard_deps_present
+  stdin_lines "" "not-yet.example" "" "y"
+  run_install --no-systemd
+  assert_status 0 "$RUN_STATUS"
+  assert_matches "$RUN_STDOUT" "bookmark: https://not-yet\.example/\?token="
+  assert_contains "$RUN_STDOUT" "It is not finished yet, and what it is waiting"
+  assert_not_contains "$RUN_STDOUT" "open that one on your phone." \
+    "a front end waiting for its configuration is not one to send somebody to"
 }
 
 test_the_address_carries_the_key_that_is_really_on_this_machine() {
@@ -179,13 +216,18 @@ test_the_key_itself_is_named_by_its_file_and_not_pasted_into_a_command() {
 
 # ==================================================== what this computer can do
 
-test_the_closing_screen_reports_the_tier_that_was_measured() {
+test_the_closing_screen_reports_what_was_set_up_not_what_was_measured() {
   # It used to print "tier : text-only" whatever the machine was, from a probe
   # of its own that had nothing to do with the measurement three stages back.
+  # Reading the measurement instead is the opposite mistake and a worse one:
+  # the hardware tier says what this computer has room for, and a run that set
+  # voice up for nobody would announce that talking works.
   _hard_deps_present
   run_install --defaults --no-systemd
-  assert_matches "$RUN_STDOUT" "^what works: (talking|typing)"
+  assert_contains "$RUN_STDOUT" "what works: typing"
   assert_not_contains "$RUN_STDOUT" "probed live"
+  assert_not_contains "$RUN_STDOUT" "what works: typing, and talking out loud" \
+    "nothing about voice was chosen in this run"
 }
 
 test_a_notification_url_is_part_of_what_works() {
@@ -199,17 +241,29 @@ ENV
   assert_contains "$RUN_STDOUT" "with notifications to your phone"
 }
 
-test_voice_is_described_once_in_a_whole_run() {
-  # Three descriptions of one capability, in two framings, is what this run
-  # used to do: a sweep in stage two, a paragraph in stage three, and a stale
-  # tier word in stage eight.
+test_only_one_thing_in_a_run_says_whether_this_computer_can_listen() {
+  # Three verdicts about one capability, in two framings, is what this run used
+  # to give: a "voice tier: missing …" sweep in stage two, a "talking to them
+  # out loud: not yet" paragraph in stage three, and a stale "tier : text-only"
+  # word in stage eight that meant something else entirely.
+  #
+  # One verdict now, from the step that measured the machine. Stage two still
+  # lists which programs are installed, and that is deliberately not a verdict:
+  # it is an inventory, it says "Nothing above is required", and it is the
+  # difference between "you do not have ffmpeg" and "this computer cannot
+  # listen".
   _hard_deps_present
   run_install --defaults --no-systemd
   assert_not_contains "$RUN_STDOUT" "voice tier:"
   assert_not_contains "$RUN_STDOUT" "What that means for you:"
+  assert_not_contains "$RUN_STDOUT" "talking to them out loud"
+  assert_not_contains "$RUN_STDOUT" "probed live"
   assert_eq "1" \
     "$(printf '%s\n' "$RUN_STDOUT" | grep -c 'Talking to your agents out loud')" \
     "the hardware step is the one place that says what talking here would be like"
+  assert_eq "1" \
+    "$(printf '%s\n' "$RUN_STDOUT" | grep -c '^what works: ')" \
+    "and the closing line says what this run set up, once"
 }
 
 # =============================================== unfinished work, and how to resume

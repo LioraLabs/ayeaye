@@ -359,6 +359,8 @@ while IFS='|' read -r image family manager id; do
       # is not there.
       check claims_service no
       check claims_systemctl_removal no
+      check agents_really_here no
+      check claims_agents no
       check says_manual_start yes
       check health_had_nothing_to_check yes
       check claims_phone_address no

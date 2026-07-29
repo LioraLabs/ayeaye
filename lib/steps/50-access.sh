@@ -1024,16 +1024,47 @@ _access_settle() {
 
 # ========================================================== 6. do the work
 
+# _access_note_installed <mode> <ready> - what is really in front of ayeaye now.
+#
+# Two keys and not one, because the closing screen has two different things to
+# say. `installed` is which way in this machine has; `ready` is whether it was
+# finished. A tailscale that is installed but not signed in is `tailscale` and
+# `0`: the address is the right one to write down and the wrong one to tell
+# somebody to open.
+#
+# Both live under step.install.access, which a deliberate rerun clears along
+# with every other step key - which is why the paths that change nothing
+# re-derive them from _access_previous_mode rather than assuming last run's
+# answer survived.
+_access_note_installed() {
+  wizard_remember step.install.access.installed "${1:-}"
+  wizard_remember step.install.access.ready "${2:-0}"
+  return 0
+}
+
+# _access_keep_what_is_there - for the paths that leave the way in alone. What
+# is on this machine is a fact about the machine, and a run that touched
+# nothing must still be able to say what that fact is.
+_access_keep_what_is_there() {
+  local previous
+  previous="$(_access_previous_mode)"
+  [ -n "$previous" ] || return 0
+  _access_note_installed "$previous" 1
+  return 0
+}
+
 _access_install_step() {
   local mode previous status
 
   if [ "$(wizard_state_get answer.change_settings 1)" = 0 ]; then
     wizard_say "leaving the way you reach ayeaye as it is."
+    _access_keep_what_is_there
     return "$WIZARD_STAGE_SKIP"
   fi
   mode="$(wizard_state_get answer.access.mode "")"
   if [ -z "$mode" ]; then
     wizard_say "leaving the way you reach ayeaye as it is."
+    _access_keep_what_is_there
     return "$WIZARD_STAGE_SKIP"
   fi
 
@@ -1071,8 +1102,10 @@ _access_install_step() {
       ;;
   esac
   status=$?
-  if [ "$status" = "$WIZARD_STAGE_OK" ] || [ "$status" = "$WIZARD_STAGE_PENDING" ]; then
-    wizard_remember step.install.access.installed "$mode"
+  if [ "$status" = "$WIZARD_STAGE_OK" ]; then
+    _access_note_installed "$mode" 1
+  elif [ "$status" = "$WIZARD_STAGE_PENDING" ]; then
+    _access_note_installed "$mode" 0
   fi
   return "$status"
 }

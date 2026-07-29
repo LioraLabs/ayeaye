@@ -257,8 +257,27 @@ printf 'ayeaye smoke test: %s\n' "$PROFILE"
 printf '  %s\n\n' "$(platform_summary)"
 
 # ------------------------------------------------------------- 1. a first run
+#
+# Answers fed down a pipe rather than --defaults, and the difference is the
+# whole reason this pass is worth running on a real machine. --defaults never
+# reads an answer, and "enable and start it now?" is an answer - so an
+# unattended run never starts the service, the health check finds nothing
+# running, and the eight checks this ticket exists for are never executed
+# anywhere. Empty lines take every offered default, which on a real host means
+# the local port, no https front (--yes cannot grant exposure, and nothing here
+# would want it to) and yes to starting the service.
 printf 'first install\n'
-( cd "$REPO_ROOT" && bash ./install.sh --defaults --yes ) >"$OUT_DIR/first" 2>&1
+( cd "$REPO_ROOT" && bash ./install.sh --yes <<'ANSWERS'
+
+
+
+
+
+
+
+
+ANSWERS
+) >"$OUT_DIR/first" 2>&1
 want_status "$?" 0 "the run finished"
 want_file "$ENV_FILE" "the settings file was written"
 want_file "$TOKEN_FILE" "the key was made"
@@ -309,13 +328,22 @@ done
 # ------------------------------------------------------------- 2. health
 printf '\nthe health check\n'
 if grep -q 'ayeaye is not running yet' "$OUT_DIR/first"; then
-  note "nothing was started, so nothing was checked - this is a --defaults run,"
-  note "and starting a service is never done without being asked"
+  # Not a note any more: this pass answers the start question, so nothing
+  # having been started means something went wrong with the service, and the
+  # eight checks below it did not happen.
+  bad "nothing was started, so none of the health checks ran"
 else
   want_in "$OUT_DIR/first" "Checking what you asked for." "the health check ran"
-  want_in "$OUT_DIR/first" "ayeaye refuses anyone without your key" \
-    "and an unauthenticated request was really refused"
+  want_in "$OUT_DIR/first" "ok       ayeaye answers on http://" \
+    "ayeaye really answered on this machine"
+  want_in "$OUT_DIR/first" "ok       ayeaye refuses anyone without your key" \
+    "and really refused a request that carried no key"
   want_not_in "$OUT_DIR/first" "STOP." "with the lock on"
+  # The four verdicts, and the one that matters most: a capability nobody
+  # asked for must be reported as such and not as working.
+  want_in "$OUT_DIR/first" "skipped  " "a capability nobody chose is marked skipped"
+  want_not_in "$OUT_DIR/first" "ok       an https address your phone can open" \
+    "a way in that was never set up is never reported as working"
 fi
 
 # ------------------------------------------------------------- 3. a rerun

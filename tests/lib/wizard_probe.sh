@@ -107,6 +107,12 @@ say plan_named_packages "$(has "$FIRST" 'which ayeaye cannot run without')"
 # otherwise is the exact failure this whole ticket exists to prevent.
 say claims_service "$(has "$FIRST" 'ayeaye starts when you log in, and is running now')"
 say claims_systemctl_removal "$(has "$FIRST" 'systemctl --user disable')"
+# None of these images has claude or codex on it and --defaults chooses
+# neither, so any sentence saying the agents are installed is a sentence about
+# a machine that is not this one.
+say claims_agents "$(has "$FIRST" 'the coding agents you chose are installed')"
+say agents_really_here \
+  "$(command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 && printf yes || printf no)"
 say claims_phone_address "$(has "$FIRST" 'open that one on your phone.')"
 say says_no_way_in_yet "$(has "$FIRST" 'cannot reach ayeaye yet')"
 say says_manual_start "$(has "$FIRST" 'run the server with:')"

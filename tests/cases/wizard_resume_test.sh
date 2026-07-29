@@ -107,9 +107,9 @@ test_an_interrupted_run_does_not_ask_the_questions_again() {
   assert_contains "$RUN_STDOUT" "Your choices (already done)" \
     "the questions were answered already, and it says so"
   assert_file_contains "$(_env)" "AYEAYE_PORT=9911"
-  assert_contains "$RUN_STDOUT" "bookmark: https://kept.example/?token=" \
+  assert_contains "$RUN_STDOUT" "https://kept.example/?token=" \
     "and the answers still drive the summary"
-  assert_contains "$RUN_STDOUT" "in a browser on this computer: http://127.0.0.1:9911/?token=" \
+  assert_contains "$RUN_STDOUT" "bookmark: http://127.0.0.1:9911/?token=" \
     "the port as well as the address that was named for the phone"
 }
 

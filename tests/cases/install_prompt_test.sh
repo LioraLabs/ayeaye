@@ -211,10 +211,11 @@ test_a_kept_config_still_drives_the_summary() {
   _existing_config
   pty_expect "rewrite it?" "n"
   pty_install --no-systemd
-  assert_contains "$PTY_TRANSCRIPT" "bookmark: https://kept.example/?token=" \
+  assert_contains "$PTY_TRANSCRIPT" "https://kept.example/?token=" \
     "the summary is read back out of the kept file, not out of the defaults"
-  assert_contains "$PTY_TRANSCRIPT" \
-    "in a browser on this computer: http://10.9.8.7:7777/?token="
+  assert_contains "$PTY_TRANSCRIPT" "bookmark: http://10.9.8.7:7777/?token="
+  assert_contains "$PTY_TRANSCRIPT" "setup did not put it there and cannot see it" \
+    "a name in a kept settings file is not a way in this run set up"
   assert_contains "$PTY_TRANSCRIPT" "with notifications to your phone" \
     "the kept ntfy URL counts towards what works here"
 }
