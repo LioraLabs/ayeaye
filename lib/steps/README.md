@@ -172,5 +172,12 @@ the bare `step.<stage>.<step>` key — those belong to the lifecycle.
 - **Add every new path your step writes to `GUARDED_PATHS` in `tests/run.sh`,
   in the same commit.** The suite declares a run void if anything on that list
   changes, and a path that is not on it is a path a test can escape through.
+- **A step that generates a file for another program to read owes that program
+  a test in its own language.** `lib/steps/70-service.sh` writes systemd units
+  and launchd property lists; `tests/lib/service_probe.sh` hands them to a real
+  distro's `systemd-analyze verify` inside a container, and
+  `service_units_test.sh` parses the agents with `plistlib`. A golden file only
+  proves the bytes have not changed by accident — it cannot tell you they were
+  ever right.
 - A prompt is only emitted to a terminal, so anything about a question needs
   the pty driver: `pty_expect`, `pty_answers`, `pty_install`.

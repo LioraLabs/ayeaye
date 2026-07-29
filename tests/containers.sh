@@ -130,9 +130,20 @@ fi
 
 PASSED=0
 FAILED=0
+SKIPPED=0
 FAILED_IMAGES=""
 CURRENT=""
 PROBE=""
+
+# skip <reason> - coverage this image cannot supply, counted and named.
+#
+# The whole point of running anything in a container is to find out what a
+# real machine says. An image that cannot answer a question has to say so:
+# a silent pass would be worth less than no check at all.
+skip() {
+  printf '  skip     %s\n' "$*"
+  SKIPPED=$((SKIPPED + 1))
+}
 
 # value <key> - a key's value out of the probe output.
 value() {
@@ -211,6 +222,64 @@ while IFS='|' read -r image family manager id; do
   check present_installed yes
   check absent_installed no
 
+  # ------------------------------------------------------------- services
+  #
+  # A second probe, because this one is about what gets written rather than
+  # about what the machine is. What a container can honestly answer:
+  #
+  #   whether a definition renders at all under this image's bash and
+  #   userland - the tumbleweed image has neither find nor python3, and
+  #   busybox coreutils are not GNU ones;
+  #
+  #   whether this distro's own systemd parser accepts what we wrote, which
+  #   is the one thing no fixture and no golden file can tell us;
+  #
+  #   and that an image with systemctl installed and no session is detected
+  #   as having no service manager, rather than being promised one.
+  #
+  # What it cannot answer is whether a unit can be enabled or started, because
+  # there is no user session bus in any of these images. That is not worked
+  # around here. It is reported as skipped, by name, every time.
+  SERVICE_PROBE="$("$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
+                     bash tests/lib/service_probe.sh 2>&1)"
+  if [ "$?" != 0 ] || [ -z "$SERVICE_PROBE" ]; then
+    printf '  FAIL     the service probe did not run:\n'
+    printf '%s\n' "$SERVICE_PROBE" | sed 's/^/           /'
+    FAILED=$((FAILED + 1))
+    FAILED_IMAGES="$FAILED_IMAGES $image"
+  else
+    [ "$VERBOSE" = 1 ] && printf '%s\n' "$SERVICE_PROBE" | sed 's/^/           /'
+    PROBE="$SERVICE_PROBE"
+    check rendered_ayeaye yes
+    check rendered_whisper yes
+    check placeholders none
+    check exec_absolute yes
+    check env_referenced yes
+    check settings_leaked no
+    # No session bus here, and the detection has to say so rather than
+    # counting the systemctl binary as an answer.
+    check user_bus absent
+    check service_manager none
+    case "$(value analyze)" in
+      ok)
+        printf '  ok       analyze = ok (this image'"'"'s own systemd parsed both units)\n'
+        PASSED=$((PASSED + 1))
+        ;;
+      unavailable)
+        skip "systemd-analyze: $image does not ship it, so nothing here parsed the units"
+        ;;
+      unusable)
+        skip "systemd-analyze: $image ships it but it will not start in a container, so nothing here parsed the units"
+        ;;
+      *)
+        printf '  FAIL     analyze: %s\n' "$(value analyze_note)"
+        FAILED=$((FAILED + 1))
+        FAILED_IMAGES="$FAILED_IMAGES $image"
+        ;;
+    esac
+    skip "enabling and starting a user service: no session bus in a container"
+  fi
+
   if [ "$RUN_SUITE" = 1 ]; then
     if "$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
          sh -c 'command -v find >/dev/null 2>&1' >/dev/null 2>&1; then
@@ -234,7 +303,13 @@ $IMAGES
 EOF
 
 ELAPSED=$(( $(date +%s) - STARTED ))
-printf '\n%s checks passed, %s failed in %ss\n' "$PASSED" "$FAILED" "$ELAPSED"
+printf '\n%s checks passed, %s failed, %s skipped in %ss\n' \
+  "$PASSED" "$FAILED" "$SKIPPED" "$ELAPSED"
+if [ "$SKIPPED" -gt 0 ]; then
+  printf 'skipped checks are coverage a container cannot supply; each is named above.\n'
+fi
+printf 'not covered anywhere: launchd. There is no Mac here, so the agents are\n'
+printf '                     pinned by golden file and by plistlib only.\n'
 if [ "$FAILED" -gt 0 ]; then
   printf 'failed images:%s\n' "$FAILED_IMAGES"
   exit 1
