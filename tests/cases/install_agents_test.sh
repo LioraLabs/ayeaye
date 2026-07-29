@@ -437,7 +437,7 @@ test_the_questions_read_the_way_they_look_when_somebody_is_watching() {
   stub_command tmux
   stub_command curl
   stub_command tar
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "install Claude Code?" "n"
   pty_expect "install OpenAI Codex?" "n"
   pty_expect "install cliban as well?" "n"
@@ -457,7 +457,7 @@ test_saying_yes_at_a_terminal_reaches_the_step_that_acts_on_it() {
   stub_command tmux
   stub_command tar
   _curl_serves "$(_fake_claude_installer)"
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "install Claude Code?" "y"
   pty_expect "install OpenAI Codex?" "n"
   pty_expect "set that up?" "n"

@@ -98,13 +98,18 @@ test_the_agent_names_this_machines_real_paths() {
 test_no_setting_is_copied_into_the_agent() {
   _hard_deps_present
   _mac_with_launchd
-  stdin_lines "0.0.0.0" "9977" "mac.example.org" "https://ntfy.example/mac"
+  # Every answer setup takes is distinctive, so any of them turning up in the
+  # property list is proof a setting leaked into it. The agent says where the
+  # program and its settings file are and nothing about what is in them, which
+  # is what makes changing a setting not a reason to reinstall the agent.
+  stdin_lines "9977" "mac.example.org" "https://ntfy.example/mac"
   run_install
   assert_status 0 "$RUN_STATUS"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9977" \
     "anchor: those answers really were taken"
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "VOICE_NTFY_URL=https://ntfy.example/mac" \
+    "anchor: and the last of them, so all three really were consumed"
   assert_file_not_contains "$(_plist)" "9977"
-  assert_file_not_contains "$(_plist)" "0.0.0.0"
   assert_file_not_contains "$(_plist)" "mac.example.org"
   assert_file_not_contains "$(_plist)" "ntfy.example"
 }
@@ -125,7 +130,7 @@ test_the_agent_is_on_disk_before_anything_is_registered() {
   # whether the file existed at the moment it was made.
   _hard_deps_present
   _mac_with_launchd
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -149,7 +154,7 @@ test_an_unattended_run_registers_nothing_and_says_how() {
 test_confirming_the_prompt_bootstraps_the_agent() {
   _hard_deps_present
   _mac_with_launchd
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "y"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -161,7 +166,7 @@ test_confirming_the_prompt_bootstraps_the_agent() {
 test_declining_the_prompt_leaves_the_agent_registered_as_it_was() {
   _hard_deps_present
   _mac_with_launchd
-  pty_answers "" "" "" ""
+  pty_answers "" "" ""
   pty_expect "enable and start it now?" "n"
   pty_install
   assert_status 0 "$PTY_STATUS"
@@ -267,9 +272,32 @@ test_a_mac_is_told_where_its_log_is_and_how_to_remove_the_agent() {
   run_install --defaults
   assert_contains "$RUN_STDOUT" "to read its log: tail -f $(_logs)/ayeaye.log"
   assert_contains "$RUN_STDOUT" "to remove it later: launchctl bootout gui/$(_uid)/dev.ayeaye"
-  assert_contains "$RUN_STDOUT" "then delete $(_plist)"
+  assert_contains "$RUN_STDOUT" "$(_plist)"
   assert_not_contains "$RUN_STDOUT" "journalctl" "there is no journal on a Mac"
   assert_not_contains "$RUN_STDOUT" "enable-linger" "and no linger either"
+}
+
+test_the_closing_summary_removes_it_the_way_this_platform_removes_things() {
+  # The summary used to print a systemctl incantation whatever machine it was
+  # on, which on a Mac is instructions for a program that is not installed
+  # followed by a plist nobody was told about. Both halves matter: the command
+  # named has to be the one that works here, and the other platform's must not
+  # appear anywhere in the run.
+  _hard_deps_present
+  _mac_with_launchd
+  run_install --defaults
+  assert_status 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "to remove it:"
+  assert_contains "$RUN_STDOUT" "launchctl bootout gui/$(_uid)/dev.ayeaye"
+  assert_contains "$RUN_STDOUT" "$(_plist)" \
+    "the file left behind is named, not left for somebody to find"
+  assert_contains "$RUN_STDOUT" "$XDG_CONFIG_HOME/ayeaye/env"
+  assert_contains "$RUN_STDOUT" "$XDG_STATE_HOME/ayeaye"
+  assert_matches "$RUN_STDOUT" "logs[[:space:]]*: tail -f $(_logs)/ayeaye.log" \
+    "and the log it points at is the one launchd was told to write"
+  assert_not_contains "$RUN_STDOUT" "systemctl" \
+    "there is no systemctl on a Mac to disable anything with"
+  assert_not_contains "$RUN_STDOUT" "journalctl" "nor a journal to read"
 }
 
 test_no_systemd_on_a_mac_installs_nothing_and_still_succeeds() {

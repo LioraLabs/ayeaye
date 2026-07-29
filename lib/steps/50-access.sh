@@ -734,10 +734,10 @@ _access_warn_open_bind() {
   wizard_say "has, which means anything that can reach this machine can reach"
   wizard_say "your agents. The key is then the only thing in the way, and none"
   wizard_say "of it is encrypted."
-  wizard_say "Nothing here has changed that, because you were asked for that"
-  wizard_say "address and that is what you answered. To undo it, put"
-  wizard_say "$ACCESS_LOOPBACK in the address question next time, or change"
-  wizard_say "AYEAYE_BIND in $(_access_env_file)."
+  wizard_say "Nothing here has changed it, because that address is already in"
+  wizard_say "your settings and it is not this step's to overwrite. To undo it,"
+  wizard_say "change AYEAYE_BIND to $ACCESS_LOOPBACK in"
+  wizard_say "$(_access_env_file), and run setup again."
   return 0
 }
 
@@ -996,9 +996,12 @@ _access_settle() {
 
   case "$mode" in
     local)
-      # Nothing. install.sh has already put "this computer only" in the plan
-      # from the address question, and saying it twice in the same list reads
-      # like two different things are about to happen.
+      # install.sh used to put this line in the plan itself, from an address
+      # question it no longer asks. It belongs here now: this is the step that
+      # decides how ayeaye is reached, in all four answers, and the plan should
+      # say what was decided rather than what somebody typed.
+      wizard_plan_add network \
+        "ayeaye will answer on $ACCESS_LOOPBACK:$(_access_app_port), this computer only"
       ;;
     tailscale)
       _access_have tailscale || wizard_plan_add package "tailscale, for a private https address"

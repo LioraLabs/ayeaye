@@ -65,6 +65,8 @@
 #   wizard_stage_status <stage>         done | pending | failed | ""
 #   wizard_step_status <stage> <step>   the same, for one step
 #   wizard_unfinished      the outstanding work, one line each, in words
+#   wizard_unfinished_rows the same, as "<stage>\t<step>\t<status>\t<label>",
+#                          for a caller that has to say how to resume each one
 #   wizard_reset_progress  forget which stages and steps finished, keep the
 #                          answers. This is what a rerun does, and what --fresh
 #                          does more of.
@@ -238,6 +240,37 @@ wizard_unfinished() {
     case "$status" in
       pending) printf '%s (not finished)\n' "$label" ;;
       failed)  printf '%s (did not work)\n' "$label" ;;
+    esac
+  done <<EOF
+$_WIZARD_STEP_TABLE
+EOF
+  return 0
+}
+
+# wizard_unfinished_rows - the same outstanding work, with the stage and the
+# step it belongs to still attached: "<stage>\t<step>\t<status>\t<label>", one
+# row each, in registration order. Empty when there is nothing.
+#
+# wizard_unfinished answers "what is left" in words a person reads; this
+# answers "which piece of setup was that" so that a caller can say how to pick
+# each one up again. Two functions rather than one because the first is printed
+# straight to a screen and adding two columns to it would put step ids in front
+# of somebody who has never used a terminal.
+wizard_unfinished_rows() {
+  local line="" stage step label status
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    stage="${line%%"$_WIZARD_STAGE_TAB"*}"
+    line="${line#*"$_WIZARD_STAGE_TAB"}"
+    step="${line%%"$_WIZARD_STAGE_TAB"*}"
+    label="${line##*"$_WIZARD_STAGE_TAB"}"
+    status="$(wizard_step_status "$stage" "$step")"
+    case "$status" in
+      pending|failed)
+        printf '%s%s%s%s%s%s%s\n' \
+          "$stage" "$_WIZARD_STAGE_TAB" "$step" "$_WIZARD_STAGE_TAB" \
+          "$status" "$_WIZARD_STAGE_TAB" "$label"
+        ;;
     esac
   done <<EOF
 $_WIZARD_STEP_TABLE

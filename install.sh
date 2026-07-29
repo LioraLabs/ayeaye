@@ -114,6 +114,32 @@ That asks before it downloads anything, fetches ayeaye $AYEAYE_VERSION into
 and then does exactly what running it from a copy does. Add arguments to it
 with -s --, for example: | bash -s -- --yes
 BOOTSTRAP
+  _release_caveat
+}
+
+# _release_caveat - said wherever the one-liner is quoted, for as long as it is
+# not true.
+#
+# The command above fetches a pinned release, and no release has been
+# published: there is no $AYEAYE_VERSION tag and nothing under
+# releases/download/$AYEAYE_VERSION/, so the fetch would 404. Cutting a release
+# is a decision for whoever owns the repository and not something setup can do
+# on their behalf, so the honest thing available here is to say so out loud
+# rather than to print a command that does not work and let somebody find out.
+#
+# When the release exists, delete this function and its two callers, and fill
+# in AYEAYE_SHA256 at the top of this file.
+_release_caveat() {
+  cat <<CAVEAT
+
+Not yet, though: ayeaye $AYEAYE_VERSION has not been published. Until somebody
+tags it and uploads ayeaye-$AYEAYE_VERSION.tar.gz and SHA256SUMS to that
+release, the command above has nothing to fetch and will fail. Clone the
+repository and run ./install.sh from it instead:
+
+  git clone https://github.com/LioraLabs/ayeaye
+  cd ayeaye && ./install.sh
+CAVEAT
 }
 
 for arg in "$@"; do
@@ -527,6 +553,8 @@ _bootstrap() {
       _boot_err "the download did not work, so nothing has been changed here."
       _boot_err "check the connection and run it again - what did arrive is kept,"
       _boot_err "and the next run carries on from where this one stopped."
+      # And the likeliest reason of all, while that is still true.
+      _release_caveat >&2
       exit 1
     fi
   fi
@@ -626,80 +654,72 @@ step_detect_machine() {
   return "$WIZARD_STAGE_OK"
 }
 
-step_detect_needs() {
+# _needs - the two programs ayeaye cannot run without, named once.
+_needs() { printf 'tmux python3'; }
+
+# _needs_missing - which of them this computer does not have, right now, with a
+# leading space when there are any. Asked of the machine every time rather than
+# read back from the state file: a run picked up tomorrow may well have had one
+# of them installed by hand in between, and re-installing something that is
+# already there is the second-worst answer available.
+_needs_missing() {
   local dep missing=""
-  for dep in tmux python3; do
+  for dep in $(_needs); do
+    command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
+  done
+  printf '%s' "$missing"
+}
+
+# Stage two looks and says what it found. It does not install: everything setup
+# would change is summarized in stage five and confirmed there, and a stage
+# that installed two packages three stages earlier would make that promise a
+# lie. What it does instead is put them in the plan, so the summary the person
+# confirms is the whole of what is about to happen.
+step_detect_needs() {
+  local dep missing
+  for dep in $(_needs); do
     if command -v "$dep" >/dev/null 2>&1; then
       wizard_item ok "$dep"
     else
       wizard_item MISSING "$dep (required)"
-      missing="$missing $dep"
     fi
   done
+  missing="$(_needs_missing)"
+  # Written down as well as planned, so that the log of a run that went wrong
+  # says what this stage actually saw rather than only what it decided.
+  wizard_remember step.detect.needs.missing "${missing# }"
   [ -n "$missing" ] || return "$WIZARD_STAGE_OK"
 
   wizard_blank
   wizard_say "ayeaye cannot run without these:$missing"
   wizard_say "tmux is what the coding agents run inside, and python3 is what"
   wizard_say "ayeaye itself is written in."
-  wizard_blank
-  # The one door to installing anything, here and in every later ticket.
-  # shellcheck disable=SC2086
-  if wizard_install_packages $missing; then
-    wizard_say "installed."
-    return "$WIZARD_STAGE_OK"
-  fi
-  wizard_blank
-  wizard_say "install the missing packages and re-run."
-  return "$WIZARD_STAGE_FAIL"
+  wizard_say "Nothing is being installed yet. Setup lists everything it would"
+  wizard_say "change in one place further down, and asks before any of it."
+  wizard_plan_add package "${missing# }, which ayeaye cannot run without"
+  # OK, not FAIL. A FAIL here is what used to stop the run before it reached
+  # the plan, which is exactly the thing this arrangement exists to prevent:
+  # the missing programs are work to be done, and stage six is where work is
+  # done. step_install_needs is what cannot be got past.
+  return "$WIZARD_STAGE_OK"
 }
 
 # ====================================================== 3. what it can do
 
-# _have_transcriber - is there anything on this computer that turns speech
-# into words?
+# Whether this computer can turn speech into words - and what that is worth -
+# is one subject and it belongs to one file. lib/steps/20-hardware.sh measures
+# it, names the tier, and says in the report stage what talking out loud would
+# be like here; this step says the one thing that file does not, which is that
+# there has to be an https address in front of ayeaye before a phone can use a
+# microphone at all.
 #
-# One question, asked from one list. whisper.cpp renamed its binaries and both
-# names are still in the world, so a check that spells one of them refuses a
-# machine that transcribes perfectly - which is exactly how bin/ayeaye's talk
-# button and bin/voice-dictate's pipeline came to disagree about the same
-# program. The list lives in lib/steps/20-hardware.sh and is borrowed here
-# rather than repeated, with a fallback for a file sourced on its own.
-_have_transcriber() {
-  local name
-  for name in ${_HW_WHISPER_COMMANDS:-whisper-server whisper-cli whisper-cpp whisper}; do
-    command -v "$name" >/dev/null 2>&1 && return 0
-  done
-  return 1
-}
-
+# There used to be a voice sweep here as well, and a second framing of the same
+# answer, and a third in the closing summary. Three descriptions of one
+# capability in one run is not thoroughness, it is a screen nobody reads.
 step_report() {
-  local dep voice_missing="" transcriber=0
   if ! command -v tailscale >/dev/null 2>&1; then
     wizard_item note "tailscale not found: you will need another way to serve https to the phone"
   fi
-  for dep in ffmpeg whisper-server ollama; do
-    command -v "$dep" >/dev/null 2>&1 || voice_missing="$voice_missing $dep"
-  done
-  if [ -n "$voice_missing" ]; then
-    wizard_say "  voice tier: missing$voice_missing (optional; text-only mode works without them)"
-  else
-    wizard_say "  voice tier: all present (ffmpeg, whisper-server, ollama)"
-  fi
-  wizard_blank
-  wizard_say "What that means for you:"
-  wizard_say "  - reading and typing to your agents from the phone: yes, always."
-  if command -v ffmpeg >/dev/null 2>&1 && _have_transcriber; then
-    transcriber=1
-  fi
-  if [ "$transcriber" = 1 ]; then
-    wizard_say "  - talking to them out loud: yes, this computer can transcribe."
-  else
-    wizard_say "  - talking to them out loud: not yet. ayeaye works without it, and"
-    wizard_say "    finds a listening server the moment one starts answering. A"
-    wizard_say "    command-line one it reads when it starts, so restart it after."
-  fi
-  wizard_blank
   wizard_say "Recommended here: text on the phone now, over an https address only"
   wizard_say "you can reach. Voice is worth adding later and costs nothing to skip."
   return "$WIZARD_STAGE_OK"
@@ -740,18 +760,22 @@ step_choose() {
   # Each question offers what is already configured, so that pressing return
   # means "leave this as it is" - which is what pressing return looks like it
   # means, and what somebody rerunning setup to change one thing expects of the
-  # other three. On a first run there is nothing configured and the offer is
+  # other two. On a first run there is nothing configured and the offer is
   # the built-in default.
   wizard_blank
-  wizard_say "Four questions about how to reach ayeaye. Press return to keep"
+  wizard_say "Three questions about how to reach ayeaye. Press return to keep"
   wizard_say "what is in the square brackets."
   wizard_blank
 
-  wizard_say "Which address should ayeaye answer on? 127.0.0.1 means this"
-  wizard_say "computer only, which is the safe answer unless something else on"
-  wizard_say "your network has to reach it directly."
-  wizard_ask "bind address" "$(_current AYEAYE_BIND answer.bind 127.0.0.1)"
-  BIND="$REPLY"
+  # The address ayeaye answers on is not one of them, and deliberately so.
+  # lib/steps/50-access.sh owns how ayeaye is reached: it keeps the program
+  # itself on this computer in every one of the four ways in, and puts the
+  # thing that is on the network in front of it. Asking here as well was
+  # asking the same question twice and getting two answers - and one of the
+  # answers this question accepted, 0.0.0.0, is the single setting this
+  # project will not write for anybody. What is already in a settings file is
+  # still honoured, and still said out loud; see _access_warn_open_bind.
+  BIND="$(_current AYEAYE_BIND answer.bind 127.0.0.1)"
 
   wizard_say "Which port? Any number will do; change it only if something else"
   wizard_say "on this computer already uses this one."
@@ -776,7 +800,6 @@ step_choose() {
     "$(_current VOICE_NTFY_URL answer.ntfy "")"
   NTFY="$REPLY"
 
-  _decide_exposure
   _remember_choices
   wizard_plan_add config "your settings, at $ENV_FILE"
   return "$WIZARD_STAGE_OK"
@@ -793,41 +816,6 @@ _current() {
   [ -n "$value" ] || value="$(wizard_state_get "$2" "")"
   [ -n "$value" ] || value="$3"
   printf '%s' "$value"
-}
-
-# Binding anywhere but this computer is the one choice that puts ayeaye within
-# reach of something else, so it is a consent decision - recorded either way,
-# and never one an unattended run is allowed to take.
-_decide_exposure() {
-  case "$BIND" in
-    127.0.0.1|localhost|::1|"")
-      wizard_consent_record expose refused "listening on this computer only"
-      wizard_plan_add network "ayeaye will answer on $BIND:$PORT, this computer only"
-      return 0
-      ;;
-  esac
-  if [ "$WIZARD_INTERACTIVE" = 0 ]; then
-    # Belt and braces. An unattended run never reads an answer, so it cannot
-    # get here today - and the day a default changes, this is what stops that
-    # change from putting somebody's machine on a network without them.
-    wizard_consent_record expose refused "an unattended run never opens ayeaye to a network"
-    BIND="127.0.0.1"
-    wizard_plan_add network "ayeaye will answer on $BIND:$PORT, this computer only"
-    return 0
-  fi
-  # The answer to the address question is the consent to exposure - it is an
-  # explicit choice, typed a moment ago, and asking a second question about it
-  # would be asking the same thing twice. What it does need is for the
-  # consequence to be said out loud in words rather than left implied by an IP
-  # address, and for the decision to be in the ledger like every other one.
-  wizard_blank
-  wizard_say "note: $BIND is not just this computer. Anything that can reach"
-  wizard_say "this machine on your network will be able to reach ayeaye, and"
-  wizard_say "the key in the bookmark is the only thing keeping them out."
-  wizard_say "Answer 127.0.0.1 instead if you did not mean that."
-  wizard_consent_record expose granted "you chose to listen on $BIND"
-  wizard_plan_add network "ayeaye will answer on $BIND:$PORT, which other computers can reach"
-  return 0
 }
 
 _remember_choices() {
@@ -864,6 +852,64 @@ step_plan() {
 }
 
 # ======================================================== 6. do the work
+
+# The two programs ayeaye cannot run without, installed here rather than in
+# stage two - after the plan has been shown and agreed to, and before anything
+# else in this stage needs them. step_write_settings runs python3, so the order
+# inside the stage is not incidental.
+#
+# It stays in install.sh rather than moving to lib/steps because a machine with
+# no tmux and no python3 cannot run ayeaye at all: that is the lifecycle's
+# business, not a capability a step adds. lib/steps/60-packages.sh checks the
+# same two and stops when they are absent, which is what keeps a run that lost
+# one of them between stages from getting any further.
+#
+# Nothing here says "installed." for a program that is not there. A zero exit
+# from wizard_install_packages means the command it built ran, which is not the
+# same fact and never was.
+step_install_needs() {
+  local dep missing still="" status
+  missing="$(_needs_missing)"
+  if [ -z "$missing" ]; then
+    return "$WIZARD_STAGE_SKIP"
+  fi
+
+  wizard_say "ayeaye needs$missing before anything else here can be done."
+  # The one door to installing anything, here and in every later ticket.
+  # shellcheck disable=SC2086
+  wizard_install_packages $missing
+  status=$?
+  case "$status" in
+    0) ;;
+    "$WIZARD_REFUSED")
+      wizard_say "nothing was installed, and this computer is exactly as it was."
+      ;;
+    *)
+      wizard_say "that software could not be installed automatically."
+      ;;
+  esac
+
+  # bash remembers where it found a command, and it also remembers having
+  # failed to find one in some shells. Ask the machine again from a clean slate.
+  hash -r 2>/dev/null || true
+  for dep in $missing; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      wizard_item ok "$dep"
+    else
+      wizard_item MISSING "$dep"
+      still="$still $dep"
+    fi
+  done
+  if [ -n "$still" ]; then
+    wizard_blank
+    wizard_say "ayeaye still cannot run here:$still is not on this computer."
+    wizard_say "Install it however you normally would, then run ./install.sh"
+    wizard_say "again - it carries on from here and asks nothing twice."
+    return "$WIZARD_STAGE_FAIL"
+  fi
+  wizard_say "installed."
+  return "$WIZARD_STAGE_OK"
+}
 
 step_write_settings() {
   local backup
@@ -958,54 +1004,250 @@ step_service() {
 }
 
 # ============================================================= 8. done
+#
+# What is left at the end of a run is a picture of this computer, and the whole
+# of this stage's job is that the picture is true. Three things follow:
+#
+#   Every instruction is built from what actually happened, not from what
+#   usually happens. The way to remove ayeaye on a Mac names launchctl and a
+#   property list; on Linux it names systemctl and a unit; on a machine with
+#   neither it says to stop the program you started by hand. A run that prints
+#   systemctl to somebody with no systemd has told them something false about
+#   their own computer, which is worse than telling them nothing.
+#
+#   The address a phone should open is the one the way-in that was set up
+#   actually answers on - not the address ayeaye itself listens on, which in
+#   every mode is this computer and is not reachable from a phone at all.
+#
+#   Work that did not finish is listed with how to pick it up, item by item.
+#   "Run setup again" is true of most of it and useless for the rest.
+
+# _summary_service_kind - systemd, launchd, or none. Asked of the platform
+# layer rather than read from SERVICE_KIND: the service stage is where that
+# variable is set and a resumed run skips it, so by the time this runs it may
+# well hold nothing but its default.
+_summary_service_kind() {
+  [ "$NO_SYSTEMD" = 0 ] || { printf 'none'; return 0; }
+  platform_service_manager
+}
+
+# _summary_voice - the listening tier, in the words the hardware step measured
+# it in, plus notifications when they are configured.
+#
+# hw_voice_tier and nothing of its own. This line used to be computed here from
+# a probe of its own and printed the word "text-only" whatever the machine was,
+# which meant a computer that had just downloaded a listening model was told it
+# was text-only in the same run.
+_summary_voice() {
+  local tier="unknown"
+  command -v hw_voice_tier >/dev/null 2>&1 && tier="$(hw_voice_tier)"
+  case "$tier" in
+    maximum)     printf 'talking and typing, with room for the best of it' ;;
+    recommended) printf 'talking and typing' ;;
+    lightweight) printf 'typing, and a little talking' ;;
+    text-only)   printf 'typing (this computer has no room to listen)' ;;
+    *)           printf 'typing' ;;
+  esac
+  [ -n "$NTFY" ] && printf ', with notifications to your phone'
+  return 0
+}
+
+# _summary_phone_url <token> - the address to open on a phone. Status 1 when
+# there is nothing a phone can open, which is what "this computer only" means
+# and is worth saying out loud rather than printing a loopback address somebody
+# will try from the sofa.
+#
+# The https front's own name is the first entry in the list of addresses ayeaye
+# was told to accept, because that list is written by the step that set the
+# front end up and its first entry is the name that front end answers to. For
+# the home-network mode that entry carries the port as well, which is why the
+# port is never added here.
+_summary_phone_url() {
+  local token="${1:-}" host
+  host="${HOSTS%%,*}"
+  [ -n "$host" ] || return 1
+  printf 'https://%s/?token=%s' "$host" "$token"
+  return 0
+}
+
+# _summary_health_trouble - the capabilities the health step checked and could
+# not report as working, in the words a person would use for them, with a
+# leading space. Empty when there are none.
+#
+# Read out of the state file by key, and not by knowing which file wrote them:
+# install.sh owns the lifecycle and never names a file in lib/steps, which is
+# what makes the seam a seam. It is read rather than remembered for the same
+# reason every other cross-stage fact is - the step that wrote it is one a
+# resumed run skips.
+_summary_health_trouble() {
+  local check verdict out=""
+  for check in service local auth agents hosts https voice board; do
+    verdict="$(wizard_state_get "step.service.health.$check" "")"
+    case "$verdict" in
+      fail|unknown) ;;
+      *) continue ;;
+    esac
+    case "$check" in
+      service) out="$out ayeaye starting when you log in" ;;
+      local)   out="$out ayeaye answering on this computer" ;;
+      auth)    out="$out ayeaye refusing anyone without your key" ;;
+      agents)  out="$out the coding agents you chose" ;;
+      hosts)   out="$out the https address you named" ;;
+      https)   out="$out the https address your phone opens" ;;
+      voice)   out="$out talking to your agents out loud" ;;
+      board)   out="$out your ticket board" ;;
+    esac
+    out="$out;"
+  done
+  # Trim the semicolon the last one left.
+  printf '%s' "${out%;}"
+  return 0
+}
+
+# _summary_resume <stage> <step> - how to pick that piece up again, in one
+# line. A step this does not know gets the general answer, which is true of
+# almost all of them; the ones named here are the ones for which it is not
+# enough.
+_summary_resume() {
+  local trouble
+  case "${1:-}.${2:-}" in
+    install.needs)
+      printf 'install it with your system'"'"'s usual software installer, then run ./install.sh again' ;;
+    install.voice)
+      printf 'run ./install.sh again and choose a listening option; what was already downloaded is kept' ;;
+    install.access)
+      printf 'run ./install.sh again from a terminal - setting up a way in is never done unattended' ;;
+    install.agents|install.board)
+      printf 'run ./install.sh again, or install it yourself and setup will find it' ;;
+    install.marker)
+      printf 'run ./install.sh again and say yes to the status line question' ;;
+    service.unit)
+      printf 'run ./install.sh again; until then start it by hand with %s/bin/ayeaye' "$REPO" ;;
+    service.health)
+      # Named, not left as "the check did not pass". The check knows which
+      # capability it was, it wrote that down, and "your ticket board on the
+      # phone did not answer" is a thing somebody can act on in a way that
+      # "the health check reported a problem" is not.
+      trouble="$(_summary_health_trouble)"
+      if [ -n "$trouble" ]; then
+        printf 'still to sort out:%s. Fix what you can and run ./install.sh again to re-check' "$trouble"
+      else
+        printf 'start ayeaye, open the address above, and run ./install.sh again to re-check'
+      fi
+      ;;
+    *)
+      printf 'run ./install.sh again - it carries on from here and asks nothing twice' ;;
+  esac
+  return 0
+}
+
+# _summary_removal <kind> - how to take it off this computer, correct for the
+# service manager that was actually used.
+_summary_removal() {
+  local kind="${1:-none}" cmd path mode files
+  files="$ENV_FILE
+$WIZARD_STATE_DIR"
+  mode="$(wizard_state_get answer.access.mode "")"
+
+  wizard_say "to remove it:"
+  case "$kind" in
+    systemd|launchd)
+      if cmd="$(platform_service_command ayeaye disable)"; then
+        wizard_say "  $cmd"
+      fi
+      if command -v service_definition_path >/dev/null 2>&1 \
+         && path="$(service_definition_path ayeaye "$kind")"; then
+        files="$path
+$files"
+      fi
+      # The https front is a second service, and a run that set one up and did
+      # not mention it here would leave something answering on the network
+      # after somebody believed they had removed ayeaye.
+      if [ "$mode" = lan ]; then
+        if cmd="$(platform_service_command ayeaye-caddy disable)"; then
+          wizard_say "  $cmd"
+        fi
+        if command -v service_definition_path >/dev/null 2>&1 \
+           && path="$(service_definition_path ayeaye-caddy "$kind")"; then
+          files="$path
+$files"
+        fi
+      fi
+      ;;
+    *)
+      wizard_say "  stop the ayeaye you started by hand - nothing on this"
+      wizard_say "  computer starts it for you"
+      ;;
+  esac
+  wizard_say "  then delete"
+  printf '%s\n' "$files" | sed 's/^/    /'
+  if [ "$mode" = lan ]; then
+    wizard_say "  and remove the certificate from every phone you put it on."
+    wizard_say "  Only you can do that; nothing here can reach your phone."
+  fi
+  return 0
+}
 
 step_summary() {
-  local tier="text-only" token url_host first_host left
+  local token url rows line stage step status label
   _load_effective_values
-  # The service stage is where SERVICE_KIND is worked out, and a resumed run
-  # skips it once it is done - so ask the platform layer again rather than
-  # trusting a variable that may never have been set this time.
-  if [ "$NO_SYSTEMD" = 0 ]; then
-    SERVICE_KIND="$(platform_service_manager)"
-  fi
-  [ -n "$NTFY" ] && tier="$tier +notifications"
-  if command -v ffmpeg >/dev/null 2>&1 && _have_transcriber; then
-    tier="$tier +voice"
-  fi
+  SERVICE_KIND="$(_summary_service_kind)"
   token="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
-  url_host="$BIND"
-  first_host="${HOSTS%%,*}"
 
-  wizard_say "tier    : $tier (probed live; the app adapts at runtime)"
+  wizard_say "what works: $(_summary_voice)"
   wizard_say "config  : $ENV_FILE"
-  wizard_say "bookmark: http://$url_host:$PORT/?token=$token"
-  if [ -n "$first_host" ]; then
-    wizard_say "          behind tailscale serve or a proxy: https://$first_host/?token=$token"
-  fi
-  wizard_say "open the bookmark URL once on the phone; it sets a cookie and"
-  wizard_say "redirects to /. Bookmark it and you never type the token again."
-  if [ "$SERVICE_KIND" = "systemd" ]; then
-    wizard_say "logs    : journalctl --user -u ayeaye -f"
+
+  # ------------------------------------------------------ opening it on a phone
+  if url="$(_summary_phone_url "$token")"; then
+    wizard_say "bookmark: $url"
+    wizard_say "          open that one on your phone."
+    wizard_say "          in a browser on this computer: http://$BIND:$PORT/?token=$token"
   else
-    wizard_say "logs    : stderr of $REPO/bin/ayeaye"
+    wizard_say "bookmark: http://$BIND:$PORT/?token=$token"
+    wizard_say "          a browser on this computer, and nothing else - your phone"
+    wizard_say "          cannot reach ayeaye yet. Run ./install.sh again and pick a"
+    wizard_say "          way in when you want it to."
   fi
-  wizard_say "https for the phone (mic needs a secure origin):"
-  wizard_say "  tailscale serve --bg http://$url_host:$PORT"
+  wizard_blank
+  wizard_say "signing in, once per device:"
+  wizard_say "  open that address once. It puts a key in the browser and sends you"
+  wizard_say "  to the page; bookmark what you land on and you never type the key"
+  wizard_say "  again."
+  wizard_say "  Anything that is not a browser sends the key as a header called"
+  wizard_say "  X-Voice-Token instead; the key itself is in $TOKEN_FILE."
+  wizard_blank
+
+  case "$SERVICE_KIND" in
+    systemd) wizard_say "logs    : journalctl --user -u ayeaye -f" ;;
+    launchd) wizard_say "logs    : tail -f $HOME/Library/Logs/ayeaye/ayeaye.log" ;;
+    *)       wizard_say "logs    : whatever the terminal you start ayeaye in shows" ;;
+  esac
 
   wizard_blank
   wizard_say "to change any of this later: run ./install.sh again. It keeps your"
-  wizard_say "key and your settings, and asks before it changes either."
-  wizard_say "to remove it: systemctl --user disable --now ayeaye, then delete"
-  wizard_say "  $UNIT_DIR/ayeaye.service"
-  wizard_say "  $ENV_FILE"
-  wizard_say "  $WIZARD_STATE_DIR"
+  wizard_say "key and your settings, asks before it changes either, and is how"
+  wizard_say "you switch between the four ways of reaching ayeaye."
+  _summary_removal "$SERVICE_KIND"
 
-  left="$(wizard_unfinished)"
-  if [ -n "$left" ]; then
+  # ------------------------------------------- what did not get done, and how to
+  rows="$(wizard_unfinished_rows)"
+  if [ -n "$rows" ]; then
     wizard_blank
     wizard_say "not finished, and worth coming back to:"
-    printf '%s\n' "$left" | sed 's/^/  - /'
-    wizard_say "running ./install.sh again picks these up."
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      stage="${line%%"$_WIZARD_STAGE_TAB"*}"; line="${line#*"$_WIZARD_STAGE_TAB"}"
+      step="${line%%"$_WIZARD_STAGE_TAB"*}";  line="${line#*"$_WIZARD_STAGE_TAB"}"
+      status="${line%%"$_WIZARD_STAGE_TAB"*}"; label="${line#*"$_WIZARD_STAGE_TAB"}"
+      if [ "$status" = failed ]; then
+        wizard_say "  - $label (did not work)"
+      else
+        wizard_say "  - $label (not finished)"
+      fi
+      wizard_say "    $(_summary_resume "$stage" "$step")"
+    done <<EOF
+$rows
+EOF
   fi
   wizard_detail_hint
   return "$WIZARD_STAGE_OK"
@@ -1030,6 +1272,7 @@ wizard_step detect    needs    step_detect_needs   "What ayeaye needs"
 wizard_step report    capable  step_report         "What ayeaye can do here" required always
 wizard_step configure choices  step_choose         "Your choices"
 wizard_step plan      confirm  step_plan           "The plan"                required always
+wizard_step install   needs    step_install_needs  "What ayeaye cannot run without"
 wizard_step install   settings step_write_settings "Your settings file"
 wizard_step install   key      step_make_key       "Your private key"
 wizard_step service   unit     step_service        "Starting ayeaye in the background"

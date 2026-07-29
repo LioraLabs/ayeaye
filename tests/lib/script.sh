@@ -63,7 +63,7 @@ run_install() {
 # ------------------------------------------------------- interactive running
 
 # The substring every prompt in this project ends with: `ask` renders
-# "bind address [127.0.0.1]: ". Override PTY_PROMPT_PATTERN if that changes.
+# "port [8911]: ". Override PTY_PROMPT_PATTERN if that changes.
 PTY_PROMPT_PATTERN="]: "
 
 # pty_expect <substring> <response> - wait for the substring, then type the
