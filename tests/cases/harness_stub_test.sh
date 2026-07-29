@@ -148,15 +148,15 @@ test_failed_stub_assertions_show_what_was_recorded() {
   stub_command curl
   curl -fsSL https://example.invalid
   local output status
-  output="$( ( assert_stub_called_with curl "wget" ) 2>&1 )"; status=$?
+  output="$( ( ASSERT_EXPECT_FAILURE=1; assert_stub_called_with curl "wget" ) 2>&1 )"; status=$?
   assert_status 1 "$status"
   assert_contains "$output" "https://example.invalid" "the diagnostic must list the real calls"
 
-  output="$( ( assert_stub_not_called curl ) 2>&1 )"
+  output="$( ( ASSERT_EXPECT_FAILURE=1; assert_stub_not_called curl ) 2>&1 )"
   assert_contains "$output" "expected no calls to"
 
   stub_command wget
-  output="$( ( assert_stub_called wget ) 2>&1 )"; status=$?
+  output="$( ( ASSERT_EXPECT_FAILURE=1; assert_stub_called wget ) 2>&1 )"; status=$?
   assert_status 1 "$status"
   assert_contains "$output" "expected at least one call to"
 }
@@ -166,4 +166,66 @@ test_stubs_do_not_leak_between_tests() {
   # fresh stub directory and a fresh log.
   assert_command_absent systemctl
   assert_eq "0" "$(stub_call_count systemctl)"
+}
+
+test_a_single_quote_in_an_argument_survives_the_recording() {
+  stub_command notify
+  notify --message "it's fine" --other "already 'quoted'"
+  # Closed, escaped, reopened: the recorded line stays unambiguous, and it
+  # round-trips through the shell rather than reading as two separate words.
+  assert_eq "notify --message 'it'\\''s fine' --other 'already '\\''quoted'\\'''" \
+    "$(stub_call notify 1)"
+  local reparsed
+  eval "set -- $(stub_call notify 1)"
+  reparsed="$2"
+  assert_eq "--message" "$reparsed"
+  eval "set -- $(stub_call notify 1)"
+  assert_eq "it's fine" "$3" "the recording must re-parse to the original argument"
+}
+
+test_a_call_assertion_does_not_match_across_two_calls() {
+  stub_command pkg
+  pkg install
+  pkg tmux
+  assert_stub_called_with pkg "pkg install"
+  assert_stub_called_with pkg "pkg tmux"
+  local output
+  output="$( ( ASSERT_EXPECT_FAILURE=1; assert_stub_called_with pkg "pkg install
+pkg tmux" ) 2>&1 )"
+  assert_contains "$output" "assert_stub_called_with failed" \
+    "a needle spanning two recorded calls must not prove a call that never happened"
+}
+
+test_stub_real_puts_the_real_command_back_over_a_stub() {
+  stub_command sed --exit 42
+  local status
+  sed --version >/dev/null 2>&1; status=$?
+  assert_status 42 "$status" "the stub must be in charge first"
+  stub_real sed
+  printf 'x\n' | sed 's/x/y/' >/dev/null; status=$?
+  assert_status 0 "$status" "stub_real must be the way back to the real command"
+}
+
+test_a_rule_the_record_format_cannot_carry_is_rejected() {
+  local output
+  output="$( ( ASSERT_EXPECT_FAILURE=1; stub_command pm --exit "" ) 2>&1 )"
+  assert_contains "$output" "--exit for pm must be a number"
+  output="$( ( ASSERT_EXPECT_FAILURE=1; stub_when pm "" --exit 0 ) 2>&1 )"
+  assert_contains "$output" "empty argv pattern"
+}
+
+test_a_command_that_has_already_run_can_still_be_replaced_or_removed() {
+  # bash remembers where it found a command. Without invalidating that memory
+  # the shell keeps calling the old path, and a stub declared after the first
+  # call would never be reached.
+  stub_real sed
+  printf 'x\n' | sed 's/x/y/' >/dev/null
+
+  stub_command sed --exit 42
+  local status
+  sed --version >/dev/null 2>&1; status=$?
+  assert_status 42 "$status" "a stub must take over even from a command already run"
+
+  stub_remove sed
+  assert_command_absent sed "removal must survive the shell's memory of the old path"
 }

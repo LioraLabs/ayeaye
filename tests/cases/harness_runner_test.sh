@@ -214,7 +214,57 @@ CASE
   ended=$(date +%s)
   assert_ne 0 "$RUNNER_STATUS"
   assert_contains "$RUNNER_OUT" "timeout"
-  [ "$((ended - started))" -lt 20 ] || fail "timeout did not cut the run short (took $((ended - started))s)"
+  [ "$((ended - started))" -lt 8 ] \
+    || fail "the 2s watchdog took $((ended - started))s to fire"
+  assert_eq "" "$(ls -d "${TMPDIR:-/tmp}"/ayeaye-test.* 2>/dev/null)" \
+    "a killed test never runs its own cleanup, so its sandbox must be swept by the run"
+}
+
+test_an_assertion_that_fails_inside_a_subshell_still_fails_the_test() {
+  # `exit` only leaves the subshell, so without a hand-off the test would go
+  # green having asserted nothing. Iterating fixtures through a pipeline is the
+  # obvious way to hit this.
+  local d="$TEST_TMPDIR/cases"
+  _write_case "$d" "swallow_test.sh" <<'CASE'
+test_assertion_in_a_pipeline() {
+  printf 'a\nb\n' | while read -r item; do assert_eq "IMPOSSIBLE" "$item"; done
+}
+test_assertion_in_a_command_substitution() {
+  local captured
+  captured="$(fail "this must not be swallowed")"
+}
+CASE
+  _run_runner "$d"
+  assert_ne 0 "$RUNNER_STATUS" "a swallowed assertion must not pass"
+  assert_contains "$RUNNER_OUT" "2 failed"
+  assert_contains "$RUNNER_OUT" "failed inside a subshell"
+}
+
+test_a_misspelled_variable_in_an_assertion_is_not_silently_empty() {
+  local d="$TEST_TMPDIR/cases"
+  _write_case "$d" "typo_test.sh" <<'CASE'
+test_typo() {
+  RUN_STDOUT="the real value"
+  assert_eq "" "$RUN_STDOTU"
+}
+CASE
+  _run_runner "$d"
+  assert_ne 0 "$RUNNER_STATUS" "an unset variable must not pass as the empty string"
+  assert_contains "$RUNNER_OUT" "unbound variable"
+}
+
+test_discovery_cannot_write_to_the_real_home() {
+  # Sourcing a case file is how the runner learns which functions it defines.
+  # The file is supposed to define functions and nothing else, but a stray
+  # top-level statement must not be able to touch the machine.
+  local d="$TEST_TMPDIR/cases"
+  _write_case "$d" "escapee_test.sh" <<'CASE'
+: > "$HOME/discovery-escape-marker"
+test_harmless() { assert_eq ok ok; }
+CASE
+  _run_runner "$d"
+  assert_status 0 "$RUNNER_STATUS"
+  assert_file_missing "$HOME/discovery-escape-marker"     "discovery must run against a scratch home, not the caller's"
 }
 
 test_each_test_gets_a_fresh_sandbox() {

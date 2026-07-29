@@ -32,6 +32,14 @@ _assert_show() {
 }
 
 # _assert_fail <location> <assertion-name> <message> [label value]...
+#
+# Ending the test is `exit`, which only leaves the current shell. Inside a
+# command substitution, a pipeline or any other subshell - `fixture_list | while
+# read` is the obvious one - that would swallow the failure and the test would
+# go green having asserted nothing. So the failure is also recorded on disk, and
+# the runner turns a recorded failure into a failed test whatever the test
+# function returned. A test that means to capture a failure says so with
+# ASSERT_EXPECT_FAILURE=1.
 _assert_fail() {
   local loc="$1" name="$2" msg="$3"
   shift 3
@@ -44,6 +52,9 @@ _assert_fail() {
       shift 2
     done
   } >&2
+  if [ "${ASSERT_EXPECT_FAILURE:-0}" != 1 ] && [ -n "${TEST_TMPDIR:-}" ]; then
+    printf '%s: %s\n' "$loc" "$name" >> "$TEST_TMPDIR/.assertion-failed"
+  fi
   exit "$TEST_EXIT_FAIL"
 }
 
@@ -166,17 +177,29 @@ assert_file_mode() {
     "expected mode of $path" "$want" "actual" "$got ($sym)"
 }
 
+# "rwsr-xr-t" -> "5751". The high digit is only printed when it is not zero, so
+# an ordinary file still compares against a plain three-digit mode. Getting this
+# wrong is not cosmetic: without the setuid and sticky bits, `assert_file_mode
+# 755` would pass on a file that is really 4755.
 _assert_symbolic_to_octal() {
-  local sym="$1" out="" i part n c
+  local sym="$1" out="" high=0 i part n c
   i=1
   while [ "$i" -le 7 ]; do
     part="$(printf '%s' "$sym" | cut -c"$i"-"$((i + 2))")"
     n=0
     c="$(printf '%s' "$part" | cut -c1)"; [ "$c" = "r" ] && n=$((n + 4))
     c="$(printf '%s' "$part" | cut -c2)"; [ "$c" = "w" ] && n=$((n + 2))
-    c="$(printf '%s' "$part" | cut -c3)"; case "$c" in x|s|t) n=$((n + 1)) ;; esac
+    c="$(printf '%s' "$part" | cut -c3)"
+    case "$c" in
+      x) n=$((n + 1)) ;;
+      s) n=$((n + 1)); [ "$i" = 1 ] && high=$((high + 4)); [ "$i" = 4 ] && high=$((high + 2)) ;;
+      S)              [ "$i" = 1 ] && high=$((high + 4)); [ "$i" = 4 ] && high=$((high + 2)) ;;
+      t) n=$((n + 1)); high=$((high + 1)) ;;
+      T)              high=$((high + 1)) ;;
+    esac
     out="$out$n"
     i=$((i + 3))
   done
+  [ "$high" = 0 ] || out="$high$out"
   printf '%s' "$out"
 }

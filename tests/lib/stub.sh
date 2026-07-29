@@ -29,17 +29,39 @@ stub_begin() {
   export PATH
 }
 
+# Forget where commands used to live. bash remembers the path of every command
+# it has run, and that memory outlives the file: after a stub replaces, or
+# stub_remove deletes, something the test already ran, an unhashed shell would
+# keep using the old path - and bash 3.2 even reports it from `command -v`.
+# Every function that changes $STUB_BIN ends with this.
+_stub_rehash() {
+  hash -r 2>/dev/null || true
+}
+
 # stub_real <command>... - link the host's real binary into $STUB_BIN, for
 # tools the code under test legitimately needs (python3 in this repo) or that
 # a test wants to behave for real. Silently skips what the host does not have.
 stub_real() {
   local name real
+  # Before resolving, not just after: bash 3.2 answers `type -P` from the hash
+  # table even though -P is supposed to force a PATH search, so a name this
+  # test has already run as a stub would resolve to the stub itself - and
+  # linking that to itself makes a symlink loop rather than a visible error.
+  _stub_rehash
   for name in "$@"; do
-    real="$(PATH="$HARNESS_HOST_PATH" command -v "$name" 2>/dev/null)" || continue
+    real="$(PATH="$HARNESS_HOST_PATH" type -P "$name" 2>/dev/null)" || continue
     [ -n "$real" ] || continue
-    [ -e "$STUB_BIN/$name" ] && continue
+    case "$real" in
+      "$STUB_BIN"/*)
+        fail "stub_real: $name resolved to the stub directory, not to the host's copy"
+        ;;
+    esac
+    # Overwrite, so that stub_real is the way back from a stub as well as the
+    # way in: stub_command python3; ...; stub_real python3 restores the real one.
+    rm -f "$STUB_BIN/$name"
     ln -s "$real" "$STUB_BIN/$name" 2>/dev/null || true
   done
+  _stub_rehash
 }
 
 # stub_remove <command>... - make a command absent again, whether it was a
@@ -49,6 +71,7 @@ stub_remove() {
   for name in "$@"; do
     rm -f "$STUB_BIN/$name"
   done
+  _stub_rehash
 }
 
 _stub_tab="$(printf '\t')"
@@ -71,6 +94,11 @@ _stub_write() {
   # meant in the calling function.
   local name="$1"
   local path="$STUB_BIN/$name"
+  # Unlink first. $STUB_BIN/$name may be a symlink to the host's real binary -
+  # everything in STUB_CORE_COMMANDS is - and `>` follows a symlink, so writing
+  # the shim without this would truncate /usr/bin/sed. It fails with a
+  # permission error as an ordinary user and succeeds as root in a container.
+  rm -f "$path"
   cat > "$path" <<EOF
 #!/usr/bin/env bash
 # Generated command stub for "$name". Recording shim, not a real command.
@@ -81,8 +109,19 @@ _rules='$STUB_LOG_DIR/$name.rules'
 _line="\$_name"
 for _arg in "\$@"; do
   case "\$_arg" in
-    ''|*[![:print:]]*|*[[:space:]]*) _line="\$_line '\$_arg'" ;;
-    *)                               _line="\$_line \$_arg" ;;
+    ''|*[![:print:]]*|*[[:space:]]*|*"'"*)
+      # Single quotes are closed, escaped and reopened, so the recorded line
+      # stays unambiguous however the argument was written.
+      _esc=""
+      while :; do
+        case "\$_arg" in
+          *"'"*) _esc="\$_esc\${_arg%%\'*}'\\''"; _arg="\${_arg#*\'}" ;;
+          *)     _esc="\$_esc\$_arg"; break ;;
+        esac
+      done
+      _line="\$_line '\$_esc'"
+      ;;
+    *) _line="\$_line \$_arg" ;;
   esac
 done
 printf '%s\n' "\$_line" >> "\$_log"
@@ -111,6 +150,7 @@ EOF
   chmod +x "$path"
   : > "$STUB_LOG_DIR/$name.log"
   [ -f "$STUB_LOG_DIR/$name.rules" ] || : > "$STUB_LOG_DIR/$name.rules"
+  _stub_rehash
 }
 
 # _stub_rule <name> <pattern> <args...> - append a match rule.
@@ -129,6 +169,14 @@ _stub_rule() {
       *) fail "stub: unknown option $1" ;;
     esac
   done
+  case "$pattern" in
+    "") fail "stub: an empty argv pattern for $name would match nothing; use '*'" ;;
+    *"$_stub_tab"*|*"
+"*) fail "stub: an argv pattern for $name may not contain a tab or a newline" ;;
+  esac
+  case "$status" in
+    ""|*[!0-9]*) fail "stub: --exit for $name must be a number, got: '$status'" ;;
+  esac
   [ "$outfile" = "-" ] && outfile="$(_stub_payload "$name" out "$out")"
   [ "$errfile" = "-" ] && errfile="$(_stub_payload "$name" err "$err")"
   printf '%s\t%s\t%s\t%s\n' "$pattern" "$status" "$outfile" "$errfile" \
@@ -196,6 +244,7 @@ stub_script() {
   local path="$STUB_BIN/$name"
   local body="$STUB_LOG_DIR/$name.body"
   cat > "$body"
+  rm -f "$path"          # see _stub_write: never write through a symlink
   cat > "$path" <<EOF
 #!/usr/bin/env bash
 # Generated command stub for "$name". Recording shim, not a real command.
@@ -203,8 +252,19 @@ _name='$name'
 _line="\$_name"
 for _arg in "\$@"; do
   case "\$_arg" in
-    ''|*[![:print:]]*|*[[:space:]]*) _line="\$_line '\$_arg'" ;;
-    *)                               _line="\$_line \$_arg" ;;
+    ''|*[![:print:]]*|*[[:space:]]*|*"'"*)
+      # Single quotes are closed, escaped and reopened, so the recorded line
+      # stays unambiguous however the argument was written.
+      _esc=""
+      while :; do
+        case "\$_arg" in
+          *"'"*) _esc="\$_esc\${_arg%%\'*}'\\''"; _arg="\${_arg#*\'}" ;;
+          *)     _esc="\$_esc\$_arg"; break ;;
+        esac
+      done
+      _line="\$_line '\$_esc'"
+      ;;
+    *) _line="\$_line \$_arg" ;;
   esac
 done
 printf '%s\n' "\$_line" >> '$STUB_LOG_DIR/$name.log'
@@ -212,6 +272,7 @@ printf '%s\n' "\$_line" >> '$STUB_LOG_DIR/$name.log'
 EOF
   chmod +x "$path"
   : > "$STUB_LOG_DIR/$name.log"
+  _stub_rehash
 }
 
 # ------------------------------------------------------------------ queries
@@ -263,9 +324,18 @@ assert_stub_not_called() {
 assert_stub_called_with() {
   local calls
   calls="$(stub_calls "$1")"
-  case "$calls" in
-    *"$2"*) return 0 ;;
-  esac
+  # Per line, in the shell rather than through grep: a needle spanning two
+  # recorded calls would otherwise "prove" a call that never happened, and
+  # grep -F reads a multi-line pattern as alternatives, which has the same
+  # effect.
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *"$2"*) return 0 ;;
+    esac
+  done <<EOF
+$calls
+EOF
   _assert_fail "${BASH_SOURCE[1]}:${BASH_LINENO[0]}" "assert_stub_called_with" "${3:-}" \
     "expected a call to $1 containing" "$2" "recorded calls" "$calls"
 }

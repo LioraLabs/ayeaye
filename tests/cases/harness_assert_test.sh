@@ -5,7 +5,7 @@
 # _assert_fails <assertion> [args...] -> captures stderr in ASSERTION_OUTPUT
 # and the exit status in ASSERTION_STATUS.
 _assert_fails() {
-  ASSERTION_OUTPUT="$( ( "$@" ) 2>&1 )"
+  ASSERTION_OUTPUT="$( ( ASSERT_EXPECT_FAILURE=1; "$@" ) 2>&1 )"
   ASSERTION_STATUS=$?
   return 0
 }
@@ -81,4 +81,27 @@ test_failure_names_the_calling_line() {
   _assert_fails fail "deliberate"
   assert_contains "$ASSERTION_OUTPUT" "harness_assert_test.sh"
   assert_contains "$ASSERTION_OUTPUT" "deliberate"
+}
+
+test_file_mode_assertion_sees_the_setuid_setgid_and_sticky_bits() {
+  # A permissions assertion blind to these would pass 755 on a 4755 file, and
+  # this suite exists partly to check the mode of a token file.
+  : > "$TEST_TMPDIR/special"
+  chmod 4755 "$TEST_TMPDIR/special"
+  assert_file_mode 4755 "$TEST_TMPDIR/special"
+  _assert_fails assert_file_mode 755 "$TEST_TMPDIR/special"
+  assert_contains "$ASSERTION_OUTPUT" "4755" "the real mode must be reported"
+
+  chmod 2755 "$TEST_TMPDIR/special"
+  assert_file_mode 2755 "$TEST_TMPDIR/special"
+
+  chmod 1777 "$TEST_TMPDIR/special"
+  assert_file_mode 1777 "$TEST_TMPDIR/special"
+
+  # Set without execute: capital S and T carry the bit and nothing else.
+  chmod 4644 "$TEST_TMPDIR/special"
+  assert_file_mode 4644 "$TEST_TMPDIR/special"
+
+  chmod 600 "$TEST_TMPDIR/special"
+  assert_file_mode 600 "$TEST_TMPDIR/special" "an ordinary mode stays three digits"
 }

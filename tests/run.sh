@@ -60,12 +60,23 @@ if [ ! -d "$CASES_DIR" ]; then
 fi
 
 # ------------------------------------------------------------------ tripwire
-# The suite must not touch the real machine. These are exactly the paths
-# install.sh writes; if any of their signatures changes across a run then a
-# test escaped its sandbox, and the run is void whatever the assertions said.
+# The suite must not touch the real machine. These are the paths an install
+# writes or could plausibly write; if any of their signatures changes across a
+# run then a test escaped its sandbox, and the run is void whatever the
+# assertions said.
+#
+# Exact paths rather than whole-directory listings, deliberately: a listing of
+# $HOME changes on its own while the suite runs, and a tripwire that cries wolf
+# gets ignored. Anything the wizard learns to write - a launchd plist, a shell
+# rc edit, a symlink into ~/.local/bin - belongs on this list.
 GUARDED_PATHS="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/env
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye.service
-${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token"
+${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token
+$HOME/.local/bin/ayeaye
+$HOME/Library/LaunchAgents/dev.ayeaye.plist
+$HOME/.bashrc
+$HOME/.zshrc
+$HOME/.profile"
 
 guard_signature() {
   printf '%s\n' "$GUARDED_PATHS" | while IFS= read -r guarded; do
@@ -91,8 +102,21 @@ scan_test_names() {
     "$1"
 }
 
+# Sourcing a case file is the only way to learn which functions it really
+# defines, and a case file is supposed to define functions and nothing else.
+# A stray top-level statement must still not be able to touch the machine, so
+# discovery runs against a scratch home of its own.
+DISCOVERY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ayeaye-discovery.XXXXXX")"
+trap 'rm -rf "$DISCOVERY_HOME"' EXIT INT TERM
+
 defined_test_names() {
-  bash "$LIB_DIR/list_functions.sh" "$1" 2>/dev/null
+  HOME="$DISCOVERY_HOME" \
+  XDG_CONFIG_HOME="$DISCOVERY_HOME/.config" \
+  XDG_STATE_HOME="$DISCOVERY_HOME/.local/state" \
+  XDG_DATA_HOME="$DISCOVERY_HOME/.local/share" \
+  XDG_CACHE_HOME="$DISCOVERY_HOME/.cache" \
+  TMPDIR="$DISCOVERY_HOME" \
+    bash "$LIB_DIR/list_functions.sh" "$1" 2>/dev/null
 }
 
 # The scan in source order, keeping only names the file really defines.
@@ -188,7 +212,16 @@ fi
 
 # ------------------------------------------------------------------- running
 RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/ayeaye-run.XXXXXX")"
-trap 'rm -rf "$RUN_TMP"' EXIT INT TERM
+trap 'rm -rf "$RUN_TMP" "$DISCOVERY_HOME"' EXIT INT TERM
+
+# A test killed by the watchdog never runs its own cleanup, so sandboxes are
+# created inside a directory this run removes on the way out. KEEP_TMPDIR means
+# the opposite is wanted, so they go to the usual place and stay.
+if [ "${KEEP_TMPDIR:-0}" = 1 ]; then
+  SANDBOX_ROOT="${TMPDIR:-/tmp}"
+else
+  SANDBOX_ROOT="$RUN_TMP"
+fi
 
 BEFORE="$(guard_signature)"
 
@@ -205,8 +238,13 @@ run_one() {
   local pid watchdog
   rm -f "$marker"
 
-  bash "$LIB_DIR/runner.sh" "$case_file" "$name" >"$out" 2>&1 &
+  # Job control gives the child a process group of its own, so the watchdog can
+  # kill what the test started as well as the test itself. Without it a test
+  # that backgrounds a process leaves it running after the suite exits.
+  set -m
+  TMPDIR="$SANDBOX_ROOT" bash "$LIB_DIR/runner.sh" "$case_file" "$name" >"$out" 2>&1 &
   pid=$!
+  set +m
   (
     waited=0
     while [ "$waited" -lt "$TIMEOUT" ]; do
@@ -216,7 +254,7 @@ run_one() {
     done
     if kill -0 "$pid" 2>/dev/null; then
       : >"$marker"
-      kill -9 "$pid" 2>/dev/null
+      kill -9 -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
     fi
   ) 2>/dev/null &
   watchdog=$!

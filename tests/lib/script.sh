@@ -67,10 +67,21 @@ run_install() {
 PTY_PROMPT_PATTERN="]: "
 
 # pty_expect <substring> <response> - wait for the substring, then type the
-# response. Rules are consumed in the order they were declared.
+# response and a newline. Rules are consumed in the order they were declared.
 pty_expect() {
+  _pty_rule "$1" send "$2"
+}
+
+# pty_await <substring> - wait for the substring and type nothing. For a
+# milestone rather than a question: answering one that was never asked feeds a
+# stray newline to whatever asks next.
+pty_await() {
+  _pty_rule "$1" await ""
+}
+
+_pty_rule() {
   [ -n "${PTY_EXPECT_FILE:-}" ] || { PTY_EXPECT_FILE="$TEST_TMPDIR/pty.expect"; : > "$PTY_EXPECT_FILE"; }
-  printf '%s\t%s\n' "$1" "$2" >> "$PTY_EXPECT_FILE"
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$PTY_EXPECT_FILE"
 }
 
 # pty_answers <answer>... - the common case: answer each prompt in turn. An

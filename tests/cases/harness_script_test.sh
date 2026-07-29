@@ -191,6 +191,25 @@ SH
     "the second answer belongs to the second prompt"
 }
 
+test_two_expectations_can_be_satisfied_by_one_burst_of_output() {
+  # The counterpart of the test above: spending the whole buffer on a match
+  # would make the second of two lines printed together unmatchable, and the
+  # driver would report never having seen text plainly visible in the
+  # transcript it prints.
+  _fake_script burst.sh <<'SH'
+#!/usr/bin/env bash
+printf 'Step 1 done\nStep 2 done\n'
+read -r -p "continue? [y]: " answer
+printf 'answered=%s\n' "$answer"
+SH
+  pty_await "Step 1 done"
+  pty_await "Step 2 done"
+  pty_expect "continue?" "y"
+  pty_run "$SCRIPT"
+  assert_contains "$PTY_TRANSCRIPT" "answered=y"
+  assert_status 0 "$PTY_STATUS"
+}
+
 test_the_pty_run_reports_the_scripts_exit_status() {
   _fake_script exiter.sh <<'SH'
 #!/usr/bin/env bash
@@ -209,7 +228,7 @@ test_an_expectation_that_never_arrives_fails_fast_with_the_transcript() {
 printf 'nothing to ask\n'
 SH
   pty_expect "a question that is never asked" "answer"
-  output="$( (PTY_TIMEOUT=5 pty_run "$SCRIPT") 2>&1 )"
+  output="$( (ASSERT_EXPECT_FAILURE=1 PTY_TIMEOUT=5 pty_run "$SCRIPT") 2>&1 )"
   status=$?
   assert_status 1 "$status" "a broken expectation must end the test"
   assert_contains "$output" "a question that is never asked" \
@@ -225,7 +244,7 @@ printf 'hanging now\n'
 sleep 60
 SH
   started="$(date +%s)"
-  output="$( (PTY_TIMEOUT=3 pty_run "$SCRIPT") 2>&1 )"
+  output="$( (ASSERT_EXPECT_FAILURE=1 PTY_TIMEOUT=3 pty_run "$SCRIPT") 2>&1 )"
   elapsed=$(( $(date +%s) - started ))
   assert_contains "$output" "timed out"
   assert_contains "$output" "hanging now"

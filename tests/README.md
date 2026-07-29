@@ -43,9 +43,11 @@ test_the_port_is_written_to_the_config() {
 
 Rules of the road:
 
-- **A case file defines functions and nothing else.** Discovery sources it
-  outside the sandbox to find out which functions really exist, so a top-level
-  statement would run on the real machine.
+- **A case file defines functions and nothing else.** Discovery sources it to
+  find out which functions really exist, before any test has run — a top-level
+  statement executes there, outside the per-test sandbox. Discovery has a
+  scratch home of its own so a stray statement cannot reach your machine, but it
+  still has no stubs, no fixtures and no `$TEST_TMPDIR`. Put setup in `setup`.
 - Name a test after the behaviour it pins, as a sentence. `test_a_missing_tmux_stops_the_install`
   reads better in the output than `test_deps_2`.
 - Tests run in source order, one process each. Nothing leaks between them: not
@@ -57,6 +59,12 @@ Rules of the road:
 - There is no `set -e`. A command that fails mid-test does not end it; assert
   on the thing you care about, and capture exit status explicitly with
   `run_script`.
+- There *is* `set -u`. A misspelled variable is an error, not an empty string,
+  so `assert_eq "" "$RUN_STDOTU"` fails loudly instead of passing.
+- An assertion that fails inside a subshell — a pipeline, a command
+  substitution — still fails the test. `exit` alone could not do that, so the
+  failure is also recorded on disk and the runner acts on it. If you mean to
+  capture a failure on purpose, run it with `ASSERT_EXPECT_FAILURE=1`.
 
 ## Assertions
 
@@ -102,10 +110,12 @@ to make a test pass on a laptop and fail in CI. A test that cares about that
 difference says `unset USER` and means it.
 
 **A test may write anywhere under `$TEST_TMPDIR` and nowhere else.** The runner
-enforces it: it takes a signature of the three paths install.sh writes
-(`~/.config/ayeaye/env`, `~/.config/systemd/user/ayeaye.service`,
-`~/.local/state/ayeaye/token`) before and after the run, and if any of them
-changed it declares the whole run void no matter what the assertions said.
+enforces it: it takes a signature of every path an install writes or could
+plausibly write (`~/.config/ayeaye/env`, the systemd unit, the token, plus
+`~/.local/bin/ayeaye`, a launchd plist and the shell rc files) before and after
+the run, and if any of them changed it declares the whole run void no matter
+what the assertions said. **When the wizard learns to write somewhere new, add
+it to `GUARDED_PATHS` in `tests/run.sh` in the same commit.**
 
 `KEEP_TMPDIR=1 tests/run.sh <filter>` leaves the sandbox in place and prints
 its path, which is how you look at what a failing test actually wrote.
@@ -120,6 +130,11 @@ and not deliberately linked in is genuinely absent, whatever the host has
 installed. That is what makes detection testable: a test asserting "tailscale
 is not installed" gives the same answer on a laptop that has it and in a bare
 container.
+
+`PATH` really is bare, and that applies to the test's own helper code as much as
+to the code under test: `stat`, `readlink`, `tee`, `xargs`, `diff`, `seq`, `tar`,
+`curl` and `getent` are all absent until you ask for them. If a test dies with
+"command not found", `stub_real <name>` is the answer.
 
 Common coreutils are linked in automatically. Deliberately *not* linked:
 `python3`, `tmux`, `uname`, `systemctl`, `tailscale`, package managers —
@@ -241,6 +256,11 @@ pty_install --no-systemd                          # or pty_run <script> [args...
 assert_contains "$PTY_TRANSCRIPT" "port [8911]: 9000"
 assert_status 0 "$PTY_STATUS"
 ```
+
+Use `pty_await <substring>` to wait for a milestone that is not a question —
+"Detecting dependencies…", "wrote ~/.config/ayeaye/env". It types nothing;
+`pty_expect` with an empty answer would send a newline, and that newline would
+be swallowed by whatever asks the next question.
 
 `pty_expect` waits for its substring to appear before typing its answer, which
 is what keeps the transcript deterministic — no answer can be typed before its

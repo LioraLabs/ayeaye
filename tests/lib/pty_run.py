@@ -45,8 +45,9 @@ def parse_rules(path):
         for raw in handle.read().split(b"\n"):
             if not raw:
                 continue
-            pattern, _, response = raw.partition(b"\t")
-            rules.append((pattern, response))
+            pattern, _, rest = raw.partition(b"\t")
+            mode, _, response = rest.partition(b"\t")
+            rules.append((pattern, mode or b"send", response))
     return rules
 
 
@@ -113,21 +114,27 @@ def main():
             transcript.extend(chunk)
 
         if index < len(rules):
-            pattern, response = rules[index]
+            pattern, mode, response = rules[index]
             found = transcript.find(pattern, searched)
             if found >= 0:
-                try:
-                    os.write(fd, response + b"\n")
-                except OSError:
-                    break
-                # Everything received so far is spent. Resuming the search at
-                # the end of the matched pattern would let the next rule match
-                # the tail of the prompt just answered - "port [8911]: " and
-                # "bind address [127.0.0.1]: " both end in "]: " - and fire an
-                # answer before the question was asked. The child cannot print
-                # its next prompt until it has read this answer, so nothing
-                # legitimate is skipped.
-                searched = len(transcript)
+                if mode == b"send":
+                    try:
+                        os.write(fd, response + b"\n")
+                    except OSError:
+                        break
+                # The answered line is spent, the rest of the buffer is not.
+                #
+                # Resuming at the end of the matched pattern would let the next
+                # rule match the tail of the prompt just answered: "rewrite it?"
+                # leaves " [n]: " on the same line, and "]: " is exactly what the
+                # next rule is usually waiting for, so it would fire an answer
+                # before the question was asked. Skipping the whole buffer
+                # instead is too much - two expectations satisfied by one burst
+                # of output ("Step 1 done\nStep 2 done\n") could then never both
+                # match, and the driver would report never having seen text
+                # plainly visible in the transcript it prints.
+                end_of_line = transcript.find(b"\n", found)
+                searched = len(transcript) if end_of_line < 0 else end_of_line + 1
                 index += 1
 
     try:

@@ -50,5 +50,18 @@ if declare -f setup >/dev/null 2>&1; then
 fi
 
 cd "$TEST_TMPDIR" || exit 1
+
+# set -u from here on: a misspelled variable in an assertion - assert_eq ""
+# "$RUN_STDOTU" - would otherwise expand to the empty string and pass.
+set -u
 "$TEST_NAME"
-exit $?
+status=$?
+
+# An assertion that failed inside a subshell could only exit that subshell, so
+# it left a note instead. A test cannot pass over one.
+if [ -f "$TEST_TMPDIR/.assertion-failed" ]; then
+  echo "runner: an assertion failed inside a subshell and could not end the test:" >&2
+  sed 's/^/runner:   /' "$TEST_TMPDIR/.assertion-failed" >&2
+  status=1
+fi
+exit "$status"
