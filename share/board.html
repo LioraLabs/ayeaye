@@ -729,12 +729,18 @@ function runPrompt(t){
   return p;
 }
 
+// Every keystroke starts a search and the server abandons the one before it,
+// so replies can arrive out of order. Only the newest request may draw.
+let rqSeq = 0;
+
 async function loadRunDirs(){
   const q = $('#rq').value.trim();
+  const seq = ++rqSeq;
   let d;
   try{ d = await (await fetch('/api/projects?q='+
                               encodeURIComponent(q))).json(); }
   catch(e){ return; }
+  if(seq !== rqSeq) return;
   const box = $('#rlist'); box.innerHTML = '';
   if(!d || !Array.isArray(d.projects)) return;
   d.projects.forEach(p=>{
