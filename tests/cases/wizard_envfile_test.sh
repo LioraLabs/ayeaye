@@ -111,6 +111,7 @@ test_a_render_that_fails_halfway_removes_what_it_had_written() {
   # prove the cleanup. This one gets past that check and fails at the write: a
   # template that is there and a destination directory that cannot be written
   # into.
+  [ "$(id -u)" = 0 ] && skip "root can write into a directory it has no write bit for"
   local locked="$TEST_TMPDIR/locked"
   mkdir -p "$locked"
   printf 'AYEAYE_PORT=@PORT@\n' > "$locked/template"

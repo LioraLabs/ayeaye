@@ -269,6 +269,7 @@ wizard_end_run 0
 test_a_state_directory_it_cannot_write_costs_progress_and_nothing_else() {
   # A read-only state directory is a real thing on a locked-down machine. It
   # must cost resumability, not the install.
+  [ "$(id -u)" = 0 ] && skip "root can write into a directory it has no write bit for"
   local locked="$TEST_TMPDIR/locked"
   mkdir -p "$locked"
   chmod 500 "$locked"

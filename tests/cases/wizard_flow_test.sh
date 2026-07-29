@@ -267,12 +267,16 @@ test_a_blanket_yes_installs_but_still_will_not_touch_the_network() {
   export PLATFORM_OS_RELEASE_FILES
   stdin_lines "0.0.0.0" "8911" "" ""
   run_install --yes --no-systemd
-  # sudo is the stub that records: the generated command is
-  # "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux", and a
-  # stubbed sudo records its arguments rather than running them.
-  assert_stub_called_with sudo "apt-get install -y tmux" \
+  # Which stub records it depends on who is running: as an ordinary user the
+  # generated command starts with sudo, which is stubbed and records rather
+  # than running what follows; as root there is no sudo prefix and apt-get is
+  # reached directly. The suite runs both ways - a container is root - so the
+  # assertion is on the command, not on which stub saw it.
+  local ran
+  ran="$(stub_calls sudo)$(stub_calls apt-get)"
+  assert_contains "$ran" "apt-get install -y tmux" \
     "--yes is what lets an unattended machine install what it is missing"
-  assert_stub_called_with sudo "apt-get update" \
+  assert_contains "$ran" "apt-get update" \
     "and the package list is refreshed under the same single question"
   local ledger
   ledger="$(cat "$(_ledger)")"
