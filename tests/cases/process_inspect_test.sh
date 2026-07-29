@@ -69,15 +69,33 @@ test_the_whole_python_suite_passes() {
   assert_not_contains "$RUN_OUTPUT" "FAILED"
 }
 
-test_ayeaye_imports_without_a_proc_filesystem_in_reach() {
-  # An import that reaches for /proc is the bug this ticket removes: on a Mac
-  # there is nothing there to reach for.
+test_ayeaye_imports_with_proc_taken_away() {
+  # An import that reaches for /proc cannot run on a Mac, where there is
+  # nothing there to reach for. This host has one, so it is taken away: every
+  # path under /proc is made to fail before the module is loaded.
   run_script "$STUB_BIN/python3" -c \
-    "import os,sys
+    "import builtins, os, sys
 from importlib.machinery import SourceFileLoader
-os.environ['AYEAYE_TOKEN']='t'
-m=SourceFileLoader('a',os.path.join(sys.argv[1],'bin','ayeaye')).load_module()
-print(type(m._make_process_info('darwin')).__name__)" "$REPO_ROOT"
+
+real_open, real_readlink, real_listdir = open, os.readlink, os.listdir
+denied = []
+
+def refuse(fn):
+    def wrapper(path, *a, **kw):
+        if str(path).startswith('/proc'):
+            denied.append(str(path))
+            raise FileNotFoundError(path)
+        return fn(path, *a, **kw)
+    return wrapper
+
+builtins.open = refuse(real_open)
+os.readlink, os.listdir = refuse(real_readlink), refuse(real_listdir)
+os.environ['AYEAYE_TOKEN'] = 't'
+m = SourceFileLoader('a', os.path.join(sys.argv[1], 'bin', 'ayeaye')).load_module()
+builtins.open, os.readlink, os.listdir = real_open, real_readlink, real_listdir
+print(type(m._make_process_info('darwin')).__name__)
+print('reached for: %s' % denied)" "$REPO_ROOT"
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
-  assert_eq "_DarwinProcessInfo" "$RUN_STDOUT"
+  assert_contains "$RUN_STDOUT" "_DarwinProcessInfo"
+  assert_contains "$RUN_STDOUT" "reached for: []"
 }

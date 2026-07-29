@@ -19,6 +19,7 @@ Run directly for the whole file, or with a test id:
     tests/python/process_inspect.py
     tests/python/process_inspect.py LinuxProcTest.test_cwd_reads_the_symlink
 """
+import builtins
 import json
 import os
 import shutil
@@ -161,6 +162,27 @@ class LinuxProcTest(TempTree):
     def test_comm_is_none_for_a_process_that_vanished(self):
         self.assertIsNone(self.linux().comm(4242))
 
+    def test_a_comm_that_is_not_utf8_does_not_end_the_request(self):
+        # comm is the tail of whatever path was exec'd, bytes and all. The
+        # blast radius is not one pane: overview() resolves every pane in a
+        # single request, so one odd process anywhere turns the board into a
+        # 500.
+        write_proc(self.tmp, 42, name="bash")
+        with open(os.path.join(self.tmp, "42", "comm"), "wb") as fh:
+            fh.write(b"co\xffdex\n")
+        got = self.linux().comm(42)
+        self.assertIsNotNone(got)
+        self.assertNotEqual("codex", got)
+
+    def test_an_undecodable_sibling_does_not_hide_the_agent(self):
+        write_proc(self.tmp, 100, name="bash")
+        write_proc(self.tmp, 101, name="odd", ppid=100)
+        write_proc(self.tmp, 102, name="codex", ppid=100)
+        with open(os.path.join(self.tmp, "101", "comm"), "wb") as fh:
+            fh.write(b"\xff\xfe\n")
+        got = self.linux(tree={"100": [101, 102]}).descendant(100, "codex")
+        self.assertEqual("102", got)
+
     def test_descendant_finds_a_direct_child(self):
         write_proc(self.tmp, 100, name="bash")
         write_proc(self.tmp, 101, name="codex", ppid=100)
@@ -216,10 +238,15 @@ class LinuxProcTest(TempTree):
 
         live = ayeaye._LinuxProcessInfo()
         for pid in (os.getpid(), os.getppid(), 1):
+            # /proc/uptime has 10ms resolution, and the two readings of it are
+            # not the same reading, so the budget is that plus scheduling --
+            # still four orders of magnitude tighter than any change of field.
             self.assertAlmostEqual(reference(pid), live.start_time(pid),
-                                   delta=0.01, msg="pid %s" % pid)
-            self.assertEqual(os.readlink("/proc/%s/cwd" % os.getpid()),
-                             live.cwd(os.getpid()))
+                                   delta=0.05, msg="pid %s" % pid)
+        self.assertEqual(os.readlink("/proc/%s/cwd" % os.getpid()),
+                         live.cwd(os.getpid()))
+        with open("/proc/%s/comm" % os.getpid()) as fh:
+            self.assertEqual(fh.read().strip(), live.comm(os.getpid()))
 
 
 # ------------------------------------------------------------------- codex
@@ -327,6 +354,15 @@ class CodexSessionTest(TempTree):
         info = FakeProcessInfo(pid="991", started=self.started, cwd=None)
         self.assertIsNone(ayeaye.codex_session_for("900", proc=info))
 
+    def test_an_unreadable_cwd_does_not_match_a_rollout_that_recorded_none(self):
+        # Both sides absent is not both sides equal. Without the explicit
+        # guard, "we could not read the cwd" matches "the rollout did not
+        # record one" and the pane is handed a conversation at random.
+        self.rollout("2026-03-04T09-00-02", None, first=json.dumps(
+            {"payload": {"id": "0123abcd-dead-beef"}}))
+        info = FakeProcessInfo(pid="991", started=self.started, cwd=None)
+        self.assertIsNone(ayeaye.codex_session_for("900", proc=info))
+
     def test_a_rollout_whose_first_line_is_not_json_is_skipped(self):
         self.rollout("2026-03-04T09-00-01", "/home/someone/dev/thing",
                      sid="bbbbbbbb-bad", first="not json at all")
@@ -359,7 +395,19 @@ class DarwinProcTest(TempTree):
         return ayeaye._DarwinProcessInfo(run=canned(responses))
 
     def ps_tree(self):
-        return {"ps -axo": fixture("ps/darwin-codex-tree")}
+        return {"ps -axww": fixture("ps/darwin-codex-tree")}
+
+    def record(self):
+        """A runner that answers with the tree and remembers being asked."""
+        class Recorder(object):
+            def __init__(self):
+                self.argv = []
+
+            def run(self, argv, **kw):
+                self.argv.append(argv)
+                return fixture("ps/darwin-codex-tree")
+
+        return Recorder()
 
     def test_a_direct_child_is_found_in_the_ps_snapshot(self):
         got = self.darwin(self.ps_tree()).descendant(701, "codex")
@@ -384,28 +432,45 @@ class DarwinProcTest(TempTree):
     def test_a_pane_with_no_agent_below_it_resolves_to_nothing(self):
         self.assertIsNone(self.darwin(self.ps_tree()).descendant(901, "codex"))
 
-    def test_the_whole_walk_costs_one_ps_call(self):
-        calls = []
+    def test_an_agent_below_a_long_interpreter_path_is_still_found(self):
+        # An nvm install puts codex 95 columns deep. BSD ps truncates to the
+        # terminal width, and to 79 columns when there is no terminal -- which
+        # is always, under capture_output -- so without -ww the basename here
+        # is a fragment of the path and matches nothing.
+        info = self.darwin(self.ps_tree())
+        self.assertEqual("codex", info.comm(961))
+        self.assertEqual("961", info.descendant(960, "codex"))
 
-        def run(argv, **kw):
-            calls.append(argv)
-            return fixture("ps/darwin-codex-tree")
-
-        ayeaye._DarwinProcessInfo(run=run).descendant(801, "codex")
-        self.assertEqual(1, len(calls))
-        self.assertEqual(["ps", "-axo", "pid=,ppid=,comm="], calls[0])
+    def test_the_snapshot_asks_ps_in_the_form_bsd_understands(self):
+        calls = self.record()
+        ayeaye._DarwinProcessInfo(run=calls.run).descendant(801, "codex")
+        self.assertEqual(1, len(calls.argv), "the whole walk costs one ps")
+        argv = calls.argv[0]
+        # An `=` makes the rest of a BSD -o argument the column header, so
+        # "pid=,ppid=,comm=" asks for one column with a silly name and yields
+        # a tree with no parents in it. One keyword per -o, and unlimited
+        # width, are what both implementations agree on.
+        self.assertEqual(["ps", "-axww", "-o", "pid=", "-o", "ppid=",
+                          "-o", "comm="], argv)
+        self.assertEqual([], [a for a in argv if "," in a],
+                         "no -o argument may carry a comma-joined list")
 
     def test_a_repeated_walk_takes_a_fresh_snapshot(self):
-        calls = []
-
-        def run(argv, **kw):
-            calls.append(argv)
-            return fixture("ps/darwin-codex-tree")
-
-        info = ayeaye._DarwinProcessInfo(run=run)
+        calls = self.record()
+        info = ayeaye._DarwinProcessInfo(run=calls.run)
         info.descendant(801, "codex")
         info.descendant(801, "codex")
-        self.assertEqual(2, len(calls))
+        self.assertEqual(2, len(calls.argv))
+
+    def test_a_walk_leaves_no_process_tree_behind_on_the_backend(self):
+        # One backend is shared by every thread of a threading server. A tree
+        # cached on the instance is a tree another request can be halfway
+        # through replacing, and the pane that lands on it resolves to the
+        # wrong agent or to none at all.
+        calls = self.record()
+        info = ayeaye._DarwinProcessInfo(run=calls.run)
+        info.descendant(801, "codex")
+        self.assertEqual(["run"], sorted(vars(info)))
 
     def test_start_time_comes_from_ps_lstart(self):
         info = self.darwin({"ps -p": fixture("ps/darwin-lstart")})
@@ -461,7 +526,7 @@ class DarwinEndToEndTest(TempTree):
 
     def test_a_macos_pane_resolves_its_codex_rollout(self):
         info = ayeaye._DarwinProcessInfo(run=canned({
-            "ps -axo": fixture("ps/darwin-codex-tree"),
+            "ps -axww": fixture("ps/darwin-codex-tree"),
             "ps -p": fixture("ps/darwin-lstart"),
             "lsof": fixture("lsof/darwin-cwd"),
         }))
@@ -488,12 +553,33 @@ class SelectionTest(unittest.TestCase):
         self.assertIsInstance(ayeaye._make_process_info("freebsd14"),
                               ayeaye._LinuxProcessInfo)
 
-    def test_selecting_a_backend_touches_nothing(self):
-        # Whichever host this runs on, building the other platform's backend
-        # must not look for tools or files it has not got. Import-time failure
-        # on macOS is exactly what this ticket exists to remove.
-        for plat in ("linux", "darwin"):
-            ayeaye._make_process_info(plat)
+    def test_the_macos_backend_never_reaches_for_proc(self):
+        # The whole point: on a Mac there is nothing at /proc to reach for.
+        # Building the backend and running a walk through it must not open a
+        # file at all, on whichever host this happens to run.
+        opened = []
+        real_open, real_readlink = builtins.open, os.readlink
+
+        def watch_open(path, *a, **kw):
+            opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        def watch_readlink(path, *a, **kw):
+            opened.append(str(path))
+            return real_readlink(path, *a, **kw)
+
+        builtins.open, os.readlink = watch_open, watch_readlink
+        self.addCleanup(setattr, os, "readlink", real_readlink)
+        self.addCleanup(setattr, builtins, "open", real_open)
+        try:
+            info = ayeaye._make_process_info("darwin")
+            info.run = lambda argv, **kw: ""
+            info.descendant(801, "codex")
+            info.start_time(801)
+            info.cwd(801)
+        finally:
+            builtins.open, os.readlink = real_open, real_readlink
+        self.assertEqual([], [p for p in opened if p.startswith("/proc")])
 
     def test_the_module_selected_one_for_this_host(self):
         self.assertTrue(hasattr(ayeaye.PROCESS_INFO, "descendant"))

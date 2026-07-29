@@ -12,3 +12,5 @@
   950     1 /bin/zsh
   951   950 /Applications/My Editor.app/Contents/MacOS/My Editor
   952   951 /opt/homebrew/bin/codex
+  960     1 /bin/zsh
+  961   960 /Users/someone/.nvm/versions/node/v22.14.0/lib/node_modules/@openai/codex/bin/codex

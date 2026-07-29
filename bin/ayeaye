@@ -266,18 +266,19 @@ class _ProcessInfo(object):
     """The shared half: finding a named process below a pane's shell."""
 
     def _snapshot(self):
-        """Called once at the start of a walk, for backends that batch."""
+        """Whatever a backend wants to gather once per walk, or None."""
+        return None
 
     def descendant(self, pid, name, depth=3):
         """Find a named descendant. tmux's pane_pid is the shell; the agent is
         a child of it (and sometimes a grandchild via a wrapper)."""
-        self._snapshot()
+        snap = self._snapshot()
         frontier = [str(pid)]
         for _ in range(depth):
             nxt = []
             for p in frontier:
-                for c in self.children(p):
-                    comm = self.comm(c)
+                for c in self.children(p, snap):
+                    comm = self.comm(c, snap)
                     if comm is None:        # gone, or not ours to look at
                         continue
                     if comm == name:
@@ -295,14 +296,17 @@ class _LinuxProcessInfo(_ProcessInfo):
         self.run = run or _run_tool
         self.clk_tck = clk_tck or os.sysconf("SC_CLK_TCK")
 
-    def children(self, pid):
+    def children(self, pid, snap=None):
         return (self.run(["pgrep", "-P", str(pid)]) or "").split()
 
-    def comm(self, pid):
+    def comm(self, pid, snap=None):
+        # errors="replace": comm is whatever bytes the exec'd path ended in,
+        # and an undecodable one is a process with an odd name, not a reason
+        # to fail a request.
         try:
-            with open("%s/%s/comm" % (self.proc, pid)) as fh:
+            with open("%s/%s/comm" % (self.proc, pid), errors="replace") as fh:
                 return fh.read().strip()
-        except OSError:
+        except (OSError, ValueError):
             return None
 
     def start_time(self, pid):
@@ -329,46 +333,54 @@ class _LinuxProcessInfo(_ProcessInfo):
             return None
 
 
+# Three things about BSD ps that a Linux reflex gets wrong, all of which fail
+# silently -- an empty process tree looks exactly like a pane with no agent
+# under it:
+#
+#   -o pid=,ppid=,comm=   an `=` makes the REST of the argument the column
+#                         header, so this asks for one column named
+#                         ",ppid=,comm=". One keyword per -o is the form that
+#                         means the same thing to both ps implementations.
+#   -ww                   output is truncated to the terminal width, and to 79
+#                         columns when there is no terminal -- which is always,
+#                         under capture_output. That cuts the tail off a long
+#                         interpreter path, and the tail is the part we match.
+#   comm                  the full executable path, where Linux gives a bare
+#                         name; it may contain spaces.
+PS_SNAPSHOT = ["ps", "-axww", "-o", "pid=", "-o", "ppid=", "-o", "comm="]
+
+
 class _DarwinProcessInfo(_ProcessInfo):
     """ps and lsof. `run` is injectable for tests only.
 
     One `ps` snapshot serves a whole walk: three levels of ancestry would
     otherwise cost a process per node, on the platform where spawning them is
-    slowest. It is retaken per walk, so nothing is ever answered from a tree
-    that has moved on.
+    slowest. It is taken per walk and carried on the stack, never on the
+    instance -- one of these is shared by every thread of a threading server,
+    and a half-replaced tree resolves a pane to the wrong agent or to none.
     """
 
     def __init__(self, run=None):
         self.run = run or _run_tool
-        self._kids = None
-        self._comm = None
 
     def _snapshot(self):
         kids, comm = {}, {}
-        for line in (self.run(["ps", "-axo", "pid=,ppid=,comm="])
-                     or "").splitlines():
+        for line in (self.run(PS_SNAPSHOT) or "").splitlines():
             parts = line.split(None, 2)
             if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
                 continue
             pid, ppid = parts[0], parts[1]
-            # macOS reports the executable's full path where Linux reports a
-            # bare name, and that path may contain spaces -- hence the split
-            # limit above and the basename here.
             comm[pid] = os.path.basename(parts[2].strip()) if len(parts) > 2 else ""
             kids.setdefault(ppid, []).append(pid)
-        self._kids, self._comm = kids, comm
+        return kids, comm
 
-    def _fresh(self):
-        if self._kids is None:
-            self._snapshot()
+    def children(self, pid, snap=None):
+        kids, _ = snap or self._snapshot()
+        return list(kids.get(str(pid), ()))
 
-    def children(self, pid):
-        self._fresh()
-        return list(self._kids.get(str(pid), ()))
-
-    def comm(self, pid):
-        self._fresh()
-        return self._comm.get(str(pid))
+    def comm(self, pid, snap=None):
+        _, comm = snap or self._snapshot()
+        return comm.get(str(pid))
 
     def start_time(self, pid):
         """`ps -o lstart=` gives "Wed Mar  4 09:00:02 2026" -- local time to
@@ -417,9 +429,12 @@ def codex_session_for(pane_pid, proc=None):
     pid = proc.descendant(pane_pid, "codex")
     if not pid:
         return None
-    started, cwd = proc.start_time(pid), proc.cwd(pid)
-    if started is None or cwd is None:
-        return None                                # gone, or nothing to read
+    started = proc.start_time(pid)
+    if started is None:
+        return None                                # gone before we looked
+    cwd = proc.cwd(pid)                            # a second probe on macOS,
+    if cwd is None:                                # so only ask if it can help
+        return None
 
     best = None
     for r in glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*",
@@ -427,7 +442,7 @@ def codex_session_for(pane_pid, proc=None):
         stamp = os.path.basename(r)[8:27]          # rollout-YYYY-MM-DDTHH-MM-SS
         try:
             t = time.mktime(time.strptime(stamp, "%Y-%m-%dT%H-%M-%S"))
-        except ValueError:
+        except (ValueError, OverflowError):        # a filename, so: anything
             continue
         delta = t - started
         # A rollout belongs to this process only if it appeared just after it
