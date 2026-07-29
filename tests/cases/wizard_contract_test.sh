@@ -233,6 +233,10 @@ test_every_path_the_wizard_writes_is_guarded_by_the_suite() {
   for path in "ayeaye/setup-state" "ayeaye/setup-consent.log" "ayeaye/setup.log" \
               "ayeaye/backups" "ayeaye/env" "ayeaye/token" \
               "share}/ayeaye" \
+              "ayeaye/Caddyfile" "ayeaye/ca/ayeaye-ca.crt" \
+              "ayeaye/reverse-proxy.caddy" "ayeaye/reverse-proxy.nginx" \
+              "ayeaye/phone-certificate.txt" \
+              "systemd/user/ayeaye-caddy.service" \
               "systemd/user/ayeaye.service"; do
     assert_contains "$guard" "$path" \
       "$path is written by setup and must be on GUARDED_PATHS"

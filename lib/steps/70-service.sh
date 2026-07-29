@@ -89,6 +89,28 @@ _service_spec() {
         *)     return 2 ;;
       esac
       ;;
+    ayeaye-caddy)
+      case "$field" in
+        title) printf 'https front for ayeaye on your home network' ;;
+        after) printf '' ;;
+        argv)
+          # Nothing about the address, the port or the certificate is here:
+          # all of it is in the settings file caddy is pointed at, which is
+          # written by lib/steps/50-access.sh and is the only place any of it
+          # lives. A machine with no caddy has no definition to write - saying
+          # so beats installing one that names nothing and fails at every
+          # login.
+          [ -n "$(_service_caddy_bin)" ] || return 2
+          printf '%s\n' "$(_service_caddy_bin)"
+          printf 'run\n'
+          printf -- '--config\n'
+          printf '%s\n' "$(_service_caddyfile)"
+          printf -- '--adapter\n'
+          printf 'caddyfile\n'
+          ;;
+        *)     return 2 ;;
+      esac
+      ;;
     whisper-server)
       case "$field" in
         title) printf 'whisper.cpp server, kept resident for dictation' ;;
@@ -121,7 +143,41 @@ _service_spec() {
 
 # service_names - every service this file knows how to write down.
 service_names() {
-  printf 'ayeaye\nvoice-agent\nwhisper-server\n'
+  printf 'ayeaye\nvoice-agent\nwhisper-server\nayeaye-caddy\n'
+}
+
+# Where caddy is on this machine, and which settings it would be started with.
+#
+# The service is called ayeaye-caddy rather than caddy on purpose: somebody who
+# would choose an https front on their home network is exactly the kind of
+# person who already runs a caddy of their own, under the obvious name, and a
+# generated definition that replaced theirs - and a mode switch that then
+# deleted it - would be setup taking somebody else's service away. The path is the one lib/steps/50-access.sh writes, read from the same
+# variable with the same default so that the file that generates it and the
+# definition that names it cannot drift apart.
+SERVICE_CADDY_BIN="${SERVICE_CADDY_BIN:-}"
+_service_caddy_bin() {
+  if [ -n "$SERVICE_CADDY_BIN" ]; then
+    printf '%s' "$SERVICE_CADDY_BIN"
+  else
+    command -v caddy 2>/dev/null || true
+  fi
+}
+_service_caddyfile() {
+  # lib/steps/50-access.sh writes this file and defines the same question's
+  # answer as _access_caddyfile. It is sourced before this one and both are in
+  # memory long before a definition is rendered, so the answer is taken from
+  # there when it is there - two spellings of one path is exactly the drift
+  # this arrangement exists to prevent.
+  if command -v _access_caddyfile >/dev/null 2>&1; then
+    _access_caddyfile
+    return 0
+  fi
+  if [ -n "${ACCESS_CADDYFILE:-}" ]; then
+    printf '%s' "$ACCESS_CADDYFILE"
+  else
+    printf '%s/Caddyfile' "${CONF_DIR:-$(_service_conf_home)/ayeaye}"
+  fi
 }
 
 # Where whisper.cpp's server is on this machine, if it is anywhere.
@@ -265,6 +321,10 @@ service_render_systemd() {
   local name="${1:-}" title after
   title="$(_service_spec "$name" title)" || return 2
   after="$(_service_spec "$name" after)" || return 2
+  # A definition whose program cannot be named is not a definition. Asked
+  # before a byte is written, because a unit with an empty ExecStart installs
+  # perfectly and starts nothing.
+  _service_spec "$name" argv >/dev/null || return 2
   cat <<UNIT
 [Unit]
 Description=$title
@@ -313,6 +373,7 @@ UNIT
 service_render_launchd() {
   local name="${1:-}" arg logs
   _service_spec "$name" title >/dev/null || return 2
+  _service_spec "$name" argv >/dev/null || return 2
   logs="$(_service_log_dir)"
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -506,12 +567,13 @@ _service_migrate_siblings() {
   local kind="${1:-}" name path running
   for name in $(service_names); do
     case "$name" in
-      # Both have an installer of their own, with conditions this loop knows
+      # Each has an installer of its own, with conditions this loop knows
       # nothing about - whether this machine still has whisper.cpp, whether a
-      # model is configured, whether the binary's path can be named in a unit.
-      # Regenerating them from here bypassed every one of those and could
-      # replace a working definition with one that restart-loops.
-      ayeaye|whisper-server) continue ;;
+      # model is configured, whether the binary's path can be named in a unit,
+      # whether the person still wants their home network to be able to reach
+      # ayeaye at all. Regenerating them from here bypassed every one of those
+      # and could replace a working definition with one that restart-loops.
+      ayeaye|whisper-server|ayeaye-caddy) continue ;;
     esac
     path="$(service_definition_path "$name" "$kind")" || continue
     [ -f "$path" ] || continue
