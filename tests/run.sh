@@ -82,6 +82,12 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/backups
 ${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye
 ${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye/statusline-command.sh
 ${CLIBAN_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/cliban/cliban.db}
+${HW_MODEL_DIR:-$HOME/whisper-models}
+${HW_MODEL_DIR:-$HOME/whisper-models}/ggml-tiny.en.bin
+${HW_MODEL_DIR:-$HOME/whisper-models}/ggml-base.en.bin
+${HW_MODEL_DIR:-$HOME/whisper-models}/ggml-small.en.bin
+${HW_MODEL_DIR:-$HOME/whisper-models}/ggml-medium.en.bin
+${HW_MODEL_DIR:-$HOME/whisper-models}/ggml-large-v3-turbo.bin
 $HOME/.claude/settings.json
 $HOME/.local/bin/ayeaye
 ${XDG_BIN_HOME:-$HOME/.local/bin}/claude

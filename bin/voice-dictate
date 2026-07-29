@@ -22,6 +22,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,19 @@ WHISPER_SERVER = os.environ.get("VOICE_WHISPER_SERVER", "127.0.0.1:8910")
 WHISPER_MODEL = os.environ.get(
     "VOICE_WHISPER_MODEL", os.path.expanduser("~/whisper-models/ggml-small.en.bin"))
 WHISPER_THREADS = os.environ.get("VOICE_WHISPER_THREADS", "16")
+
+# The command-line transcriber, for when the resident server is not up.
+#
+# Not a single hard-coded name any more. whisper.cpp renamed its binaries: the
+# project's own builds and Homebrew's formula install `whisper-cli`, Arch's
+# package installs `whisper-cli` too, and only older builds and some distro
+# packages still carry `whisper-cpp`. Setup looks for any of them and records
+# what it found, so the name checked here is the name that is really on this
+# machine rather than the one that was current when this line was written.
+# VOICE_WHISPER_CLI overrides, and an absolute path works.
+WHISPER_CLI = os.environ.get("VOICE_WHISPER_CLI", "") or next(
+    (name for name in ("whisper-cli", "whisper-cpp", "whisper")
+     if shutil.which(name)), "whisper-cpp")
 OLLAMA_MODEL = os.environ.get("VOICE_OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_HOST = os.environ.get("VOICE_OLLAMA_HOST", "localhost:11434")
 KEEP_ALIVE = os.environ.get("VOICE_KEEP_ALIVE", "1h")
@@ -321,7 +335,7 @@ def transcribe_pcm(pcm):
                 fh.write(pcm)
                 fh.flush()
                 res = subprocess.run(
-                    ["whisper-cpp", "-m", WHISPER_MODEL, "-f", fh.name,
+                    [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", fh.name,
                      "-l", "en", "-nt", "-np", "-t", WHISPER_THREADS],
                     capture_output=True, text=True)
         except Exception:
