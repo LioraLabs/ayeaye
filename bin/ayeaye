@@ -627,6 +627,148 @@ def live_sessions():
     return set(tmux("list-sessions", "-F", "#{session_name}").split())
 
 
+# --------------------------------------------------------- finding projects
+# The picker used to read zoxide's database, which meant a first-time user had
+# to install and then train a second tool before "+ new agent" did anything at
+# all. It walks the filesystem itself now. The whole design problem is that
+# this happens while someone types on a phone, so every part of the walk is
+# bounded and the bounds are the interesting behaviour.
+
+# Where to look. Colon separated, ~ expanded. A root is scanned whatever it is
+# called, which is also the escape hatch for a directory the exclusions below
+# would otherwise hide.
+PROJECT_ROOTS = [os.path.expanduser(p)
+                 for p in _env("PROJECT_ROOTS", "~").split(":") if p.strip()]
+# How far below a root a project may sit. Six covers ~/src/org/repo/sub and
+# stops well short of the leaves of a source tree.
+PROJECT_DEPTH = int(_env("PROJECT_DEPTH", "6"))
+# Wall clock one walk may spend. It runs on a worker thread, so this bounds
+# the work rather than the response.
+PROJECT_BUDGET = float(_env("PROJECT_BUDGET", "4"))
+# Wall clock a request may wait for that walk before answering with whatever
+# has arrived. This is the number that keeps the request loop moving.
+PROJECT_WAIT = float(_env("PROJECT_WAIT", "0.4"))
+# How long a completed search stays usable, and how long a directory listing
+# is trusted. Short enough that a repo cloned a minute ago shows up.
+PROJECT_TTL = float(_env("PROJECT_TTL", "60"))
+
+# Directories that are never a project and never contain one. Every name here
+# is a decision, so the set is explicit rather than a clever heuristic:
+# dependency trees and build output, caches and trash, virtualenvs, and the
+# platform's own folders. Extend it on one machine with
+# AYEAYE_PROJECT_SKIP=name,name -- names, matched exactly, not paths.
+PROJECT_SKIP = set("""
+    node_modules bower_components jspm_packages vendor Godeps
+    target build dist out obj Debug Release
+    site-packages dist-packages __pycache__ eggs venv virtualenv env
+    Library Applications System Volumes AppData
+    Trash trash tmp temp cache Caches
+    snap flatpak
+""".split()) | set(n for n in
+                   (s.strip() for s in _env("PROJECT_SKIP").split(",")) if n)
+
+
+def _project_skip(name):
+    """True for a directory the walk must neither return nor enter.
+
+    Leading dot covers the whole class the exclusion list cannot enumerate:
+    tool and application internals, .venv and .tox and .cache and .git and
+    every dotfile directory a package manager will invent next year.
+    """
+    return (name.startswith(".")
+            or name in PROJECT_SKIP
+            or name.endswith(".egg-info"))
+
+
+# Listing the same directory once per keystroke is what would make searching
+# while typing unaffordable, so listings are memoised for PROJECT_TTL. The
+# cache is bounded by clearing it wholesale: an eviction policy would be more
+# code than the walk it serves, and refilling costs one bounded walk.
+_LIST_MAX = 20000
+_list_cache = {}
+_list_lock = threading.Lock()
+
+
+def _list_dir(path):
+    """Interesting sub-directories of `path`, as (name, path, is_git).
+
+    Symlinked directories are skipped outright. A symlink is either a second
+    name for something the walk will reach anyway or a way out of the bounded
+    region entirely, and following one is how a walk finds a cycle.
+    """
+    now = time.monotonic()
+    with _list_lock:
+        hit = _list_cache.get(path)
+    if hit and now - hit[0] < PROJECT_TTL:
+        return hit[1]
+    rows = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if _project_skip(entry.name):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                # A worktree and a submodule keep .git as a file rather than a
+                # directory, and both are somewhere you would start an agent.
+                rows.append((entry.name, entry.path,
+                             os.path.exists(os.path.join(entry.path, ".git"))))
+    except OSError:
+        rows = []
+    with _list_lock:
+        if len(_list_cache) >= _LIST_MAX:
+            _list_cache.clear()
+        _list_cache[path] = (now, rows)
+    return rows
+
+
+def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
+                  cancel=None):
+    """Directories under `roots` whose path contains `query`, breadth first.
+
+    Returns (rows, stopped), where a row is (path, is_git, level) and stopped
+    names the bound that ended the walk -- "depth", "deadline", "cancel",
+    "limit", or "" when the tree was exhausted. Callers care which: a walk
+    that finished is worth caching and one that was cut short is not.
+
+    Breadth first because a project sits a couple of levels below home, so
+    the answers worth having arrive before any bound can bite. The bounds are
+    checked per directory rather than per level, since one directory with a
+    hundred thousand entries in it is precisely the case that would otherwise
+    hang. `limit` of 0 means no early stop.
+    """
+    roots = PROJECT_ROOTS if roots is None else roots
+    depth = PROJECT_DEPTH if depth is None else depth
+    q = query.strip().lower()
+    rows, stopped = [], ""
+    frontier = [(os.path.abspath(r), 0) for r in roots if os.path.isdir(r)]
+    seen = set(p for p, _ in frontier)
+    while frontier:
+        nxt = []
+        for path, level in frontier:
+            if cancel is not None and cancel.is_set():
+                return rows, "cancel"
+            if deadline is not None and time.monotonic() >= deadline:
+                return rows, "deadline"
+            if level >= depth:
+                stopped = "depth"
+                continue
+            for _name, child, is_git in _list_dir(path):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if not q or q in child.lower():
+                    rows.append((child, is_git, level + 1))
+                    if limit and len(rows) >= limit:
+                        return rows, "limit"
+                nxt.append((child, level + 1))
+        frontier = nxt
+    return rows, stopped
+
+
 def projects(query="", limit=40):
     """Candidate directories, newest-frecency first, straight from zoxide --
     the same source ftz picks from."""
