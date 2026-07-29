@@ -23,7 +23,9 @@
 # ---------------------------------------------------------------- the contract
 #
 #   wizard_consent <kind> <question> [detail]…
-#         0 granted, 1 refused, 2 the kind is not one of the six (caller bug).
+#         0 granted, 3 refused, 2 the kind is not one of the six (caller bug).
+#         3 rather than 1 so that "refused" is the same number here as it is
+#         from every wrapper below, where 1 already means "it ran and failed".
 #         The question is plain language and is what the user sees; the details
 #         are the raw commands and go to the log, not into the question.
 #
@@ -47,6 +49,7 @@
 #   wizard_privileged <question> <command-string>
 #   wizard_firewall   <question> <command-string>
 #   wizard_trust      <question> <command-string>
+#   wizard_may_expose <question> [detail]…   the kind with nothing to run
 #   wizard_download   <question> <url> <destination> [bytes]
 #   wizard_replace    <path> [question]     -> 0 when the caller may now write
 #   wizard_install_packages <logical>…      -> the package layer, with consent
@@ -79,14 +82,43 @@
 #                           the run may not ask. firewall, trust and expose are
 #                           ignored here whatever it says: they are never
 #                           granted on someone's behalf.
-#   WIZARD_CONSENT_LEDGER   where the audit trail goes
-#   WIZARD_BACKUP_DIR       where replaced files are copied to
+#   WIZARD_CONSENT_LEDGER   where the audit trail goes. Empty means
+#                           $WIZARD_STATE_DIR/setup-consent.log, resolved when
+#                           it is used rather than when this file is sourced.
+#   WIZARD_BACKUP_DIR       where replaced files are copied to. Empty means
+#                           $WIZARD_STATE_DIR/backups, resolved the same way.
+#
+# platform_pkg_install and platform_service_run change the machine and are not
+# wrappers. Nothing in this project may call them directly; use
+# wizard_install_packages, and route a service operation through
+# platform_service_command plus a wrapper. tests/cases/wizard_contract_test.sh
+# is what stops that rule from being quietly forgotten.
 #
 # bash 3.2: no associative arrays, no ${var,,}, no mapfile, no local -n.
 
-WIZARD_CONSENT_LEDGER="${WIZARD_CONSENT_LEDGER:-${WIZARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye}/setup-consent.log}"
-WIZARD_BACKUP_DIR="${WIZARD_BACKUP_DIR:-${WIZARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye}/backups}"
+# Both default to a name under $WIZARD_STATE_DIR, resolved at the moment they
+# are used rather than at the moment this file is sourced: an argument parser
+# can only choose a state directory after the libraries it parses with are
+# already in memory.
+WIZARD_CONSENT_LEDGER="${WIZARD_CONSENT_LEDGER:-}"
+WIZARD_BACKUP_DIR="${WIZARD_BACKUP_DIR:-}"
 WIZARD_AUTO_CONSENT="${WIZARD_AUTO_CONSENT:-}"
+
+wizard_ledger_path() {
+  if [ -n "$WIZARD_CONSENT_LEDGER" ]; then
+    printf '%s' "$WIZARD_CONSENT_LEDGER"
+  else
+    printf '%s/setup-consent.log' "$WIZARD_STATE_DIR"
+  fi
+}
+
+wizard_backup_dir() {
+  if [ -n "$WIZARD_BACKUP_DIR" ]; then
+    printf '%s' "$WIZARD_BACKUP_DIR"
+  else
+    printf '%s/backups' "$WIZARD_STATE_DIR"
+  fi
+}
 
 # Refused. Not a failure: the user said no and the machine is as they left it.
 WIZARD_REFUSED=3
@@ -134,23 +166,34 @@ wizard_consent_policy() {
 # ------------------------------------------------------------------ ledger
 
 wizard_consent_reset() {
-  local dir="${WIZARD_CONSENT_LEDGER%/*}"
-  [ "$dir" = "$WIZARD_CONSENT_LEDGER" ] || mkdir -p "$dir" 2>/dev/null || return 0
-  : > "$WIZARD_CONSENT_LEDGER" 2>/dev/null || true
+  local path dir
+  path="$(wizard_ledger_path)"
+  dir="${path%/*}"
+  [ "$dir" = "$path" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  : > "$path" 2>/dev/null || true
   return 0
 }
 
 # wizard_consent_record <kind> <decision> <text> - always 0.
+#
+# Public, and meant to be called directly for a decision that was settled by an
+# explicit answer earlier in the run rather than by asking now - choosing an
+# address to listen on is a consent to exposure, and the audit trail should say
+# so without asking the same question twice.
 wizard_consent_record() {
-  local dir="${WIZARD_CONSENT_LEDGER%/*}"
-  [ "$dir" = "$WIZARD_CONSENT_LEDGER" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  local path dir
+  path="$(wizard_ledger_path)"
+  dir="${path%/*}"
+  [ "$dir" = "$path" ] || mkdir -p "$dir" 2>/dev/null || return 0
   printf '%s%s%s%s%s\n' "${1:-}" "$_WIZARD_TAB" "${2:-}" "$_WIZARD_TAB" "${3:-}" \
-    >> "$WIZARD_CONSENT_LEDGER" 2>/dev/null || true
+    >> "$path" 2>/dev/null || true
   return 0
 }
 
 wizard_consent_ledger() {
-  [ -f "$WIZARD_CONSENT_LEDGER" ] && cat "$WIZARD_CONSENT_LEDGER" 2>/dev/null
+  local path
+  path="$(wizard_ledger_path)"
+  [ -f "$path" ] && cat "$path" 2>/dev/null
   return 0
 }
 
@@ -178,7 +221,7 @@ wizard_consent() {
       ;;
     refuse)
       wizard_consent_record "$kind" refused "$question"
-      return 1
+      return "$WIZARD_REFUSED"
       ;;
   esac
 
@@ -187,7 +230,7 @@ wizard_consent() {
     return 0
   fi
   wizard_consent_record "$kind" refused "$question"
-  return 1
+  return "$WIZARD_REFUSED"
 }
 
 # ------------------------------------------------------------- doing things
@@ -205,12 +248,51 @@ _wizard_do() {
   [ "$status" = 2 ] && return 2
   [ "$status" = 0 ] || return "$WIZARD_REFUSED"
 
+
   wizard_detail "running: $cmd"
-  out="$(eval "$cmd" 2>&1)"
-  status=$?
-  [ -n "$out" ] && wizard_detail "$out"
+  # Assigned through an `if`, never bare: a command substitution that returns
+  # non-zero is fatal under `set -e`, and "it ran and did not work" is an
+  # outcome this function is supposed to be able to report.
+  if out="$(eval "$cmd" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$out" ]; then
+    wizard_detail "$out"
+  fi
   if [ "$status" != 0 ]; then
-    [ -n "$out" ] && printf '%s\n' "$out" >&2
+    # The tool's own words, once, on stderr: the one moment they are worth more
+    # to the reader than the plain-language explanation above them.
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# _wizard_exec <command-string> - run something a grant already covers.
+#
+# The one door past wizard_consent, and it is private for that reason: it may
+# only be called inside a function that has just been granted consent covering
+# exactly this command. wizard_install_packages is its only caller.
+_wizard_exec() {
+  local cmd="${1:-}" out status
+  [ -n "$cmd" ] || return 2
+  wizard_detail "running: $cmd"
+  if out="$(eval "$cmd" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$out" ]; then
+    wizard_detail "$out"
+  fi
+  if [ "$status" != 0 ]; then
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" >&2
+    fi
     return 1
   fi
   return 0
@@ -218,6 +300,20 @@ _wizard_do() {
 
 wizard_privileged() { _wizard_do privileged "${1:-}" "${2:-}"; }
 wizard_firewall()   { _wizard_do firewall   "${1:-}" "${2:-}"; }
+
+# wizard_may_expose <question> [detail]… - may ayeaye be reachable from
+# somewhere other than this computer?
+#
+# The one kind with no command behind it: exposure is a decision, not a thing
+# to run. It still goes through the same primitive and the same ledger, so
+# "did anything put this machine on a network" has one place to look and one
+# answer, and an unattended run can never answer it yes.
+wizard_may_expose() {
+  local question="${1:-}"
+  [ -n "$question" ] || return 2
+  shift
+  wizard_consent expose "$question" "$@"
+}
 wizard_trust()      { _wizard_do trust      "${1:-}" "${2:-}"; }
 
 # wizard_download <question> <url> <destination> [bytes]
@@ -254,14 +350,15 @@ wizard_download() {
 # wizard_backup <path> -> the backup path on stdout. 1 when it could not be
 # made, which a caller must treat as a reason not to overwrite anything.
 wizard_backup() {
-  local path="${1:-}" name stamp target
+  local path="${1:-}" name stamp target dir
   [ -n "$path" ] || return 2
   [ -e "$path" ] || return 1
   name="${path##*/}"
   stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null)" || stamp=""
   [ -n "$stamp" ] || stamp="backup"
-  mkdir -p "$WIZARD_BACKUP_DIR" 2>/dev/null || return 1
-  target="$WIZARD_BACKUP_DIR/$name.$stamp"
+  dir="$(wizard_backup_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  target="$dir/$name.$stamp"
   # A second backup inside the same second must not silently replace the
   # first: the two versions are exactly what somebody comparing them needs.
   if [ -e "$target" ]; then
@@ -307,13 +404,29 @@ wizard_replace() {
 # which is the honest outcome and the one the platform layer is built to
 # produce.
 wizard_install_packages() {
-  local cmd
+  local cmd refresh status
   [ "$#" -gt 0 ] || return 2
   if ! cmd="$(platform_pkg_install_command "$@")" || [ -z "$cmd" ]; then
     platform_pkg_manual_hint "$@"
     return 1
   fi
-  wizard_privileged "may I install $* on this computer?" "$cmd"
+  refresh="$(platform_pkg_refresh_command)" || refresh=""
+
+  # One question covering both commands, not two: refreshing the package list
+  # is part of installing, and asking about it separately would be asking a
+  # person to make a decision they have no way to make.
+  wizard_consent privileged "may I install $* on this computer?" "$refresh" "$cmd"
+  status=$?
+  [ "$status" = 2 ] && return 2
+  [ "$status" = 0 ] || return "$WIZARD_REFUSED"
+
+  # The refresh is best effort everywhere but Arch, where pacman -S against a
+  # database that was never synced fails outright - so its failure is left for
+  # the install below to report in terms of the packages the user asked for.
+  if [ -n "$refresh" ]; then
+    _wizard_exec "$refresh" || true
+  fi
+  _wizard_exec "$cmd"
 }
 
 # --------------------------------------------------------------- the plan
@@ -396,8 +509,12 @@ EOF
   done
   [ "$any" = 1 ] || wizard_say "nothing needs to be installed or changed."
   if [ "$_WIZARD_PLAN_BYTES" -gt 0 ]; then
-    mb=$(( (_WIZARD_PLAN_BYTES + 499999) / 1000000 ))
-    wizard_say "about $mb MB of downloads and disk space."
+    if [ "$_WIZARD_PLAN_BYTES" -lt 1000000 ]; then
+      wizard_say "less than 1 MB of downloads and disk space."
+    else
+      mb=$(( (_WIZARD_PLAN_BYTES + 999999) / 1000000 ))
+      wizard_say "about $mb MB of downloads and disk space."
+    fi
   fi
   return 0
 }

@@ -32,7 +32,16 @@ setup() {
 _marker() { printf '%s' "$TEST_TMPDIR/ran"; }
 _touch_marker_command() { printf '%s' "printf ran > $(_marker)"; }
 
-_answers() { stdin_lines "$@"; }
+# Answers for a call made in this same shell. stdin_lines is for run_script,
+# which starts a process of its own and cannot help here.
+_answers() {
+  local file="$TEST_TMPDIR/answers" line
+  : > "$file"
+  for line in "$@"; do
+    printf '%s\n' "$line" >> "$file"
+  done
+  printf '%s' "$file"
+}
 
 # ------------------------------------------------------------------- policy
 
@@ -78,9 +87,11 @@ test_blanket_yes_still_cannot_reach_the_network_or_the_trust_store() {
 
 # ------------------------------------------------------------------ asking
 
-test_a_refused_consent_returns_one_and_records_the_refusal() {
+test_a_refused_consent_returns_three_and_records_the_refusal() {
+  # 3, the same number every wrapper uses, so that "refused" never has to be
+  # told apart from "it ran and failed" by which function was called.
   wizard_consent privileged "install two packages"
-  assert_status 1 "$?"
+  assert_status 3 "$?"
   assert_contains "$(wizard_consent_ledger)" "privileged	refused	install two packages"
 }
 
@@ -93,23 +104,20 @@ test_a_granted_consent_returns_zero_and_records_the_grant() {
 
 test_the_question_is_asked_in_words_and_answered_no_by_default() {
   WIZARD_INTERACTIVE=1
-  _answers ""
-  wizard_consent privileged "may I install ffmpeg for you?"
-  assert_status 1 "$?" "an empty answer must not be read as permission"
+  wizard_consent privileged "may I install ffmpeg for you?" < "$(_answers "")"
+  assert_status 3 "$?" "an empty answer must not be read as permission"
 }
 
 test_a_typed_yes_grants_it() {
   WIZARD_INTERACTIVE=1
-  _answers "y"
-  wizard_consent privileged "may I install ffmpeg for you?"
+  wizard_consent privileged "may I install ffmpeg for you?" < "$(_answers "y")"
   assert_status 0 "$?"
 }
 
 test_details_are_logged_rather_than_put_in_the_question() {
   WIZARD_INTERACTIVE=1
-  _answers "n"
   wizard_consent privileged "may I install ffmpeg for you?" \
-    "sudo apt-get install -y ffmpeg"
+    "sudo apt-get install -y ffmpeg" < "$(_answers "n")"
   assert_file_contains "$WIZARD_LOG_FILE" "sudo apt-get install -y ffmpeg" \
     "the raw command belongs in the technical detail"
 }
@@ -253,6 +261,26 @@ test_installing_packages_where_they_cannot_be_installed_explains_instead() {
   assert_contains "$out" "packages needed:" "the manual instructions are printed instead"
 }
 
+test_a_run_that_may_ask_ignores_the_blanket_yes() {
+  # --yes is what an unattended run does instead of asking. A run that can ask
+  # must still ask, or the flag would silently answer questions on behalf of
+  # somebody sitting right there.
+  WIZARD_INTERACTIVE=1
+  WIZARD_AUTO_CONSENT="privileged download replace"
+  assert_eq "ask" "$(wizard_consent_policy privileged)"
+}
+
+test_exposure_is_asked_about_through_the_same_primitive() {
+  wizard_may_expose "may other computers on your network reach ayeaye?"
+  assert_status 3 "$?" "an unattended run never puts ayeaye on a network"
+  assert_contains "$(wizard_consent_ledger)" "expose	refused"
+}
+
+test_a_decision_taken_elsewhere_still_reaches_the_ledger() {
+  wizard_consent_record expose granted "you chose to listen on 0.0.0.0"
+  assert_contains "$(wizard_consent_ledger)" "expose	granted	you chose to listen on 0.0.0.0"
+}
+
 test_installing_packages_goes_through_consent() {
   stub_command apt-get
   stub_command dpkg-query
@@ -284,6 +312,12 @@ test_the_plan_totals_the_disk_it_will_use() {
   wizard_plan_add package "tmux" 20000000
   wizard_plan_add download "a voice model" 80000000
   assert_contains "$(wizard_plan_show)" "100 MB"
+}
+
+test_a_small_plan_does_not_round_itself_down_to_nothing() {
+  wizard_plan_add package "a config snippet" 120000
+  assert_contains "$(wizard_plan_show)" "less than 1 MB" \
+    "\"about 0 MB\" reads as \"this is free\", which is not what it means"
 }
 
 test_an_empty_plan_says_there_is_nothing_to_do() {

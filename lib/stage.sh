@@ -59,8 +59,10 @@
 #                          run or starts a new pass, and say which. Always 0.
 #   wizard_run_stages      walk them. 0 when nothing required was left undone,
 #                          non-zero when the run stopped early.
-#   wizard_end_run         record that the walk finished. Always 0.
-#   wizard_stage_status <stage>         done | pending | skipped | failed | ""
+#   wizard_end_run <walk-status>
+#                          record how the walk ended: completed when the status
+#                          is 0, still open otherwise. Always 0.
+#   wizard_stage_status <stage>         done | pending | failed | ""
 #   wizard_step_status <stage> <step>   the same, for one step
 #   wizard_unfinished      the outstanding work, one line each, in words
 #   wizard_reset_progress  forget which stages and steps finished, keep the
@@ -93,6 +95,22 @@ WIZARD_STEP_ID="${WIZARD_STEP_ID:-}"
 WIZARD_RESUMING="${WIZARD_RESUMING:-0}"
 
 _WIZARD_STAGE_TAB='	'
+_WIZARD_RECOVER="${_WIZARD_RECOVER:-}"
+_WIZARD_STORE_WARNED=0
+
+# _wizard_remember <key> <value> - persist, and never let the store take the
+# run down with it. A store that cannot be written costs resumability, which is
+# worth one warning and nothing more; every call site here is bare under
+# `set -e`, so wizard_state_set's status 1 must stop here.
+_wizard_remember() {
+  wizard_state_set "$1" "$2" && return 0
+  if [ "$_WIZARD_STORE_WARNED" = 0 ]; then
+    _WIZARD_STORE_WARNED=1
+    wizard_say "note: setup cannot save its progress to $(wizard_state_path),"
+    wizard_say "so an interrupted run will start over rather than pick up."
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------- registering
 
@@ -162,6 +180,12 @@ wizard_step() {
   _wizard_stage_known "$stage" || return 2
   _wizard_step_known "$stage" "$step" && return 2
   case "$policy" in required|optional) ;; *) return 2 ;; esac
+  # The registry is a tab-delimited table and the label is its last column, so
+  # a label carrying either delimiter would be read back as something else.
+  case "$label" in
+    *"$_WIZARD_STAGE_TAB"*|*"
+"*) return 2 ;;
+  esac
   case "$resume" in once|always) ;; *) return 2 ;; esac
   # Eagerly, so a mistyped step name is a complaint at registration rather
   # than a stage that quietly does nothing halfway through a run.
@@ -230,28 +254,47 @@ wizard_reset_progress() {
 # the top with the previous answers offered back as defaults. A run that did
 # not get that far was interrupted, and is picked up where it stopped.
 wizard_begin_run() {
+  local count
   wizard_state_load
   WIZARD_RESUMING=0
   if wizard_state_is_new; then
-    wizard_state_set run.version 1
-    wizard_state_set run.count 1
+    _wizard_remember run.version 1
+    _wizard_remember run.count 1
   elif [ "$(wizard_state_get run.completed)" = 1 ]; then
     wizard_reset_progress
-    wizard_state_set run.count "$(( $(wizard_state_get run.count 0) + 1 ))"
+    count="$(wizard_state_get run.count 0)"
+    # The store tolerates a file somebody edited, so the count might not be a
+    # number. Under `set -u` feeding that to $(( )) is fatal, not zero.
+    case "$count" in
+      ""|*[!0-9]*) count=0 ;;
+    esac
+    _wizard_remember run.count "$((count + 1))"
   else
     WIZARD_RESUMING=1
   fi
-  wizard_state_set run.completed 0
-  wizard_state_set run.started "$(date +%s 2>/dev/null || printf 0)"
+  _wizard_remember run.completed 0
+  _wizard_remember run.started "$(date +%s 2>/dev/null || printf 0)"
   return 0
 }
 
+# wizard_end_run <walk-status> - record how the walk ended. Always 0.
+#
+# Completion means "the walk reached the last stage", not "everything got
+# done": a stage holding an unfinished seam is still a stage the wizard walked
+# past, and the next invocation is a deliberate rerun rather than a resume.
+# Anything short of that - a failure, a keyboard interrupt - leaves the run
+# open, which is what makes the next invocation pick up where this one stopped.
 wizard_end_run() {
-  wizard_state_set run.completed 1
+  if [ "${1:-1}" = 0 ]; then
+    _wizard_remember run.completed 1
+  else
+    _wizard_remember run.completed 0
+  fi
   return 0
 }
 
-# _wizard_step_recover <policy> <may-retry> -> again | skip | stop | auto
+# _wizard_step_recover <policy> <may-retry> -> $_WIZARD_RECOVER
+#      again | skip | stop | auto
 #
 # Plain language, and it never offers to leave out work the install cannot do
 # without: an offer that would produce a broken install is worse than no offer.
@@ -260,10 +303,15 @@ wizard_end_run() {
 # decision to policy: the caller carries on past optional work and gives up on
 # required work. An optional failure stays recorded as a failure rather than
 # being dressed up as a choice nobody made.
+#
+# It answers through a variable rather than stdout because it also *talks*:
+# "please answer with one of the words in brackets" is stdout too, and a
+# command substitution would hand that text back as the user's answer.
 _wizard_step_recover() {
   local policy="$1" may_retry="$2" tries=0
+  _WIZARD_RECOVER=""
   if [ "${WIZARD_INTERACTIVE:-1}" = 0 ]; then
-    printf 'auto'
+    _WIZARD_RECOVER="auto"
     return 0
   fi
   while [ "$tries" -lt 5 ]; do
@@ -280,15 +328,15 @@ _wizard_step_recover() {
     case "$REPLY" in
       a|again|retry|y|yes)
         if [ "$may_retry" = 1 ]; then
-          printf 'again'
+          _WIZARD_RECOVER="again"
           return 0
         fi
         wizard_say "it has been tried enough times; something else has to change first."
         ;;
-      s|stop|q|quit|exit|n|no) printf 'stop'; return 0 ;;
+      s|stop|q|quit|exit|n|no) _WIZARD_RECOVER="stop"; return 0 ;;
       skip|leave|omit)
         if [ "$policy" = optional ]; then
-          printf 'skip'
+          _WIZARD_RECOVER="skip"
           return 0
         fi
         wizard_say "this part is needed, so it cannot be left out."
@@ -296,7 +344,7 @@ _wizard_step_recover() {
       *) wizard_say "please answer with one of the words in brackets." ;;
     esac
   done
-  printf 'stop'
+  _WIZARD_RECOVER="stop"
   return 0
 }
 
@@ -329,7 +377,17 @@ _wizard_run_step() {
     "$fn" <&8
     status=$?
     word="$(_wizard_status_word "$status")"
-    [ "$resume" = always ] || wizard_state_set "step.$stage.$step" "$word"
+    if [ "$resume" = always ]; then
+      # Nothing to remember about work that runs every time - except a failure,
+      # which the closing summary has to be able to report.
+      if [ "$word" = failed ]; then
+        _wizard_remember "step.$stage.$step" failed
+      else
+        wizard_state_unset "step.$stage.$step" || true
+      fi
+    else
+      _wizard_remember "step.$stage.$step" "$word"
+    fi
     if [ "$word" != failed ]; then
       _WIZARD_STEP_OUTCOME="$word"
       return 0
@@ -345,11 +403,12 @@ _wizard_run_step() {
 
     may_retry=1
     [ "$attempts" -lt "$WIZARD_MAX_RETRIES" ] || may_retry=0
-    choice="$(_wizard_step_recover "$policy" "$may_retry" <&8)"
+    _wizard_step_recover "$policy" "$may_retry" <&8
+    choice="$_WIZARD_RECOVER"
     case "$choice" in
       again) continue ;;
       skip)
-        wizard_state_set "step.$stage.$step" skipped
+        _wizard_remember "step.$stage.$step" skipped
         _WIZARD_STEP_OUTCOME="skipped"
         wizard_say "leaving that out. Setup can add it later."
         return 0
@@ -411,7 +470,7 @@ EOF
 
     WIZARD_STAGE_ID=""
     WIZARD_STEP_ID=""
-    wizard_state_set "stage.$stage" "$stage_word"
+    _wizard_remember "stage.$stage" "$stage_word"
     [ "$stopped" = 1 ] && break
   done 3<<EOF
 $_WIZARD_STAGE_IDS
