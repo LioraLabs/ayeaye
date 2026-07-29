@@ -232,7 +232,7 @@ test_every_path_the_wizard_writes_is_guarded_by_the_suite() {
   guard="$(cat "$REPO_ROOT/tests/run.sh")"
   for path in "ayeaye/setup-state" "ayeaye/setup-consent.log" "ayeaye/setup.log" \
               "ayeaye/backups" "ayeaye/env" "ayeaye/token" \
-              "share}/ayeaye" \
+              "share}/ayeaye" "whisper-models" \
               "systemd/user/ayeaye.service"; do
     assert_contains "$guard" "$path" \
       "$path is written by setup and must be on GUARDED_PATHS"

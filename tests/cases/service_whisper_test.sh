@@ -142,6 +142,9 @@ test_being_asked_about_whisper_is_what_starts_it() {
   run_install --defaults
   _a_model_is_configured
   pty_answers ""                            # keep the settings that are there
+  # This machine has whisper, so setup offers to set listening up as well.
+  # Not what this file is about: 1 is "type to your agents, download nothing".
+  pty_expect "which one?" "1"
   pty_expect "enable and start it now?" "y"
   pty_expect "keep the transcription model loaded and ready?" "y"
   pty_install
@@ -156,6 +159,9 @@ test_declining_leaves_whisper_installed_and_stopped() {
   run_install --defaults
   _a_model_is_configured
   pty_answers ""
+  # This machine has whisper, so setup offers to set listening up as well.
+  # Not what this file is about: 1 is "type to your agents, download nothing".
+  pty_expect "which one?" "1"
   pty_expect "enable and start it now?" "y"
   pty_expect "keep the transcription model loaded and ready?" "n"
   pty_install
