@@ -22,10 +22,53 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
+
+
+def _load_sibling(name, filename):
+    """A python file next to this command, loaded as a module.
+
+    Loaded rather than imported because bin/ holds commands: they have no .py
+    extension, they are not on any import path, and there is no package here
+    and no intention of adding one. The same few lines appear in bin/ayeaye;
+    that is the price of having no package, and it is cheaper than the
+    packaging that would remove it.
+
+    realpath, not abspath. The tmux binding runs this off PATH, and the way it
+    gets onto PATH is a symlink -- abspath would resolve "next to" as next to
+    the symlink, where there is nothing. It would fail at import, and
+    `run-shell -b` discards the traceback: the key would simply stop working.
+
+    sys.modules is consulted first because bin/ayeaye loads this file and both
+    of them load bin/process_inspect.py. Loading that twice would give the two
+    of them separate class objects and a PROCESS_INFO each -- the same
+    divergence the shared module exists to prevent, arriving one process later.
+
+    Registered before it is executed, which is what lets a module load its own
+    sibling, and removed again if the body raises -- otherwise the next caller
+    is handed a half-built module instead of an error.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), filename)
+    # The loader is named rather than inferred: importlib picks one from the
+    # file extension, and a command deliberately has none.
+    spec = spec_from_file_location(name, path,
+                                   loader=SourceFileLoader(name, path))
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
+    return module
 
 
 def _load_env_file():
@@ -60,6 +103,50 @@ WHISPER_SERVER = os.environ.get("VOICE_WHISPER_SERVER", "127.0.0.1:8910")
 WHISPER_MODEL = os.environ.get(
     "VOICE_WHISPER_MODEL", os.path.expanduser("~/whisper-models/ggml-small.en.bin"))
 WHISPER_THREADS = os.environ.get("VOICE_WHISPER_THREADS", "16")
+
+# The command-line transcriber, for when the resident server is not up.
+#
+# Not a single hard-coded name any more. whisper.cpp renamed its binaries: the
+# project's own builds and Homebrew's formula install `whisper-cli`, Arch's
+# package installs `whisper-cli` too, and only older builds and some distro
+# packages still carry `whisper-cpp`. Setup looks for any of them and records
+# what it found, so the name checked here is the name that is really on this
+# machine rather than the one that was current when this line was written.
+# VOICE_WHISPER_CLI overrides, and an absolute path works.
+WHISPER_CLI_NAMES = ("whisper-cli", "whisper-cpp", "whisper")
+
+
+def whisper_cli():
+    """The command-line transcriber on this machine, asked for now.
+
+    A function and not a constant, and the difference matters to exactly one
+    caller. bin/voice-dictate is a fresh process per dictation, so it could not
+    tell; bin/ayeaye imports this module once and then runs for weeks, and it
+    asks this question every time it decides whether the talk button is live.
+    Resolved at import, the answer on a machine that had no transcriber when
+    the server started would be the fallback name for ever - so installing
+    whisper.cpp would light the button up only after somebody thought to
+    restart ayeaye, which is precisely the thing setup promises they will not
+    have to do.
+
+    shutil.which is a PATH lookup and a stat; asking it once every
+    VOICE_PROBE_TTL seconds costs nothing worth measuring.
+    """
+    override = os.environ.get("VOICE_WHISPER_CLI", "")
+    if override:
+        return override
+    for name in WHISPER_CLI_NAMES:
+        if shutil.which(name):
+            return name
+    # Nothing here yet. The last name is returned rather than an empty string
+    # so that every caller still has something to put in an error message.
+    return "whisper-cpp"
+
+
+# Kept because it is what the transcription path below spells, and because a
+# module-level name is what a reader looks for. It is this process's answer,
+# which for a one-shot dictation is the only answer there is.
+WHISPER_CLI = whisper_cli()
 OLLAMA_MODEL = os.environ.get("VOICE_OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_HOST = os.environ.get("VOICE_OLLAMA_HOST", "localhost:11434")
 KEEP_ALIVE = os.environ.get("VOICE_KEEP_ALIVE", "1h")
@@ -167,10 +254,26 @@ def clear_state():
 
 
 # ------------------------------------------------------------ which device?
+#
+# Recording happens where the person is, not where tmux is, so picking the
+# right client is picking the right room. Both questions below -- is this pid
+# still alive, and what address was it reached from -- are asked of the
+# platform backend rather than of /proc, which is a file tree that exists on
+# exactly one of the two systems this project supports. Reading it directly
+# was not an error on a Mac; it was an empty answer, which made every client
+# look local and handed the microphone to whichever one tmux listed first.
+process_inspect = _load_sibling("ayeaye_process_inspect", "process_inspect.py")
+
+# Module-level so a test can put another platform's backend here, and read
+# through the global on every call for the same reason. bin/ayeaye binds a
+# name to the same object: replacing one of the two does not replace the
+# other, which is what a test that wants both patched has to know.
+PROCESS_INFO = process_inspect.PROCESS_INFO
+
 
 def resolve_client_pid(pane_id, passed):
     """Prefer the pid tmux handed us; fall back to the pane's own session."""
-    if passed and passed.isdigit() and os.path.exists("/proc/%s" % passed):
+    if passed and passed.isdigit() and PROCESS_INFO.exists(passed):
         return passed
     session = tmux("display-message", "-p", "-t", pane_id, "#{session_name}")
     clients = tmux("list-clients", "-t", session, "-F", "#{client_pid}").split()
@@ -182,17 +285,7 @@ def resolve_client_pid(pane_id, passed):
 
 def client_peer_ip(client_pid):
     """The IP the tmux client is connected from, or None if it's local."""
-    try:
-        with open("/proc/%s/environ" % client_pid, "rb") as fh:
-            entries = fh.read().split(b"\0")
-    except OSError:
-        return None
-    for entry in entries:
-        if entry.startswith(b"SSH_CONNECTION="):
-            parts = entry.decode("utf-8", "replace").split("=", 1)[1].split()
-            if parts:
-                return parts[0]
-    return None
+    return PROCESS_INFO.ssh_peer_ip(client_pid)
 
 
 def tailscale_name(ip):
@@ -321,7 +414,7 @@ def transcribe_pcm(pcm):
                 fh.write(pcm)
                 fh.flush()
                 res = subprocess.run(
-                    ["whisper-cpp", "-m", WHISPER_MODEL, "-f", fh.name,
+                    [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", fh.name,
                      "-l", "en", "-nt", "-np", "-t", WHISPER_THREADS],
                     capture_output=True, text=True)
         except Exception:

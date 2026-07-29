@@ -1,0 +1,4 @@
+  PID  PPID COMM
+    1     0 /sbin/launchd
+  701   690 /bin/zsh
+  702   701 /opt/homebrew/bin/codex

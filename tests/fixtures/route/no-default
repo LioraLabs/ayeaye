@@ -1,0 +1,2 @@
+Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT
+lo	0000007F	00000000	0001	0	0	0	000000FF	0	0	0

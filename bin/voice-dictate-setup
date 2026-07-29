@@ -86,11 +86,24 @@ Needs ffmpeg or sox for recording. (For a phone: voice-dictate-setup android)
   voice-agent --selftest     # confirm the mic works
   voice-agent                # then leave it running
 
-Keep it running:
+Keep it running. There is no unit to copy from ${HERE}: voice-agent belongs
+on the device with the microphone, and ayeaye's setup does not install one on
+the machine it runs on. A tmux window is enough; if you want it to survive a
+reboot, write this on THIS device and enable it:
 
-  macOS   leave it in a tmux window, or wrap it in a launchd plist
-  Linux   copy the systemd unit from ${HERE}:
-          ~/.config/systemd/user/voice-agent.service
+  ~/.config/systemd/user/voice-agent.service
+
+    [Unit]
+    Description=voice-dictate mic recorder
+
+    [Service]
+    ExecStart=%h/.local/bin/voice-agent
+    Restart=on-failure
+
+    [Install]
+    WantedBy=default.target
+
+  systemctl --user enable --now voice-agent
 
 Then hit M-v in tmux on ${HERE}.
 

@@ -1,0 +1,5 @@
+https://my-box.tail1a2b3c.ts.net (tailnet only)
+|-- / proxy http://127.0.0.1:8911
+
+Serve started and running in the background.
+Press Ctrl+C to exit.

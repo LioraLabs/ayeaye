@@ -1,0 +1,15 @@
+ca-certificates
+gettext
+git
+jq
+libevent
+libyaml
+ncurses
+node
+openssl@3
+pcre2
+python@3.12
+readline
+ripgrep
+tmux
+utf8proc
