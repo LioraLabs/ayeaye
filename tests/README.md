@@ -195,8 +195,13 @@ esac
 SH
 ```
 
+`require_host_command python3` skips the test when the machine cannot supply
+something the code under test genuinely needs.
+
 Every invocation of every stub is recorded, one line per call, as the command
-name followed by its argv, with any argument containing whitespace quoted:
+name followed by its argv. An argument containing whitespace, a quote or a
+non-printable character is single-quoted, so a recorded line re-parses to the
+arguments that were really passed:
 
 ```sh
 run_install --defaults
@@ -207,8 +212,12 @@ stub_call systemctl 2                             # just the second one
 ```
 
 **This is how generated commands are tested.** Assert on what the installer
-*would* run; never run it. Note that a stub records what was *executed* —
-`command -v foo` looks a command up without running it and records nothing.
+*would* run; never run it. Two things to know:
+
+- A stub records what was *executed*. `command -v foo` looks a command up
+  without running it and records nothing.
+- `assert_stub_called_with` matches within a single recorded call, so a needle
+  cannot span two of them.
 
 ## Fixtures
 
