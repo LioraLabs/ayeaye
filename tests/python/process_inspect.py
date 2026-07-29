@@ -330,13 +330,22 @@ class CodexSessionTest(TempTree):
         self.assertIsNotNone(self.resolve()[0])
 
     def test_the_nearest_rollout_wins_when_two_could_match(self):
-        self.rollout("2026-03-04T09-00-30", "/home/someone/dev/thing",
-                     sid="ffffffff-late")
+        late = self.rollout("2026-03-04T09-00-30", "/home/someone/dev/thing",
+                            sid="ffffffff-late")
         near = self.rollout("2026-03-04T09-00-01", "/home/someone/dev/thing",
                             sid="aaaaaaaa-near")
-        got, _ = self.resolve()
-        self.assertEqual(near, got["path"])
-        self.assertEqual("aaaaaaaa", got["id"])
+        # Both orders, because glob returns directory order and directory
+        # order is the filesystem's business: a "first hit wins" bug would
+        # otherwise pass or fail depending on the machine.
+        for order in ([near, late], [late, near]):
+            saved = ayeaye.glob.glob
+            ayeaye.glob.glob = lambda pattern, _o=order: list(_o)
+            try:
+                got, _ = self.resolve()
+            finally:
+                ayeaye.glob.glob = saved
+            self.assertEqual(near, got["path"], "glob order %s" % (order,))
+            self.assertEqual("aaaaaaaa", got["id"])
 
     def test_no_codex_below_the_pane_means_no_session(self):
         self.rollout("2026-03-04T09-00-02", "/home/someone/dev/thing")
@@ -472,22 +481,65 @@ class DarwinProcTest(TempTree):
         info.descendant(801, "codex")
         self.assertEqual(["run"], sorted(vars(info)))
 
+    def test_a_row_ps_gave_no_name_for_is_kept_with_an_empty_one(self):
+        # A row with no third column. It still has a pid, and a pid can have
+        # children worth walking, so it is not dropped.
+        self.assertEqual("", self.darwin(self.ps_tree()).comm(111))
+
+    def test_the_accounting_names_of_other_users_processes_parse(self):
+        # Most rows on a real Mac look like this: ps cannot read the argument
+        # buffer of a process it does not own and falls back to the
+        # parenthesised 16-character accounting name.
+        info = self.darwin(self.ps_tree())
+        self.assertEqual("(logd)", info.comm(222))
+        self.assertEqual("(mdworker_shared)", info.comm(333))
+
+    def test_a_header_line_is_not_mistaken_for_a_process(self):
+        info = self.darwin({"ps -axww": fixture("ps/darwin-with-header")})
+        self.assertEqual("702", info.descendant(701, "codex"))
+        self.assertIsNone(info.comm("PID"))
+
+    def test_an_undecodable_path_elsewhere_does_not_empty_the_tree(self):
+        raw = fixture("ps/darwin-codex-tree").replace(
+            "/usr/bin/vim", "/Users/someone/b�d/vim")
+        info = self.darwin({"ps -axww": raw})
+        self.assertEqual("702", info.descendant(701, "codex"))
+
     def test_start_time_comes_from_ps_lstart(self):
-        info = self.darwin({"ps -p": fixture("ps/darwin-lstart")})
+        info = self.darwin({"ps -ww": fixture("ps/darwin-lstart")})
         expected = time.mktime(time.strptime("Wed Mar 4 09:00:02 2026",
                                              "%a %b %d %H:%M:%S %Y"))
         self.assertEqual(expected, info.start_time(702))
 
     def test_start_time_parses_a_space_padded_day_of_month(self):
-        info = self.darwin({"ps -p": fixture("ps/darwin-lstart-padded")})
+        info = self.darwin({"ps -ww": fixture("ps/darwin-lstart-padded")})
         expected = time.mktime(time.strptime("Tue Jul 7 04:05:06 2026",
                                              "%a %b %d %H:%M:%S %Y"))
         self.assertEqual(expected, info.start_time(702))
 
+    def test_the_two_per_process_probes_ask_for_what_they_need(self):
+        # The canned runner matches on an argv prefix, so without this the
+        # flags and the pid could both be wrong and nothing would notice --
+        # on the platform that cannot be run here.
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return ""
+
+        info = ayeaye._DarwinProcessInfo(run=run)
+        info.start_time(702)
+        info.cwd(702)
+        self.assertEqual(["ps", "-ww", "-p", "702", "-o", "lstart="], seen[0])
+        # -a is what ANDs -d with -p. Without it lsof ORs them and the first
+        # n line can be some other process's working directory entirely.
+        self.assertEqual(["lsof", "-a", "-d", "cwd", "-p", "702", "-Fn"],
+                         seen[1])
+
     def test_start_time_is_none_when_ps_says_nothing(self):
-        self.assertIsNone(self.darwin({"ps -p": ""}).start_time(702))
+        self.assertIsNone(self.darwin({"ps -ww": ""}).start_time(702))
         self.assertIsNone(self.darwin({}).start_time(702))
-        self.assertIsNone(self.darwin({"ps -p": "not a date\n"}).start_time(702))
+        self.assertIsNone(self.darwin({"ps -ww": "not a date\n"}).start_time(702))
 
     def test_cwd_comes_from_the_lsof_field_output(self):
         info = self.darwin({"lsof": fixture("lsof/darwin-cwd")})
@@ -504,6 +556,35 @@ class DarwinProcTest(TempTree):
         # output is exactly what makes it safe to read.
         info = self.darwin({"lsof": fixture("lsof/darwin-cwd-spaces")})
         self.assertEqual("/Users/someone/My Projects/thing", info.cwd(702))
+
+
+class BothBackendsTest(unittest.TestCase):
+    """The one cross-platform check this host can actually execute.
+
+    GNU ps is not BSD ps, so this says nothing about `-ww` or how `-o` parses
+    its keywords. What it does check is the half that is pure arithmetic and
+    would otherwise only ever be compared against bytes written by hand: that
+    an `lstart` string parsed by the macOS backend lands on the same instant
+    as /proc/<pid>/stat field 22 parsed by the Linux one. A wrong format
+    string, a UTC-for-local mix-up or a mktime/timegm slip all miss by hours.
+
+    The tolerance is two seconds and the test asserts no direction, because
+    GNU ps does not derive lstart the way Darwin does: it adds field 22 to
+    /proc/stat's `btime`, a whole-second reconstruction of the boot instant,
+    where Darwin reads the kernel's recorded start timeval directly. Only the
+    latter is a pure truncation of the true value.
+    """
+
+    def test_lstart_and_proc_agree_on_when_this_process_started(self):
+        if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
+            self.skipTest("needs /proc to compare against")
+        pid = os.getpid()
+        by_lstart = ayeaye._DarwinProcessInfo().start_time(pid)
+        if by_lstart is None:
+            self.skipTest("this ps cannot report lstart")
+        by_proc = ayeaye._LinuxProcessInfo().start_time(pid)
+        self.assertLess(abs(by_proc - by_lstart), 2.0,
+                        "lstart %r vs /proc %r" % (by_lstart, by_proc))
 
 
 class DarwinEndToEndTest(TempTree):
@@ -527,7 +608,7 @@ class DarwinEndToEndTest(TempTree):
     def test_a_macos_pane_resolves_its_codex_rollout(self):
         info = ayeaye._DarwinProcessInfo(run=canned({
             "ps -axww": fixture("ps/darwin-codex-tree"),
-            "ps -p": fixture("ps/darwin-lstart"),
+            "ps -ww": fixture("ps/darwin-lstart"),
             "lsof": fixture("lsof/darwin-cwd"),
         }))
         got = ayeaye.codex_session_for("801", proc=info)
@@ -596,6 +677,16 @@ class SelectionTest(unittest.TestCase):
         # is an answer, not a failure.
         out = ayeaye._run_tool(["sh", "-c", "printf hi; exit 3"])
         self.assertEqual("hi", out)
+
+    def test_a_tool_that_emits_undecodable_bytes_still_answers(self):
+        # ps prints the path of every process on the machine, and nothing
+        # promises those are UTF-8. A strict decode raises inside
+        # subprocess.run, which reads as "no processes at all" -- one stray
+        # filename anywhere and every pane loses its agent.
+        out = ayeaye._run_tool(["sh", "-c", r"printf 'be\377fore\n'"])
+        self.assertIsNotNone(out, "one bad byte must not lose the output")
+        self.assertTrue(out.startswith("be"), out)
+        self.assertTrue(out.rstrip().endswith("fore"), out)
 
 
 class ClaudeMarkerTest(TempTree):

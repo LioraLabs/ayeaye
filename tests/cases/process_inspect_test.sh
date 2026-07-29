@@ -53,6 +53,20 @@ test_a_macos_pane_resolves_its_codex_rollout_with_no_proc_anywhere() {
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
 }
 
+test_lstart_and_proc_put_this_process_at_the_same_moment() {
+  # The only cross-backend check this host can run. GNU ps is not BSD ps, so
+  # it says nothing about the flags -- but the two start times are arithmetic,
+  # and they have to agree.
+  case "$OSTYPE" in
+    linux*) ;;
+    *) skip "needs /proc to compare against" ;;
+  esac
+  require_host_command ps
+  stub_real ps
+  run_proc_tests BothBackendsTest
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
 test_the_backend_is_chosen_by_platform_and_never_raises() {
   run_proc_tests SelectionTest
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"

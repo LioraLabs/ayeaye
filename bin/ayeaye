@@ -253,10 +253,15 @@ def _run_tool(argv, timeout=5):
     A non-zero exit is not a failure here. pgrep exits 1 when nothing matched
     and lsof exits 1 when it had a complaint about a file it could still
     report on; in both cases the output is the answer.
+
+    errors="replace" is load-bearing. `ps` prints the path of every process on
+    the machine, no filesystem this runs on enforces valid UTF-8 in a name,
+    and a strict decode would turn one unrelated process into an empty tree
+    for every pane at once.
     """
     try:
         return subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout,
+                              errors="replace", timeout=timeout,
                               env=dict(os.environ, LC_ALL="C")).stdout
     except Exception:
         return None
@@ -341,12 +346,17 @@ class _LinuxProcessInfo(_ProcessInfo):
 #                         header, so this asks for one column named
 #                         ",ppid=,comm=". One keyword per -o is the form that
 #                         means the same thing to both ps implementations.
-#   -ww                   output is truncated to the terminal width, and to 79
-#                         columns when there is no terminal -- which is always,
-#                         under capture_output. That cuts the tail off a long
-#                         interpreter path, and the tail is the part we match.
+#   -ww                   the last column is clipped to the output width,
+#                         which ps takes from $COLUMNS or from whichever of
+#                         its three streams is still a terminal. Under
+#                         capture_output that is stdin, so the answer depends
+#                         on how the server was started -- a clipped
+#                         interpreter path is exactly the part being matched,
+#                         and -ww is the only way to stop asking.
 #   comm                  the full executable path, where Linux gives a bare
-#                         name; it may contain spaces.
+#                         name truncated to 15 characters; it may contain
+#                         spaces, and an agent name longer than 15 characters
+#                         would match here and not there.
 PS_SNAPSHOT = ["ps", "-axww", "-o", "pid=", "-o", "ppid=", "-o", "comm="]
 
 
@@ -379,16 +389,21 @@ class _DarwinProcessInfo(_ProcessInfo):
         return list(kids.get(str(pid), ()))
 
     def comm(self, pid, snap=None):
+        # "" for a row ps gave no name, which still has children worth
+        # walking. The Linux side returns None there and prunes the subtree,
+        # because that is what it did before this was an interface.
         _, comm = snap or self._snapshot()
         return comm.get(str(pid))
 
     def start_time(self, pid):
-        """`ps -o lstart=` gives "Wed Mar  4 09:00:02 2026" -- local time to
-        the second, which the rollout window is far wider than. LC_ALL=C in
-        the runner is what keeps the month and weekday names parseable."""
-        out = self.run(["ps", "-p", str(pid), "-o", "lstart="]) or ""
+        """`ps -o lstart=` gives "Wed Mar  4 09:00:02 2026" -- local time
+        truncated to the second, so it can only ever be earlier than the true
+        start, which moves a rollout away from the window's lower edge rather
+        than off it. The strptime format is fixed: lstart is ctime(3) output,
+        which is C-locale regardless."""
+        out = self.run(["ps", "-ww", "-p", str(pid), "-o", "lstart="]) or ""
         try:
-            return time.mktime(time.strptime(" ".join(out.split()),
+            return time.mktime(time.strptime(out.strip(),
                                              "%a %b %d %H:%M:%S %Y"))
         except (ValueError, OverflowError):
             return None

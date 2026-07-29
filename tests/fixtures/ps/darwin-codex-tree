@@ -14,3 +14,6 @@
   952   951 /opt/homebrew/bin/codex
   960     1 /bin/zsh
   961   960 /Users/someone/.nvm/versions/node/v22.14.0/lib/node_modules/@openai/codex/bin/codex
+  111     1 
+  222     1 (logd)
+  333     1 (mdworker_shared)
