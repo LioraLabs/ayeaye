@@ -76,7 +76,11 @@ done
 # shellcheck source=lib/wizard.sh
 . "$REPO/lib/wizard.sh"
 
-# What the conversation decided, for the stages after the one that decided it.
+# What the conversation decided. These are working copies: the decisions
+# themselves live in the state file, because a resumed run skips the step that
+# made them and a variable set by a step that did not run this time holds
+# nothing but its default. Anything one stage tells a later stage goes through
+# wizard_remember, and is read back where it is used.
 CHANGE_SETTINGS=0
 BIND="127.0.0.1"
 PORT="8911"
@@ -232,6 +236,7 @@ step_choose() {
     CHANGE_SETTINGS=1
   fi
 
+  wizard_remember answer.change_settings "$CHANGE_SETTINGS"
   if [ "$CHANGE_SETTINGS" = 0 ]; then
     return "$WIZARD_STAGE_OK"
   fi
@@ -317,6 +322,15 @@ step_plan() {
 
 step_write_settings() {
   local backup
+  # From the state file, not from the variables: the stage that made these
+  # decisions may have been finished by an earlier run that was interrupted
+  # before it got here.
+  CHANGE_SETTINGS="$(wizard_state_get answer.change_settings 0)"
+  BIND="$(wizard_state_get answer.bind 127.0.0.1)"
+  PORT="$(wizard_state_get answer.port 8911)"
+  HOSTS="$(wizard_state_get answer.hosts "")"
+  NTFY="$(wizard_state_get answer.ntfy "")"
+
   if [ "$CHANGE_SETTINGS" = 0 ]; then
     wizard_say "keeping the settings that are already there."
     return "$WIZARD_STAGE_SKIP"
@@ -359,14 +373,19 @@ step_make_key() {
     wizard_say "phone still works."
   fi
   chmod 600 "$TOKEN_FILE"
+  return "$WIZARD_STAGE_OK"
+}
 
-  # Whatever is in the file now is what everything after this reads, so a kept
-  # config gets a correct summary and a correct service unit.
+# Whatever is in the settings file now is what the last two stages report, so a
+# kept config gets a correct summary and a correct service unit. Read at the
+# start of every stage that needs it rather than once in a step that a resumed
+# run may well skip.
+_load_effective_values() {
   BIND="$(wizard_env_get "$ENV_FILE" AYEAYE_BIND 127.0.0.1)"
   PORT="$(wizard_env_get "$ENV_FILE" AYEAYE_PORT 8911)"
   HOSTS="$(wizard_env_get "$ENV_FILE" AYEAYE_ALLOWED_HOSTS "")"
   NTFY="$(wizard_env_get "$ENV_FILE" VOICE_NTFY_URL "")"
-  return "$WIZARD_STAGE_OK"
+  return 0
 }
 
 # ====================================================== 7. start it up
@@ -378,6 +397,7 @@ _manual_instructions() {
 
 step_service() {
   local out cmd who
+  _load_effective_values
   SERVICE_KIND="$(platform_service_manager)"
 
   if [ "$NO_SYSTEMD" = 1 ]; then
@@ -464,6 +484,13 @@ step_service() {
 
 step_summary() {
   local tier="text-only" token url_host first_host left
+  _load_effective_values
+  # The service stage is where SERVICE_KIND is worked out, and a resumed run
+  # skips it once it is done - so ask the platform layer again rather than
+  # trusting a variable that may never have been set this time.
+  if [ "$NO_SYSTEMD" = 0 ]; then
+    SERVICE_KIND="$(platform_service_manager)"
+  fi
   [ -n "$NTFY" ] && tier="$tier +notifications"
   if command -v ffmpeg >/dev/null 2>&1 \
      && { command -v whisper-server >/dev/null 2>&1 \
