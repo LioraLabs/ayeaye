@@ -69,12 +69,24 @@ test_systemd_names_a_unit_and_launchd_names_a_label() {
     "the label this project's plist already uses"
 }
 
-test_a_name_that_already_carries_its_suffix_is_left_alone() {
+test_one_name_works_whichever_platform_it_was_written_for() {
+  # Shared code holds one name for the service. It must not matter whether it
+  # was spelled the systemd way, the launchd way, or neither.
   _on_systemd
   assert_eq "ayeaye.service" "$(platform_service_unit ayeaye.service)"
+  assert_eq "ayeaye.service" "$(platform_service_unit dev.ayeaye)" \
+    "the launchd spelling must not become dev.ayeaye.service"
 
   _on_launchd
   assert_eq "dev.ayeaye" "$(platform_service_unit dev.ayeaye)"
+  assert_eq "dev.ayeaye" "$(platform_service_unit ayeaye.service)" \
+    "and the systemd spelling must not become the label ayeaye.service"
+}
+
+test_a_unit_that_is_not_a_service_keeps_its_own_kind() {
+  _on_systemd
+  assert_eq "ayeaye.socket" "$(platform_service_unit ayeaye.socket)"
+  assert_eq "ayeaye.timer" "$(platform_service_unit ayeaye.timer)"
 }
 
 test_naming_a_unit_where_there_is_no_service_manager_says_nothing() {
@@ -86,6 +98,18 @@ test_naming_a_unit_where_there_is_no_service_manager_says_nothing() {
   assert_status 1 "$status"
 }
 
+test_naming_nothing_at_all_is_a_caller_bug_not_a_platform_fact() {
+  _on_systemd
+  local status
+  platform_service_unit >/dev/null
+  status=$?
+  assert_status 2 "$status"
+
+  platform_service_command "" start >/dev/null
+  status=$?
+  assert_status 2 "$status" "and set -u must not turn a missing argument into a crash"
+}
+
 # ---------------------------------------------------------- systemd commands
 
 test_systemd_generates_its_user_scoped_commands() {
@@ -94,6 +118,8 @@ test_systemd_generates_its_user_scoped_commands() {
     "$(platform_service_command ayeaye reload)"
   assert_eq "systemctl --user enable --now ayeaye.service" \
     "$(platform_service_command ayeaye enable)"
+  assert_eq "systemctl --user disable --now ayeaye.service" \
+    "$(platform_service_command ayeaye disable)"
   assert_eq "systemctl --user start ayeaye.service" \
     "$(platform_service_command ayeaye start)"
   assert_eq "systemctl --user stop ayeaye.service" \
@@ -105,7 +131,7 @@ test_systemd_generates_its_user_scoped_commands() {
 test_every_systemd_command_is_user_scoped_and_none_asks_for_root() {
   _on_systemd
   local op cmd
-  for op in reload enable start stop status; do
+  for op in reload enable disable start stop status; do
     cmd="$(platform_service_command ayeaye "$op")"
     assert_contains "$cmd" "--user" "$op must not reach for the system manager"
     assert_not_contains "$cmd" "sudo" "$op is a per-user service; root is never right"
@@ -118,12 +144,53 @@ test_launchd_generates_domain_addressed_commands() {
   _on_launchd
   assert_eq "launchctl bootstrap gui/501 /tmp/dev.ayeaye.plist" \
     "$(platform_service_command ayeaye enable /tmp/dev.ayeaye.plist)"
+  assert_eq "launchctl bootout gui/501/dev.ayeaye" \
+    "$(platform_service_command ayeaye disable)"
   assert_eq "launchctl kickstart gui/501/dev.ayeaye" \
     "$(platform_service_command ayeaye start)"
-  assert_eq "launchctl bootout gui/501/dev.ayeaye" \
-    "$(platform_service_command ayeaye stop)"
   assert_eq "launchctl print gui/501/dev.ayeaye" \
     "$(platform_service_command ayeaye status)"
+}
+
+test_stopping_leaves_the_service_registered_on_both_platforms() {
+  # bootout is the inverse of bootstrap, so mapping stop to it would make
+  # stop-then-start work on Linux and fail on a Mac with "Could not find
+  # service". A signal is the analogue of systemctl --user stop.
+  _on_launchd
+  assert_eq "launchctl kill SIGTERM gui/501/dev.ayeaye" \
+    "$(platform_service_command ayeaye stop)"
+  assert_ne "$(platform_service_command ayeaye stop)" \
+    "$(platform_service_command ayeaye disable)" \
+    "stop and disable are different questions"
+}
+
+test_a_plist_path_with_a_space_in_it_stays_one_argument() {
+  # macOS home directories with a space in them are ordinary, and this string
+  # is about to be handed to eval.
+  _on_launchd
+  local cmd
+  cmd="$(platform_service_command ayeaye enable "/Users/John Smith/Library/LaunchAgents/dev.ayeaye.plist")"
+  assert_contains "$cmd" "'/Users/John Smith/Library/LaunchAgents/dev.ayeaye.plist'"
+
+  platform_service_run ayeaye enable "/Users/John Smith/Library/LaunchAgents/dev.ayeaye.plist"
+  assert_stub_called_with launchctl \
+    "launchctl bootstrap gui/501 '/Users/John Smith/Library/LaunchAgents/dev.ayeaye.plist'"
+}
+
+test_launchd_without_a_uid_refuses_rather_than_addressing_nothing() {
+  _stub_uname Darwin arm64
+  stub_command_from_fixture sw_vers sw_vers/macos-15.1
+  stub_command launchctl
+  stub_remove id
+  assert_command_absent id
+  _platform_from none
+  assert_eq "launchd" "$(platform_service_manager)" "anchor: launchd is still there"
+  assert_eq "" "$(platform_uid)"
+  local out status
+  out="$(platform_service_command ayeaye start)"
+  status=$?
+  assert_eq "" "$out" "gui//dev.ayeaye addresses nothing at all"
+  assert_status 1 "$status"
 }
 
 test_launchd_has_no_reload_and_does_not_invent_one() {
@@ -152,7 +219,7 @@ test_where_there_is_no_service_manager_every_command_is_empty() {
   assert_eq "no-service-manager" "$(platform_service_blocker)"
 
   local op out status
-  for op in reload enable start stop status; do
+  for op in reload enable disable start stop status; do
     out="$(platform_service_command ayeaye "$op")"
     status=$?
     assert_eq "" "$out" "$op has no meaning here"
@@ -191,7 +258,7 @@ test_asking_what_would_be_run_runs_nothing() {
   platform_detect
   before="$(stub_call_count systemctl)"
   assert_ne "0" "$before" "anchor: detection really did probe"
-  for op in reload enable start stop status; do
+  for op in reload enable disable start stop status; do
     platform_service_command ayeaye "$op" >/dev/null
   done
   after="$(stub_call_count systemctl)"
@@ -214,4 +281,26 @@ test_the_executing_form_refuses_where_there_is_nothing_to_run() {
   platform_service_run ayeaye start
   status=$?
   assert_status 1 "$status"
+}
+
+test_the_executing_form_reports_the_same_status_the_string_form_would_have() {
+  # Without this the "the statuses are load-bearing" promise holds for the
+  # string form only, and a caller acting on platform_service_run cannot tell
+  # its own typo from a platform that cannot help.
+  _on_systemd
+  local status
+  platform_service_run ayeaye restart-please
+  status=$?
+  assert_status 2 "$status" "an operation this interface does not have"
+  assert_stub_not_called sudo
+
+  _on_launchd
+  platform_service_run ayeaye reload
+  status=$?
+  assert_status 1 "$status" "an operation launchd does not have"
+
+  platform_service_run ayeaye enable
+  status=$?
+  assert_status 1 "$status" "bootstrap with no plist path given"
+  assert_stub_not_called launchctl "none of those may have run anything"
 }

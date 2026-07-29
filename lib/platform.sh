@@ -91,6 +91,7 @@ _PLATFORM_VERSION="${_PLATFORM_VERSION:-}"
 _PLATFORM_PRETTY="${_PLATFORM_PRETTY:-}"
 _PLATFORM_ARCH="${_PLATFORM_ARCH:-}"
 _PLATFORM_PKG_MANAGER="${_PLATFORM_PKG_MANAGER:-}"
+_PLATFORM_PKG_TOOL="${_PLATFORM_PKG_TOOL:-}"
 _PLATFORM_SERVICE_MANAGER="${_PLATFORM_SERVICE_MANAGER:-}"
 _PLATFORM_BREW_PREFIX="${_PLATFORM_BREW_PREFIX:-}"
 _PLATFORM_IMMUTABLE="${_PLATFORM_IMMUTABLE:-0}"
@@ -144,6 +145,33 @@ _platform_lower() {
       V) c=v ;; W) c=w ;; X) c=x ;; Y) c=y ;; Z) c=z ;;
     esac
     out="$out$c"
+  done
+  _PLATFORM_S="$out"
+}
+
+# _platform_quote <word> -> $_PLATFORM_S, safe to paste into a command line.
+#
+# A word made only of characters that mean nothing to the shell is left
+# exactly as it was, so the commands this layer generates stay readable and
+# pasteable - "sudo apt-get install -y tmux ffmpeg", not a wall of quotes.
+# Anything else is single-quoted, with embedded single quotes closed, escaped
+# and reopened. That is what stops a package name or a plist path with a space
+# in it from becoming two arguments, and a name with a semicolon in it from
+# becoming two commands.
+_platform_quote() {
+  local s out
+  case "$1" in
+    "") _PLATFORM_S="''"; return 0 ;;
+    *[!A-Za-z0-9._/@%+:=-]*) ;;
+    *) _PLATFORM_S="$1"; return 0 ;;
+  esac
+  s="$1"
+  out="'"
+  while :; do
+    case "$s" in
+      *"'"*) out="$out${s%%\'*}'\\''"; s="${s#*\'}" ;;
+      *) out="$out$s'"; break ;;
+    esac
   done
   _PLATFORM_S="$out"
 }
@@ -297,6 +325,7 @@ platform_reset() {
   _PLATFORM_PRETTY=""
   _PLATFORM_ARCH=""
   _PLATFORM_PKG_MANAGER=""
+  _PLATFORM_PKG_TOOL=""
   _PLATFORM_SERVICE_MANAGER=""
   _PLATFORM_BREW_PREFIX=""
   _PLATFORM_IMMUTABLE=0
@@ -449,10 +478,7 @@ _platform_detect_brew() {
 _platform_detect_pkg_manager() {
   local candidates="" candidate
   _PLATFORM_PKG_MANAGER="none"
-  # An image-based system has its package manager right there and cannot use
-  # it for this. Saying none sends the wizard down the manual path, which is
-  # the only one that works.
-  [ "$_PLATFORM_IMMUTABLE" = 1 ] && return 0
+  _PLATFORM_PKG_TOOL="none"
   case "$_PLATFORM_FAMILY" in
     debian) candidates="apt-get" ;;
     fedora) candidates="dnf yum" ;;
@@ -464,14 +490,21 @@ _platform_detect_pkg_manager() {
   for candidate in $candidates; do
     if [ "$candidate" = "brew" ]; then
       [ -n "$_PLATFORM_BREW_PREFIX" ] || continue
-      _PLATFORM_PKG_MANAGER="brew"
-      return 0
+      _PLATFORM_PKG_TOOL="brew"
+      break
     fi
     if command -v "$candidate" >/dev/null 2>&1; then
-      _PLATFORM_PKG_MANAGER="$candidate"
-      return 0
+      _PLATFORM_PKG_TOOL="$candidate"
+      break
     fi
   done
+  # An image-based system has its package manager right there and cannot use
+  # it to install. Saying none sends the wizard down the manual path, which is
+  # the only one that works - but the tool is remembered, because asking it
+  # what is already installed is a read, and the manual instructions are much
+  # better for knowing the answer.
+  [ "$_PLATFORM_IMMUTABLE" = 1 ] && return 0
+  _PLATFORM_PKG_MANAGER="$_PLATFORM_PKG_TOOL"
   return 0
 }
 

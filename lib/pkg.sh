@@ -3,32 +3,62 @@
 # Sourced by lib/platform.sh; never on its own. Like the rest of the layer it
 # is inert on load and every answer comes from platform_detect's cache.
 #
-#   platform_pkg_can_act              status 0 when packages can be installed
-#                                     here without asking a human anything
-#   platform_pkg_blocker              why not, as one word, or empty:
-#                                     unknown-platform | image-based |
-#                                     no-homebrew | no-root
-#   platform_pkg_name <logical>       this family's real name for a package.
-#                                     Status 1 means "no mapping, here is your
-#                                     own string back" - a guess, and the
-#                                     caller is told it is one.
-#   platform_pkg_is_installed <l>     status 0 when it is already there. Asks;
-#                                     never installs.
-#   platform_pkg_query_command <l>    the command that asking would run
-#   platform_pkg_refresh_command      "update the package lists", as a string
-#   platform_pkg_install_command <l>… "install these", as a string. Empty and
-#                                     status 1 when this layer cannot act.
-#   platform_pkg_install <l>…         the same thing, actually run. The only
-#                                     function in this file with an effect.
-#   platform_pkg_manual_hint <l>…     what to tell a human, several lines
-#   platform_privilege                root | sudo | none
-#   platform_sudo_prefix              "sudo" or ""; empty for both root and
-#                                     for a manager that never needed it
+# ------------------------------------------------------------------ questions
+#
+#   platform_pkg_can_act              0 when packages can be installed here
+#                                     without asking a human anything
+#   platform_pkg_blocker              why not, as one word, or empty. Always 0.
+#                                     unknown-platform | no-package-manager |
+#                                     image-based | no-homebrew | no-root
+#   platform_pkg_has_mapping <l>      0 when the name table has an opinion
+#                                     about that logical name
+#   platform_pkg_is_installed <l>     0 when it is already there. Asks; never
+#                                     installs. 1 for "no", and also for "no
+#                                     way to ask".
+#   platform_privilege                root | sudo | none. Always 0.
+#
+# --------------------------------------------------------------- what to run
+#
+#   platform_pkg_name <logical>       this family's real name for a package,
+#                                     or the logical name back unchanged when
+#                                     the table has no opinion. Always 0 - ask
+#                                     platform_pkg_has_mapping if the
+#                                     difference matters.
+#   platform_pkg_query_command <l>    what "is this installed?" would run
+#   platform_pkg_refresh_command      "update the package lists"
+#   platform_pkg_install_command <l>… "install these"
+#   platform_pkg_manual_hint <l>…     what to tell a human, several lines.
+#                                     Always 0.
+#   platform_sudo_prefix              "sudo" or "". Always 0.
+#
+# ------------------------------------------------------------------- do it
+#
+#   platform_pkg_install <logical>…   runs exactly what
+#                                     platform_pkg_install_command returned.
+#                                     The only function here with an effect.
+#
+# ------------------------------------------------------------------ statuses
+#
+# The command-returning functions answer with a string and 0, or with nothing
+# and non-zero. Two non-zero values, and the difference matters:
+#
+#   1   this machine cannot do that - no package manager, no root, an
+#       image-based system. A fact about the machine, and the wizard's cue to
+#       print platform_pkg_manual_hint instead.
+#   2   the call was wrong - no packages named. A bug in the caller, which
+#       should not be reported to a user as "your platform is unsupported".
+#
+# **A consumer running under `set -e` must not write `cmd="$(platform_pkg_…)"`
+# bare.** A command substitution that returns non-zero is fatal there. Write
+# `if cmd="$(platform_pkg_install_command tmux)"; then … else … fi`, or add
+# `|| true` and test for the empty string. Everything documented "Always 0"
+# above is safe to assign bare.
+#
+# ---------------------------------------------------------------------- names
 #
 # The logical names are the ones this project installs: tmux, python3, ffmpeg,
-# curl, git. Anything else is passed through unchanged, with a non-zero status
-# to say the table had no opinion. Extending the table is the intended way to
-# add a dependency - see _platform_pkg_name_for.
+# curl, git. Anything else is passed through unchanged. Extending the table is
+# the intended way to add a dependency - see _platform_pkg_name_for.
 #
 # bash 3.2: no associative arrays, so the name table is a case statement. It
 # reads better than a parallel-array lookup would anyway.
@@ -72,21 +102,35 @@ platform_sudo_prefix() {
   return 0
 }
 
-# _platform_pkg_cmd <words...> - join with the sudo prefix, if there is one.
+# _platform_pkg_cmd <word>... - the words, quoted where a word needs it, with
+# the sudo prefix in front if one is called for. Reads the cache directly
+# rather than calling platform_sudo_prefix: this runs for every generated
+# command, and a subshell to learn one word is a subshell too many.
 _platform_pkg_cmd() {
-  local prefix
-  prefix="$(platform_sudo_prefix)"
-  if [ -n "$prefix" ]; then
-    printf '%s %s' "$prefix" "$*"
-  else
-    printf '%s' "$*"
+  local out="" word
+  if _platform_pkg_needs_root && [ "$_PLATFORM_PRIVILEGE" = "sudo" ]; then
+    out="sudo"
   fi
+  for word in "$@"; do
+    _platform_quote "$word"
+    if [ -n "$out" ]; then
+      out="$out $_PLATFORM_S"
+    else
+      out="$_PLATFORM_S"
+    fi
+  done
+  printf '%s' "$out"
 }
 
 # ---------------------------------------------------------------- can we act
 
 # platform_pkg_blocker - one word, or empty when nothing is in the way. The
 # order is the order a human would notice them in.
+#
+# "unknown platform" and "recognised platform, no package manager" are
+# different words because they call for different guidance: one is "ayeaye has
+# never heard of this distro", the other is "this is Debian and apt-get is not
+# installed".
 platform_pkg_blocker() {
   platform_detect
   if [ "$_PLATFORM_IMMUTABLE" = 1 ]; then
@@ -97,8 +141,12 @@ platform_pkg_blocker() {
     printf 'no-homebrew'
     return 0
   fi
-  if [ "$_PLATFORM_PKG_MANAGER" = "none" ]; then
+  if [ "$_PLATFORM_FAMILY" = "unknown" ]; then
     printf 'unknown-platform'
+    return 0
+  fi
+  if [ "$_PLATFORM_PKG_MANAGER" = "none" ]; then
+    printf 'no-package-manager'
     return 0
   fi
   if _platform_pkg_needs_root && [ "$_PLATFORM_PRIVILEGE" = "none" ]; then
@@ -118,7 +166,7 @@ platform_pkg_can_act() {
 # _platform_pkg_name_for <family> <logical> - the table. Non-zero means the
 # table has no opinion, and the logical name is the best guess available.
 #
-# Only the differences are interesting, and there are four of them:
+# Only the differences are interesting, and there are three of them:
 #   arch calls the python 3 interpreter "python"; "python3" there is an
 #     entirely different, older package.
 #   fedora's own repositories carry "ffmpeg-free"; plain "ffmpeg" needs a
@@ -139,27 +187,32 @@ _platform_pkg_name_for() {
   esac
 }
 
-# platform_pkg_name <logical>
+# platform_pkg_name <logical> - always succeeds. A name the table has no
+# opinion about comes back unchanged, which is the most useful thing to do
+# with it; platform_pkg_has_mapping is how a caller learns it was a guess.
 platform_pkg_name() {
   platform_detect
-  if [ "$_PLATFORM_FAMILY" = "unknown" ]; then
-    printf '%s' "$1"
-    return 1
-  fi
-  _platform_pkg_name_for "$_PLATFORM_FAMILY" "$1"
+  _platform_pkg_name_for "$_PLATFORM_FAMILY" "${1:-}" || true
 }
 
-# _platform_pkg_names <logical>... - the mapped names, space separated. An
-# unmapped name is still included; a caller that cares asked platform_pkg_name
-# about it directly.
+# platform_pkg_has_mapping <logical> - status only.
+platform_pkg_has_mapping() {
+  platform_detect
+  [ "$_PLATFORM_FAMILY" != "unknown" ] || return 1
+  _platform_pkg_name_for "$_PLATFORM_FAMILY" "${1:-}" >/dev/null
+}
+
+# _platform_pkg_names <logical>... - the mapped names, space separated and
+# quoted where a name needs it.
 _platform_pkg_names() {
   local out="" one name
   for one in "$@"; do
     name="$(_platform_pkg_name_for "$_PLATFORM_FAMILY" "$one")" || true
+    _platform_quote "$name"
     if [ -n "$out" ]; then
-      out="$out $name"
+      out="$out $_PLATFORM_S"
     else
-      out="$name"
+      out="$_PLATFORM_S"
     fi
   done
   printf '%s' "$out"
@@ -167,18 +220,25 @@ _platform_pkg_names() {
 
 # ------------------------------------------------------------------ querying
 
-# platform_pkg_query_command <logical> - what "is this installed?" runs.
+# platform_pkg_query_command <logical> - what "is this installed?" would run.
+#
+# It uses the package manager the family has, even on an image-based system
+# where installing with it is not allowed: asking is a read, it needs no root,
+# and manual instructions are far better for knowing what is already there.
 #
 # The redirections are part of the string on purpose: this is the single
 # source of truth for the question, and platform_pkg_is_installed answers by
-# running exactly it. Two of them need more than an exit status - dpkg-query
+# running exactly it. One of them needs more than an exit status - dpkg-query
 # exits 0 for a package whose configuration files survive its removal - so the
 # test is in the command rather than around it.
 platform_pkg_query_command() {
   platform_detect
   local name
-  name="$(platform_pkg_name "$1")" || true
-  case "$_PLATFORM_PKG_MANAGER" in
+  [ "$#" -gt 0 ] || return 2
+  name="$(platform_pkg_name "$1")"
+  _platform_quote "$name"
+  name="$_PLATFORM_S"
+  case "$_PLATFORM_PKG_TOOL" in
     apt-get)
       printf "dpkg-query -W -f='\${db:Status-Status}' %s 2>/dev/null | grep -qx installed" "$name" ;;
     dnf|yum|zypper)
@@ -197,7 +257,7 @@ platform_pkg_query_command() {
 # platform_pkg_is_installed <logical> - status only. Asks; never installs.
 platform_pkg_is_installed() {
   local cmd
-  cmd="$(platform_pkg_query_command "$1")" || return 1
+  cmd="$(platform_pkg_query_command "$@")" || return 1
   [ -n "$cmd" ] || return 1
   eval "$cmd" >/dev/null 2>&1
 }
@@ -206,12 +266,15 @@ platform_pkg_is_installed() {
 
 # platform_pkg_refresh_command - "update the package lists".
 #
-# Arch is the awkward one: -Sy without a full -Syu is a partial upgrade, which
-# Arch documents as unsupported. It is also what every install script does,
-# and a wizard that ran -Syu would be rebooting people's machines. -Sy it is,
-# and the caller is free to offer -Syu instead.
+# Callers should run this before platform_pkg_install_command. On Arch it is
+# not optional: pacman -S against a database that was never synced fails
+# outright. -Sy without a full -Syu is a partial upgrade, which Arch documents
+# as unsupported; it is also what every install script does, and a wizard that
+# ran -Syu would be rebooting people's machines. -Sy it is, and a caller is
+# free to offer -Syu instead.
 platform_pkg_refresh_command() {
   platform_detect
+  platform_pkg_can_act || return 1
   case "$_PLATFORM_PKG_MANAGER" in
     apt-get) _platform_pkg_cmd apt-get update ;;
     dnf)     _platform_pkg_cmd dnf makecache ;;
@@ -224,20 +287,27 @@ platform_pkg_refresh_command() {
 }
 
 # platform_pkg_install_command <logical>... - "install these", as a string.
-# Empty and non-zero whenever this layer cannot act, because an install
+# Nothing and non-zero whenever this layer cannot act, because an install
 # command it is not allowed to run is worse than no command at all.
+#
+# apt-get is handed DEBIAN_FRONTEND=noninteractive through env, because a
+# debconf prompt in the middle of a wizard that already promised to be
+# unattended is a hang with no explanation. `sudo env VAR=x` rather than
+# `sudo VAR=x`, which many sudoers configurations reject outright.
 platform_pkg_install_command() {
   platform_detect
-  [ "$#" -gt 0 ] || return 1
+  [ "$#" -gt 0 ] || return 2
   platform_pkg_can_act || return 1
   local names
   names="$(_platform_pkg_names "$@")"
   case "$_PLATFORM_PKG_MANAGER" in
-    apt-get) _platform_pkg_cmd apt-get install -y "$names" ;;
-    dnf)     _platform_pkg_cmd dnf install -y "$names" ;;
-    yum)     _platform_pkg_cmd yum install -y "$names" ;;
-    pacman)  _platform_pkg_cmd pacman -S --needed --noconfirm "$names" ;;
-    zypper)  _platform_pkg_cmd zypper --non-interactive install "$names" ;;
+    apt-get) printf '%s %s' \
+               "$(_platform_pkg_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y)" \
+               "$names" ;;
+    dnf)     printf '%s %s' "$(_platform_pkg_cmd dnf install -y)" "$names" ;;
+    yum)     printf '%s %s' "$(_platform_pkg_cmd yum install -y)" "$names" ;;
+    pacman)  printf '%s %s' "$(_platform_pkg_cmd pacman -S --needed --noconfirm)" "$names" ;;
+    zypper)  printf '%s %s' "$(_platform_pkg_cmd zypper --non-interactive install)" "$names" ;;
     brew)    printf 'brew install %s' "$names" ;;
     *)       return 1 ;;
   esac
@@ -246,15 +316,18 @@ platform_pkg_install_command() {
 # platform_pkg_install <logical>... - the executing form, and the only
 # function in this file that changes the machine.
 platform_pkg_install() {
-  local cmd
-  cmd="$(platform_pkg_install_command "$@")" || return 1
+  local cmd status
+  cmd="$(platform_pkg_install_command "$@")"
+  status=$?
+  [ "$status" = 0 ] || return "$status"
   [ -n "$cmd" ] || return 1
   eval "$cmd"
 }
 
 # ------------------------------------------------------------ manual guidance
 
-# platform_pkg_manual_hint <logical>... - several lines, for a human.
+# platform_pkg_manual_hint <logical>... - several lines, for a human. Always
+# succeeds: there is always something worth saying.
 #
 # The first line is the actionable one: the command, when there is a command,
 # and otherwise why there is not. Then the packages, by the name this platform
@@ -262,14 +335,19 @@ platform_pkg_install() {
 # somewhere.
 platform_pkg_manual_hint() {
   platform_detect
-  local blocker names
+  local blocker names cmd
   blocker="$(platform_pkg_blocker)"
   names="$(_platform_pkg_names "$@")"
   [ -n "$names" ] || names="(nothing)"
 
   case "$blocker" in
     "")
-      printf '%s\n' "install them with: $(platform_pkg_install_command "$@")"
+      cmd="$(platform_pkg_install_command "$@")" || cmd=""
+      if [ -n "$cmd" ]; then
+        printf '%s\n' "install them with: $cmd"
+      else
+        printf '%s\n' "install them with $_PLATFORM_PKG_MANAGER."
+      fi
       ;;
     image-based)
       case "$_PLATFORM_FAMILY" in
@@ -285,8 +363,14 @@ platform_pkg_manual_hint() {
     unknown-platform)
       printf '%s\n' "this platform was not recognised (id: $_PLATFORM_ID), so there is no package manager to drive."
       ;;
+    no-package-manager)
+      printf '%s\n' "this is $_PLATFORM_PRETTY, but its package manager is not installed here."
+      ;;
     no-root)
       printf '%s\n' "$_PLATFORM_PKG_MANAGER needs root, and this session has neither root nor sudo."
+      ;;
+    *)
+      printf '%s\n' "packages cannot be installed automatically here ($blocker)."
       ;;
   esac
   printf '%s\n' "packages needed: $names"

@@ -87,7 +87,12 @@ test_a_name_this_layer_has_no_opinion_about_is_passed_through_and_says_so() {
   name="$(platform_pkg_name ripgrep)"
   status=$?
   assert_eq "ripgrep" "$name" "passing it through is more useful than refusing"
-  assert_status 1 "$status" "but the caller has to be able to tell it was a guess"
+  assert_status 0 "$status" \
+    "a value-returning function that fails is fatal under set -e, and this one has a value"
+  if platform_pkg_has_mapping ripgrep; then
+    fail "the caller still has to be able to tell it was a guess"
+  fi
+  platform_pkg_has_mapping tmux || fail "and to tell when it was not"
 }
 
 test_an_unknown_platform_maps_nothing_and_admits_it() {
@@ -98,15 +103,40 @@ test_an_unknown_platform_maps_nothing_and_admits_it() {
   name="$(platform_pkg_name python3)"
   status=$?
   assert_eq "python3" "$name"
-  assert_status 1 "$status"
+  assert_status 0 "$status"
+  if platform_pkg_has_mapping python3; then
+    fail "there is no family here to have a mapping for"
+  fi
+}
+
+test_a_value_returning_call_is_safe_to_assign_under_set_e() {
+  # The wizard runs under set -euo pipefail, where cmd="$(f)" with a non-zero
+  # f ends the script. Every function documented "Always 0" has to survive it.
+  _stub_uname Linux x86_64
+  local probe="$TEST_TMPDIR/probe.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+    'export PLATFORM_OS_RELEASE_FILES=""' \
+    ". \"\$REPO_ROOT/lib/platform.sh\"" 'platform_detect' \
+    'name="$(platform_pkg_name ripgrep)"' \
+    'blocker="$(platform_pkg_blocker)"' \
+    'privilege="$(platform_privilege)"' \
+    'prefix="$(platform_sudo_prefix)"' \
+    'hint="$(platform_pkg_manual_hint tmux)"' \
+    'printf "%s|%s|%s|%s\n" "$name" "$blocker" "$privilege" "$prefix"' > "$probe"
+  chmod +x "$probe"
+  run_script "$probe"
+  assert_status 0 "$RUN_STATUS" "none of these may end the caller's script"
+  assert_eq "" "$RUN_STDERR"
+  assert_contains "$RUN_STDOUT" "ripgrep|unknown-platform|"
 }
 
 # -------------------------------------------------------- generated commands
 
 test_each_family_generates_its_own_install_command() {
   _on debian-12 apt-get
-  assert_eq "sudo apt-get install -y tmux ffmpeg" \
-    "$(platform_pkg_install_command tmux ffmpeg)"
+  assert_eq "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux ffmpeg" \
+    "$(platform_pkg_install_command tmux ffmpeg)" \
+    "a debconf prompt inside a wizard that promised to be unattended is a hang"
 
   _on fedora-40 dnf
   assert_eq "sudo dnf install -y tmux ffmpeg-free" \
@@ -140,7 +170,9 @@ test_root_needs_no_sudo() {
   stub_command apt-get
   _platform_from debian-12
   assert_eq "root" "$(platform_privilege)"
-  assert_eq "apt-get install -y tmux" "$(platform_pkg_install_command tmux)"
+  assert_eq "env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux" \
+    "$(platform_pkg_install_command tmux)"
+  assert_eq "" "$(platform_sudo_prefix)"
 }
 
 test_each_family_generates_its_own_refresh_command() {
@@ -171,7 +203,40 @@ test_asking_what_would_be_run_runs_nothing() {
 test_the_executing_form_runs_exactly_what_the_string_said() {
   _on debian-12 apt-get
   platform_pkg_install tmux ffmpeg
-  assert_stub_called_with sudo "sudo apt-get install -y tmux ffmpeg"
+  assert_stub_called_with sudo \
+    "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux ffmpeg"
+}
+
+test_a_package_name_with_a_space_or_a_semicolon_in_it_stays_one_argument() {
+  # The interface invites names it has no opinion about, and a later ticket
+  # will read a dependency list out of a config file. Everything generated
+  # here goes through eval, so a name has to arrive as one argument or not at
+  # all.
+  _on debian-12 apt-get
+  local cmd
+  cmd="$(platform_pkg_install_command "tmux; touch pwned")"
+  assert_contains "$cmd" "'tmux; touch pwned'" "quoted, so eval sees one word"
+
+  platform_pkg_install "tmux; touch pwned"
+  assert_file_missing "$TEST_TMPDIR/pwned" "the semicolon must not have started a second command"
+  assert_stub_called_with sudo "tmux; touch pwned"
+  assert_stub_call_count sudo 1
+}
+
+test_the_call_being_wrong_is_told_apart_from_the_platform_being_unable() {
+  _on debian-12 apt-get
+  local status
+  platform_pkg_install_command >/dev/null
+  status=$?
+  assert_status 2 "$status" \
+    "no packages named is a bug in the caller, not news about the machine"
+
+  _stub_uname Linux x86_64
+  _as_user_with_sudo
+  _platform_from void
+  platform_pkg_install_command tmux >/dev/null
+  status=$?
+  assert_status 1 "$status" "whereas this really is news about the machine"
 }
 
 test_the_executing_form_refuses_where_the_string_form_would_be_empty() {
@@ -242,6 +307,38 @@ test_a_missing_query_tool_is_not_the_same_as_an_installed_package() {
   fi
 }
 
+test_an_image_based_system_can_still_be_asked_what_is_already_installed() {
+  # Installing here is refused, but asking is a read that needs no root, and
+  # manual instructions are far better for knowing which packages are already
+  # there.
+  _stub_uname Linux x86_64
+  _as_user_with_sudo
+  stub_command dnf
+  stub_command rpm
+  _platform_from fedora-silverblue-40
+  assert_eq "none" "$(platform_pkg_manager)" "anchor: it still refuses to install"
+  assert_eq "" "$(platform_pkg_install_command tmux)" "anchor: and offers no install command"
+  assert_eq "rpm -q --whatprovides tmux" "$(platform_pkg_query_command tmux)"
+  platform_pkg_is_installed tmux || fail "rpm said yes and rpm is right there"
+}
+
+test_the_query_command_is_published_in_its_own_right() {
+  _on debian-12 apt-get
+  local cmd
+  cmd="$(platform_pkg_query_command tmux)"
+  assert_contains "$cmd" "dpkg-query -W"
+  assert_contains "$cmd" "grep -qx installed" \
+    "the status word is part of the question, not something a caller adds"
+
+  _stub_uname Linux x86_64
+  _as_user_with_sudo
+  _platform_from void
+  local status
+  platform_pkg_query_command tmux >/dev/null
+  status=$?
+  assert_status 1 "$status" "with no package manager there is no question to ask"
+}
+
 test_asking_on_an_unknown_platform_is_answered_not_attempted() {
   _stub_uname Linux x86_64
   _as_user_with_sudo
@@ -269,6 +366,21 @@ test_an_unknown_platform_cannot_act_and_names_the_reason() {
   assert_eq "unknown-platform" "$(platform_pkg_blocker)"
   assert_eq "" "$(platform_pkg_install_command tmux)" \
     "there is no command to offer, and inventing one would be worse than none"
+  assert_eq "" "$(platform_pkg_refresh_command)" "nor a refresh that would only fail"
+}
+
+test_a_recognised_family_whose_package_manager_is_missing_says_which_it_is() {
+  # A stripped Debian image. "Never heard of this distro" and "this is Debian
+  # and apt-get is not installed" want different guidance, so they are
+  # different words.
+  _stub_uname Linux x86_64
+  _as_user_with_sudo
+  assert_command_absent apt-get
+  _platform_from debian-12
+  assert_eq "debian" "$(platform_family)" "it was recognised perfectly well"
+  assert_eq "no-package-manager" "$(platform_pkg_blocker)"
+  assert_not_contains "$(platform_pkg_manual_hint tmux)" "not recognised" \
+    "the hint must not contradict the family it just reported"
 }
 
 test_macos_without_homebrew_cannot_act_and_names_the_reason() {
@@ -302,6 +414,20 @@ test_no_way_to_reach_root_cannot_act_and_names_the_reason() {
   if platform_pkg_can_act; then fail "apt-get needs root and there is no way to it"; fi
   assert_eq "no-root" "$(platform_pkg_blocker)"
   assert_eq "" "$(platform_pkg_install_command tmux)"
+  assert_eq "" "$(platform_pkg_refresh_command)" \
+    "a refresh that is certain to fail on a permission error is not a useful answer"
+}
+
+test_a_sudo_capable_session_says_so_and_prefixes_with_it() {
+  _on debian-12 apt-get
+  assert_eq "sudo" "$(platform_privilege)"
+  assert_eq "sudo" "$(platform_sudo_prefix)"
+}
+
+test_homebrew_never_asks_for_a_sudo_prefix_even_where_sudo_exists() {
+  _on_macos_with_brew
+  assert_eq "sudo" "$(platform_privilege)" "sudo is right there"
+  assert_eq "" "$(platform_sudo_prefix)" "and brew still must not be given it"
 }
 
 test_homebrew_needs_no_root_so_a_rootless_mac_can_still_act() {
@@ -359,7 +485,7 @@ test_the_manual_hint_on_a_platform_it_can_act_on_shows_the_command() {
   _on debian-12 apt-get
   local hint
   hint="$(platform_pkg_manual_hint tmux ffmpeg)"
-  assert_contains "$hint" "sudo apt-get install -y tmux ffmpeg" \
+  assert_contains "$hint" "apt-get install -y tmux ffmpeg" \
     "when there is a command, the useful hint is that command"
 }
 
