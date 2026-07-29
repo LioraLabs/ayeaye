@@ -323,23 +323,26 @@ test_forgetting_everything_is_a_supported_thing_to_want() {
 # ------------------------------------------------- honest about seams
 
 test_work_this_version_cannot_do_is_reported_as_not_done() {
-  # macOS is another ticket's. What matters here is the shape of the answer:
-  # the stage says what it could not do, the stage is not recorded as done, and
-  # the closing summary lists it.
+  # This used to be macOS, because starting ayeaye at login was not built for
+  # it and the stage said so. It is built now, so the example had to move to a
+  # seam that is still genuinely open: a machine with no curl on it cannot be
+  # asked whether ayeaye is answering. What is being pinned is the shape of
+  # the answer, not the example - the stage says what it could not do, the
+  # stage is not recorded as done, and the closing summary lists it.
   require_host_command python3
   stub_real python3
   stub_command tmux
-  stub_command launchctl
-  stub_command uname --exit 1
-  stub_when uname '-s' --stdout "Darwin"
-  stub_when uname '-m' --stdout "arm64"
-  stub_command_from_fixture sw_vers sw_vers/macos-15.1
-  PLATFORM_OS_RELEASE_FILES=""
-  export PLATFORM_OS_RELEASE_FILES
-  run_install --defaults
-  assert_status 0 "$RUN_STATUS" "unfinished optional work is not a failed install"
-  assert_contains "$RUN_STDOUT" "not set up for"
-  assert_contains "$RUN_STDOUT" "not finished, and worth coming back to:"
+  stub_command systemctl --exit 1 --stderr "unknown systemctl invocation"
+  stub_when systemctl '--user show-environment' --exit 0
+  stub_when systemctl '--user daemon-reload' --exit 0
+  stub_when systemctl '--user enable --now *' --exit 0
+  assert_command_absent curl "the check this test is about has to be impossible"
+  pty_answers "" "" "" ""
+  pty_expect "enable and start it now?" "y"
+  pty_install
+  assert_status 0 "$PTY_STATUS" "unfinished optional work is not a failed install"
+  assert_contains "$PTY_TRANSCRIPT" "this computer has no curl"
+  assert_contains "$PTY_TRANSCRIPT" "not finished, and worth coming back to:"
   assert_file_contains "$(_state)" "stage.service=pending" \
     "a stage holding work it could not do is never recorded as done"
   assert_file_not_contains "$(_state)" "stage.service=done"

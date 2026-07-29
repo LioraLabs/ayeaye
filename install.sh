@@ -445,107 +445,20 @@ _manual_instructions() {
 }
 
 step_service() {
-  local out cmd who
-  _load_effective_values
-  SERVICE_KIND="$(platform_service_manager)"
-
-  if [ "$NO_SYSTEMD" = 1 ]; then
-    wizard_say "skipping systemd (--no-systemd)"
-    _manual_instructions
-    SERVICE_KIND="none"
-    return "$WIZARD_STAGE_SKIP"
-  fi
-
-  case "$SERVICE_KIND" in
-    systemd) ;;
-    launchd)
-      # The macOS half of this is another ticket's. Saying so is the only
-      # honest thing to do: reporting it as done would be a lie, and reporting
-      # it as broken would send somebody looking for a fault that is not there.
-      wizard_say "starting ayeaye automatically when you log in is not set up for"
-      wizard_say "macOS by this version yet."
-      _manual_instructions
-      return "$WIZARD_STAGE_PENDING"
-      ;;
-    *)
-      wizard_say "no systemd user session detected"
-      _manual_instructions
-      return "$WIZARD_STAGE_SKIP"
-      ;;
-  esac
-
-  # The unit is a build artefact, not a config file: it holds two paths and
-  # nothing else, and every setting lives in the env file it points at. That is
-  # why it is regenerated rather than merged, and why replacing it is not one
-  # of the things worth asking about.
+  # The lifecycle's hook, and nothing more. What a service definition
+  # contains, how it is installed on each platform, how an existing one is
+  # migrated or repaired, and what to say on a machine that has no service
+  # manager at all are one subject and they live together, in
+  # lib/steps/70-service.sh. This file owns when that happens, not what it is.
   #
-  # Written through a temporary file, and every step of it checked. A step body
-  # runs with errexit suspended, so an unchecked redirection here would print
-  # "installed" for a file that was never created.
-  if ! mkdir -p "$UNIT_DIR" 2>/dev/null; then
-    wizard_say "cannot create $UNIT_DIR, so ayeaye cannot be started for you."
-    return "$WIZARD_STAGE_FAIL"
+  # A missing implementation is reported as unfinished rather than as done:
+  # the manual instructions are still true, and the run picks it up next time.
+  if ! command -v service_step >/dev/null 2>&1; then
+    wizard_say "the part of setup that starts ayeaye for you is not installed."
+    _manual_instructions
+    return "$WIZARD_STAGE_PENDING"
   fi
-  if ! out="$(sed -e "s|@REPO@|$REPO|g" -e "s|@ENV_FILE@|$ENV_FILE|g" \
-        "$REPO/systemd/user/ayeaye.service.template" \
-        > "$UNIT_DIR/ayeaye.service.tmp.$$" 2>&1)"; then
-    rm -f "$UNIT_DIR/ayeaye.service.tmp.$$" 2>/dev/null
-    wizard_detail "$out"
-    wizard_say "cannot write into $UNIT_DIR, so ayeaye cannot be started for you."
-    return "$WIZARD_STAGE_FAIL"
-  fi
-  if ! mv -f "$UNIT_DIR/ayeaye.service.tmp.$$" "$UNIT_DIR/ayeaye.service" 2>/dev/null; then
-    rm -f "$UNIT_DIR/ayeaye.service.tmp.$$" 2>/dev/null
-    wizard_say "cannot write into $UNIT_DIR, so ayeaye cannot be started for you."
-    return "$WIZARD_STAGE_FAIL"
-  fi
-  wizard_say "installed $UNIT_DIR/ayeaye.service"
-  wizard_say "(regenerated on every run; put settings in $ENV_FILE, not the unit)"
-
-  if cmd="$(platform_service_command ayeaye reload)"; then
-    wizard_detail "running: $cmd"
-    if ! out="$(eval "$cmd" 2>&1)"; then
-      wizard_detail "$out"
-      if [ -n "$out" ]; then
-        printf '%s\n' "$out" >&2
-      fi
-      wizard_say "this computer's service manager would not reload its files, so"
-      wizard_say "ayeaye cannot be started for you."
-      return "$WIZARD_STAGE_FAIL"
-    fi
-  fi
-
-  if [ "$WIZARD_INTERACTIVE" = 1 ] && wizard_confirm "enable and start it now?" "y"; then
-    cmd="$(platform_service_command ayeaye enable)"
-    wizard_detail "running: $cmd"
-    if out="$(eval "$cmd" 2>&1)"; then
-      STARTED=1
-      wizard_remember step.service.unit.started 1
-      wizard_say "started. status: systemctl --user status ayeaye"
-    else
-      wizard_detail "$out"
-      if [ -n "$out" ]; then
-        printf '%s\n' "$out" >&2
-      fi
-      wizard_say "ayeaye is installed but would not start."
-      return "$WIZARD_STAGE_FAIL"
-    fi
-  else
-    wizard_remember step.service.unit.started 0
-    wizard_say "start it with: systemctl --user enable --now ayeaye"
-  fi
-
-  # $USER is not exported on every machine - a container shell does not have
-  # it - and reading it bare under `set -u` used to end the run right here,
-  # after the unit was already installed.
-  who="${USER:-}"
-  [ -n "$who" ] || who="$(id -un 2>/dev/null || true)"
-  if [ -n "$who" ] && command -v loginctl >/dev/null 2>&1 \
-     && [ "$(loginctl show-user "$who" -P Linger 2>/dev/null || true)" != "yes" ]; then
-    wizard_say "recommended: loginctl enable-linger $who"
-    wizard_say "(without it, user services stop when your last session ends)"
-  fi
-  return "$WIZARD_STAGE_OK"
+  service_step
 }
 
 # ============================================================= 8. done

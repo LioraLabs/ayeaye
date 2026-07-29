@@ -75,7 +75,7 @@ test_no_systemd_installs_and_starts_nothing() {
 
 # ---------------------------------------------------------- the unit file
 
-test_the_unit_is_written_from_the_template_with_both_paths_filled_in() {
+test_the_unit_names_the_program_and_the_settings_file_by_absolute_path() {
   _hard_deps_present
   _systemd_session
   run_install --defaults
@@ -86,9 +86,10 @@ test_the_unit_is_written_from_the_template_with_both_paths_filled_in() {
   assert_file_contains "$unit" "EnvironmentFile=$XDG_CONFIG_HOME/ayeaye/env"
   assert_file_not_contains "$unit" "@REPO@"
   assert_file_not_contains "$unit" "@ENV_FILE@"
-  # Nothing else about the unit's contents is asserted here: the rest comes from
-  # systemd/user/ayeaye.service.template, and editing that file is not an
-  # install.sh regression.
+  # Nothing else about the unit's contents is asserted here: the body comes
+  # from the renderer in lib/steps/70-service.sh, which has a golden file of
+  # its own in service_units_test.sh. What this pins is that an install put
+  # this machine's real paths into it.
 }
 
 test_no_placeholder_survives_in_the_unit() {
@@ -274,19 +275,69 @@ test_a_failing_daemon_reload_stops_the_run_after_the_unit_is_written() {
 }
 
 test_the_repo_path_may_contain_a_space() {
-  # macOS paths routinely do, and the unit is rendered with sed, where an
-  # unquoted expansion would split the path.
+  # macOS paths routinely do. This used to assert the *unquoted* form, which
+  # is what sed over a template produced and what systemd reads as a program
+  # called ".../my" taking an argument "repo/bin/ayeaye" - a unit that
+  # installs cleanly and never starts. The generated unit quotes it; the
+  # quoting rules for each format are pinned in service_units_test.sh.
   _hard_deps_present
   _systemd_session
   local repo="$TEST_TMPDIR/my repo"
   mkdir -p "$repo"
   cp "$REPO_ROOT/install.sh" "$REPO_ROOT/env.template" "$repo/"
   cp -R "$REPO_ROOT/lib" "$repo/lib"
-  mkdir -p "$repo/systemd/user"
-  cp "$REPO_ROOT/systemd/user/ayeaye.service.template" "$repo/systemd/user/"
 
   run_script "$repo/install.sh" --defaults
   assert_status 0 "$RUN_STATUS"
   assert_contains "$RUN_STDOUT" "repo: $repo"
-  assert_file_contains "$(_unit_file)" "ExecStart=$repo/bin/ayeaye"
+  assert_file_contains "$(_unit_file)" "ExecStart=\"$repo/bin/ayeaye\""
+}
+
+# ------------------------------------------------- what the next step reads
+
+# The service stage tells the health check whether anything was started, and
+# it does so through the state file rather than through a shell variable: a
+# resumed run skips the step that set the variable, and the health check one
+# step later would read a default instead of a decision. These pin both ends
+# of that - what was written, and what the reader made of it.
+
+_state_file() {
+  printf '%s' "$XDG_STATE_HOME/ayeaye/setup-state"
+}
+
+test_a_run_that_did_not_start_the_service_records_that_it_did_not() {
+  _hard_deps_present
+  _systemd_session
+  run_install --defaults
+  assert_file_contains "$(_state_file)" "step.service.unit.started=0"
+  assert_contains "$RUN_STDOUT" "ayeaye is not running yet, so there is nothing to check." \
+    "and the health check downstream read it"
+}
+
+test_a_run_that_started_the_service_records_that_it_did() {
+  _hard_deps_present
+  _systemd_session
+  pty_answers "" "" "" ""
+  pty_expect "enable and start it now?" "y"
+  pty_install
+  assert_status 0 "$PTY_STATUS"
+  assert_file_contains "$(_state_file)" "step.service.unit.started=1"
+  assert_not_contains "$PTY_TRANSCRIPT" "ayeaye is not running yet" \
+    "the health check downstream believed it"
+}
+
+test_a_run_that_installed_no_service_at_all_records_that_too() {
+  # The dangerous case: a machine that started ayeaye last week and is being
+  # re-run with --no-systemd today. A stale 1 would have the health check
+  # reporting on something nothing started.
+  _hard_deps_present
+  _systemd_session
+  pty_answers "" "" "" ""
+  pty_expect "enable and start it now?" "y"
+  pty_install
+  assert_file_contains "$(_state_file)" "step.service.unit.started=1"
+  run_install --defaults --no-systemd
+  assert_status 0 "$RUN_STATUS"
+  assert_file_contains "$(_state_file)" "step.service.unit.started=0"
+  assert_contains "$RUN_STDOUT" "ayeaye is not running yet, so there is nothing to check."
 }
