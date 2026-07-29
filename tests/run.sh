@@ -84,11 +84,21 @@ guard_signature() {
 # text, but the text alone over-reports (a here-document can contain something
 # that looks like a definition), so the scan is intersected with the functions
 # the file actually defines when sourced.
+scan_test_names() {
+  sed -n \
+    -e 's/^\(test_[A-Za-z0-9_]*\)[[:space:]]*().*/\1/p' \
+    -e 's/^function[[:space:]]\{1,\}\(test_[A-Za-z0-9_]*\).*/\1/p' \
+    "$1"
+}
+
+defined_test_names() {
+  bash "$LIB_DIR/list_functions.sh" "$1" 2>/dev/null
+}
+
+# The scan in source order, keeping only names the file really defines.
 test_names_in() {
-  local defined seen name
-  defined="$(bash "$LIB_DIR/list_functions.sh" "$1" 2>/dev/null)"
-  seen=""
-  for name in $(sed -n 's/^\(test_[A-Za-z0-9_]*\)[[:space:]]*()[[:space:]]*{.*/\1/p' "$1"); do
+  local defined="$2" seen="" name
+  for name in $(scan_test_names "$1"); do
     printf '%s\n' "$defined" | grep -qx "$name" || continue
     case "$seen" in
       *" $name "*) continue ;;
@@ -123,11 +133,29 @@ EOF
 
 SELECTION=""
 SELECTION_COUNT=0
+
 while IFS= read -r case_file; do
   [ -n "$case_file" ] || continue
   base="${case_file##*/}"
   base="${base%.sh}"
-  for name in $(test_names_in "$case_file"); do
+  defined="$(defined_test_names "$case_file")"
+  found=""
+  for name in $(test_names_in "$case_file" "$defined"); do
+    found="$found $name "
+    id="$base::$name"
+    if selected "$id"; then
+      SELECTION="$SELECTION$case_file|$id|$name
+"
+      SELECTION_COUNT=$((SELECTION_COUNT + 1))
+    fi
+  done
+  # A test the text scan could not place - one defined through eval, say -
+  # still runs. It goes after the ones that could be placed, in name order.
+  # Skipping it in silence would be the worst thing this runner could do.
+  for name in $defined; do
+    case "$found" in
+      *" $name "*) continue ;;
+    esac
     id="$base::$name"
     if selected "$id"; then
       SELECTION="$SELECTION$case_file|$id|$name

@@ -144,6 +144,31 @@ CASE
   assert_not_contains "$RUNNER_OUT" "passed"
 }
 
+test_a_test_the_scanner_cannot_place_still_runs() {
+  local d="$TEST_TMPDIR/cases"
+  _write_case "$d" "generated_test.sh" <<'CASE'
+test_written_out() { assert_eq ok ok; }
+eval 'test_generated_by_eval() { assert_eq ok ok; }'
+CASE
+  _run_runner "$d"
+  assert_status 0 "$RUNNER_STATUS"
+  assert_contains "$RUNNER_OUT" "test_generated_by_eval" \
+    "a test the text scan cannot place must still run, never be skipped in silence"
+  assert_contains "$RUNNER_OUT" "2 passed"
+}
+
+test_the_function_keyword_and_spaced_parentheses_are_understood() {
+  local d="$TEST_TMPDIR/cases"
+  _write_case "$d" "spelling_test.sh" <<'CASE'
+test_plain() { assert_eq ok ok; }
+test_spaced ()  { assert_eq ok ok; }
+function test_keyword() { assert_eq ok ok; }
+CASE
+  _run_runner "$d"
+  assert_status 0 "$RUNNER_STATUS"
+  assert_contains "$RUNNER_OUT" "3 passed"
+}
+
 test_no_matching_filter_is_an_error() {
   local d="$TEST_TMPDIR/cases"
   _write_case "$d" "nomatch_test.sh" <<'CASE'

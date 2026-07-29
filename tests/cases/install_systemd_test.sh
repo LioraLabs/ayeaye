@@ -179,8 +179,8 @@ test_a_user_without_linger_is_told_to_enable_it() {
   _systemd_session
   stub_command loginctl --stdout "no"
   run_install --defaults
-  assert_stub_called_with loginctl "loginctl show-user"
-  assert_contains "$RUN_STDOUT" "recommended: loginctl enable-linger"
+  assert_stub_called_with loginctl "loginctl show-user $USER -P Linger"
+  assert_contains "$RUN_STDOUT" "recommended: loginctl enable-linger $USER"
   assert_contains "$RUN_STDOUT" "(without it, user services stop when your last session ends)"
 }
 

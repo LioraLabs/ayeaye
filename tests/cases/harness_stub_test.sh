@@ -7,17 +7,28 @@ test_path_is_exactly_the_stub_directory() {
 }
 
 test_an_unstubbed_command_is_absent_whatever_the_host_has() {
-  # git is certainly installed on any machine checking this repository out,
-  # and must still be invisible to the code under test.
-  assert_command_absent git
+  # Prove it against something this host really does have, whatever that
+  # happens to be: the guarantee is about the host, not about a fixed list.
+  local candidate present=""
+  for candidate in git curl wget tar gzip vi; do
+    if PATH="$HARNESS_HOST_PATH" command -v "$candidate" >/dev/null 2>&1; then
+      present="$candidate"
+      break
+    fi
+  done
+  [ -n "$present" ] || skip "this host has none of the candidate commands"
+  assert_command_absent "$present" "the host has $present and the test must not"
   assert_command_absent tailscale
   assert_command_absent tmux
 }
 
 test_stub_real_brings_a_host_command_back() {
-  assert_command_absent git
-  stub_real git
-  command -v git >/dev/null 2>&1 || fail "stub_real must put git back on PATH"
+  # sed is linked in by default, so removing it first makes this independent of
+  # what else the host happens to have installed.
+  stub_remove sed
+  assert_command_absent sed
+  stub_real sed
+  command -v sed >/dev/null 2>&1 || fail "stub_real must put sed back on PATH"
 }
 
 test_stub_remove_takes_a_command_away_again() {

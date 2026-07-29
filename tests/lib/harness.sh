@@ -60,6 +60,13 @@ harness_begin() {
   export LC_ALL LANG TERM
   unset CDPATH
 
+  # A container shell does not export USER and a desktop one does, which is by
+  # itself enough to make the same test pass on a laptop and fail in CI. Pin
+  # it. A test that cares about the difference says `unset USER` and means it.
+  USER="ayeaye-tester"
+  LOGNAME="$USER"
+  export USER LOGNAME
+
   # Harness infrastructure that happens to need an interpreter resolves it
   # from the host before PATH is narrowed, so that the code under test can
   # still be told python3 does not exist.

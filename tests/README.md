@@ -96,7 +96,10 @@ home directory is redirected inside it:
 
 `AYEAYE_*` and `VOICE_*` variables are scrubbed from the environment, and the
 locale is pinned, so a contributor with `AYEAYE_PORT` exported gets the same
-results as a clean machine.
+results as a clean machine. `USER` and `LOGNAME` are pinned too — a container
+shell does not export `USER` and a desktop one does, which by itself is enough
+to make a test pass on a laptop and fail in CI. A test that cares about that
+difference says `unset USER` and means it.
 
 **A test may write anywhere under `$TEST_TMPDIR` and nowhere else.** The runner
 enforces it: it takes a signature of the three paths install.sh writes
