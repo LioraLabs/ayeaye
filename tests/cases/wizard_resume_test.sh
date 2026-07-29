@@ -196,11 +196,16 @@ test_a_rerun_offers_back_what_was_chosen_last_time() {
   # which nobody would have chosen on purpose.
   _hard_deps_present
   _answer_config_prompts "10.1.2.3" "9911" "one.example" "https://ntfy.example/t"
+  # Naming an https address of your own is now asked about once - it is what
+  # lets something that is not this computer reach ayeaye - so the answer
+  # to that question belongs here too.
+  pty_expect "may one.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
 
   pty_expect "rewrite it?" "y"
   _answer_config_prompts "" "" "" ""
+  pty_expect "may one.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
   assert_contains "$PTY_TRANSCRIPT" "bind address [10.1.2.3]:"

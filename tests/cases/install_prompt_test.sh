@@ -61,6 +61,10 @@ test_an_empty_answer_takes_the_offered_default() {
 test_a_typed_answer_overrides_the_default() {
   _hard_deps_present
   _answer_config_prompts "192.168.1.10" "9000" "box.example,other.example" "https://ntfy.sh/mine"
+  # Naming an https address of your own is now asked about once - it is what
+  # lets something that is not this computer reach ayeaye - so the answer
+  # to that question belongs here too.
+  pty_expect "may box.example,other.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
   assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=192.168.1.10"
@@ -72,6 +76,7 @@ test_a_typed_answer_overrides_the_default() {
 test_answers_are_reflected_in_the_bookmark_url() {
   _hard_deps_present
   _answer_config_prompts "192.168.1.10" "9000" "box.example,other.example" ""
+  pty_expect "may box.example,other.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" "bookmark: http://192.168.1.10:9000/?token="
   assert_contains "$PTY_TRANSCRIPT" "https://box.example/?token=" \
@@ -140,6 +145,9 @@ test_confirm_reads_y_upper_y_yes_and_upper_yes_as_yes() {
     _existing_config
     pty_expect "rewrite it?" "$answer"
     _answer_config_prompts "" "9000" "" ""
+    # The config kept from before names an https address, which setup asks
+    # about once before it lets anything through it.
+    pty_expect "may kept.example reach ayeaye?" "y"
     pty_install --no-systemd
     assert_status 0 "$PTY_STATUS"
     assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_PORT=9000" \
@@ -154,6 +162,7 @@ test_the_questions_offer_back_what_is_already_configured() {
   _existing_config
   pty_expect "rewrite it?" "y"
   _answer_config_prompts "" "" "" ""
+  pty_expect "may kept.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" "bind address [10.9.8.7]:"
   assert_contains "$PTY_TRANSCRIPT" "port [7777]:"

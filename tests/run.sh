@@ -73,6 +73,14 @@ GUARDED_PATHS="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/env
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye.service
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-agent.service
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/whisper-server.service
+${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye-caddy.service
+${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/Caddyfile
+${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/ca
+${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/ca/ayeaye-ca.crt
+${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/reverse-proxy.caddy
+${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/reverse-proxy.nginx
+${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/phone-certificate.txt
+${XDG_DATA_HOME:-$HOME/.local/share}/ayeaye/caddy
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/projects.json
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-state
@@ -96,6 +104,7 @@ ${XDG_BIN_HOME:-$HOME/.local/bin}/cliban
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
 $HOME/Library/LaunchAgents/dev.voice-agent.plist
 $HOME/Library/LaunchAgents/dev.whisper-server.plist
+$HOME/Library/LaunchAgents/dev.ayeaye-caddy.plist
 $HOME/Library/Logs/ayeaye
 $HOME/.bashrc
 $HOME/.zshrc

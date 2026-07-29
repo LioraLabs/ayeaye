@@ -126,6 +126,10 @@ test_the_temporary_file_is_not_left_next_to_the_config() {
 test_answers_typed_at_a_terminal_reach_the_same_keys() {
   _hard_deps_present
   _answer_config_prompts "192.0.2.77" "8123" "typed.example" "https://ntfy.example/typed"
+  # Naming an https address of your own is now asked about once - it is what
+  # lets something that is not this computer reach ayeaye - so the answer
+  # to that question belongs here too.
+  pty_expect "may typed.example reach ayeaye?" "y"
   pty_install --no-systemd
   assert_status 0 "$PTY_STATUS"
 

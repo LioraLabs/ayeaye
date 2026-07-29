@@ -174,6 +174,10 @@ test_the_allowed_hosts_prompt_offers_the_tailscale_name() {
   _hard_deps_present
   stub_command_from_fixture tailscale tailscale/status-online
   pty_answers "" "" "" ""
+  # A machine with tailscale is offered the ways in that tailscale makes
+  # possible, which is a question after these four. Answered "this computer
+  # only" so that this test stays about the wording of the prompt above.
+  pty_expect "which one?" "2"
   pty_install --no-systemd
   assert_contains "$PTY_TRANSCRIPT" "allowed hosts (your https front) [my-box.tail1a2b3c.ts.net]:"
 }
