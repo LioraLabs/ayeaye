@@ -139,6 +139,7 @@ test_ayeaye_imports_with_proc_taken_away() {
   run_script "$STUB_BIN/python3" -c \
     "import builtins, os, sys
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
 # The tree under test is not a place to write to, and loading a .py sibling
 # out of bin/ would otherwise leave a __pycache__ in it.
@@ -158,7 +159,15 @@ def refuse(fn):
 builtins.open = refuse(real_open)
 os.readlink, os.listdir = refuse(real_readlink), refuse(real_listdir)
 os.environ['AYEAYE_TOKEN'] = 't'
-m = SourceFileLoader('a', os.path.join(sys.argv[1], 'bin', 'ayeaye')).load_module()
+# Loaded, not imported, and with a named loader: bin/ayeaye has no .py
+# extension for importlib to infer one from. exec_module rather than the
+# load_module() that goes away in python 3.15, registered under its name
+# first because that is what load_module() did.
+path = os.path.join(sys.argv[1], 'bin', 'ayeaye')
+spec = spec_from_file_location('a', path, loader=SourceFileLoader('a', path))
+m = module_from_spec(spec)
+sys.modules['a'] = m
+spec.loader.exec_module(m)
 builtins.open, os.readlink, os.listdir = real_open, real_readlink, real_listdir
 print(type(m._make_process_info('darwin')).__name__)
 print('reached for: %s' % denied)" "$REPO_ROOT"

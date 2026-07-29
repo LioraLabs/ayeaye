@@ -46,6 +46,44 @@ test_a_card_too_small_to_hold_a_model_still_gets_the_offer() {
     "and the offer is still there, on the processor"
 }
 
+test_a_two_gigabyte_card_is_offered_the_smallest_model_on_the_processor() {
+  # Written down because it was raised as a doubt at the close of the
+  # milestone: does the tier ladder leave a two gigabyte graphics board with no
+  # listening option at all, not even the 78 MB one?
+  #
+  # It does not, and this is the proof rather than a reading of the code. A
+  # card below the useful line caps the tier at "recommended" and never below
+  # it - a card cannot take away memory or disk the machine has - so both the
+  # smallest experience and the balanced one stay on offer, on the processor,
+  # with the speed warning the tests below pin. Only memory, free space or
+  # processor count can put a machine on text-only.
+  _machine recommended cuda 2048
+  assert_eq "" "$(_voice_preset_blocker lightweight)" \
+    "the 78 MB model is on offer"
+  assert_eq "tiny.en" "$(_voice_preset_model lightweight)" \
+    "and lightweight is what that model is called here"
+  assert_eq "recommended" \
+    "$(hw_tier_for "$(_big_ram)" 8 "$(_big_disk)" cuda 2048)" \
+    "a small card caps the tier and never lowers it to text-only"
+}
+
+test_only_the_machine_itself_can_take_listening_away() {
+  # The other half of the same claim: text-only is reached by not having the
+  # memory, the space or the processors, and by nothing a graphics card does or
+  # does not do.
+  assert_eq "text-only" "$(hw_tier_for 1024 8 "$(_big_disk)" cuda 24576)" \
+    "not enough memory, however big the card"
+  assert_eq "text-only" "$(hw_tier_for "$(_big_ram)" 8 512 cuda 24576)" \
+    "not enough room on the disk, however big the card"
+  assert_eq "maximum" "$(hw_tier_for "$(_big_ram)" 8 "$(_big_disk)" cuda 24576)" \
+    "and a machine with all three reaches the top"
+}
+
+# _big_ram / _big_disk - comfortably above every line in the ladder, so that
+# the one dimension under test is the only one that can be binding.
+_big_ram()  { printf '65536'; }
+_big_disk() { printf '102400'; }
+
 test_a_card_setup_could_not_measure_still_gets_the_offer() {
   _machine recommended rocm unknown
   assert_eq "cpu" "$(_voice_backend)"

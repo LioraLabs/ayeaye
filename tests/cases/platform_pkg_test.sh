@@ -132,6 +132,84 @@ test_a_value_returning_call_is_safe_to_assign_under_set_e() {
 
 # -------------------------------------------------------- generated commands
 
+# _assert_pkg_fixture <family> - the generated command against the file.
+#
+# The package list is one fixed set for every family, so that the five files
+# read side by side are the difference between the families and nothing else.
+# It is the logical name table from lib/pkg.sh minus tar, and that omission is
+# deliberate rather than an oversight: macOS has no formula called tar, so the
+# builder would generate `brew install ... tar` for a formula that does not
+# exist. That is the documented contract and
+# test_a_name_with_no_package_on_this_family_still_reaches_the_command_line
+# pins it at length. A file a reviewer reads to answer "what would this run on
+# my machine" should not have a command that cannot run in it, so the sharp
+# edge stays where it is explained and the fixtures stay commands that work.
+#
+# fixture_cat inside a command substitution, so the fixture's trailing newline
+# is dropped and the comparison is against the bytes that matter. The message
+# names the file, because the only useful thing to do about a failure here is
+# to look at the two side by side and decide which one is wrong.
+_assert_pkg_fixture() {
+  local list="tmux python3 ffmpeg curl git"
+  assert_fixture_exists "pkg-commands/$1"
+  # shellcheck disable=SC2086
+  assert_eq "$(fixture_cat "pkg-commands/$1")" \
+    "$(platform_pkg_install_command $list)" \
+    "the generated command no longer matches tests/fixtures/pkg-commands/$1"
+}
+
+test_the_command_each_family_would_run_matches_its_fixture() {
+  # The inline assertions below say what each family does one clause at a
+  # time, which is the right shape for a test and the wrong shape for a
+  # question a person actually asks: "what is this going to run on my
+  # machine?" Nobody can answer that by reading a test body per family.
+  #
+  # tests/fixtures/pkg-commands/ answers it. One file per family, the whole
+  # command, nothing else, for one fixed package list - so the five files read
+  # side by side are the difference between the families, and a change to any
+  # generated command shows up in a diff as the command itself rather than as
+  # a moved quotation mark inside a test.
+  #
+  # It is an addition, not a replacement. The inline tests say *why* each
+  # family's command looks the way it does - the debconf hang, brew and root,
+  # arch's python - and a fixture cannot carry a reason.
+  _on debian-12 apt-get
+  _assert_pkg_fixture debian
+
+  _on fedora-40 dnf
+  _assert_pkg_fixture fedora
+
+  _on arch pacman
+  _assert_pkg_fixture arch
+
+  _on opensuse-tumbleweed zypper
+  _assert_pkg_fixture suse
+
+  _on_macos_with_brew
+  _assert_pkg_fixture macos
+}
+
+test_every_family_this_layer_supports_has_a_command_fixture() {
+  # The fixture directory is a reference, and a reference with a family
+  # missing from it is worse than none: it reads as complete. A sixth family
+  # added to lib/pkg.sh has to arrive with its file, and this is what says so.
+  local family found listed
+  listed="$(fixture_list pkg-commands)"
+  for family in debian fedora arch suse macos; do
+    found=0
+    case "
+$listed
+" in
+      *"
+$family
+"*) found=1 ;;
+    esac
+    [ "$found" = 1 ] || fail "no tests/fixtures/pkg-commands/$family"
+  done
+  assert_eq "5" "$(printf '%s\n' "$listed" | grep -c .)" \
+    "a family with no fixture, or a fixture for a family this layer does not have"
+}
+
 test_each_family_generates_its_own_install_command() {
   _on debian-12 apt-get
   assert_eq "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux ffmpeg" \
