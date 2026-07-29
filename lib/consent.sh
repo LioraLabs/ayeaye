@@ -37,6 +37,13 @@
 #         answer earlier in the run rather than by asking now, so the audit
 #         trail is complete either way. Always 0.
 #
+#   wizard_firewall_rule <subnet> <port>
+#         -> the command that would let one private subnet reach one port on
+#         this computer, or nothing and non-zero. It builds a string and has
+#         no effect of its own; wizard_firewall is what asks and runs. It is
+#         here because this is the only file allowed to name a firewall
+#         program at all - see the note at the bottom of this header.
+#
 #   wizard_consent_ledger          -> the audit trail, one decision per line,
 #         "<kind>\t<decision>\t<question>". Always 0.
 #   wizard_consent_reset           start a fresh ledger. Always 0.
@@ -309,6 +316,68 @@ _wizard_exec() {
 
 wizard_privileged() { _wizard_do privileged "${1:-}" "${2:-}"; }
 wizard_firewall()   { _wizard_do firewall   "${1:-}" "${2:-}"; }
+
+# wizard_firewall_rule <subnet> <port> - the command that would let one private
+# subnet reach one port on this computer. The string on stdout and 0, or
+# nothing and non-zero when no such rule can be written here.
+#
+# It has no effect of its own and it is not a wrapper: it prints. What it is
+# doing in this file is the rule in tests/cases/wizard_contract_test.sh that
+# makes lib/consent.sh the only place in this project allowed to name a
+# firewall program at all. A caller that spelled one out would be the exception
+# that ends that rule, so the one command each caller could need is built here,
+# beside the wrapper that asks about it and runs it.
+#
+# Every rule this can produce is scoped to the subnet the connection has to
+# come from. There is deliberately no way to ask it for an unscoped one: a
+# firewall it cannot write a scoped rule for gets nothing and a non-zero
+# status, because "let anything reach this port" is not a smaller version of
+# what the caller asked for, it is a different and much worse thing.
+#
+#   1  this machine has no firewall this knows how to write for, or no way to
+#      run a command as root
+#   2  the call was wrong: a subnet that is not one, or a port that is not a
+#      number
+wizard_firewall_rule() {
+  local subnet="${1:-}" port="${2:-}" lead
+  [ -n "$subnet" ] && [ -n "$port" ] || return 2
+  # A subnet, and nothing that could be anything else. This value ends up
+  # inside a command that runs as root, so it is checked here rather than
+  # trusted from a probe.
+  case "$subnet" in
+    */*) ;;
+    *) return 2 ;;
+  esac
+  case "$subnet" in
+    *[!0-9./]*) return 2 ;;
+  esac
+  case "$port" in
+    *[!0-9]*) return 2 ;;
+  esac
+
+  case "$(platform_privilege)" in
+    root) lead="" ;;
+    sudo) lead="sudo " ;;
+    *)    return 1 ;;
+  esac
+
+  if command -v ufw >/dev/null 2>&1; then
+    printf '%sufw allow proto tcp from %s to any port %s' "$lead" "$subnet" "$port"
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    # Two commands and one question: a permanent rule that is never reloaded
+    # is a rule that does nothing until the next reboot, and asking about the
+    # reload separately would be asking a person to decide something they have
+    # no way to decide.
+    printf '%sfirewall-cmd --permanent --add-rich-rule=' "$lead"
+    printf "'rule family=\"ipv4\" source address=\"%s\" port port=\"%s\" protocol=\"tcp\" accept'" \
+      "$subnet" "$port"
+    printf ' && %sfirewall-cmd --reload' "$lead"
+    return 0
+  fi
+  return 1
+}
 
 # wizard_may_expose <question> [detail]… - may ayeaye be reachable from
 # somewhere other than this computer?
