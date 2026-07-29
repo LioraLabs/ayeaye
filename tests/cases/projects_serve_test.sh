@@ -110,31 +110,85 @@ test_a_session_that_already_exists_is_marked() {
   assert_contains "$RUN_STDOUT" '"session": "myproj"'
 }
 
-test_a_request_does_not_wait_on_the_filesystem() {
+test_a_request_answers_from_a_walk_that_has_not_finished() {
   probe maketree "$TREE" --width 6 --depth 5
   assert_eq "9330" "$(probe_value made)"
   AYEAYE_PROJECT_WAIT="0.3"
   export AYEAYE_PROJECT_WAIT
-  # Two milliseconds a listing: this tree cannot be walked inside the wait,
-  # and the point is that the answer arrives anyway.
-  probe --slow 0.002 projects --field dir
+  # Two milliseconds a listing, and a query that matches one subtree rather
+  # than everything: too few matches to end the walk early, but the first of
+  # them are found almost immediately. So the walk is certainly still going
+  # when the wait expires, and the answer has to come from a walk in progress.
+  probe --slow 0.002 projects --query L1n0/L2n0 --field dir
+  assert_below 0.25 "$(probe_value elapsed)" \
+    "the walk really did outlast the wait, or this proves nothing"
   assert_below "$(probe_value elapsed)" 1.5 \
-    "the wait bounds the response, the walk's own budget does not"
+    "the wait bounds the response; the walk's own budget does not"
   assert_below 0 "$(probe_value count)" \
-    "a partial walk still answers with what it found"
+    "a walk still running must still deliver what it has found so far"
+  assert_contains "$RUN_STDOUT" "$TREE/L1n0/L2n0"
+}
+
+test_two_callers_asking_the_same_thing_share_one_walk() {
+  probe maketree "$TREE" --width 5 --depth 4
+  AYEAYE_PROJECT_WAIT="10"
+  export AYEAYE_PROJECT_WAIT
+  probe --slow 0.002 join --query L2n1 --gap 0.2
+  assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
+  assert_eq "1" "$(probe_value walks)" \
+    "a second caller joins the walk in flight rather than restarting it"
+  assert_eq "$(probe_value first_rows)" "$(probe_value second_rows)"
+  assert_below 0 "$(probe_value first_rows)" \
+    "and neither caller is starved by the other"
 }
 
 test_a_superseded_search_delivers_nothing() {
   probe maketree "$TREE" --width 6 --depth 4
   AYEAYE_PROJECT_WAIT="10"
   export AYEAYE_PROJECT_WAIT
-  probe --slow 0.004 supersede --query-a L1n0 --query-b L1n1 --gap 0.4
+  # Queries narrow enough that neither can reach the candidate cap and stop
+  # early, so the first is certainly still walking when the second arrives.
+  probe --slow 0.004 supersede --query-a L1n0/L2n0 --query-b L1n1/L2n0 --gap 0.25
   assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
   assert_eq "0" "$(probe_value first_rows)" \
     "the query the user has typed past must not race the current one"
   assert_below 0 "$(probe_value second_rows)" "the current query still answers"
   assert_eq "yes" "$(probe_value stopped_walking)" \
     "cancellation stops the walking thread, not merely the waiting one"
+}
+
+test_a_walk_that_finishes_late_is_still_kept() {
+  probe maketree "$TREE" --width 5 --depth 4
+  AYEAYE_PROJECT_WAIT="0.15"
+  export AYEAYE_PROJECT_WAIT
+  # The first call gives up waiting long before the walk ends. The second
+  # asks the same thing once the walk has had time to finish, and must be
+  # answered from that finished walk rather than starting another.
+  probe --slow 0.002 cached --query L2n1 --settle 3
+  assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
+  assert_below 0 "$(probe_value settle_listings)" \
+    "the walk carries on after the request that started it gave up"
+  assert_below 0 "$(probe_value second_count)" \
+    "a walk nobody was still waiting for is not thrown away"
+  assert_eq "0" "$(probe_value second_listings)" \
+    "and the query that outlived its waiter is not walked twice"
+}
+
+test_the_limit_is_a_limit_even_at_zero() {
+  mkdir -p "$TREE/one" "$TREE/two"
+  probe projects --limit 0 --field dir
+  assert_eq "0" "$(probe_value count)"
+}
+
+test_a_sibling_of_home_is_not_mistaken_for_a_path_inside_it() {
+  mkdir -p "$HOME-ish/tree/proj"
+  AYEAYE_PROJECT_ROOTS="$HOME-ish/tree"
+  export AYEAYE_PROJECT_ROOTS
+  probe projects --field short
+  assert_contains "$RUN_STDOUT" "$HOME-ish/tree/proj" \
+    "collapsing to ~ is a path prefix, not a string prefix"
+  assert_not_contains "$RUN_STDOUT" "~" \
+    "nothing here is under home, so nothing may be shortened as if it were"
 }
 
 test_a_repeated_query_is_answered_without_walking_again() {

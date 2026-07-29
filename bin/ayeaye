@@ -685,17 +685,24 @@ def _project_skip(name):
 # while typing unaffordable, so listings are memoised for PROJECT_TTL. The
 # cache is bounded by clearing it wholesale: an eviction policy would be more
 # code than the walk it serves, and refilling costs one bounded walk.
-_LIST_MAX = 20000
+_LIST_MAX = 4000               # directories remembered
+_PER_DIR_MAX = 5000            # entries examined in any one of them
 _list_cache = {}
 _list_lock = threading.Lock()
 
 
 def _list_dir(path):
-    """Interesting sub-directories of `path`, as (name, path, is_git).
+    """Interesting sub-directories of `path`, as (path, is_git).
 
     Symlinked directories are skipped outright. A symlink is either a second
     name for something the walk will reach anyway or a way out of the bounded
     region entirely, and following one is how a walk finds a cycle.
+
+    Only the first _PER_DIR_MAX entries are examined. Every other bound in
+    the search is checked between directories, which is no help at all inside
+    a single one holding a hundred thousand children -- a package cache, a
+    maildir, a downloads folder someone never emptied. Truncating there is
+    what keeps the clock and the cancel flag reachable.
     """
     now = time.monotonic()
     with _list_lock:
@@ -705,7 +712,11 @@ def _list_dir(path):
     rows = []
     try:
         with os.scandir(path) as entries:
+            examined = 0
             for entry in entries:
+                examined += 1
+                if examined > _PER_DIR_MAX:
+                    break
                 if _project_skip(entry.name):
                     continue
                 try:
@@ -715,7 +726,7 @@ def _list_dir(path):
                     continue
                 # A worktree and a submodule keep .git as a file rather than a
                 # directory, and both are somewhere you would start an agent.
-                rows.append((entry.name, entry.path,
+                rows.append((entry.path,
                              os.path.exists(os.path.join(entry.path, ".git"))))
     except OSError:
         rows = []
@@ -727,7 +738,7 @@ def _list_dir(path):
 
 
 def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
-                  cancel=None):
+                  cancel=None, out=None):
     """Directories under `roots` whose path contains `query`, breadth first.
 
     Returns (rows, stopped), where a row is (path, is_git, level) and stopped
@@ -735,16 +746,21 @@ def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
     "limit", or "" when the tree was exhausted. Callers care which: a walk
     that finished is worth caching and one that was cut short is not.
 
+    Pass `out` to be given the results as they are found rather than at the
+    end. That is what lets a request answer from a walk still in progress:
+    appending to a list is atomic, so a reader taking a copy of it always
+    sees a coherent prefix of the answer.
+
     Breadth first because a project sits a couple of levels below home, so
-    the answers worth having arrive before any bound can bite. The bounds are
-    checked per directory rather than per level, since one directory with a
-    hundred thousand entries in it is precisely the case that would otherwise
-    hang. `limit` of 0 means no early stop.
+    the answers worth having arrive before any bound can bite. Bounds are
+    checked before each directory is listed; the case that check cannot
+    cover -- one directory with a hundred thousand entries -- is bounded
+    inside _list_dir instead. `limit` of 0 means no early stop.
     """
     roots = PROJECT_ROOTS if roots is None else roots
     depth = PROJECT_DEPTH if depth is None else depth
     q = query.strip().lower()
-    rows, stopped = [], ""
+    rows, stopped = ([] if out is None else out), ""
     frontier = [(os.path.abspath(r), 0) for r in roots if os.path.isdir(r)]
     seen = set(p for p, _ in frontier)
     while frontier:
@@ -757,7 +773,7 @@ def walk_projects(query="", limit=0, roots=None, depth=None, deadline=None,
             if level >= depth:
                 stopped = "depth"
                 continue
-            for _name, child, is_git in _list_dir(path):
+            for child, is_git in _list_dir(path):
                 if child in seen:
                     continue
                 seen.add(child)
@@ -853,6 +869,10 @@ def note_project_pick(path):
             pass
 
 
+class ProjectSearchSuperseded(Exception):
+    """A newer query took this search over before it could answer."""
+
+
 class _Search(object):
     """One walk, running on a thread of its own.
 
@@ -865,18 +885,36 @@ class _Search(object):
         self.query, self.cap = query, cap
         self.cancel = threading.Event()
         self.done = threading.Event()
-        self.rows, self.stopped = [], "pending"
+        # Appended to by the walking thread and copied by whoever is waiting.
+        # Both operations are atomic, so a waiter that gives up early still
+        # gets a coherent prefix of the answer -- which is the entire reason
+        # a request can be answered before the walk has finished.
+        self.rows = []
+        self.stopped = "pending"
 
     def run(self):
+        global _search_current
         try:
-            self.rows, self.stopped = walk_projects(
-                self.query, self.cap,
+            _rows, self.stopped = walk_projects(
+                self.query, self.cap, out=self.rows,
                 deadline=time.monotonic() + PROJECT_BUDGET,
                 cancel=self.cancel)
         except Exception:
-            self.rows, self.stopped = [], "error"
+            self.stopped = "error"
         finally:
             self.done.set()
+            with _search_lock:
+                # Cached here rather than by whoever was waiting, because a
+                # walk finishing after its waiter gave up is the ordinary
+                # case on a cold cache. Throwing that result away would mean
+                # the next keystroke starts again from nothing, forever.
+                if self.stopped in ("", "depth", "limit"):
+                    if len(_search_cache) > 64:
+                        _search_cache.clear()
+                    _search_cache[(self.query, self.cap)] = (time.monotonic(),
+                                                             list(self.rows))
+                if _search_current is self:
+                    _search_current = None
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
@@ -884,8 +922,7 @@ class _Search(object):
 
 
 _search_lock = threading.Lock()
-_search_gen = 0             # every call takes a number; the newest one wins
-_search_current = None
+_search_current = None      # the one walk in flight, if any
 _search_cache = {}          # (query, cap) -> (time, rows), for a walk that finished
 
 
@@ -902,12 +939,28 @@ def project_rows(found, q, limit):
     """
     now = time.time()
     recents = _recents_load()
-    home = os.path.expanduser("~")
+    home = os.path.expanduser("~").rstrip("/")
     found = list(found)
     seen = set(path for path, _git, _level in found)
+
+    def shorten(path):
+        # A path prefix, not a string prefix: /home/alexander is not inside
+        # /home/alex. And an empty home -- HOME=/ -- shortens nothing, since
+        # "~etc" helps nobody read where they are.
+        if not home:
+            return path
+        if path == home:
+            return "~"
+        if path.startswith(home + os.sep):
+            return "~" + path[len(home):]
+        return path
+
     # Somewhere you have started an agent is a candidate even when the walk
-    # cannot reach it: outside the roots, or below the depth bound.
-    for path in recents:
+    # cannot reach it: outside the roots, or below the depth bound. Only the
+    # strongest handful are worth checking -- each costs two stats on the
+    # request thread, and the rest could never reach the top of the list.
+    strongest = sorted(recents, key=lambda p: -_recent_score(recents[p], now))
+    for path in strongest[:50]:
         if path in seen or (q and q not in path.lower()):
             continue
         if not os.path.isdir(path):
@@ -924,13 +977,11 @@ def project_rows(found, q, limit):
 
     live, rows = live_sessions(), []
     for path, is_git, _level in sorted(found, key=rank):
-        name = session_name_for(path)
-        rows.append({"dir": path,
-                     "short": "~" + path[len(home):] if path.startswith(home)
-                              else path,
-                     "session": name, "exists": name in live, "git": is_git})
         if len(rows) >= limit:
             break
+        name = session_name_for(path)
+        rows.append({"dir": path, "short": shorten(path),
+                     "session": name, "exists": name in live, "git": is_git})
     return rows
 
 
@@ -944,46 +995,49 @@ def projects(query="", limit=40):
     and answers with whatever has arrived by then -- partial and immediate
     beats complete and late when the next keystroke is 150ms away.
 
-    A new query supersedes the one before it: the older call abandons its
-    wait at once and returns nothing rather than racing the newer answer to
-    the browser, and its walk is cancelled instead of left running.
+    A different query supersedes the one before it: the older call abandons
+    its wait at once and raises ProjectSearchSuperseded rather than racing
+    the newer answer to the browser, and its walk is cancelled instead of
+    left running. Two callers asking the *same* thing share one walk, so a
+    second browser cannot starve the first.
     """
-    global _search_gen, _search_current
+    global _search_current
     q = query.strip().lower()
     # Ranking wants more candidates than it returns, because the first
     # `limit` directories a breadth-first walk meets are not the best
     # `limit`. This is still an early stop, just not a myopic one.
     cap = max(limit * 8, 200)
 
+    started = None
     with _search_lock:
-        _search_gen += 1
-        gen = _search_gen
         hit = _search_cache.get((q, cap))
         if hit and time.monotonic() - hit[0] < PROJECT_TTL:
             search, found = None, hit[1]
         else:
-            if _search_current is not None:
-                _search_current.cancel.set()
-            search = _search_current = _Search(q, cap)
+            current = _search_current
+            if current is not None and (current.query, current.cap) == (q, cap):
+                search = current           # already being walked; wait on it
+            else:
+                if current is not None:
+                    current.cancel.set()
+                search = _search_current = started = _Search(q, cap)
+
+    if started is not None:
+        started.start()
 
     if search is not None:
-        search.start()
         # Waiting in slices, so that being superseded cuts the wait short
         # rather than merely changing the answer at the end of it.
         deadline = time.monotonic() + PROJECT_WAIT
         while not search.done.wait(0.02):
             if search.cancel.is_set() or time.monotonic() >= deadline:
                 break
-        with _search_lock:
-            if gen != _search_gen:
-                return []
-            found = list(search.rows)
-            # Only a search that ran to one of its own bounds is worth
-            # keeping; a cancelled or timed-out one saw an arbitrary slice.
-            if search.done.is_set() and search.stopped in ("", "depth", "limit"):
-                if len(_search_cache) > 64:
-                    _search_cache.clear()
-                _search_cache[(q, cap)] = (time.monotonic(), found)
+        # Cancelled means superseded, whether or not the walk has noticed yet.
+        # Asking whether it had also finished would be a race: cancelling it
+        # is precisely what makes it finish, a few milliseconds later.
+        if search.cancel.is_set():
+            raise ProjectSearchSuperseded(q)
+        found = list(search.rows)
 
     return project_rows(found, q, limit)
 
@@ -1506,7 +1560,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/projects":
             q = self._query().get("q", [""])[0]
-            return self._json({"projects": projects(q)})
+            try:
+                return self._json({"projects": projects(q)})
+            except ProjectSearchSuperseded:
+                # Distinguishable from an honest empty result on purpose: the
+                # page must leave its list alone rather than repaint it with
+                # "nothing matching" for a question already moved on from.
+                return self._json({"projects": [], "superseded": True})
         if path == "/api/pane":
             pane = self._query().get("id", [""])[0]
             if not pane:

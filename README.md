@@ -170,8 +170,8 @@ it is off.
 In this tier the pane list, transcripts, prompt answering, spawning agents
 and typed input all work with no ffmpeg, no whisper.cpp and no ollama
 installed. The talk button greys out with "voice not configured".
-The project picker needs nothing installed either: it searches below your
-home directory itself, offers Git repositories first, and learns from the
+The project picker needs nothing installed: it searches below your home
+directory itself, offers Git repositories first, and learns from the
 directories you actually start agents in. Tune it, if you ever need to,
 with the `AYEAYE_PROJECT_*` settings in `~/.config/ayeaye/env`.
 

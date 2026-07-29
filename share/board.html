@@ -741,6 +741,9 @@ async function loadRunDirs(){
                               encodeURIComponent(q))).json(); }
   catch(e){ return; }
   if(seq !== rqSeq) return;
+  // Dropped by the server for a newer search: not an answer, so keep what is
+  // on screen and ask again rather than blanking the list.
+  if(d && d.superseded){ return loadRunDirs(); }
   const box = $('#rlist'); box.innerHTML = '';
   if(!d || !Array.isArray(d.projects)) return;
   d.projects.forEach(p=>{

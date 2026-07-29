@@ -102,6 +102,26 @@ test_a_store_of_the_wrong_shape_is_ignored() {
   assert_eq "0" "$(probe_value entries)"
 }
 
+test_starting_an_agent_is_what_records_the_pick() {
+  mkdir -p "$HOME/work/thing"
+  stub_command tmux --stdout "%7"
+  probe spawn "$HOME/work/thing"
+  assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
+  assert_contains "$RUN_STDOUT" "session=thing"
+  probe recents dump
+  assert_contains "$RUN_STDOUT" "pick	$HOME/work/thing	1" \
+    "the wiring that feeds the store is the whole point of the store"
+}
+
+test_a_spawn_that_tmux_refuses_records_nothing() {
+  mkdir -p "$HOME/work/thing"
+  stub_command tmux --stdout ""
+  probe spawn "$HOME/work/thing"
+  probe recents dump
+  assert_eq "0" "$(probe_value entries)" \
+    "no agent started means nothing was picked"
+}
+
 test_the_store_stays_capped_however_many_projects_you_visit() {
   local args="" i=1
   while [ "$i" -le 250 ]; do

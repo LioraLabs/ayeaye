@@ -131,6 +131,23 @@ test_a_huge_tree_returns_within_the_time_bound() {
     "a bounded walk visits a fraction of a 9330-directory tree"
 }
 
+test_one_enormous_directory_cannot_hold_the_walk_hostage() {
+  # The bound that matters is not "how many directories" but "how many
+  # entries in one of them": a single cache directory with a hundred
+  # thousand children would otherwise be listed to the end before anything
+  # could check the clock or the cancel flag.
+  probe maketree "$TREE/huge" --width 6000 --depth 1
+  assert_eq "6000" "$(probe_value made)"
+  mkdir -p "$TREE/small"
+  probe walk
+  assert_status 0 "$RUN_STATUS" "$RUN_STDERR"
+  assert_contains "$RUN_STDOUT" "$TREE/small"
+  local hits
+  hits="$(printf '%s\n' "$RUN_STDOUT" | grep -c "^hit")"
+  assert_below "$hits" 5100 \
+    "one directory may not contribute more entries than the per-listing cap"
+}
+
 test_a_cancelled_walk_stops_walking() {
   probe maketree "$TREE" --width 6 --depth 4
   probe --slow 0.01 walk --cancel-after 0.2
