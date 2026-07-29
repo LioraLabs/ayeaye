@@ -3,10 +3,14 @@
 #   . "$REPO/lib/platform.sh"
 #
 # Sourcing is inert. It defines functions, gives the tunables their defaults
-# and does nothing else: no command is run, no file is read or written, no
-# shell option is changed, nothing is sent anywhere. The first question asked
-# triggers detection, the answer is cached, and platform_reset throws the
-# cache away.
+# and sources its own two siblings, and does nothing else: no command is run,
+# no file outside lib/ is read, nothing is written, no shell option is
+# changed, nothing is sent anywhere. The first question asked triggers
+# detection, the answer is cached, and platform_reset throws the cache away.
+#
+# One `.` line gets a consumer the whole layer: the package adapter in
+# lib/pkg.sh and the service adapter in lib/service.sh are sourced from here
+# and documented in their own files.
 #
 # Every answer is a lower-case word, never a sentence, so callers can `case`
 # on it. "unknown" is a first-class answer everywhere: this layer would rather
@@ -294,6 +298,7 @@ platform_reset() {
   _PLATFORM_SERVICE_MANAGER=""
   _PLATFORM_BREW_PREFIX=""
   _PLATFORM_IMMUTABLE=0
+  _PLATFORM_PRIVILEGE=""
 }
 
 # platform_detect - work everything out, once. A no-op when the cache is
@@ -340,6 +345,7 @@ platform_detect() {
   _platform_detect_brew
   _platform_detect_pkg_manager
   _platform_detect_service_manager
+  _platform_detect_privilege
   return 0
 }
 
@@ -519,3 +525,20 @@ platform_summary() {
     "$name" "$_PLATFORM_FAMILY" "$_PLATFORM_ARCH" \
     "$_PLATFORM_PKG_MANAGER" "$_PLATFORM_SERVICE_MANAGER" "$note"
 }
+
+# ------------------------------------------------------------------- adapters
+#
+# The directory is worked out by parameter expansion alone. Running dirname
+# here would be a command executed at source time, and a `cd` would read
+# CDPATH - both of them side effects in the one place this library promises
+# to have none.
+_platform_lib_dir="${BASH_SOURCE[0]:-}"
+case "$_platform_lib_dir" in
+  */*) _platform_lib_dir="${_platform_lib_dir%/*}" ;;
+  *)   _platform_lib_dir="." ;;
+esac
+# shellcheck source=lib/pkg.sh
+. "$_platform_lib_dir/pkg.sh"
+# shellcheck source=lib/service.sh
+. "$_platform_lib_dir/service.sh"
+unset _platform_lib_dir
