@@ -13,13 +13,19 @@ _platform_load() {
   fi
 }
 
+#
+# The fixture is asserted to exist before it is used. fixture_file prints
+# nothing for a name that is not there, which would leave the candidate list
+# empty - and an empty list means "this machine has no os-release", not "read
+# the real one", so a typo here would silently pin the developer's own distro.
 _platform_from() {
   if [ "$1" = "none" ]; then
-    PLATFORM_OS_RELEASE_FILE="$TEST_TMPDIR/nowhere/os-release"
+    PLATFORM_OS_RELEASE_FILES=""
   else
-    PLATFORM_OS_RELEASE_FILE="$(fixture_file "os-release/$1")"
+    assert_fixture_exists "os-release/$1"
+    PLATFORM_OS_RELEASE_FILES="$(fixture_file "os-release/$1")"
   fi
-  export PLATFORM_OS_RELEASE_FILE
+  export PLATFORM_OS_RELEASE_FILES
   _platform_load
 }
 
@@ -245,9 +251,51 @@ test_macos_never_claims_systemd_however_much_systemctl_is_installed() {
 
 test_a_machine_with_no_service_manager_says_none() {
   _stub_uname Linux x86_64
+  assert_command_absent systemctl
+  assert_command_absent launchctl
   _platform_from void
+  assert_eq "linux" "$(platform_os)" "anchor: it did detect something"
   assert_eq "none" "$(platform_service_manager)" \
     "none is the documented manual-fallback path, not a failure"
+}
+
+# ------------------------------------------------------- image-based systems
+
+test_an_image_based_system_has_its_package_manager_and_may_not_use_it() {
+  # Silverblue arrives as plain ID=fedora with dnf right there, and installing
+  # with it does not survive a reboot. Only VARIANT_ID gives it away.
+  _stub_uname Linux x86_64
+  stub_command dnf
+  _platform_from fedora-silverblue-40
+  assert_eq "fedora" "$(platform_family)" "it is still recognisably Fedora"
+  assert_eq "none" "$(platform_pkg_manager)"
+  platform_detect
+  platform_is_immutable || fail "silverblue is image-based"
+  if platform_is_known; then
+    fail "promising to install here and then not surviving a reboot is worse than the manual path"
+  fi
+  assert_stub_not_called dnf
+}
+
+test_an_image_based_system_is_still_named_in_the_summary() {
+  _stub_uname Linux x86_64
+  stub_command pacman
+  _platform_from steamos-3.5
+  local summary
+  summary="$(platform_summary)"
+  assert_contains "$summary" "SteamOS" "the manual instructions have to be able to name it"
+  assert_contains "$summary" "packages: none"
+  assert_contains "$summary" "image-based" "and say why there is no package manager"
+}
+
+test_an_ordinary_fedora_is_not_mistaken_for_an_image_based_one() {
+  _stub_uname Linux x86_64
+  stub_command dnf
+  _platform_from fedora-40
+  platform_detect
+  if platform_is_immutable; then fail "Workstation is not image-based"; fi
+  assert_eq "dnf" "$(platform_pkg_manager)"
+  platform_is_known || fail "an ordinary Fedora is exactly what this layer acts on"
 }
 
 # ----------------------------------------------------------------- verdict

@@ -19,13 +19,19 @@ _platform_load() {
 }
 
 # _platform_from <os-release-fixture|none> - point detection at a fixture.
+#
+# The fixture is asserted to exist before it is used. fixture_file prints
+# nothing for a name that is not there, which would leave the candidate list
+# empty - and an empty list means "this machine has no os-release", not "read
+# the real one", so a typo here would silently pin the developer's own distro.
 _platform_from() {
   if [ "$1" = "none" ]; then
-    PLATFORM_OS_RELEASE_FILE="$TEST_TMPDIR/nowhere/os-release"
+    PLATFORM_OS_RELEASE_FILES=""
   else
-    PLATFORM_OS_RELEASE_FILE="$(fixture_file "os-release/$1")"
+    assert_fixture_exists "os-release/$1"
+    PLATFORM_OS_RELEASE_FILES="$(fixture_file "os-release/$1")"
   fi
-  export PLATFORM_OS_RELEASE_FILE
+  export PLATFORM_OS_RELEASE_FILES
   _platform_load
 }
 
@@ -54,6 +60,9 @@ test_sourcing_the_library_runs_no_command_at_all() {
   stub_command dnf
   stub_command pacman
   stub_command zypper
+  stub_command dirname
+  stub_command basename
+  stub_command readlink
 
   local probe="$TEST_TMPDIR/probe.sh"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
@@ -71,7 +80,11 @@ test_sourcing_the_library_runs_no_command_at_all() {
   assert_eq "$before" "$after" "sourcing must not create or remove a file"
 
   local cmd
-  for cmd in uname sw_vers systemctl launchctl brew apt-get dnf pacman zypper; do
+  # dirname and basename among them: the harness links the real ones in, so a
+  # library that shelled out to work out its own directory would go unnoticed
+  # by a list of package managers alone.
+  for cmd in uname sw_vers systemctl launchctl brew apt-get dnf pacman zypper \
+             dirname basename readlink; do
     assert_stub_not_called "$cmd" "sourcing must not probe anything; detection is on demand"
   done
 }
@@ -82,8 +95,8 @@ test_a_consumer_under_set_u_never_meets_an_unbound_variable() {
   # os-release path is set below - and only so the run cannot read the real
   # machine's; PLATFORM_BREW_PREFIXES is deliberately left unset.
   _stub_uname Linux x86_64
-  PLATFORM_OS_RELEASE_FILE="$TEST_TMPDIR/nowhere/os-release"
-  export PLATFORM_OS_RELEASE_FILE
+  PLATFORM_OS_RELEASE_FILES=""
+  export PLATFORM_OS_RELEASE_FILES
 
   local probe="$TEST_TMPDIR/probe.sh"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
@@ -147,9 +160,27 @@ test_the_debian_family_covers_its_derivatives() {
   _assert_family raspbian-12 debian
 }
 
-test_a_derivative_of_a_derivative_still_lands_in_the_right_family() {
-  # Linux Mint says ID_LIKE=ubuntu, and ubuntu is itself only debian-like, so
-  # a single-level ID_LIKE lookup would call this one unknown.
+test_a_distro_nobody_here_has_heard_of_is_placed_by_id_like() {
+  # Trisquel is deliberately absent from the id table. The only thing that can
+  # place it is ID_LIKE=ubuntu - and ubuntu is itself only debian by the same
+  # rule, so this also pins that the lookup recurses through the one table
+  # rather than mapping ID_LIKE separately.
+  _assert_family trisquel-11 debian
+  assert_eq "trisquel" "$(platform_id)" "it is still named after itself"
+}
+
+test_the_id_like_list_is_searched_past_its_first_token() {
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID=speculative' 'ID_LIKE="madeup alsomadeup debian"' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "debian" "$(platform_family)" \
+    "a distro that lists three parents must be placed by whichever one we know"
+}
+
+test_a_derivative_named_in_the_table_does_not_need_id_like() {
   _assert_family linuxmint-21 debian
 }
 
@@ -221,8 +252,8 @@ test_an_os_release_without_an_id_is_unknown_too() {
   _stub_uname Linux x86_64
   local path="$TEST_TMPDIR/os-release"
   printf '%s\n' 'PRETTY_NAME="Something Else"' 'HOME_URL="https://example.invalid/"' > "$path"
-  PLATFORM_OS_RELEASE_FILE="$path"
-  export PLATFORM_OS_RELEASE_FILE
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
   _platform_load
   assert_eq "unknown" "$(platform_id)"
   assert_eq "unknown" "$(platform_family)"
@@ -232,8 +263,8 @@ test_a_windows_line_ending_does_not_become_part_of_the_value() {
   _stub_uname Linux x86_64
   local path="$TEST_TMPDIR/os-release"
   printf 'ID=debian\r\nVERSION_ID="12"\r\n' > "$path"
-  PLATFORM_OS_RELEASE_FILE="$path"
-  export PLATFORM_OS_RELEASE_FILE
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
   _platform_load
   assert_eq "debian" "$(platform_id)"
   assert_eq "12" "$(platform_version)"
@@ -327,6 +358,15 @@ test_an_unfamiliar_architecture_is_passed_through_not_flattened() {
     "reporting an architecture we have no opinion about beats calling it unknown"
 }
 
+test_a_32_bit_userland_on_a_64_bit_kernel_is_not_called_arm64() {
+  # armv8l is 32-bit Raspberry Pi OS on an arm64 kernel. Calling it arm64
+  # hands whoever picks a binary by architecture the wrong one.
+  _stub_uname Linux armv8l
+  _platform_from raspbian-12
+  assert_eq "armv8l" "$(platform_arch)"
+  assert_ne "arm64" "$(platform_arch)"
+}
+
 # ---------------------------------------------------------------- summary
 
 test_the_summary_names_everything_the_wizard_reports() {
@@ -344,5 +384,120 @@ test_the_summary_names_everything_the_wizard_reports() {
 test_the_summary_of_an_unknown_platform_says_so_plainly() {
   _stub_uname Linux x86_64
   _platform_from void
-  assert_contains "$(platform_summary)" "unknown"
+  local summary
+  summary="$(platform_summary)"
+  assert_contains "$summary" "void" "it still names what it found"
+  assert_contains "$summary" "(unknown)" "and says the family is not one it knows"
+  assert_contains "$summary" "packages: none"
+  assert_contains "$summary" "services: none"
+}
+
+# --------------------------------------------------- os-release, harder cases
+
+test_the_candidate_paths_are_tried_in_order() {
+  # The real default is "/etc/os-release /usr/lib/os-release", and which one
+  # wins matters: a distro that ships both expects the first to shadow the
+  # second.
+  _stub_uname Linux x86_64
+  local first="$TEST_TMPDIR/etc-os-release" second="$TEST_TMPDIR/usrlib-os-release"
+  printf 'ID=debian\n' > "$first"
+  printf 'ID=fedora\n' > "$second"
+
+  PLATFORM_OS_RELEASE_FILES="$first $second"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "debian" "$(platform_id)"
+
+  rm -f "$first"
+  _platform_load
+  assert_eq "fedora" "$(platform_id)" "the fallback is used only once the first is gone"
+}
+
+test_an_empty_candidate_list_means_no_os_release_not_the_real_one() {
+  # This is the property the whole suite's isolation rests on. If an empty
+  # list fell back to /etc/os-release, every fixture-driven test here would
+  # quietly start reporting the machine it happens to run on.
+  _stub_uname Linux x86_64
+  PLATFORM_OS_RELEASE_FILES=""
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "unknown" "$(platform_id)"
+  assert_eq "unknown" "$(platform_family)"
+}
+
+test_a_value_with_trailing_blanks_is_still_the_value() {
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID="fedora"   ' 'VERSION_ID=40  ' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "fedora" "$(platform_id)" "trailing blanks must not defeat the quote stripping"
+  assert_eq "fedora" "$(platform_family)"
+  assert_eq "40" "$(platform_version)"
+}
+
+test_a_trailing_comment_is_not_part_of_an_unquoted_value() {
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID=arch # rolling' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "arch" "$(platform_id)" "the shell would read it this way too"
+  assert_eq "arch" "$(platform_family)"
+}
+
+test_an_id_in_capitals_is_matched_all_the_same() {
+  # Deepin has shipped ID=Deepin. An id is compared, not displayed.
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID=Deepin' 'PRETTY_NAME="deepin 23"' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "debian" "$(platform_family)"
+  assert_eq "deepin" "$(platform_id)"
+}
+
+test_an_os_release_that_is_not_a_file_is_quiet_about_it() {
+  # A path pointing at a directory passes a naive readability check and then
+  # fails inside the read loop, on the consumer's stderr, from a library that
+  # promised to be quiet.
+  _stub_uname Linux x86_64
+  mkdir -p "$TEST_TMPDIR/a-directory"
+  PLATFORM_OS_RELEASE_FILES="$TEST_TMPDIR/a-directory"
+  export PLATFORM_OS_RELEASE_FILES
+
+  local probe="$TEST_TMPDIR/probe.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+    ". \"\$REPO_ROOT/lib/platform.sh\"" 'platform_detect' \
+    'printf "%s\n" "$(platform_id)"' > "$probe"
+  chmod +x "$probe"
+  run_script "$probe"
+
+  assert_status 0 "$RUN_STATUS"
+  assert_eq "" "$RUN_STDERR" "no read error, no unbound variable"
+  assert_eq "unknown" "$RUN_STDOUT"
+}
+
+test_a_pretty_name_that_is_missing_falls_back_to_the_id() {
+  _stub_uname Linux x86_64
+  local path="$TEST_TMPDIR/os-release"
+  printf '%s\n' 'ID=debian' > "$path"
+  PLATFORM_OS_RELEASE_FILES="$path"
+  export PLATFORM_OS_RELEASE_FILES
+  _platform_load
+  assert_eq "debian" "$(platform_pretty)" "there has to be something to print"
+}
+
+test_sourcing_the_library_twice_keeps_an_answer_already_worked_out() {
+  _stub_uname Linux x86_64
+  _platform_from debian-12
+  platform_detect
+  assert_stub_call_count uname 2
+
+  . "$REPO_ROOT/lib/platform.sh"
+  assert_eq "debian" "$(platform_family)"
+  assert_stub_call_count uname 2 "a second source must not throw the cache away"
 }
