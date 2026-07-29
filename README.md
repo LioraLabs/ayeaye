@@ -121,7 +121,8 @@ remove them and it degrades cleanly instead of breaking.
 
 Hard requirements on the machine running your agents:
 
-- Linux with `/proc` (session mapping reads process start times)
+- Linux or macOS (session mapping reads process start times: `/proc` on
+  Linux, `ps` and `lsof` on a Mac)
 - `tmux`
 - `python3` (3.9+, standard library only: no pip install)
 
@@ -259,9 +260,10 @@ marker fails silently: the pane still works, the transcript button just
 goes quiet.
 
 **Codex** has no statusline, so it's matched by **process start time**:
-find the codex process in the pane, read its `cwd` and start time from
-`/proc`, then pick the rollout whose filename timestamp lands within a couple
-of seconds of it. That stays exact with two codex agents in one directory, and
+find the codex process in the pane, read its `cwd` and start time, then pick
+the rollout whose filename timestamp lands within a couple of seconds of it.
+That lookup is the one platform-specific corner in the server -- `/proc` on
+Linux, `ps` and `lsof` on macOS -- behind a single internal interface. That stays exact with two codex agents in one directory, and
 works however codex was launched.
 
 Codex hooks are *not* used. They do fire, but only on the first turn, by
@@ -466,7 +468,8 @@ and a bad rewrite (`final`). Other outcomes: `silence`, `empty`,
   round-trip.
 - The transcript view shows the last `VOICE_TX_ROWS` entries. There is no
   pagination; scrolling back further means reading the JSONL directly.
-- Linux only. Session mapping depends on `/proc`.
+- Session mapping is the only platform-specific part of the server, and the
+  macOS half has been exercised only against canned `ps` and `lsof` output.
 
 ## Layout
 

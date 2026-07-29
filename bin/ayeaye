@@ -236,37 +236,199 @@ def pane_session(pane_id):
     return None
 
 
-def _proc_start(pid):
-    """Wall-clock time the process began, from /proc/<pid>/stat field 22."""
-    with open("/proc/%s/stat" % pid) as fh:
-        fields = fh.read().rsplit(")", 1)[1].split()
-    with open("/proc/uptime") as fh:
-        uptime = float(fh.read().split()[0])
-    return (time.time() - uptime) + float(fields[19]) / os.sysconf("SC_CLK_TCK")
+# ---------------------------------------------------------- process lookup
+# Everything below the pane is platform-specific: Linux answers out of /proc,
+# macOS has no /proc at all and answers out of ps and lsof. Only four
+# questions are ever asked -- who are this process's children, what is each
+# one called, when did it start, and where is it running -- so that is the
+# whole interface, and the walk that uses them is shared.
+#
+# None means "could not find out", never an exception: this runs inside a
+# request handler, and a pane whose agent cannot be identified is an ordinary
+# state of the world, not an error.
+
+def _run_tool(argv, timeout=5):
+    """Standard output of an inspection tool, or None if it could not run.
+
+    A non-zero exit is not a failure here. pgrep exits 1 when nothing matched
+    and lsof exits 1 when it had a complaint about a file it could still
+    report on; in both cases the output is the answer.
+
+    errors="replace" is load-bearing. `ps` prints the path of every process on
+    the machine, no filesystem this runs on enforces valid UTF-8 in a name,
+    and a strict decode would turn one unrelated process into an empty tree
+    for every pane at once.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace", timeout=timeout,
+                              env=dict(os.environ, LC_ALL="C")).stdout
+    except Exception:
+        return None
 
 
-def _descendant(pid, name, depth=3):
-    """Find a named descendant. tmux's pane_pid is the shell; the agent is a
-    child of it (and sometimes a grandchild via a wrapper)."""
-    frontier = [str(pid)]
-    for _ in range(depth):
-        nxt = []
-        for p in frontier:
-            out = subprocess.run(["pgrep", "-P", p], capture_output=True,
-                                 text=True).stdout.split()
-            for c in out:
-                try:
-                    with open("/proc/%s/comm" % c) as fh:
-                        if fh.read().strip() == name:
-                            return c
-                except OSError:
-                    continue
-                nxt.append(c)
-        frontier = nxt
-    return None
+class _ProcessInfo(object):
+    """The shared half: finding a named process below a pane's shell."""
+
+    def _snapshot(self):
+        """Whatever a backend wants to gather once per walk, or None."""
+        return None
+
+    def descendant(self, pid, name, depth=3):
+        """Find a named descendant. tmux's pane_pid is the shell; the agent is
+        a child of it (and sometimes a grandchild via a wrapper)."""
+        snap = self._snapshot()
+        frontier = [str(pid)]
+        for _ in range(depth):
+            nxt = []
+            for p in frontier:
+                for c in self.children(p, snap):
+                    comm = self.comm(c, snap)
+                    if comm is None:        # gone, or not ours to look at
+                        continue
+                    if comm == name:
+                        return c
+                    nxt.append(c)
+            frontier = nxt
+        return None
 
 
-def codex_session_for(pane_pid):
+class _LinuxProcessInfo(_ProcessInfo):
+    """/proc. `proc`, `run` and `clk_tck` are injectable for tests only."""
+
+    def __init__(self, proc="/proc", run=None, clk_tck=None):
+        self.proc = proc
+        self.run = run or _run_tool
+        self.clk_tck = clk_tck or os.sysconf("SC_CLK_TCK")
+
+    def children(self, pid, snap=None):
+        return (self.run(["pgrep", "-P", str(pid)]) or "").split()
+
+    def comm(self, pid, snap=None):
+        # errors="replace": comm is whatever bytes the exec'd path ended in,
+        # and an undecodable one is a process with an odd name, not a reason
+        # to fail a request.
+        try:
+            with open("%s/%s/comm" % (self.proc, pid), errors="replace") as fh:
+                return fh.read().strip()
+        except (OSError, ValueError):
+            return None
+
+    def start_time(self, pid):
+        """Wall-clock time the process began, from /proc/<pid>/stat field 22.
+
+        The comm sits in parentheses and may contain one itself, so the split
+        is from the right; what is left starts at field 3, putting starttime
+        at index 19. It counts clock ticks since boot, and boot is now minus
+        uptime.
+        """
+        try:
+            with open("%s/%s/stat" % (self.proc, pid)) as fh:
+                fields = fh.read().rsplit(")", 1)[1].split()
+            with open("%s/uptime" % self.proc) as fh:
+                uptime = float(fh.read().split()[0])
+            return (time.time() - uptime) + float(fields[19]) / self.clk_tck
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def cwd(self, pid):
+        try:
+            return os.readlink("%s/%s/cwd" % (self.proc, pid))
+        except OSError:
+            return None
+
+
+# Three things about BSD ps that a Linux reflex gets wrong, all of which fail
+# silently -- an empty process tree looks exactly like a pane with no agent
+# under it:
+#
+#   -o pid=,ppid=,comm=   an `=` makes the REST of the argument the column
+#                         header, so this asks for one column named
+#                         ",ppid=,comm=". One keyword per -o is the form that
+#                         means the same thing to both ps implementations.
+#   -ww                   the last column is clipped to the output width,
+#                         which ps takes from $COLUMNS or from whichever of
+#                         its three streams is still a terminal. Under
+#                         capture_output that is stdin, so the answer depends
+#                         on how the server was started -- a clipped
+#                         interpreter path is exactly the part being matched,
+#                         and -ww is the only way to stop asking.
+#   comm                  the full executable path, where Linux gives a bare
+#                         name truncated to 15 characters; it may contain
+#                         spaces, and an agent name longer than 15 characters
+#                         would match here and not there.
+PS_SNAPSHOT = ["ps", "-axww", "-o", "pid=", "-o", "ppid=", "-o", "comm="]
+
+
+class _DarwinProcessInfo(_ProcessInfo):
+    """ps and lsof. `run` is injectable for tests only.
+
+    One `ps` snapshot serves a whole walk: three levels of ancestry would
+    otherwise cost a process per node, on the platform where spawning them is
+    slowest. It is taken per walk and carried on the stack, never on the
+    instance -- one of these is shared by every thread of a threading server,
+    and a half-replaced tree resolves a pane to the wrong agent or to none.
+    """
+
+    def __init__(self, run=None):
+        self.run = run or _run_tool
+
+    def _snapshot(self):
+        kids, comm = {}, {}
+        for line in (self.run(PS_SNAPSHOT) or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            pid, ppid = parts[0], parts[1]
+            comm[pid] = os.path.basename(parts[2].strip()) if len(parts) > 2 else ""
+            kids.setdefault(ppid, []).append(pid)
+        return kids, comm
+
+    def children(self, pid, snap=None):
+        kids, _ = snap or self._snapshot()
+        return list(kids.get(str(pid), ()))
+
+    def comm(self, pid, snap=None):
+        # "" for a row ps gave no name, which still has children worth
+        # walking. The Linux side returns None there and prunes the subtree,
+        # because that is what it did before this was an interface.
+        _, comm = snap or self._snapshot()
+        return comm.get(str(pid))
+
+    def start_time(self, pid):
+        """`ps -o lstart=` gives "Wed Mar  4 09:00:02 2026" -- local time
+        truncated to the second, so it can only ever be earlier than the true
+        start, which moves a rollout away from the window's lower edge rather
+        than off it. The strptime format is fixed: lstart is ctime(3) output,
+        which is C-locale regardless."""
+        out = self.run(["ps", "-ww", "-p", str(pid), "-o", "lstart="]) or ""
+        try:
+            return time.mktime(time.strptime(out.strip(),
+                                             "%a %b %d %H:%M:%S %Y"))
+        except (ValueError, OverflowError):
+            return None
+
+    def cwd(self, pid):
+        """`lsof -Fn` puts each field on its own line behind a one-letter tag,
+        which is the only form that survives a path with a space in it."""
+        out = self.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"]) or ""
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+        return None
+
+
+def _make_process_info(plat=None):
+    """Pick a backend. By platform at runtime, never by import-time failure:
+    the module has to load on a machine with no /proc and on one with no ps."""
+    plat = sys.platform if plat is None else plat
+    return _DarwinProcessInfo() if plat == "darwin" else _LinuxProcessInfo()
+
+
+PROCESS_INFO = _make_process_info()
+
+
+def codex_session_for(pane_pid, proc=None):
     """Match a codex process to its rollout by start time and cwd.
 
     Codex hooks would be the clean route, but SessionStart never fires in an
@@ -278,13 +440,15 @@ def codex_session_for(pane_pid):
     cwd and two codex agents in one directory stay distinct -- and it works
     however codex was launched, not just from this app.
     """
-    pid = _descendant(pane_pid, "codex")
+    proc = proc or PROCESS_INFO
+    pid = proc.descendant(pane_pid, "codex")
     if not pid:
         return None
-    try:
-        started = _proc_start(pid)
-        cwd = os.readlink("/proc/%s/cwd" % pid)
-    except OSError:
+    started = proc.start_time(pid)
+    if started is None:
+        return None                                # gone before we looked
+    cwd = proc.cwd(pid)                            # a second probe on macOS,
+    if cwd is None:                                # so only ask if it can help
         return None
 
     best = None
@@ -293,7 +457,7 @@ def codex_session_for(pane_pid):
         stamp = os.path.basename(r)[8:27]          # rollout-YYYY-MM-DDTHH-MM-SS
         try:
             t = time.mktime(time.strptime(stamp, "%Y-%m-%dT%H-%M-%S"))
-        except ValueError:
+        except (ValueError, OverflowError):        # a filename, so: anything
             continue
         delta = t - started
         # A rollout belongs to this process only if it appeared just after it
