@@ -153,17 +153,19 @@ test_answers_full_of_separators_reach_the_file_unmangled() {
     "the ntfy URL must also read back out of the file it was just written to"
 }
 
-test_an_answer_shaped_like_a_placeholder_is_substituted_a_second_time() {
-  # Documented, not endorsed: install.sh:125-127 replaces the four placeholders
-  # in sequence over the whole text, so a value substituted early is still
-  # eligible for the substitutions that follow. Answering "@PORT@" to the bind
-  # question puts the port in AYEAYE_BIND.
+test_an_answer_shaped_like_a_placeholder_is_written_literally() {
+  # This used to replace the four placeholders in sequence over the whole text,
+  # so a value substituted early was still eligible for the substitutions that
+  # followed it: answering "@PORT@" to the address question put the port number
+  # in AYEAYE_BIND. Templating is now one pass, and an answer is a value rather
+  # than another instruction.
   _hard_deps_present
   stdin_lines "@PORT@" "9911" "" ""
   run_install --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=9911" \
-    "today the injected placeholder is expanded rather than written literally"
+  assert_file_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=@PORT@"
+  assert_file_not_contains "$XDG_CONFIG_HOME/ayeaye/env" "AYEAYE_BIND=9911" \
+    "an answer must never be substituted a second time"
 }
 
 # ----------------------------------------------------------- re-running
@@ -390,19 +392,22 @@ test_a_key_absent_from_a_kept_config_falls_back_to_its_default() {
 
 # ------------------------------------------------------- failure paths
 
-test_a_missing_template_aborts_and_leaves_the_temporary_file_behind() {
-  # Documented, not endorsed: the render target is created inside the config
-  # directory and is only ever removed by the mv that follows it. Under set -e
-  # a failed render aborts in between, so env.tmp survives - and because the
-  # guard on the next run tests -s on the env file, nothing ever notices it or
-  # cleans it up.
+test_a_missing_template_aborts_and_leaves_nothing_behind() {
+  # The render target used to be created inside the config directory and
+  # removed only by the rename that followed it, so a render that aborted in
+  # between left an env.tmp that nothing ever looked at again - the guard on
+  # the next run tests the env file, not the leftovers. The render now writes
+  # to a temporary file it removes on any failure.
   _hard_deps_present
   mkdir -p "$TEST_TMPDIR/repo-without-template"
+  cp -R "$REPO_ROOT/lib" "$TEST_TMPDIR/repo-without-template/lib"
   cp "$REPO_ROOT/install.sh" "$TEST_TMPDIR/repo-without-template/install.sh"
 
   run_script "$TEST_TMPDIR/repo-without-template/install.sh" --defaults --no-systemd
   assert_ne 0 "$RUN_STATUS" "a template it cannot read must not be reported as success"
   assert_file_missing "$XDG_CONFIG_HOME/ayeaye/env" "no config was written"
-  assert_file_exists "$XDG_CONFIG_HOME/ayeaye/env.tmp" \
-    "today the half-written render target is left in the config directory"
+  assert_eq "" "$(find "$XDG_CONFIG_HOME" -name 'env.tmp*' 2>/dev/null)" \
+    "and no half-written file survives to confuse the next run"
+  assert_contains "$RUN_STDOUT" "settings template is missing" \
+    "it says what is wrong rather than leaving a python traceback"
 }

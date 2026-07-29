@@ -47,17 +47,18 @@ test_the_https_hint_names_the_command_that_provides_it() {
   assert_contains "$RUN_STDOUT" "tailscale serve --bg http://127.0.0.1:8911"
 }
 
-test_the_https_hint_ignores_the_bind_address_that_was_chosen() {
-  # Documented, not endorsed: the serve hint hardcodes 127.0.0.1 while the
-  # bookmark above it uses the address the user actually chose, so the two
-  # lines contradict each other for any bind but the default. It does pick up
-  # the chosen port.
+test_the_https_hint_names_the_address_that_was_chosen() {
+  # The serve hint used to hardcode 127.0.0.1 while the bookmark above it used
+  # the address the user actually chose, so for any bind but the default the
+  # two lines contradicted each other and one of them was wrong. They agree
+  # now.
   _hard_deps_present
   stdin_lines "10.1.2.3" "9000" "" ""
   run_install --no-systemd
   assert_contains "$RUN_STDOUT" "bookmark: http://10.1.2.3:9000/?token="
-  assert_contains "$RUN_STDOUT" "tailscale serve --bg http://127.0.0.1:9000" \
-    "today the hint says 127.0.0.1 whatever the user bound to"
+  assert_contains "$RUN_STDOUT" "tailscale serve --bg http://10.1.2.3:9000"
+  assert_not_contains "$RUN_STDOUT" "tailscale serve --bg http://127.0.0.1:9000" \
+    "the two lines must not disagree about where ayeaye is listening"
 }
 
 test_no_allowed_host_means_no_https_front_is_offered() {

@@ -68,6 +68,9 @@
 #   wizard_reset_progress  forget which stages and steps finished, keep the
 #                          answers. This is what a rerun does, and what --fresh
 #                          does more of.
+#   wizard_remember <key> <value>
+#                          persist something without any risk of ending the run.
+#                          What a step records its own state through.
 #
 # A resumed run skips steps recorded done, says so, and re-runs everything
 # else. That is the whole of resumability: nothing is redone, and nothing that
@@ -98,11 +101,14 @@ _WIZARD_STAGE_TAB='	'
 _WIZARD_RECOVER="${_WIZARD_RECOVER:-}"
 _WIZARD_STORE_WARNED=0
 
-# _wizard_remember <key> <value> - persist, and never let the store take the
-# run down with it. A store that cannot be written costs resumability, which is
-# worth one warning and nothing more; every call site here is bare under
-# `set -e`, so wizard_state_set's status 1 must stop here.
-_wizard_remember() {
+# wizard_remember <key> <value> - persist, and never let the store take the run
+# down with it. Always 0.
+#
+# This is what a step should record its own state through, rather than
+# wizard_state_set: a store that cannot be written costs resumability, which is
+# worth one warning and nothing more, and every call site is bare under
+# `set -e` where wizard_state_set's status 1 would be fatal.
+wizard_remember() {
   wizard_state_set "$1" "$2" && return 0
   if [ "$_WIZARD_STORE_WARNED" = 0 ]; then
     _WIZARD_STORE_WARNED=1
@@ -258,8 +264,8 @@ wizard_begin_run() {
   wizard_state_load
   WIZARD_RESUMING=0
   if wizard_state_is_new; then
-    _wizard_remember run.version 1
-    _wizard_remember run.count 1
+    wizard_remember run.version 1
+    wizard_remember run.count 1
   elif [ "$(wizard_state_get run.completed)" = 1 ]; then
     wizard_reset_progress
     count="$(wizard_state_get run.count 0)"
@@ -268,12 +274,12 @@ wizard_begin_run() {
     case "$count" in
       ""|*[!0-9]*) count=0 ;;
     esac
-    _wizard_remember run.count "$((count + 1))"
+    wizard_remember run.count "$((count + 1))"
   else
     WIZARD_RESUMING=1
   fi
-  _wizard_remember run.completed 0
-  _wizard_remember run.started "$(date +%s 2>/dev/null || printf 0)"
+  wizard_remember run.completed 0
+  wizard_remember run.started "$(date +%s 2>/dev/null || printf 0)"
   return 0
 }
 
@@ -286,9 +292,9 @@ wizard_begin_run() {
 # open, which is what makes the next invocation pick up where this one stopped.
 wizard_end_run() {
   if [ "${1:-1}" = 0 ]; then
-    _wizard_remember run.completed 1
+    wizard_remember run.completed 1
   else
-    _wizard_remember run.completed 0
+    wizard_remember run.completed 0
   fi
   return 0
 }
@@ -381,12 +387,12 @@ _wizard_run_step() {
       # Nothing to remember about work that runs every time - except a failure,
       # which the closing summary has to be able to report.
       if [ "$word" = failed ]; then
-        _wizard_remember "step.$stage.$step" failed
+        wizard_remember "step.$stage.$step" failed
       else
         wizard_state_unset "step.$stage.$step" || true
       fi
     else
-      _wizard_remember "step.$stage.$step" "$word"
+      wizard_remember "step.$stage.$step" "$word"
     fi
     if [ "$word" != failed ]; then
       _WIZARD_STEP_OUTCOME="$word"
@@ -408,7 +414,7 @@ _wizard_run_step() {
     case "$choice" in
       again) continue ;;
       skip)
-        _wizard_remember "step.$stage.$step" skipped
+        wizard_remember "step.$stage.$step" skipped
         _WIZARD_STEP_OUTCOME="skipped"
         wizard_say "leaving that out. Setup can add it later."
         return 0
@@ -470,7 +476,7 @@ EOF
 
     WIZARD_STAGE_ID=""
     WIZARD_STEP_ID=""
-    _wizard_remember "stage.$stage" "$stage_word"
+    wizard_remember "stage.$stage" "$stage_word"
     [ "$stopped" = 1 ] && break
   done 3<<EOF
 $_WIZARD_STAGE_IDS

@@ -71,9 +71,9 @@
 #         categories: package download privileged network trust config service
 #   wizard_plan_show              the summary, including estimated disk use
 #   wizard_plan_is_consequential  status 0 when the plan contains something
-#         worth stopping for. Writing your own config file and your own user
-#         service is not; installing, downloading, privilege and the network
-#         are.
+#         worth stopping for: installing, downloading, privilege or trust.
+#         Writing your own config file, your own user service, and the address
+#         the user just chose to listen on are not.
 #   wizard_plan_reset
 #
 # ----------------------------------------------------------------- tunables
@@ -455,13 +455,21 @@ wizard_plan_add() {
 }
 
 # wizard_plan_is_consequential - status 0 when something in the plan deserves
-# to be stopped for.
+# to be stopped for before it happens.
+#
+# Installing, downloading, privilege and trust do. Writing your own settings
+# file and your own background service do not. Neither does the network line,
+# which is shown for the same reason everything else is - so the summary is
+# complete - but which was decided by an answer the person typed a moment
+# earlier and is already in the consent ledger; asking about it again would be
+# asking the same question twice. A *firewall* change is a different thing and
+# is asked about at the point of action, by wizard_firewall.
 wizard_plan_is_consequential() {
   local line=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       package"$_WIZARD_TAB"*|download"$_WIZARD_TAB"*|privileged"$_WIZARD_TAB"*\
-        |network"$_WIZARD_TAB"*|trust"$_WIZARD_TAB"*) return 0 ;;
+        |trust"$_WIZARD_TAB"*) return 0 ;;
     esac
   done <<EOF
 $_WIZARD_PLAN

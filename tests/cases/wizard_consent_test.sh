@@ -332,8 +332,10 @@ test_only_consequential_work_needs_confirming() {
   # are.
   wizard_plan_add config "your settings file"
   wizard_plan_add service "a service that starts ayeaye when you log in"
+  wizard_plan_add network "reachable from this computer only"
   wizard_plan_is_consequential
-  assert_status 1 "$?"
+  assert_status 1 "$?" \
+    "the address to listen on was typed one question ago; asking again is asking twice"
   wizard_plan_add package "ffmpeg"
   wizard_plan_is_consequential
   assert_status 0 "$?"
