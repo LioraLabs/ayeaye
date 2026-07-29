@@ -71,6 +71,8 @@ fi
 # rc edit, a symlink into ~/.local/bin - belongs on this list.
 GUARDED_PATHS="${XDG_CONFIG_HOME:-$HOME/.config}/ayeaye/env
 ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ayeaye.service
+${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-agent.service
+${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/whisper-server.service
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/token
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/projects.json
 ${XDG_STATE_HOME:-$HOME/.local/state}/ayeaye/setup-state
@@ -86,6 +88,9 @@ ${XDG_BIN_HOME:-$HOME/.local/bin}/claude
 ${XDG_BIN_HOME:-$HOME/.local/bin}/codex
 ${XDG_BIN_HOME:-$HOME/.local/bin}/cliban
 $HOME/Library/LaunchAgents/dev.ayeaye.plist
+$HOME/Library/LaunchAgents/dev.voice-agent.plist
+$HOME/Library/LaunchAgents/dev.whisper-server.plist
+$HOME/Library/Logs/ayeaye
 $HOME/.bashrc
 $HOME/.zshrc
 $HOME/.profile"

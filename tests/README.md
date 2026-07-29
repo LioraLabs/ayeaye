@@ -82,6 +82,19 @@ tumbleweed image ships neither `find` nor `python3`, so `--suite` skips it and
 reports why; both probes still run there, and the install probe is in fact how
 python3 gets there.
 
+`tests/lib/platform_probe.sh` is what it runs inside each image, and it is also
+the quickest way to see what the platform layer makes of your own machine.
+`tests/lib/service_probe.sh` is the second one, and it answers a different
+question: what a real distro's own `systemd-analyze verify` makes of the unit
+files this project generates. No golden file can tell you that.
+
+A container cannot tell you everything, and the runner says which parts out
+loud rather than passing them quietly. There is no user session bus in any of
+these images, so nothing there proves a unit can be enabled or started; that
+is printed as a named `skip` for every image, and the summary counts skips
+separately. launchd is not covered at all — there is no Mac — so the agents
+are pinned by golden file and by `plistlib` and nothing else.
+
 ## Adding a test
 
 Create `tests/cases/<area>_test.sh`. Every function named `test_*` in it is a

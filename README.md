@@ -244,9 +244,13 @@ endpoint at runtime (cached 30 s, `VOICE_PROBE_TTL`), reports it as a
 `voice` boolean in `/api/overview`, and the talk button comes alive when
 the probe answers. `/api/dictate` answers 503 while it does not.
 
-A user unit example for whisper.cpp ships at
-`systemd/user/whisper-server.service.example`; copy it to
-`~/.config/systemd/user/` and point it at your binary and model.
+There is nothing to copy or edit by hand: once `whisper-server` is on your
+`PATH` and `VOICE_WHISPER_MODEL` in `~/.config/ayeaye/env` says where the
+model is, `./install.sh` writes the service itself - a systemd user unit on
+Linux, a launchd agent on a Mac - and asks whether to keep the model loaded.
+It reads the model, the address and the thread count out of that settings
+file every time it starts, so changing the port means editing one file and
+restarting, and never editing a unit.
 
 For the `M-v` binding that dictates into the pane you are sitting in, and
 for recording from another device you SSH in from, see
@@ -258,7 +262,7 @@ for recording from another device you SSH in from, see
 Model size is nearly free on a modern GPU: on an RTX 5090, `large-v3` encodes
 in ~68 ms, the same as `small.en`. What costs time is *loading* it: 1.5 s for
 `large-v3` on every invocation. So run it as a server and keep it resident.
-`whisper-server.service` does that.
+The service `./install.sh` writes does that.
 
 ```sh
 # build with CUDA (adjust the arch for your card; 120 = Blackwell)
@@ -540,6 +544,7 @@ lib/consent.sh            permission, and the only wrappers allowed to act
 lib/envfile.sh            the settings file: render once, merge ever after
 lib/stage.sh              the eight-stage lifecycle and its steps
 lib/steps/                work registered onto a stage; see its README
+lib/steps/70-service.sh   what a service is, in both platforms' formats
 env.template              every setting, documented; install.sh fills it in
 bin/voice-dictate         pipeline: record → whisper → polish → send-keys
 bin/voice-agent           recorder daemon for remote tmux clients
@@ -547,8 +552,6 @@ bin/ayeaye          web app + API
 bin/voice-dictate-setup   prints per-device setup for voice-agent
 share/app.html            the entire front end, one file, no build step
 share/board.html          cliban issue board at /board, same deal
-systemd/user/             unit templates install.sh fills in, plus the
-                          whisper-server example
 examples/                 statusline marker, reverse-proxy snippet
 ```
 
