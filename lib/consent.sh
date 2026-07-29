@@ -69,6 +69,8 @@
 #
 #   wizard_plan_add <category> <text> [bytes]
 #         categories: package download privileged network trust config service
+#         Recorded in the state file, so a run that is resumed still knows what
+#         it was going to do even though the stage that decided it was skipped.
 #   wizard_plan_show              the summary, including estimated disk use
 #   wizard_plan_is_consequential  status 0 when the plan contains something
 #         worth stopping for: installing, downloading, privilege or trust.
@@ -78,10 +80,12 @@
 #
 # ----------------------------------------------------------------- tunables
 #
-#   WIZARD_AUTO_CONSENT     space-separated kinds granted without asking when
-#                           the run may not ask. firewall, trust and expose are
-#                           ignored here whatever it says: they are never
-#                           granted on someone's behalf.
+#   WIZARD_AUTO_CONSENT     space-separated kinds granted without asking, which
+#                           is what --yes sets. It applies whether or not the
+#                           run could have asked: passing the flag is the
+#                           answer. firewall, trust and expose are ignored here
+#                           whatever it says - they are never granted on
+#                           somebody's behalf.
 #   WIZARD_CONSENT_LEDGER   where the audit trail goes. Empty means
 #                           $WIZARD_STATE_DIR/setup-consent.log, resolved when
 #                           it is used rather than when this file is sourced.
@@ -128,8 +132,7 @@ WIZARD_REFUSED=3
 # to want; a blanket yes to opening a firewall is not.
 _WIZARD_NEVER_AUTO="firewall trust expose"
 
-_WIZARD_PLAN="${_WIZARD_PLAN:-}"
-_WIZARD_PLAN_BYTES="${_WIZARD_PLAN_BYTES:-0}"
+_WIZARD_PLAN_SEQ="${_WIZARD_PLAN_SEQ:-0}"
 
 _WIZARD_TAB='	'
 
@@ -146,19 +149,25 @@ _wizard_consent_known_kind() {
 wizard_consent_policy() {
   local kind="${1:-}" auto
   _wizard_consent_known_kind "$kind" || return 2
+  # WIZARD_AUTO_CONSENT is consulted first, and deliberately: it is set by a
+  # person passing --yes, which is itself an answer to these questions. A flag
+  # that only worked when nobody was watching would be a flag that did nothing
+  # in the case its own help text describes.
+  case " $_WIZARD_NEVER_AUTO " in
+    *" $kind "*) ;;
+    *)
+      for auto in ${WIZARD_AUTO_CONSENT:-}; do
+        if [ "$auto" = "$kind" ]; then
+          printf 'grant'
+          return 0
+        fi
+      done
+      ;;
+  esac
   if [ "${WIZARD_INTERACTIVE:-1}" != 0 ]; then
     printf 'ask'
     return 0
   fi
-  case " $_WIZARD_NEVER_AUTO " in
-    *" $kind "*) printf 'refuse'; return 0 ;;
-  esac
-  for auto in ${WIZARD_AUTO_CONSENT:-}; do
-    if [ "$auto" = "$kind" ]; then
-      printf 'grant'
-      return 0
-    fi
-  done
   printf 'refuse'
   return 0
 }
@@ -432,14 +441,27 @@ wizard_install_packages() {
 # --------------------------------------------------------------- the plan
 
 wizard_plan_reset() {
-  _WIZARD_PLAN=""
-  _WIZARD_PLAN_BYTES=0
+  _WIZARD_PLAN_SEQ=0
+  wizard_state_unset_prefix "plan."
   return 0
+}
+
+# _wizard_plan - the whole plan, as "category<TAB>text" lines.
+#
+# Read back out of the state file rather than kept in a variable, because the
+# stage that decides what to install is a stage a resumed run skips - and a
+# plan that empties itself on the second run would let stage five say "nothing
+# needs to be installed" and then install something.
+_wizard_plan() {
+  local key
+  for key in $(wizard_state_keys "plan.item." | LC_ALL=C sort); do
+    printf '%s\n' "$(wizard_state_get "$key")"
+  done
 }
 
 # wizard_plan_add <category> <text> [bytes]
 wizard_plan_add() {
-  local category="${1:-}" text="${2:-}" bytes="${3:-0}"
+  local category="${1:-}" text="${2:-}" bytes="${3:-0}" total seq
   [ -n "$category" ] && [ -n "$text" ] || return 2
   case "$category" in
     package|download|privileged|network|trust|config|service) ;;
@@ -448,9 +470,20 @@ wizard_plan_add() {
   case "$bytes" in
     ""|*[!0-9]*) bytes=0 ;;
   esac
-  _WIZARD_PLAN="$_WIZARD_PLAN$category$_WIZARD_TAB$text
-"
-  _WIZARD_PLAN_BYTES=$((_WIZARD_PLAN_BYTES + bytes))
+  # Zero-padded, so the keys sort in the order they were added.
+  _WIZARD_PLAN_SEQ=$((_WIZARD_PLAN_SEQ + 1))
+  seq="$_WIZARD_PLAN_SEQ"
+  while [ "${#seq}" -lt 3 ]; do
+    seq="0$seq"
+  done
+  wizard_state_set "plan.item.$seq" "$category$_WIZARD_TAB$text" || true
+  if [ "$bytes" != 0 ]; then
+    total="$(wizard_state_get plan.bytes 0)"
+    case "$total" in
+      ""|*[!0-9]*) total=0 ;;
+    esac
+    wizard_state_set plan.bytes "$((total + bytes))" || true
+  fi
   return 0
 }
 
@@ -472,7 +505,7 @@ wizard_plan_is_consequential() {
         |trust"$_WIZARD_TAB"*) return 0 ;;
     esac
   done <<EOF
-$_WIZARD_PLAN
+$(_wizard_plan)
 EOF
   return 1
 }
@@ -493,8 +526,9 @@ _wizard_plan_heading() {
 
 # wizard_plan_show - the whole plan, grouped, in the order a person reads it.
 wizard_plan_show() {
-  local category line="" any=0 shown mb
-  if [ -z "$_WIZARD_PLAN" ]; then
+  local category line="" any=0 shown mb plan bytes
+  plan="$(_wizard_plan)"
+  if [ -z "$plan" ]; then
     wizard_say "nothing needs to be installed or changed."
     return 0
   fi
@@ -512,15 +546,19 @@ wizard_plan_show() {
       fi
       wizard_say "  - ${line#*"$_WIZARD_TAB"}"
     done <<EOF
-$_WIZARD_PLAN
+$plan
 EOF
   done
   [ "$any" = 1 ] || wizard_say "nothing needs to be installed or changed."
-  if [ "$_WIZARD_PLAN_BYTES" -gt 0 ]; then
-    if [ "$_WIZARD_PLAN_BYTES" -lt 1000000 ]; then
+  bytes="$(wizard_state_get plan.bytes 0)"
+  case "$bytes" in
+    ""|*[!0-9]*) bytes=0 ;;
+  esac
+  if [ "$bytes" -gt 0 ]; then
+    if [ "$bytes" -lt 1000000 ]; then
       wizard_say "less than 1 MB of downloads and disk space."
     else
-      mb=$(( (_WIZARD_PLAN_BYTES + 999999) / 1000000 ))
+      mb=$(( (bytes + 999999) / 1000000 ))
       wizard_say "about $mb MB of downloads and disk space."
     fi
   fi

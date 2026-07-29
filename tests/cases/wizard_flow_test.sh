@@ -243,10 +243,43 @@ ENV
 }
 
 test_the_settings_file_is_not_readable_by_anybody_else() {
-  # It is documented as a place to put AYEAYE_TOKEN.
+  # It is documented as a place to put AYEAYE_TOKEN. The umask is loosened
+  # first, because inheriting a strict one from whoever ran the suite would
+  # make this pass without the installer doing anything at all.
   _hard_deps_present
+  umask 000
   run_install --defaults --no-systemd
   assert_file_mode 600 "$XDG_CONFIG_HOME/ayeaye/env"
+  assert_file_mode 600 "$XDG_STATE_HOME/ayeaye/token"
+}
+
+test_a_blanket_yes_installs_but_still_will_not_touch_the_network() {
+  # --yes is the automation path, and it has to actually do something: it
+  # applies whether or not the run could have asked. What it may never do is
+  # answer the firewall, certificate or network questions.
+  require_host_command python3
+  stub_real python3
+  stub_command apt-get
+  stub_command sudo
+  stub_command dpkg-query --exit 1
+  stub_command_from_fixture uname uname/linux-x86_64
+  PLATFORM_OS_RELEASE_FILES="$(fixture_file os-release/debian-12)"
+  export PLATFORM_OS_RELEASE_FILES
+  stdin_lines "0.0.0.0" "8911" "" ""
+  run_install --yes --no-systemd
+  # sudo is the stub that records: the generated command is
+  # "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux", and a
+  # stubbed sudo records its arguments rather than running them.
+  assert_stub_called_with sudo "apt-get install -y tmux" \
+    "--yes is what lets an unattended machine install what it is missing"
+  assert_stub_called_with sudo "apt-get update" \
+    "and the package list is refreshed under the same single question"
+  local ledger
+  ledger="$(cat "$(_ledger)")"
+  assert_contains "$ledger" "privileged	granted"
+  assert_not_contains "$ledger" "firewall	granted" \
+    "no combination of flags may open a firewall"
+  assert_not_contains "$ledger" "trust	granted"
 }
 
 # -------------------------------------------------------- the state file

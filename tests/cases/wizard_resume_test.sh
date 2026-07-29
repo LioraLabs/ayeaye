@@ -101,8 +101,11 @@ test_an_interrupted_run_does_not_ask_the_questions_again() {
   _systemd_that_works
   run_install
   assert_status 0 "$RUN_STATUS"
-  assert_not_contains "$RUN_OUTPUT" "bind address" \
-    "the questions were answered already"
+  # Not "the prompt is absent from the output": a prompt is only ever written
+  # to a terminal, so that assertion could not fail under a pipe. What proves
+  # it is that the stage was kept rather than walked.
+  assert_contains "$RUN_STDOUT" "Your choices (already done)" \
+    "the questions were answered already, and it says so"
   assert_file_contains "$(_env)" "AYEAYE_PORT=9911"
   assert_contains "$RUN_STDOUT" "bookmark: http://10.1.2.3:9911/?token=" \
     "and the answers still drive the summary"
@@ -188,15 +191,89 @@ test_a_rerun_that_changes_one_answer_keeps_the_rest_of_the_file() {
 }
 
 test_a_rerun_offers_back_what_was_chosen_last_time() {
+  # Pressing return through a rerun means "leave it as it is". It used to mean
+  # "put everything back to the factory defaults", which is the opposite, and
+  # which nobody would have chosen on purpose.
   _hard_deps_present
-  stdin_lines "10.1.2.3" "9911" "one.example" ""
+  _answer_config_prompts "10.1.2.3" "9911" "one.example" "https://ntfy.example/t"
+  pty_install --no-systemd
+  assert_status 0 "$PTY_STATUS"
+
+  pty_expect "rewrite it?" "y"
+  _answer_config_prompts "" "" "" ""
+  pty_install --no-systemd
+  assert_status 0 "$PTY_STATUS"
+  assert_contains "$PTY_TRANSCRIPT" "bind address [10.1.2.3]:"
+  assert_contains "$PTY_TRANSCRIPT" "port [9911]:"
+  local env_file
+  env_file="$(_env)"
+  assert_file_contains "$env_file" "AYEAYE_BIND=10.1.2.3"
+  assert_file_contains "$env_file" "AYEAYE_PORT=9911"
+  assert_file_contains "$env_file" "AYEAYE_ALLOWED_HOSTS=one.example"
+  assert_file_contains "$env_file" "VOICE_NTFY_URL=https://ntfy.example/t"
+}
+
+# The four configuration questions, answered by name rather than by position so
+# a misplaced answer cannot pass unnoticed.
+_answer_config_prompts() {
+  pty_expect "bind address" "$1"
+  pty_expect "port [" "$2"
+  pty_expect "allowed hosts" "$3"
+  pty_expect "ntfy topic URL" "$4"
+}
+
+# ------------------------------------ what a resumed run must not throw away
+
+test_a_resumed_run_still_knows_what_it_was_going_to_do() {
+  # Stage five summarises what stage four decided. A resumed run skips stage
+  # four, so a plan kept only in memory would empty itself - and stage five
+  # would say "nothing needs to be installed or changed" immediately before
+  # installing something.
+  _hard_deps_present
+  _systemd_that_will_not_reload
+  stdin_lines "10.1.2.3" "9911" "" ""
+  run_install
+  assert_ne 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "ayeaye will answer on 10.1.2.3:9911"
+
+  _systemd_that_works
+  run_install
+  assert_status 0 "$RUN_STATUS"
+  assert_contains "$RUN_STDOUT" "ayeaye will answer on 10.1.2.3:9911" \
+    "the plan is what stage five shows, and it must survive being resumed"
+  assert_not_contains "$RUN_STDOUT" "nothing needs to be installed or changed."
+}
+
+test_a_resumed_run_keeps_the_audit_trail_of_the_first_one() {
+  # "Did that script do anything to my machine" has one place to look, and an
+  # interruption must not empty it.
+  _hard_deps_present
+  _systemd_that_will_not_reload
+  stdin_lines "0.0.0.0" "9911" "" ""
+  run_install
+  assert_ne 0 "$RUN_STATUS"
+  local ledger="$XDG_STATE_HOME/ayeaye/setup-consent.log"
+  assert_file_contains "$ledger" "expose	granted"
+
+  _systemd_that_works
+  run_install
+  assert_status 0 "$RUN_STATUS"
+  assert_file_contains "$ledger" "expose	granted" \
+    "the decision was made, and it is still on the record"
+}
+
+test_a_deliberate_rerun_starts_the_audit_trail_over() {
+  _hard_deps_present
+  stdin_lines "0.0.0.0" "9911" "" ""
   run_install --no-systemd
-  assert_file_contains "$(_state)" "answer.port=9911"
+  local ledger="$XDG_STATE_HOME/ayeaye/setup-consent.log"
+  assert_file_contains "$ledger" "expose	granted"
 
   stdin_lines "n"
   run_install --no-systemd
-  assert_file_contains "$(_state)" "answer.port=9911" \
-    "the answers survive a rerun even when the rerun changes nothing"
+  assert_status 0 "$RUN_STATUS"
+  assert_file_not_contains "$ledger" "expose	granted" \
+    "a new pass is a new set of decisions; last week's are not this run's"
 }
 
 test_forgetting_everything_and_starting_over_is_possible() {

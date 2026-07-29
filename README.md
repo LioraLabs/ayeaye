@@ -162,8 +162,9 @@ alternative.
 
 Installer flags: `--defaults` accepts every default without prompting and
 grants no permission of any kind, so it can never expose ayeaye to a network;
-`--yes` answers the install and configuration questions but still refuses
-anything touching the network or the certificate store; `--no-systemd` skips
+`--yes` answers the install and configuration questions — whether or not
+anybody is watching — but still refuses anything touching the network, the
+firewall or the certificate store; `--no-systemd` skips
 the unit and prints the manual run command instead (`bin/ayeaye` reads the
 config file by itself); `--details` shows the raw commands; `--fresh` forgets
 what earlier runs recorded.

@@ -241,23 +241,62 @@ step_choose() {
     return "$WIZARD_STAGE_OK"
   fi
 
-  wizard_ask "bind address" "127.0.0.1"
+  # Each question offers what is already configured, so that pressing return
+  # means "leave this as it is" - which is what pressing return looks like it
+  # means, and what somebody rerunning setup to change one thing expects of the
+  # other three. On a first run there is nothing configured and the offer is
+  # the built-in default.
+  wizard_blank
+  wizard_say "Four questions about how to reach ayeaye. Press return to keep"
+  wizard_say "what is in the square brackets."
+  wizard_blank
+
+  wizard_say "Which address should ayeaye answer on? 127.0.0.1 means this"
+  wizard_say "computer only, which is the safe answer unless something else on"
+  wizard_say "your network has to reach it directly."
+  wizard_ask "bind address" "$(_current AYEAYE_BIND answer.bind 127.0.0.1)"
   BIND="$REPLY"
-  wizard_ask "port" "8911"
+
+  wizard_say "Which port? Any number will do; change it only if something else"
+  wizard_say "on this computer already uses this one."
+  wizard_ask "port" "$(_current AYEAYE_PORT answer.port 8911)"
   PORT="$REPLY"
-  if [ -n "$TS_HOST" ]; then
+
+  wizard_say "If you reach ayeaye through an https address - a tailscale name,"
+  wizard_say "or your own domain - name it here so the app accepts it."
+  if [ -n "$(_current AYEAYE_ALLOWED_HOSTS answer.hosts "")" ]; then
+    wizard_ask "allowed hosts (your https front)" \
+      "$(_current AYEAYE_ALLOWED_HOSTS answer.hosts "")"
+  elif [ -n "$TS_HOST" ]; then
     wizard_ask "allowed hosts (your https front)" "$TS_HOST"
   else
     wizard_ask "allowed hosts (your https front, comma separated; empty for none)" ""
   fi
   HOSTS="$REPLY"
-  wizard_ask "ntfy topic URL for push notifications (empty disables)" ""
+
+  wizard_say "ayeaye can send your phone a notification when an agent needs you."
+  wizard_say "That needs an ntfy topic address; leave it empty to switch it off."
+  wizard_ask "ntfy topic URL for push notifications (empty disables)" \
+    "$(_current VOICE_NTFY_URL answer.ntfy "")"
   NTFY="$REPLY"
 
   _decide_exposure
   _remember_choices
   wizard_plan_add config "your settings, at $ENV_FILE"
   return "$WIZARD_STAGE_OK"
+}
+
+# _current <env-key> <state-key> <built-in> - what to offer as the default.
+#
+# What is in the settings file wins, because that is what is true right now.
+# Then what was chosen last time, which is what an interrupted run left behind
+# before it got as far as writing anything. Then the built-in.
+_current() {
+  local value
+  value="$(wizard_env_get "$ENV_FILE" "$1" "")"
+  [ -n "$value" ] || value="$(wizard_state_get "$2" "")"
+  [ -n "$value" ] || value="$3"
+  printf '%s' "$value"
 }
 
 # Binding anywhere but this computer is the one choice that puts ayeaye within
@@ -280,6 +319,16 @@ _decide_exposure() {
     wizard_plan_add network "ayeaye will answer on $BIND:$PORT, this computer only"
     return 0
   fi
+  # The answer to the address question is the consent to exposure - it is an
+  # explicit choice, typed a moment ago, and asking a second question about it
+  # would be asking the same thing twice. What it does need is for the
+  # consequence to be said out loud in words rather than left implied by an IP
+  # address, and for the decision to be in the ledger like every other one.
+  wizard_blank
+  wizard_say "note: $BIND is not just this computer. Anything that can reach"
+  wizard_say "this machine on your network will be able to reach ayeaye, and"
+  wizard_say "the key in the bookmark is the only thing keeping them out."
+  wizard_say "Answer 127.0.0.1 instead if you did not mean that."
   wizard_consent_record expose granted "you chose to listen on $BIND"
   wizard_plan_add network "ayeaye will answer on $BIND:$PORT, which other computers can reach"
   return 0
@@ -425,14 +474,31 @@ step_service() {
       ;;
   esac
 
-  mkdir -p "$UNIT_DIR"
   # The unit is a build artefact, not a config file: it holds two paths and
   # nothing else, and every setting lives in the env file it points at. That is
   # why it is regenerated rather than merged, and why replacing it is not one
   # of the things worth asking about.
-  sed -e "s|@REPO@|$REPO|g" -e "s|@ENV_FILE@|$ENV_FILE|g" \
-    "$REPO/systemd/user/ayeaye.service.template" \
-    > "$UNIT_DIR/ayeaye.service"
+  #
+  # Written through a temporary file, and every step of it checked. A step body
+  # runs with errexit suspended, so an unchecked redirection here would print
+  # "installed" for a file that was never created.
+  if ! mkdir -p "$UNIT_DIR" 2>/dev/null; then
+    wizard_say "cannot create $UNIT_DIR, so ayeaye cannot be started for you."
+    return "$WIZARD_STAGE_FAIL"
+  fi
+  if ! out="$(sed -e "s|@REPO@|$REPO|g" -e "s|@ENV_FILE@|$ENV_FILE|g" \
+        "$REPO/systemd/user/ayeaye.service.template" \
+        > "$UNIT_DIR/ayeaye.service.tmp.$$" 2>&1)"; then
+    rm -f "$UNIT_DIR/ayeaye.service.tmp.$$" 2>/dev/null
+    wizard_detail "$out"
+    wizard_say "cannot write into $UNIT_DIR, so ayeaye cannot be started for you."
+    return "$WIZARD_STAGE_FAIL"
+  fi
+  if ! mv -f "$UNIT_DIR/ayeaye.service.tmp.$$" "$UNIT_DIR/ayeaye.service" 2>/dev/null; then
+    rm -f "$UNIT_DIR/ayeaye.service.tmp.$$" 2>/dev/null
+    wizard_say "cannot write into $UNIT_DIR, so ayeaye cannot be started for you."
+    return "$WIZARD_STAGE_FAIL"
+  fi
   wizard_say "installed $UNIT_DIR/ayeaye.service"
   wizard_say "(regenerated on every run; put settings in $ENV_FILE, not the unit)"
 
@@ -454,6 +520,7 @@ step_service() {
     wizard_detail "running: $cmd"
     if out="$(eval "$cmd" 2>&1)"; then
       STARTED=1
+      wizard_remember step.service.unit.started 1
       wizard_say "started. status: systemctl --user status ayeaye"
     else
       wizard_detail "$out"
@@ -464,6 +531,7 @@ step_service() {
       return "$WIZARD_STAGE_FAIL"
     fi
   else
+    wizard_remember step.service.unit.started 0
     wizard_say "start it with: systemctl --user enable --now ayeaye"
   fi
 
@@ -568,8 +636,14 @@ if [ "$FRESH" = 1 ]; then
   wizard_state_clear
 fi
 wizard_begin_run
-wizard_consent_reset
-wizard_plan_reset
+# A new pass starts a fresh plan and a fresh audit trail. A resumed run does
+# not: the stages that filled them in are the stages it is about to skip, and
+# emptying them would let stage five say "nothing needs to be installed" and
+# then install something.
+if [ "$WIZARD_RESUMING" = 0 ]; then
+  wizard_consent_reset
+  wizard_plan_reset
+fi
 
 STATUS=0
 wizard_run_stages || STATUS=$?

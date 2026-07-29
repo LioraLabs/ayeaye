@@ -67,7 +67,23 @@ for work that did not happen is the one thing a step must never do.
 
 Anything one stage tells a later stage goes through `wizard_remember`, never a
 shell variable: a resumed run skips the step that set the variable, and the
-later stage would read its default instead of the decision.
+later stage would read its default instead of the decision. `lib/steps/80-health.sh`
+is the worked example — it reads `step.service.unit.started` out of the state
+file rather than the `STARTED` variable one stage over, for exactly this reason.
+
+Two more things about the environment a step body runs in:
+
+- **Standard input is fd 8.** The walk reads its own tables from heredocs and
+  re-plumbs the real standard input onto fd 8 for the duration of each step, so
+  `wizard_ask` and `wizard_confirm` work as they look. A step that consumes
+  standard input in a loop of its own will eat the answers to the questions
+  after it; read from a file or a process substitution instead.
+- **Do not assume `set -e` is in force.** `install.sh` runs under
+  `set -euo pipefail`, but the walk is invoked inside an `|| STATUS=$?` list,
+  which suspends errexit for everything beneath it. Check the commands you care
+  about: an unchecked redirection into a directory that cannot be written will
+  not stop your step, and reporting `OK` after it is the one thing a step must
+  never do.
 
 ## Talking and asking
 
@@ -119,14 +135,35 @@ that stage five can say so before it happens:
     wizard_plan_add <category> <text> [bytes]
     # package download privileged network trust config service
 
+The plan is kept in the state file, not in memory, so it survives being
+resumed — a run that is picked up halfway skips the stage that filled the plan
+in, and a plan that emptied itself would let stage five say "nothing needs to
+be installed" immediately before installing something. `package`, `download`,
+`privileged` and `trust` entries are what make stage five stop and ask; the
+rest are shown and not gated.
+
 ## Remembering
 
     wizard_remember <key> <value>          persist. Always 0.
     wizard_state_get <key> [default]       read it back. Always 0.
 
+The rest of the layer a step may call:
+
+    wizard_consent <kind> <question> [detail]…
+          0 granted, 3 refused, 2 the kind is not one of the six. The primitive
+          the wrappers above are built on. Use it directly only for something
+          with no command behind it.
+    wizard_consent_record <kind> <decision> <text>
+          put a decision in the audit trail that was settled by an answer given
+          earlier rather than by asking now. Always 0.
+    wizard_unfinished                      the outstanding work, in words
+    wizard_detail_hint                     name the log, at most once per run
+    WIZARD_MAX_RETRIES                     how many times a failing step is
+                                           offered another try (default 3)
+
 Use `answer.<name>` for something the user chose and `step.<stage>.<step>.<x>`
-for a step's own bookkeeping. Never write into `run.*`, `stage.*` or the bare
-`step.<stage>.<step>` key — those belong to the lifecycle.
+for a step's own bookkeeping. Never write into `run.*`, `stage.*`, `plan.*` or
+the bare `step.<stage>.<step>` key — those belong to the lifecycle.
 
 ## Testing a step
 

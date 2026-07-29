@@ -106,6 +106,24 @@ test_a_failed_render_leaves_nothing_behind() {
   assert_eq "" "$(_leftovers)" "no half-written file may survive a failed render"
 }
 
+test_a_render_that_fails_halfway_removes_what_it_had_written() {
+  # The missing-template path gives up before it creates anything, so it cannot
+  # prove the cleanup. This one gets past that check and fails at the write: a
+  # template that is there and a destination directory that cannot be written
+  # into.
+  local locked="$TEST_TMPDIR/locked"
+  mkdir -p "$locked"
+  printf 'AYEAYE_PORT=@PORT@\n' > "$locked/template"
+  chmod 500 "$locked"
+  wizard_env_render "$locked/template" "$locked/env" "AYEAYE_PORT=8911"
+  local status=$?
+  chmod 700 "$locked"
+  assert_ne 0 "$status" "a render it could not write is not a success"
+  assert_file_missing "$locked/env"
+  assert_eq "" "$(find "$locked" -name 'env.tmp*')" \
+    "and the temporary file it did create is gone"
+}
+
 test_a_failed_render_does_not_touch_the_file_that_was_there() {
   printf 'AYEAYE_PORT=7777\n' > "$ENV_FILE"
   wizard_env_render "$TEST_TMPDIR/no-such-template" "$ENV_FILE" "AYEAYE_PORT=8911"

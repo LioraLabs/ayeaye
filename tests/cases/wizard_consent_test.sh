@@ -261,13 +261,18 @@ test_installing_packages_where_they_cannot_be_installed_explains_instead() {
   assert_contains "$out" "packages needed:" "the manual instructions are printed instead"
 }
 
-test_a_run_that_may_ask_ignores_the_blanket_yes() {
-  # --yes is what an unattended run does instead of asking. A run that can ask
-  # must still ask, or the flag would silently answer questions on behalf of
-  # somebody sitting right there.
+test_a_blanket_yes_applies_whether_or_not_the_run_could_have_asked() {
+  # --yes is itself an answer, typed by a person. A flag that only worked when
+  # nobody was watching would be a flag that does nothing in the case its own
+  # help text describes.
   WIZARD_INTERACTIVE=1
   WIZARD_AUTO_CONSENT="privileged download replace"
-  assert_eq "ask" "$(wizard_consent_policy privileged)"
+  assert_eq "grant" "$(wizard_consent_policy privileged)"
+  assert_eq "grant" "$(wizard_consent_policy replace)"
+  assert_eq "ask" "$(wizard_consent_policy trust)" \
+    "and the three it may never grant are still asked about"
+  assert_eq "ask" "$(wizard_consent_policy firewall)"
+  assert_eq "ask" "$(wizard_consent_policy expose)"
 }
 
 test_exposure_is_asked_about_through_the_same_primitive() {

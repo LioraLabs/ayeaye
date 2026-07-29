@@ -116,7 +116,7 @@ test_a_step_file_dropped_into_the_steps_directory_is_picked_up() {
     "install.sh must not know the name of any file in lib/steps"
   run_install --defaults --no-systemd
   assert_status 0 "$RUN_STATUS"
-  assert_contains "$RUN_STDOUT" "nothing was started just now" \
+  assert_contains "$RUN_STDOUT" "ayeaye is not running yet, so there is nothing to check." \
     "the registered step ran, and said what it could see"
 }
 

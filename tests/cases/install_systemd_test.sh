@@ -255,11 +255,13 @@ test_an_unset_user_variable_is_harmless_without_loginctl() {
     "anchor: it ran all the way to the summary, not just far enough to not crash"
 }
 
-test_a_failing_daemon_reload_aborts_after_the_unit_is_written() {
-  # Documented, not endorsed: daemon-reload is unguarded under set -e, so a
-  # systemd that refuses it takes the whole install down at that point - the
-  # unit is on disk, the summary never prints, and systemctl's own error is
-  # what the user sees.
+test_a_failing_daemon_reload_stops_the_run_after_the_unit_is_written() {
+  # A systemd that refuses to reload cannot be asked to start anything, so the
+  # run stops there rather than promising a service it could not install. The
+  # unit is on disk and the state file records how far it got, so running setup
+  # again picks up from exactly here - which wizard_resume_test.sh pins.
+  # systemctl's own words still reach stderr, because at the moment something
+  # fails they are worth more to the reader than any paraphrase.
   _hard_deps_present
   stub_command systemctl --exit 1
   stub_when systemctl '--user show-environment' --exit 0
