@@ -36,16 +36,20 @@ harness_begin() {
   XDG_STATE_HOME="$HOME/.local/state"
   XDG_DATA_HOME="$HOME/.local/share"
   XDG_CACHE_HOME="$HOME/.cache"
+  # Pinned rather than left alone: setup installs programs into it, so a
+  # contributor who exports it would have the suite write outside the sandbox.
+  XDG_BIN_HOME="$HOME/.local/bin"
   XDG_RUNTIME_DIR="$TEST_TMPDIR/run"
   TMPDIR="$TEST_TMPDIR/tmp"
   STUB_BIN="$TEST_TMPDIR/stub-bin"
   STUB_LOG_DIR="$TEST_TMPDIR/stub-log"
 
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" \
-           "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" "$STUB_BIN" "$STUB_LOG_DIR"
+           "$XDG_CACHE_HOME" "$XDG_BIN_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" \
+           "$STUB_BIN" "$STUB_LOG_DIR"
 
   export HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME \
-         XDG_RUNTIME_DIR TMPDIR TEST_TMPDIR STUB_BIN STUB_LOG_DIR \
+         XDG_BIN_HOME XDG_RUNTIME_DIR TMPDIR TEST_TMPDIR STUB_BIN STUB_LOG_DIR \
          TESTS_DIR REPO_ROOT FIXTURES_DIR HARNESS_LIB
 
   # Ambient application configuration must not reach the code under test: a

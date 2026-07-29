@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Does the platform layer say the right thing about a real Debian, Fedora,
-# Arch and openSUSE? Fixtures can only prove that a file was parsed the way
-# somebody typed it; this proves the answer matches a machine.
+# Arch and openSUSE, and does the command it generates for each of them really
+# install what it says? Fixtures can only prove that a file was parsed the way
+# somebody typed it, and a stub can only prove that a string came out the way
+# somebody typed it. This proves both against a machine.
 #
-#   tests/containers.sh                 every image
+#   tests/containers.sh                 every image: what it says, and what it does
 #   tests/containers.sh arch fedora     images whose name contains one of these
 #   tests/containers.sh --list          what would be run
+#   tests/containers.sh --quick         only the questions; install nothing
 #   tests/containers.sh --suite         also run the unit tests inside each image
 #   tests/containers.sh --engine podman
 #   tests/containers.sh -v              print every probed value, not just the
@@ -16,9 +19,17 @@
 # engine and a few hundred megabytes of images. With no engine it says so and
 # exits 0, because "could not check" is not the same as "found a problem".
 #
-# Nothing is installed inside the containers. The repository is mounted
-# read-only and the probe only asks questions; the commands this layer would
-# run are asserted as strings, never executed.
+# Two probes, and they differ in exactly one respect.
+#
+#   tests/lib/platform_probe.sh only asks questions. The repository is mounted
+#   read-only and nothing on the machine changes; the commands the layer would
+#   run are asserted as strings and never executed.
+#
+#   tests/lib/install_probe.sh really installs, through the same
+#   wizard_install_packages install.sh goes through - so the consent layer, the
+#   name table and the generated command are all exercised rather than
+#   imitated. It runs inside a container that is thrown away when it exits, and
+#   the repository is still mounted read-only. --quick leaves it out.
 #
 # bash 3.2: no associative arrays, no ${var,,}, no mapfile.
 set -u
@@ -30,9 +41,10 @@ ENGINE="${CONTAINER_ENGINE:-}"
 VERBOSE=0
 LIST_ONLY=0
 RUN_SUITE=0
+RUN_INSTALL=1
 FILTERS=""
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -40,6 +52,7 @@ while [ "$#" -gt 0 ]; do
     -v|--verbose) VERBOSE=1 ;;
     -l|--list)    LIST_ONLY=1 ;;
     --suite)      RUN_SUITE=1 ;;
+    --quick)      RUN_INSTALL=0 ;;
     --engine)
       [ "$#" -gt 1 ] || { echo "--engine needs the name of a container engine" >&2; exit 2; }
       ENGINE="$2"; shift ;;
@@ -210,6 +223,32 @@ while IFS='|' read -r image family manager id; do
   # The query really did reach the real package database, in both directions.
   check present_installed yes
   check absent_installed no
+
+  if [ "$RUN_INSTALL" = 1 ]; then
+    printf '  -- installing for real inside %s\n' "$image"
+    # Writable, unlike the probe above: this one installs. The repository stays
+    # read-only, and the container is gone the moment it exits.
+    PROBE="$("$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \
+               bash tests/lib/install_probe.sh 2>&1)"
+    if [ "$?" != 0 ] || [ -z "$PROBE" ]; then
+      printf '  FAIL     the install probe did not run:\n'
+      printf '%s\n' "$PROBE" | sed 's/^/           /'
+      FAILED=$((FAILED + 1))
+      FAILED_IMAGES="$FAILED_IMAGES $image"
+      continue
+    fi
+    [ "$VERBOSE" = 1 ] && printf '%s\n' "$PROBE" | sed 's/^/           /'
+
+    # The command really was this family's, and it really worked.
+    check_contains install_command "$manager"
+    check install_status 0
+    # And the programs are there afterwards - which is the only claim worth
+    # making, and the one an exit status of zero does not by itself support.
+    for want in tmux python3 curl tar; do
+      check "after_$want" yes
+      check "db_$want" yes
+    done
+  fi
 
   if [ "$RUN_SUITE" = 1 ]; then
     if "$ENGINE" run --rm -v "$REPO_ROOT:/repo:ro" -w /repo "$image" \

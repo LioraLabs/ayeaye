@@ -279,6 +279,12 @@ Eight hex characters is enough to glob the transcript uniquely, and it's dim
 enough to ignore on screen. `capture-pane` strips the colour but keeps the
 text.
 
+`./install.sh` offers to set this up for you: it writes a small status line
+script to `~/.local/share/ayeaye/statusline-command.sh` and points
+`~/.claude/settings.json` at it, after showing you the change and taking a copy
+of the file. A status line you already have is never replaced without being
+shown to you first.
+
 **Print it on its own line, first on that line.** Appended to a path segment
 it gets truncated the moment the working directory is long, and a clipped
 marker fails silently: the pane still works, the transcript button just

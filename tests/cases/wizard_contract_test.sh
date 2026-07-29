@@ -96,11 +96,25 @@ test_the_lint_can_actually_fail() {
   # A lint that cannot fire is decoration. This proves the scan reads the files
   # it says it reads by looking for something that really is in one of them.
   local found
-  found="$(_offenders 'wizard_install_packages' install.sh consent.sh)"
-  assert_eq "" "$found" "nothing else calls it today"
   found="$(_offenders 'wizard_install_packages' consent.sh)"
   assert_contains "$found" "install.sh:" \
     "the scan really does read install.sh"
+}
+
+test_the_only_callers_of_the_install_wrapper_are_where_work_is_added() {
+  # install.sh owns the lifecycle and lib/steps/ is where a ticket adds work to
+  # it. Anywhere else calling the wrapper - a library, an adapter - would be a
+  # layer installing something on a caller's behalf, which is how "we ask
+  # first" quietly stops being true.
+  local allowed="" file found
+  for file in "$REPO_ROOT"/lib/steps/*.sh; do
+    [ -f "$file" ] || continue
+    allowed="$allowed ${file##*/}"
+  done
+  # shellcheck disable=SC2086
+  found="$(_offenders 'wizard_install_packages' install.sh consent.sh $allowed)"
+  assert_eq "" "$found" \
+    "installing is asked for by install.sh or a file in lib/steps, and nowhere else"
 }
 
 # ------------------------------------------------------- the step seam

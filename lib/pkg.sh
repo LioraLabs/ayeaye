@@ -60,8 +60,8 @@
 # ---------------------------------------------------------------------- names
 #
 # The logical names are the ones this project installs: tmux, python3, ffmpeg,
-# curl, git. Anything else is passed through unchanged. Extending the table is
-# the intended way to add a dependency - see _platform_pkg_name_for.
+# curl, git, tar. Anything else is passed through unchanged. Extending the
+# table is the intended way to add a dependency - see _platform_pkg_name_for.
 #
 # bash 3.2: no associative arrays, so the name table is a case statement. It
 # reads better than a parallel-array lookup would anyway.
@@ -169,7 +169,7 @@ platform_pkg_can_act() {
 # _platform_pkg_name_for <family> <logical> - the table. Non-zero means the
 # table has no opinion, and the logical name is the best guess available.
 #
-# Only the differences are interesting, and there are three of them:
+# Only the differences are interesting, and there are four of them:
 #   arch calls the python 3 interpreter "python"; "python3" there is an
 #     entirely different, older package.
 #   fedora's own repositories carry "ffmpeg-free"; plain "ffmpeg" needs a
@@ -177,15 +177,22 @@ platform_pkg_can_act() {
 #   openSUSE has no package literally called ffmpeg or python3 either - they
 #     are capabilities, provided by ffmpeg-7 and python313 - but zypper
 #     installs a capability by name, so the logical name works as written.
+#   macOS has no package called tar and needs none: it ships bsdtar in the base
+#     system, and Homebrew's nearest formula is gnu-tar, which installs as gtar
+#     and is not what anything here is asking for. So that one row says the
+#     table has no opinion, which is the truth - there is nothing to install -
+#     and platform_pkg_has_mapping is how a caller finds that out.
 _platform_pkg_name_for() {
   case "$1:$2" in
     arch:python3)     printf 'python' ;;
     fedora:ffmpeg)    printf 'ffmpeg-free' ;;
+    macos:tar)        printf 'tar'; return 1 ;;
     *:tmux)           printf 'tmux' ;;
     *:python3)        printf 'python3' ;;
     *:ffmpeg)         printf 'ffmpeg' ;;
     *:curl)           printf 'curl' ;;
     *:git)            printf 'git' ;;
+    *:tar)            printf 'tar' ;;
     *)                printf '%s' "$2"; return 1 ;;
   esac
 }
