@@ -23,6 +23,8 @@
 . "$HARNESS_LIB/fixture.sh"
 # shellcheck source=tests/lib/stub.sh
 . "$HARNESS_LIB/stub.sh"
+# shellcheck source=tests/lib/script.sh
+. "$HARNESS_LIB/script.sh"
 
 # Build the sandbox and redirect the environment into it. Called by the runner.
 harness_begin() {
