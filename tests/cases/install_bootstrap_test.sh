@@ -34,15 +34,21 @@ lone_install() {
   local dir="$TEST_TMPDIR/lone"
   mkdir -p "$dir"
   if [ ! -f "$dir/install.sh" ]; then
-    cp "$REPO_ROOT/install.sh" "$dir/install.sh"
+    # Blank the baked-in checksum. Every test here serves an artifact of its
+    # own making, and once a release has been stamped the real checksum is in
+    # the tracked file - so an unstamped repository would exercise the served
+    # SHA256SUMS and a stamped one would abort on every single test. Starting
+    # from empty makes what a test is checking a property of the test rather
+    # than of whether somebody has cut a release lately.
+    sed 's/^AYEAYE_SHA256=".*"$/AYEAYE_SHA256=""/' "$REPO_ROOT/install.sh" > "$dir/install.sh"
     chmod +x "$dir/install.sh"
   fi
   printf '%s' "$dir"
 }
 
 # pin_sha256 <hex> - write a checksum into the copy under test, the way the
-# release process writes one into the script it publishes. That path cannot be
-# reached any other way: in the repository the line is deliberately empty.
+# release process writes one into the script it publishes. lone_install has
+# just blanked it, so this is the only way that path is reached here.
 pin_sha256() {
   local dir
   dir="$(lone_install)"
