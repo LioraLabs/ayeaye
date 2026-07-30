@@ -33,7 +33,7 @@ set -euo pipefail
 #                   run says out loud that nothing was compared, rather than
 #                   letting silence imply that it was.
 AYEAYE_VERSION="v0.1.0"
-AYEAYE_SHA256=""
+AYEAYE_SHA256="513a0421f62376ecc2fdade91fd5794fefabe7a8d0db2a1d4ca93f5d1741440e"
 
 # The published one-liner, quoted in --help and in README.md. It fetches this
 # script, and this script pins the release above.
