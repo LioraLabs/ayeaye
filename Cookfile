@@ -1,0 +1,77 @@
+# ayeaye - the gates a release has to pass, and the artifacts it needs.
+#
+#   cook test      every test file as its own cached unit, plus the release gates
+#   cook dist      build the release tarball and its checksums
+#   cook stamp     write the artifact's checksum into install.sh
+#   cook publish   tag and upload it  (refuses a dirty tree)
+#
+# The version lives in exactly one place - AYEAYE_VERSION at the top of
+# install.sh - and `release-version` fails if this file or anything else has
+# drifted from it.
+
+# --- determinants -------------------------------------------------------
+# What changes a test's answer without ever appearing on its command line.
+# These are sealed rather than listed as ingredients: the test harness
+# iterates case files, it does not iterate the wizard it is testing.
+
+probe wizard
+    files { "install.sh" "lib/*.sh" "lib/steps/*.sh" }
+
+probe app
+    files { "bin/ayeaye" "bin/voice-dictate" "bin/voice-agent" "bin/voice-dictate-setup" "bin/process_inspect.py" }
+
+probe harness
+    files { "tests/run.sh" "tests/lib/*" "tests/python/*" }
+
+probe fixtures
+    files { "tests/fixtures/*/*" }
+
+# --- the suite ----------------------------------------------------------
+# One unit per case file, so editing one test re-runs one test. The whole
+# suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
+# single file, and an edit costs only that file.
+
+recipe suite
+    ingredients "tests/cases/*_test.sh"
+    seal wizard
+    seal app
+    seal harness
+    seal fixtures
+    test { bash tests/run.sh $<in.stem> }
+
+# --- release gates ------------------------------------------------------
+
+recipe release-version
+    ingredients "scripts/check-release-version.sh"
+    seal wizard
+    test { bash scripts/check-release-version.sh v0.1.0 }
+
+# --- the artifacts ------------------------------------------------------
+# Gated on the suite: a red test blocks the tarball rather than shipping it.
+# Sealed on the sources because `git archive` names none of them, so nothing
+# else would tell cook the artifact is stale.
+
+recipe dist: suite release-version
+    seal wizard
+    seal app
+    cook "dist/ayeaye-v0.1.0.tar.gz" { bash scripts/release-archive.sh $<out> }
+    cook "dist/SHA256SUMS" { bash scripts/release-checksums.sh $<in> $<out> }
+
+# No source, so it always runs: the question is not "did the inputs change"
+# but "is the thing on disk right now something the bootstrap can install".
+recipe release-installable: dist
+    test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.1.0.tar.gz }
+
+# --- publishing ---------------------------------------------------------
+# Chores, not recipes: they mutate a tracked file and talk to GitHub, and
+# neither belongs in `cook test`.
+
+chore stamp: dist
+    bash scripts/release-stamp.sh dist/SHA256SUMS install.sh
+
+chore publish version="v0.1.0": dist release-installable
+    git diff-index --quiet HEAD -- || { echo "working tree is dirty - commit before publishing" >&2; exit 1; }
+    bash scripts/release-publish.sh $<version>
+
+chore clean
+    rm -rf dist
