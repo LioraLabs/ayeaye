@@ -26,6 +26,13 @@ probe harness
 probe fixtures
     files { "tests/fixtures/*/*" }
 
+# The artifact is `git archive HEAD`, so its determinant is the commit, not the
+# working tree. Sealing it on file contents looked right and was not: adding
+# a tracked file leaves every sealed path untouched, so the tarball stayed
+# cached while the tree it claimed to hold had changed underneath it.
+probe commit
+    { git rev-parse HEAD }
+
 # --- the suite ----------------------------------------------------------
 # One unit per case file, so editing one test re-runs one test. The whole
 # suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
@@ -52,8 +59,7 @@ recipe release-version
 # else would tell cook the artifact is stale.
 
 recipe dist: suite release-version
-    seal wizard
-    seal app
+    seal commit
     cook "dist/ayeaye-v0.1.0.tar.gz" { bash scripts/release-archive.sh $<out> }
     cook "dist/SHA256SUMS" { bash scripts/release-checksums.sh $<in> $<out> }
 
