@@ -158,6 +158,25 @@
   .m.assistant .h{color:var(--green)}
   .m pre{white-space:pre-wrap;word-break:break-word;margin:4px 0 2px;
          font:12.5px/1.55 var(--mono);color:var(--fg)}
+  .m .md{font:13.5px/1.58 var(--sans);color:var(--fg);overflow-wrap:anywhere}
+  .m .md p{margin:7px 0}
+  .m .md p:first-child,.m .md h3:first-child{margin-top:3px}
+  .m .md p:last-child,.m .md ul:last-child,.m .md ol:last-child{margin-bottom:2px}
+  .m .md h3,.m .md h4,.m .md h5{margin:14px 0 5px;line-height:1.25;color:#fff;font-weight:700}
+  .m .md h3{font-size:16px}.m .md h4{font-size:14.5px}.m .md h5{font-size:13.5px}
+  .m .md strong{color:#fff;font-weight:750}.m .md em{color:var(--sub)}
+  .m .md code{font:12px/1.45 var(--mono);background:rgba(138,173,244,.11);
+        border:1px solid rgba(138,173,244,.16);border-radius:5px;padding:1px 4px;color:#dce5ff}
+  .m .md pre{margin:9px 0;padding:10px 11px;overflow-x:auto;white-space:pre;
+        word-break:normal;background:#151621;border:1px solid var(--line);border-radius:8px}
+  .m .md pre code{padding:0;border:0;background:none;color:var(--fg)}
+  .m .md ul,.m .md ol{margin:7px 0;padding-left:22px}.m .md li{margin:3px 0;padding-left:2px}
+  .m .md blockquote{margin:8px 0;padding:2px 0 2px 11px;border-left:3px solid var(--blue);color:var(--sub)}
+  .m .md-table{overflow-x:auto;margin:10px 0;border:1px solid var(--line);border-radius:8px}
+  .m .md table{width:100%;border-collapse:collapse;font-size:12.5px;white-space:nowrap}
+  .m .md th,.m .md td{padding:7px 9px;text-align:left;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .m .md th{background:rgba(138,173,244,.09);color:#fff;font-weight:700}
+  .m .md tr:last-child td{border-bottom:0}.m .md th:last-child,.m .md td:last-child{border-right:0}
   .m.tool pre,.m.result pre{font-size:12px;color:var(--muted)}
   .m summary{color:var(--muted);font:12px/1.5 var(--mono);cursor:pointer;
              list-style-position:outside}
@@ -686,6 +705,80 @@ async function loadSession(){
   }catch(e){ /* leave the button disabled */ }
 }
 
+function markdownInline(text){
+  let out = '', at = 0;
+  const token = /(`+)([\s\S]*?)\1|\*\*([^\n*]+)\*\*|__([^\n_]+)__/g;
+  let m;
+  while((m=token.exec(text))){
+    out += linkify(text.slice(at, m.index));
+    if(m[1]) out += '<code>'+esc(m[2])+'</code>';
+    else out += '<strong>'+markdownInline(m[3] || m[4])+'</strong>';
+    at = token.lastIndex;
+  }
+  out += linkify(text.slice(at));
+  return out.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?])/g,
+                     '$1<em>$2</em>');
+}
+
+function markdownHTML(text){
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  const cells = line => line.trim().replace(/^\||\|$/g, '')
+    .split('|').map(s=>s.trim());
+  const divider = line => cells(line).length > 0 &&
+    cells(line).every(s=>/^:?-{3,}:?$/.test(s));
+  let i = 0;
+  while(i < lines.length){
+    if(!lines[i].trim()){ i++; continue; }
+    if(/^\s*```/.test(lines[i])){
+      const code = [];
+      for(i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      if(i < lines.length) i++;
+      out.push('<pre><code>'+esc(code.join('\n'))+'</code></pre>');
+      continue;
+    }
+    if(i+1 < lines.length && lines[i].includes('|') && divider(lines[i+1])){
+      const head = cells(lines[i]); i += 2;
+      const body = [];
+      while(i < lines.length && lines[i].includes('|') && lines[i].trim())
+        body.push(cells(lines[i++]));
+      out.push('<div class="md-table"><table><thead><tr>'+
+        head.map(c=>'<th>'+markdownInline(c)+'</th>').join('')+
+        '</tr></thead><tbody>'+body.map(row=>'<tr>'+row.map(c=>
+          '<td>'+markdownInline(c)+'</td>').join('')+'</tr>').join('')+
+        '</tbody></table></div>');
+      continue;
+    }
+    const heading = lines[i].match(/^(#{1,3})\s+(.+)$/);
+    if(heading){
+      const level = heading[1].length + 2;
+      out.push('<h'+level+'>'+markdownInline(heading[2])+'</h'+level+'>'); i++; continue;
+    }
+    const item = lines[i].match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.+)$/);
+    if(item){
+      const tag = item[2] ? 'ol' : 'ul', rows = [];
+      while(i < lines.length){
+        const next = lines[i].match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.+)$/);
+        if(!next || (next[2] ? 'ol' : 'ul') !== tag) break;
+        rows.push('<li>'+markdownInline(next[3])+'</li>'); i++;
+      }
+      out.push('<'+tag+'>'+rows.join('')+'</'+tag+'>'); continue;
+    }
+    if(/^\s*>/.test(lines[i])){
+      const quote = [];
+      while(i < lines.length && /^\s*>/.test(lines[i]))
+        quote.push(lines[i++].replace(/^\s*>\s?/, ''));
+      out.push('<blockquote>'+markdownInline(quote.join(' '))+'</blockquote>'); continue;
+    }
+    const para = [];
+    while(i < lines.length && lines[i].trim() &&
+          !/^\s*```|^#{1,3}\s|^\s*(?:[-*+] |\d+[.)] |>) /.test(lines[i]))
+      para.push(lines[i++].trim());
+    out.push('<p>'+markdownInline(para.join(' '))+'</p>');
+  }
+  return out.join('');
+}
+
 function card(row){
   const el = document.createElement('div');
   el.className = 'm ' + row.cls;
@@ -707,7 +800,9 @@ function card(row){
     d.addEventListener('toggle', ()=>{ s.textContent = d.open ? 'hide' : first; });
     d.appendChild(s); d.appendChild(pre); el.appendChild(d);
   }else{
-    el.appendChild(pre);
+    const body = document.createElement('div');
+    body.className = 'md'; body.innerHTML = markdownHTML(row.text);
+    el.appendChild(body);
   }
   return el;
 }
