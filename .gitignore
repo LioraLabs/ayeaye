@@ -7,3 +7,4 @@ token
 .DS_Store
 assets/*.png
 dist/
+.worktrees/
