@@ -234,14 +234,18 @@ def tmux(*args):
 
 def list_panes():
     fmt = ("#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}"
-           "\t#{pane_current_command}\t#{?pane_active,1,0}")
+           "\t#{pane_current_command}\t#{?pane_active,1,0}"
+           "\t#{?pane_dead,1,0}")
     out = []
     for line in tmux("list-panes", "-a", "-F", fmt).splitlines():
         parts = line.split("\t")
-        if len(parts) != 6:
+        if len(parts) != 7:
             continue
-        pid, sess, widx, wname, cmd, active = parts
-        if sess.startswith("_"):        # floating scratch panes; not targets
+        pid, sess, widx, wname, cmd, active, dead = parts
+        if sess.startswith("_") or dead == "1":
+            # Floating scratch panes are not targets. With remain-on-exit,
+            # tmux also keeps exited panes around; they are history, not live
+            # sessions, and must disappear from the panel.
             continue
         out.append({"id": pid, "session": sess, "window": widx,
                     "name": wname, "cmd": cmd, "active": active == "1"})
@@ -1187,7 +1191,14 @@ def kill_pane(pane_id):
     """
     if not any(p["id"] == pane_id for p in list_panes()):
         return {"error": "no such pane"}
-    tmux("kill-pane", "-t", pane_id)
+    try:
+        killed = subprocess.run(("tmux", "kill-pane", "-t", pane_id),
+                                capture_output=True, text=True, timeout=5)
+    except Exception as exc:
+        return {"error": "could not kill pane: %s" % exc}
+    if killed.returncode:
+        detail = killed.stderr.strip() or "tmux refused the request"
+        return {"error": "could not kill pane: %s" % detail}
     return {"ok": True}
 
 

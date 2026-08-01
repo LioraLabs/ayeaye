@@ -144,6 +144,30 @@ test_a_project_with_a_live_session_gets_a_window_in_it() {
     "a second session for the same project is the thing the naming rule exists to prevent"
 }
 
+# ----------------------------------------------------------- closing panes
+
+test_a_failed_kill_is_reported_instead_of_claiming_the_pane_was_killed() {
+  stub_command tmux
+  stub_when tmux 'list-panes *' --stdout '%7	thing	0	codex	codex	1	0'
+  stub_when tmux 'kill-pane *' --exit 1 --stderr 'pane still busy'
+
+  probe kill '%7'
+
+  assert_contains "$RUN_STDOUT" 'error=' \
+    "the API must not tell the browser to remove a card when tmux left it alive"
+}
+
+test_a_dead_tmux_pane_is_not_a_live_session() {
+  stub_command tmux
+  stub_when tmux 'list-panes *' --stdout '%7	thing	0	codex	codex	1	0
+%8	old	0	codex	codex	0	1'
+
+  probe panes
+
+  assert_eq '%7' "$(probe_value ids)" \
+    "remain-on-exit leaves dead panes in tmux, but they are closed sessions"
+}
+
 test_the_window_target_forces_an_exact_session_match() {
   # The "=" is load-bearing and is commented as such in bin/ayeaye. tmux
   # resolves a bare -t target as a prefix, so a project called "web" would

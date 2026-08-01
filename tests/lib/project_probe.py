@@ -25,6 +25,8 @@ Sub-commands:
   join --query Q                        the same query twice at once
   session-name DIR                      the tmux session name for a directory
   spawn DIR                             start an agent, as /api/spawn does
+  kill PANE                             kill a listed pane, as /api/kill does
+  panes                                 list pane ids the sessions panel sees
 
 Every sub-command takes --slow to give each directory listing a fixed cost.
 Real filesystems have latency and tmpfs in a container does not, so a bound
@@ -286,6 +288,15 @@ def cmd_spawn(m, args):
     emit(**m.spawn_agent(args.dir, args.agent))
 
 
+def cmd_kill(m, args):
+    """Kill one pane through the same function the HTTP endpoint calls."""
+    emit(**m.kill_pane(args.pane))
+
+
+def cmd_panes(m, _args):
+    emit(ids=",".join(p["id"] for p in m.list_panes()))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--slow", type=float, default=0.0,
@@ -350,6 +361,13 @@ def main():
     p.add_argument("dir")
     p.add_argument("--agent", default="claude")
     p.set_defaults(fn=cmd_spawn)
+
+    p = sub.add_parser("kill")
+    p.add_argument("pane")
+    p.set_defaults(fn=cmd_kill)
+
+    p = sub.add_parser("panes")
+    p.set_defaults(fn=cmd_panes)
 
     args = ap.parse_args()
     if not getattr(args, "fn", None):
