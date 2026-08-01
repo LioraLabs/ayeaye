@@ -410,6 +410,38 @@
                             box-shadow:none;cursor:default}
   a.tick{color:var(--blue);text-decoration:none;
          border-bottom:1px dotted rgba(138,173,244,.6)}
+  .file-ref{display:inline;padding:0;border:0;background:none;color:var(--blue);
+            font:inherit;text-align:inherit;text-decoration:underline;
+            text-decoration-style:dotted;text-underline-offset:2px}
+  body.preview-open{overflow:hidden}
+  .file-modal{position:fixed;inset:0;z-index:20;display:none;align-items:center;
+              justify-content:center;padding:18px;background:rgba(10,11,18,.78)}
+  .file-modal.show{display:flex}
+  .file-dialog{width:min(900px,100%);max-height:min(86vh,900px);display:flex;
+               flex-direction:column;overflow:hidden;background:var(--panel2);
+               border:1px solid var(--line2);border-radius:var(--r-l);
+               box-shadow:0 18px 60px rgba(0,0,0,.55)}
+  .file-bar{display:flex;align-items:center;gap:8px;padding:10px 12px;
+            border-bottom:1px solid var(--line)}
+  .file-bar b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .file-bar button,.file-match{min-height:42px;border:1px solid var(--line2);
+            border-radius:var(--r-s);background:var(--panel);color:var(--fg)}
+  .file-bar button{padding:7px 11px}.file-bar .close{margin-left:auto}
+  #fileBody{min-height:9rem;overflow:auto;padding:12px;-webkit-overflow-scrolling:touch}
+  .file-empty{color:var(--muted);padding:24px 4px;text-align:center}
+  .file-matches{display:grid;gap:8px}
+  .file-match{width:100%;padding:10px 12px;text-align:left;font:12px/1.4 var(--mono);
+              overflow-wrap:anywhere}
+  .file-image{display:block;max-width:100%;max-height:70vh;margin:auto}
+  .file-text{margin:0;overflow:auto;white-space:pre;font:12px/1.5 var(--mono)}
+  .file-line{display:block}.file-line.focus{background:rgba(238,212,159,.12)}
+  .file-number{display:inline-block;width:5ch;margin-right:2ch;color:var(--faint);
+               text-align:right;user-select:none}
+  @media (max-width: 520px){
+    .file-modal{padding:0;align-items:stretch}.file-dialog{width:100%;max-height:none;
+      height:100%;border-radius:0;border:0;padding-top:env(safe-area-inset-top)}
+    #fileBody{padding:10px;overflow:auto}.file-bar button{min-height:44px}
+  }
 </style>
 </head>
 <body>
@@ -452,6 +484,18 @@
 <pre id="out">select a pane…</pre>
 <div id="tx"><div id="txnote"></div><div id="txrows"></div></div>
 <div id="txask"></div>
+
+<div class="file-modal" id="fileModal" role="dialog" aria-modal="true"
+     aria-labelledby="fileTitle" aria-hidden="true">
+  <div class="file-dialog">
+    <div class="file-bar">
+      <button id="fileBack" type="button" hidden>back</button>
+      <b id="fileTitle">file preview</b>
+      <button class="close" id="fileClose" type="button" aria-label="close file preview">close</button>
+    </div>
+    <div id="fileBody"></div>
+  </div>
+</div>
 
 <footer>
   <div id="msg" role="status" aria-live="polite"></div>
@@ -705,17 +749,44 @@ async function loadSession(){
   }catch(e){ /* leave the button disabled */ }
 }
 
+const FILE_EXT_RE = /\.(?:c|cc|cpp|css|csv|gif|go|h|hpp|html?|ico|java|jpeg|jpg|js|json|jsx|lua|md|mjs|pdf|php|png|py|rb|rs|sh|svg|toml|ts|tsx|txt|webp|xml|ya?ml)(?::[1-9]\d*)?$/i;
+function fileReference(value, allowExtensionless){
+  if(!value || /^(?:[a-z]+:)?\/\//i.test(value) || /[<>"']/.test(value)) return false;
+  const path = value.replace(/:[1-9]\d*$/, '');
+  if(FILE_EXT_RE.test(value)) return true;
+  return !!allowExtensionless && /^[\w@+.,=()\/-]+$/.test(path);
+}
+function fileButton(label, reference, code){
+  return '<button type="button" class="file-ref" data-reference="'+esc(reference)+'">'+
+         (code ? '<code>'+esc(label)+'</code>' : esc(label))+'</button>';
+}
+function fileLinkify(text){
+  const token = /(?:\.{0,2}\/)?[\w@+.,=()-]+(?:\/[\w@+.,=()-]+)+(?::[1-9]\d*)?|[\w@+-]+\.[\w.+-]+(?::[1-9]\d*)?/g;
+  let out='', at=0, m;
+  while((m=token.exec(text))){
+    let value=m[0], trailing='';
+    while(/[),.;!?]$/.test(value)){ trailing=value.slice(-1)+trailing; value=value.slice(0,-1); }
+    out += linkify(text.slice(at,m.index));
+    out += fileReference(value, value.includes('/')) ? fileButton(value,value,false) : linkify(value);
+    out += linkify(trailing); at=m.index+m[0].length;
+  }
+  return out+linkify(text.slice(at));
+}
+
 function markdownInline(text){
   let out = '', at = 0;
-  const token = /(`+)([\s\S]*?)\1|\*\*([^\n*]+)\*\*|__([^\n_]+)__/g;
+  const token = /\[([^\]\n]+)\]\(([^)\n]+)\)|(`+)([\s\S]*?)\3|\*\*([^\n*]+)\*\*|__([^\n_]+)__/g;
   let m;
   while((m=token.exec(text))){
-    out += linkify(text.slice(at, m.index));
-    if(m[1]) out += '<code>'+esc(m[2])+'</code>';
-    else out += '<strong>'+markdownInline(m[3] || m[4])+'</strong>';
+    out += fileLinkify(text.slice(at, m.index));
+    if(m[1]) out += fileReference(m[2],true) ? fileButton(m[1],m[2],false) :
+      esc(m[1])+' ('+fileLinkify(m[2])+')';
+    else if(m[3]) out += fileReference(m[4],true) ? fileButton(m[4],m[4],true) :
+      '<code>'+esc(m[4])+'</code>';
+    else out += '<strong>'+markdownInline(m[5] || m[6])+'</strong>';
     at = token.lastIndex;
   }
-  out += linkify(text.slice(at));
+  out += fileLinkify(text.slice(at));
   return out.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?])/g,
                      '$1<em>$2</em>');
 }
@@ -779,6 +850,78 @@ function markdownHTML(text){
   return out.join('');
 }
 
+function filePreviewState(result){
+  const candidates = Array.isArray(result && result.candidates)
+    ? result.candidates.slice(0,20) : [];
+  if(!candidates.length) return {view:'empty',candidates:[],line:null};
+  if(candidates.length===1) return {view:'preview',candidates,path:candidates[0].path,
+                                    line:result.line || null};
+  return {view:'matches',candidates,line:result.line || null};
+}
+function filePreviewBack(state){
+  return state && state.candidates && state.candidates.length>1
+    ? Object.assign({},state,{view:'matches',path:null}) : state;
+}
+
+let filePreview = null, filePreviewReturnFocus = null;
+function closeFilePreview(){
+  const modal=$('#fileModal'); modal.classList.remove('show');
+  modal.setAttribute('aria-hidden','true'); document.body.classList.remove('preview-open');
+  const back=filePreviewReturnFocus; filePreview=null; filePreviewReturnFocus=null;
+  if(back && back.isConnected) back.focus();
+}
+function previewURL(path,line){
+  const q=new URLSearchParams({pane:sel,path}); if(line) q.set('line',line);
+  return '/api/files/preview?'+q;
+}
+async function renderFilePreview(path){
+  const body=$('#fileBody'); body.textContent=''; $('#fileTitle').textContent=path;
+  $('#fileBack').hidden=!(filePreview.candidates.length>1);
+  const candidate=filePreview.candidates.find(c=>c.path===path) || {};
+  if(candidate.kind==='image' || candidate.kind==='svg'){
+    const img=document.createElement('img'); img.className='file-image'; img.alt=path;
+    img.src=previewURL(path,filePreview.line); body.appendChild(img); return;
+  }
+  try{
+    const r=await fetch(previewURL(path,filePreview.line)); if(!r.ok) throw new Error();
+    const data=await r.json(); const pre=document.createElement('pre'); pre.className='file-text';
+    (data.lines || []).forEach(line=>{
+      const row=document.createElement('span'); row.className='file-line'+
+        (data.line===line.number?' focus':'');
+      const number=document.createElement('span'); number.className='file-number';
+      number.textContent = line.number; row.appendChild(number);
+      row.appendChild(document.createTextNode(line.text)); pre.appendChild(row);
+    }); body.appendChild(pre);
+  }catch(e){ body.innerHTML='<div class="file-empty">preview unavailable</div>'; }
+}
+function renderFileState(){
+  const body=$('#fileBody'); body.textContent='';
+  $('#fileBack').hidden=true; $('#fileTitle').textContent='file preview';
+  if(filePreview.view==='empty'){
+    const empty=document.createElement('div'); empty.className='file-empty';
+    empty.textContent='no tracked file found'; body.appendChild(empty); return;
+  }
+  if(filePreview.view==='preview'){ renderFilePreview(filePreview.path); return; }
+  const list=document.createElement('div'); list.className='file-matches';
+  filePreview.candidates.forEach(candidate=>{
+    const button=document.createElement('button'); button.type='button';
+    button.className='file-match'; button.textContent=candidate.path;
+    button.onclick=()=>{ filePreview.view='preview'; filePreview.path=candidate.path;
+      renderFilePreview(candidate.path); };
+    list.appendChild(button);
+  }); body.appendChild(list);
+}
+async function openFilePreview(reference, trigger){
+  filePreviewReturnFocus=trigger; const modal=$('#fileModal'); modal.classList.add('show');
+  modal.setAttribute('aria-hidden','false'); document.body.classList.add('preview-open');
+  $('#fileBody').innerHTML='<div class="file-empty">looking for file…</div>'; $('#fileClose').focus();
+  try{
+    const r=await fetch('/api/files/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pane:sel,reference})});
+    filePreview=filePreviewState(r.ok ? await r.json() : null); renderFileState();
+  }catch(e){ filePreview=filePreviewState(null); renderFileState(); }
+}
+
 function card(row){
   const el = document.createElement('div');
   el.className = 'm ' + row.cls;
@@ -806,6 +949,16 @@ function card(row){
   }
   return el;
 }
+
+$('#txrows').addEventListener('click',ev=>{
+  const ref=ev.target.closest('.file-ref'); if(ref) openFilePreview(ref.dataset.reference,ref);
+});
+$('#fileClose').onclick=closeFilePreview;
+$('#fileBack').onclick=()=>{ filePreview=filePreviewBack(filePreview); renderFileState(); };
+$('#fileModal').onclick=ev=>{ if(ev.target===$('#fileModal')) closeFilePreview(); };
+document.addEventListener('keydown',ev=>{
+  if(ev.key==='Escape' && $('#fileModal').classList.contains('show')) closeFilePreview();
+});
 
 function pinned(){
   const t = $('#tx');

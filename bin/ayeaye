@@ -16,12 +16,14 @@ import glob
 import hmac
 import http.cookies
 import json
+from collections import deque
 import os
 import re
 import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import sys
@@ -250,6 +252,290 @@ def list_panes():
         out.append({"id": pid, "session": sess, "window": widx,
                     "name": wname, "cmd": cmd, "active": active == "1"})
     return out
+
+
+# File references are resolved from pane state, never from a root supplied by
+# the browser.  Keeping this boundary body-free lets the later preview route
+# independently revalidate every path before it reads anything.
+_TEXT_FILE_EXTS = {
+    ".c", ".cc", ".cfg", ".conf", ".cpp", ".css", ".csv", ".go",
+    ".h", ".hpp", ".html", ".ini", ".java", ".js", ".json", ".jsx",
+    ".lua", ".md", ".py", ".rb", ".rs", ".sh", ".sql", ".toml",
+    ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+}
+_TEXT_FILE_NAMES = {
+    "dockerfile", "gemfile", "license", "makefile", "readme",
+}
+_IMAGE_FILE_EXTS = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_IMAGE_MIME_TYPES = {
+    ".gif": "image/gif", ".jpeg": "image/jpeg", ".jpg": "image/jpeg",
+    ".png": "image/png", ".svg": "image/svg+xml", ".webp": "image/webp",
+}
+_MAX_PREVIEW_LINES = 200
+_MAX_TEXT_PREVIEW_BYTES = 256 * 1024
+_MAX_TEXT_SCAN_BYTES = 1024 * 1024
+_MAX_IMAGE_PREVIEW_BYTES = 8 * 1024 * 1024
+
+
+def _reference_path_and_line(reference):
+    """Remove transcript markup and split only a final positive :line."""
+    reference = reference.strip()
+    markdown = re.fullmatch(r"\[[^\]]*\]\((.*)\)", reference, re.DOTALL)
+    if markdown:
+        reference = markdown.group(1).strip()
+    if len(reference) >= 2 and reference[0] == reference[-1] == "`":
+        reference = reference[1:-1].strip()
+    match = re.fullmatch(r"(.*):([1-9][0-9]*)", reference, re.DOTALL)
+    if match:
+        return match.group(1), int(match.group(2))
+    return reference, None
+
+
+def _file_kind(path):
+    name = os.path.basename(path).lower()
+    ext = os.path.splitext(name)[1]
+    if ext in _IMAGE_FILE_EXTS:
+        return "image"
+    if ext == ".svg":
+        return "svg"
+    if ext in _TEXT_FILE_EXTS or name in _TEXT_FILE_NAMES:
+        return "text"
+    return "binary"
+
+
+def _path_distance(left, right):
+    left_parts = [part for part in left.split("/") if part]
+    right_parts = [part for part in right.split("/") if part]
+    common = 0
+    for a, b in zip(left_parts, right_parts):
+        if a != b:
+            break
+        common += 1
+    return len(left_parts) + len(right_parts) - 2 * common
+
+
+def resolve_file_reference(pane_id, reference):
+    """Resolve a transcript reference against one live pane's tracked files."""
+    path, line = _reference_path_and_line(
+        reference if isinstance(reference, str) else "")
+    empty = {"candidates": [], "line": line}
+    if not path or not any(p.get("id") == pane_id for p in list_panes()):
+        return empty
+
+    cwd = tmux("display-message", "-p", "-t", pane_id,
+               "#{pane_current_path}").strip()
+    if not cwd:
+        return empty
+    try:
+        root_run = subprocess.run(
+            ("git", "-C", cwd, "rev-parse", "--show-toplevel"),
+            capture_output=True, text=True, timeout=5)
+        if root_run.returncode:
+            return empty
+        root = root_run.stdout.strip()
+        files_run = subprocess.run(
+            ("git", "-C", cwd, "ls-files", "--full-name", "-z", "--", ":/"),
+            capture_output=True,
+            timeout=10)
+        if files_run.returncode:
+            return empty
+    except (OSError, subprocess.SubprocessError):
+        return empty
+
+    pane_rel = os.path.relpath(cwd, root).replace(os.sep, "/")
+    pane_rel = "" if pane_rel == "." else pane_rel
+    wanted = path
+    while wanted.startswith("./"):
+        wanted = wanted[2:]
+    ranked = []
+    for raw in files_run.stdout.split(b"\0"):
+        if not raw:
+            continue
+        tracked = os.fsdecode(raw).replace(os.sep, "/")
+        if tracked == wanted:
+            match_rank = 0
+        elif "/" in wanted and tracked.endswith("/" + wanted):
+            match_rank = 1
+        elif os.path.basename(tracked) == os.path.basename(wanted):
+            match_rank = 2
+        else:
+            continue
+        full = os.path.join(root, *tracked.split("/"))
+        try:
+            size = os.stat(full, follow_symlinks=False).st_size
+        except OSError:
+            continue
+        directory = tracked.rpartition("/")[0]
+        proximity = _path_distance(pane_rel, directory)
+        ranked.append(((match_rank, proximity, len(tracked), tracked),
+                       {"path": tracked, "kind": _file_kind(tracked),
+                        "size": size}))
+    ranked.sort(key=lambda item: item[0])
+    return {"candidates": [item[1] for item in ranked[:20]], "line": line}
+
+
+def _tracked_preview_target(pane_id, path):
+    """Re-derive and validate one regular, tracked, non-symlink file."""
+    if (not isinstance(path, str) or not path or "\0" in path
+            or path.startswith("/")
+            or any(part in ("", ".", "..") for part in path.split("/"))):
+        return None, "bad path"
+    if not any(p.get("id") == pane_id for p in list_panes()):
+        return None, "not found"
+    cwd = tmux("display-message", "-p", "-t", pane_id,
+               "#{pane_current_path}").strip()
+    if not cwd:
+        return None, "not found"
+    try:
+        root_run = subprocess.run(
+            ("git", "-C", cwd, "rev-parse", "--show-toplevel"),
+            capture_output=True, text=True, timeout=5)
+        if root_run.returncode:
+            return None, "not found"
+        root = root_run.stdout.strip()
+        files_run = subprocess.run(
+            ("git", "-C", cwd, "ls-files", "--full-name", "-z", "--", ":/"),
+            capture_output=True, timeout=10)
+        if files_run.returncode:
+            return None, "not found"
+        tracked = {os.fsdecode(raw).replace(os.sep, "/")
+                   for raw in files_run.stdout.split(b"\0") if raw}
+        if path not in tracked:
+            return None, "not found"
+        parts = path.split("/")
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                child = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+                os.close(directory)
+                directory = child
+            descriptor = os.open(
+                parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory)
+        finally:
+            os.close(directory)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            return None, "not found"
+        return (descriptor, info), None
+    except (OSError, subprocess.SubprocessError):
+        return None, "not found"
+
+
+def file_preview(pane_id, path, line=None):
+    """Return a freshly validated, bounded preview response description."""
+    target, error = _tracked_preview_target(pane_id, path)
+    if error:
+        return {"error": error}, 400 if error == "bad path" else 404
+    descriptor, info = target
+    kind = _file_kind(path)
+    try:
+        if kind in ("image", "svg"):
+            if info.st_size > _MAX_IMAGE_PREVIEW_BYTES:
+                return {"error": "image too large"}, 413
+            with os.fdopen(descriptor, "rb", closefd=False) as fh:
+                body = fh.read(_MAX_IMAGE_PREVIEW_BYTES + 1)
+            if len(body) > _MAX_IMAGE_PREVIEW_BYTES:
+                return {"error": "image too large"}, 413
+            ext = os.path.splitext(path.lower())[1]
+            headers = {"Content-Disposition": "inline",
+                       "X-Content-Type-Options": "nosniff"}
+            if ext == ".svg":
+                headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+            return {"body": body, "content_type": _IMAGE_MIME_TYPES[ext],
+                    "headers": headers}, 200
+        if kind == "binary":
+            return {"path": path, "size": info.st_size, "kind": "binary",
+                    "preview": "unavailable"}, 200
+
+        with os.fdopen(descriptor, "rb", closefd=False) as fh:
+            raw_lines = _bounded_text_lines(fh, line)
+    except OSError:
+        return {"error": "not found"}, 404
+    finally:
+        os.close(descriptor)
+    start = raw_lines[0][0] if raw_lines else 1
+    rows = []
+    remaining = _MAX_TEXT_PREVIEW_BYTES
+    for number, raw in raw_lines:
+        text = raw.decode("utf-8", "replace")
+        encoded = text.encode("utf-8")
+        if len(encoded) > remaining:
+            text = encoded[:remaining].decode("utf-8", "ignore")
+            encoded = text.encode("utf-8")
+        rows.append({"number": number, "text": text})
+        remaining -= len(encoded)
+        if remaining <= 0:
+            break
+    result = {"path": path, "size": info.st_size, "kind": "text",
+              "start": start, "lines": rows}
+    if line is not None:
+        result["line"] = line
+    return result, 200
+
+
+def _bounded_text_lines(fh, requested_line):
+    """Read only the bounded excerpt, retaining no more than its byte cap."""
+    if requested_line is None:
+        rows = []
+        remaining = _MAX_TEXT_PREVIEW_BYTES
+        for number in range(1, _MAX_PREVIEW_LINES + 1):
+            raw = fh.readline(remaining + 1)
+            if not raw:
+                break
+            rows.append((number, raw[:remaining]))
+            if len(raw) > remaining:
+                break
+            remaining -= len(raw)
+            if not remaining:
+                break
+        return rows
+
+    rows = deque()
+    fallback = []
+    fallback_bytes = 0
+    retained = 0
+    number = 0
+    scan_remaining = _MAX_TEXT_SCAN_BYTES
+    while scan_remaining:
+        raw = fh.readline(min(_MAX_TEXT_PREVIEW_BYTES + 1, scan_remaining))
+        if not raw:
+            break
+        scan_remaining -= len(raw)
+        number += 1
+        kept = raw[:_MAX_TEXT_PREVIEW_BYTES]
+        # A single logical line may exceed the response limit. Consume it in
+        # bounded chunks so later requested lines can still be reached.
+        while raw and not raw.endswith(b"\n") and scan_remaining:
+            raw = fh.readline(min(_MAX_TEXT_PREVIEW_BYTES + 1,
+                                  scan_remaining))
+            scan_remaining -= len(raw)
+        if (len(fallback) < _MAX_PREVIEW_LINES
+                and fallback_bytes < _MAX_TEXT_PREVIEW_BYTES):
+            initial = kept[:_MAX_TEXT_PREVIEW_BYTES - fallback_bytes]
+            fallback.append((number, initial))
+            fallback_bytes += len(initial)
+        if (number > requested_line
+                and retained + len(kept) > _MAX_TEXT_PREVIEW_BYTES):
+            available = _MAX_TEXT_PREVIEW_BYTES - retained
+            if available:
+                rows.append((number, kept[:available]))
+            break
+        rows.append((number, kept))
+        retained += len(kept)
+        while (len(rows) > _MAX_PREVIEW_LINES
+               or retained > _MAX_TEXT_PREVIEW_BYTES):
+            retained -= len(rows.popleft()[1])
+        if number >= requested_line + (_MAX_PREVIEW_LINES // 2 - 1):
+            break
+    if scan_remaining == 0 and number < requested_line:
+        # A distant requested line must not turn preview into an unbounded
+        # file scan. The stable fallback is the bounded beginning excerpt.
+        return fallback
+    return list(rows)
 
 
 # Written by ~/.claude/statusline-command.sh. The pane is the only thing this
@@ -1637,6 +1923,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/panes":
             return self._json({"host": HOST_NAME, "panes": list_panes()})
 
+        if path == "/api/files/preview":
+            query = self._query()
+            pane = query.get("pane", [""])[0]
+            file_path = query.get("path", [""])[0]
+            line_text = query.get("line", [""])[0]
+            if not pane or not file_path:
+                return self._json({"error": "pane and path required"}, 400)
+            if (line_text and (len(line_text) > 10
+                               or not re.fullmatch(r"[1-9][0-9]*", line_text))):
+                return self._json({"error": "line must be positive"}, 400)
+            result, code = file_preview(
+                pane, file_path, int(line_text) if line_text else None)
+            if code == 200 and "body" in result:
+                return self._send(code, result["body"], result["content_type"],
+                                  result["headers"])
+            return self._json(result, code)
+
         if path == "/api/overview":
             return self._json({"host": HOST_NAME,
                                "panes": overview(),
@@ -1757,6 +2060,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no pane"}, 400)
             res = answer_prompt(pane, key)
             return self._json(res, 400 if res.get("error") else 200)
+
+        if path == "/api/files/resolve":
+            try:
+                req = json.loads(self._body() or b"{}")
+            except Exception:
+                return self._json({"error": "bad json"}, 400)
+            if not isinstance(req, dict):
+                return self._json({"error": "json object required"}, 400)
+            pane = req.get("pane", "")
+            reference = req.get("reference", "")
+            if (not isinstance(pane, str) or not pane
+                    or not isinstance(reference, str) or not reference):
+                return self._json({"error": "pane and reference required"}, 400)
+            return self._json(resolve_file_reference(pane, reference))
 
         if path == "/api/kill":
             try:
