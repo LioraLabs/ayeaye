@@ -435,6 +435,9 @@
   .file-image{display:block;max-width:100%;max-height:70vh;margin:auto}
   .file-text{margin:0;overflow:auto;white-space:pre;font:12px/1.5 var(--mono)}
   .file-line{display:block}.file-line.focus{background:rgba(238,212,159,.12)}
+  .file-code{color:var(--fg)}
+  .syn-key{color:#c6a0f6;font-weight:600}.syn-string{color:#a6da95}
+  .syn-comment{color:#6e738d;font-style:italic}.syn-number{color:#f5a97f}
   .file-number{display:inline-block;width:5ch;margin-right:2ch;color:var(--faint);
                text-align:right;user-select:none}
   @media (max-width: 520px){
@@ -874,6 +877,33 @@ function previewURL(path,line){
   const q=new URLSearchParams({pane:sel,path}); if(line) q.set('line',line);
   return '/api/files/preview?'+q;
 }
+
+function highlightCode(path,text){
+  const name=path.toLowerCase(), ext=(name.match(/\.([^.\/]+)$/)||[])[1]||'';
+  let words='';
+  if(['py'].includes(ext)) words='and as assert async await break class continue def del elif else except false finally for from global if import in is lambda none nonlocal not or pass raise return true try while with yield';
+  else if(['js','jsx','mjs','cjs','ts','tsx'].includes(ext)) words='async await break case catch class const continue debugger default delete do else export extends false finally for from function get if import in instanceof let new null of return set static super switch this throw true try typeof undefined var void while with yield';
+  else if(['sh','bash','zsh','fish'].includes(ext)) words='break case continue do done elif else esac exit export fi for function if in local readonly return set then unset until while';
+  else if(['json'].includes(ext)) words='false null true';
+  else if(['rs'].includes(ext)) words='as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while';
+  else if(['go'].includes(ext)) words='break case chan const continue default defer else fallthrough false for func go goto if import interface map nil package range return select struct switch true type var';
+  else if(['c','h','cc','cpp','cxx','hpp'].includes(ext)) words='auto bool break case catch char class const constexpr continue default delete do double else enum explicit extern false float for friend if inline int long namespace new nullptr private protected public register return short signed sizeof static struct switch template this throw true try typedef typename union unsigned using virtual void volatile while';
+  else if(['html','htm','svg','css','md','markdown'].includes(ext)) words='html head body script style div span class id import media display position color background border margin padding width height flex grid';
+  else if(['toml','yaml','yml'].includes(ext) || /(^|\/)(cookfile|makefile)$/.test(name)) words='false true null';
+  else return esc(text);
+  const keys=new Set(words.split(' '));
+  const token=/(<!--[\s\S]*?-->|\/\*[\s\S]*?\*\/|\/\/.*|#.*|[rubf]*"(?:\\.|[^"\\])*"|[rubf]*'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:0x[\da-f]+|\d+(?:\.\d+)?)\b|[A-Za-z_$][\w$-]*)/gi;
+  let out='',at=0,m;
+  while((m=token.exec(text))){
+    out+=esc(text.slice(at,m.index)); const t=m[0]; let cls='';
+    if(/^(?:<!--|\/\*|\/\/|#)/.test(t)) cls='syn-comment';
+    else if(/^[rubf]*["'`]/i.test(t)) cls='syn-string';
+    else if(/^(?:0x[\da-f]+|\d)/i.test(t)) cls='syn-number';
+    else if(keys.has(t.toLowerCase())) cls='syn-key';
+    out+=cls?'<span class="'+cls+'">'+esc(t)+'</span>':esc(t); at=token.lastIndex;
+  }
+  return out+esc(text.slice(at));
+}
 async function renderFilePreview(path){
   const body=$('#fileBody'); body.textContent=''; $('#fileTitle').textContent=path;
   $('#fileBack').hidden=!(filePreview.candidates.length>1);
@@ -890,7 +920,8 @@ async function renderFilePreview(path){
         (data.line===line.number?' focus':'');
       const number=document.createElement('span'); number.className='file-number';
       number.textContent = line.number; row.appendChild(number);
-      row.appendChild(document.createTextNode(line.text)); pre.appendChild(row);
+      const code=document.createElement('span'); code.className='file-code';
+      code.innerHTML=highlightCode(path,line.text); row.appendChild(code); pre.appendChild(row);
     }); body.appendChild(pre);
   }catch(e){ body.innerHTML='<div class="file-empty">preview unavailable</div>'; }
 }

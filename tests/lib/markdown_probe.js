@@ -83,3 +83,16 @@ for(const required of [
 ]) includes(html, required, 'preview UI contract');
 if(/innerHTML\s*=.*svg/i.test(html.slice(html.indexOf('function renderFilePreview'))))
   throw new Error('preview renderer may inject SVG markup');
+
+const python = highlightCode('src/example.py', 'def greet(name): # hello\n  return f"Hi {name}"');
+includes(python, '<span class="syn-key">def</span>', 'python keyword highlighting');
+includes(python, '<span class="syn-comment"># hello</span>', 'python comment highlighting');
+includes(python, '<span class="syn-string">f&quot;Hi {name}&quot;</span>', 'python string highlighting');
+const json = highlightCode('config.json', '{"enabled": true, "count": 3}');
+includes(json, '<span class="syn-string">&quot;enabled&quot;</span>', 'json strings highlighted');
+includes(json, '<span class="syn-key">true</span>', 'json literals highlighted');
+includes(json, '<span class="syn-number">3</span>', 'numbers highlighted');
+const unsafeCode = highlightCode('x.js', '<img onerror="bad">');
+if(unsafeCode.includes('<img')) throw new Error('syntax highlighter emitted raw HTML');
+if(highlightCode('notes.unknown', 'plain < text') !== 'plain &lt; text')
+  throw new Error('unknown syntax does not safely fall back to plain text');
