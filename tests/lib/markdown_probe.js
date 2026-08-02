@@ -54,7 +54,7 @@ includes(refs, '<strong>See <button', 'strong markdown composes with file links'
 if(/data-reference="(?:ordinary|prose|changelog)"/.test(refs))
   throw new Error('ordinary extensionless prose became a file reference');
 
-const boundary = markdownInline('version 1.2.3, example.com, UTF-8, SHA-256, and foo.xyzzy');
+const boundary = markdownInline('version 1.2.3, example.com, UTF-8, SHA-256, foo.xyzzy, HTML/CSS, read/write, and TCP/IP');
 if(boundary.includes('file-ref')) throw new Error('false positive boundary became a file reference');
 
 const hostileRef = markdownInline('src/&lt;bad&gt;.js and [x](a&quot;b.md)');

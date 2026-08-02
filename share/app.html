@@ -770,7 +770,9 @@ function fileLinkify(text){
     let value=m[0], trailing='';
     while(/[),.;!?]$/.test(value)){ trailing=value.slice(-1)+trailing; value=value.slice(0,-1); }
     out += linkify(text.slice(at,m.index));
-    out += fileReference(value, value.includes('/')) ? fileButton(value,value,false) : linkify(value);
+    // Slash-separated prose is often a label (HTML/CSS, read/write, TCP/IP),
+    // not a path. Extensionless paths need explicit backticks or Markdown.
+    out += fileReference(value, false) ? fileButton(value,value,false) : linkify(value);
     out += linkify(trailing); at=m.index+m[0].length;
   }
   return out+linkify(text.slice(at));
