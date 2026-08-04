@@ -63,20 +63,32 @@ _PKGS_CLAUDE_INSTALLER="${AYEAYE_CLAUDE_INSTALLER_URL:-https://claude.ai/install
 # what the latest is - one request, and it is the download itself.
 _PKGS_CODEX_BASE="${AYEAYE_CODEX_RELEASE_URL:-https://github.com/openai/codex/releases/latest/download}"
 
-# cliban names its archives after the release, so the version is part of the
-# path. It is pinned rather than looked up: resolving "latest" would mean a
-# request to an API before the user has agreed to any network access at all,
-# and one download the user said yes to is the whole of what this file does to
-# the network.
-_PKGS_CLIBAN_VERSION="${AYEAYE_CLIBAN_VERSION:-v0.1.0}"
-_PKGS_CLIBAN_BASE="${AYEAYE_CLIBAN_RELEASE_URL:-https://github.com/LioraLabs/cliban/releases/download}"
-_PKGS_CLIBAN_SOURCE="https://github.com/LioraLabs/cliban"
+# cliban releases often, and the board page in bin/ayeaye speaks its current
+# CLI, so the release taken is always the latest one. That resolves without
+# asking an API which version "latest" is, because cliban publishes every
+# artifact under a versionless alias as well - the same property the Codex
+# release has, and it matters here for the same reason: the URL is known
+# before any question is asked, so consent still comes before the first byte
+# moves.
+#
+# cliban publishes other routes as well - its own curl-pipe-sh installer, a
+# Homebrew tap, crates.io, an AUR package - and this file still takes the
+# release tarball, because every one of those routes installs cliband, the
+# multi-user server, alongside it, and putting a server on somebody's computer
+# is an explicit non-goal here. The tarball is the one route that lets setup
+# take the single program it wants and nothing else.
+#
+# What arrives is compared against the SHA256SUMS published beside it, fetched
+# on the same consent - the bootstrap's model, and worth what it is worth
+# there: it catches a download that broke in transit, and it does not catch
+# somebody in a position to replace both files at once.
+_PKGS_CLIBAN_BASE="${AYEAYE_CLIBAN_RELEASE_URL:-https://github.com/LioraLabs/cliban/releases/latest/download}"
 
 # Rounded up from the real artifacts, for the "about N MB" line in stage five.
 # Codex really is that big: 110 MB compressed and around 300 MB unpacked.
 _PKGS_CLAUDE_BYTES=30000000
 _PKGS_CODEX_BYTES=115000000
-_PKGS_CLIBAN_BYTES=8000000
+_PKGS_CLIBAN_BYTES=11000000
 
 # ------------------------------------------------------------------- where
 #                                                                     things go
@@ -328,14 +340,31 @@ _pkgs_say_path_note() {
   return 0
 }
 
+# _pkgs_digest <file> - the sha256 of a file, using whatever this machine has.
+# 1 when it has none of them, which is a thing to say out loud rather than a
+# thing to fail over - the same shape as the bootstrap's own digest.
+_pkgs_digest() {
+  if _pkgs_have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  elif _pkgs_have shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif _pkgs_have openssl; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
 # _pkgs_verify_archive <archive> <member> - is this really the archive it should
 # be, and does it contain what it should?
 #
-# There are no published checksums for either of the two projects this file
-# downloads from, so this is what verification can honestly be: the bytes are a
-# real gzip stream, the archive is a real tar, and the one file that is wanted
-# is in it under the name it should have. The program is then run with a
-# harmless flag before anything reports success.
+# Codex publishes no checksums, so for it this is what verification can
+# honestly be: the bytes are a real gzip stream, the archive is a real tar, and
+# the one file that is wanted is in it under the name it should have. cliban's
+# checksum is pinned above and compared before this is called; this still runs
+# after it, because an archive that matches its checksum can still be missing
+# the one file this step is about to take out of it. The program is then run
+# with a harmless flag before anything reports success.
 _pkgs_verify_archive() {
   local archive="${1:-}" member="${2:-}" listing
   [ -s "$archive" ] || {
@@ -520,7 +549,7 @@ _pkgs_choose_step() {
     wizard_plan_add config "a status line for Claude Code, added to $(_pkgs_claude_settings)"
   fi
   if _pkgs_fetching_board; then
-    wizard_plan_add download "cliban $_PKGS_CLIBAN_VERSION, for the project board" \
+    wizard_plan_add download "cliban (its latest release), for the project board" \
       "$_PKGS_CLIBAN_BYTES"
   fi
   return "$WIZARD_STAGE_OK"
@@ -1354,15 +1383,17 @@ _pkgs_cliban_tell_ayeaye() {
 
 # _pkgs_cliban_cargo - the advanced route, offered and never assumed.
 #
-# It compiles the program from its source, which takes several minutes and a
-# rust toolchain. Somebody who already has cargo knows what that means; anybody
-# else is better served by being told the download did not work.
+# It compiles the program from its source - cliban is published on crates.io,
+# so this is the release's own source rather than whatever is on a branch -
+# which takes several minutes and a rust toolchain. Somebody who already has
+# cargo knows what that means; anybody else is better served by being told the
+# download did not work.
 _pkgs_cliban_cargo() {
   if ! _pkgs_have cargo; then
     wizard_say "the other way to install cliban is to build it from its source,"
     wizard_say "which needs the rust toolchain from https://rustup.rs and takes"
     wizard_say "several minutes:"
-    wizard_say "  cargo install --git $_PKGS_CLIBAN_SOURCE cliban"
+    wizard_say "  cargo install cliban"
     return 1
   fi
   if [ "${WIZARD_INTERACTIVE:-1}" = 0 ]; then
@@ -1378,11 +1409,52 @@ _pkgs_cliban_cargo() {
   wizard_say "minutes and a lot of this computer's attention."
   # One question, not two. wizard_privileged asks it and shows the command.
   wizard_privileged "build cliban from source now? It takes several minutes." \
-    "cargo install --git $_PKGS_CLIBAN_SOURCE cliban </dev/null"
+    "cargo install cliban </dev/null"
+}
+
+# _pkgs_verify_checksum <archive> <artifact-name> <sums-file> - 0 to carry on,
+# 1 to stop.
+#
+# Says which of the three things happened, every time, because silence here
+# reads as "verified" and is the one thing this must never mean: the checksum
+# matched; there was nothing to compare, and which half was missing; or a
+# mismatch - which stops the board, and only the board.
+_pkgs_verify_checksum() {
+  local archive="${1:-}" name="${2:-}" sums="${3:-}" expected actual
+  if [ ! -s "$sums" ]; then
+    wizard_say "not checked: the checksums cliban publishes beside its releases"
+    wizard_say "did not arrive, so the only thing protecting this download was"
+    wizard_say "the encrypted connection to the server."
+    return 0
+  fi
+  expected="$(awk -v want="$name" \
+    '{ n = $2; sub(/^\*/, "", n); if (n == want) { print $1; exit } }' "$sums")"
+  if [ -z "$expected" ]; then
+    wizard_say "not checked: the checksums published with this cliban release say"
+    wizard_say "nothing about $name, so there was nothing to compare against."
+    return 0
+  fi
+  actual="$(_pkgs_digest "$archive")" || actual=""
+  if [ -z "$actual" ]; then
+    wizard_say "not checked: this computer has no sha256sum, shasum or openssl,"
+    wizard_say "so the checksum cliban publishes could not be compared."
+    return 0
+  fi
+  if [ "$actual" != "$expected" ]; then
+    wizard_say "what was downloaded is not what cliban published, so nothing has"
+    wizard_say "been unpacked or installed. This can be an interrupted download,"
+    wizard_say "and it can be somebody in the way of this one. Try again, and if"
+    wizard_say "it happens twice do not run it."
+    wizard_detail "checksum expected $expected"
+    wizard_detail "checksum received $actual"
+    return 1
+  fi
+  wizard_item ok "the download matches the checksums published beside it"
+  return 0
 }
 
 _pkgs_board_step() {
-  local work target name url archive member status found dest
+  local work target name url archive member sums status found dest
 
   if ! _pkgs_wants answer.board; then
     wizard_say "no project board. Everything ayeaye puts on your phone works"
@@ -1422,13 +1494,17 @@ _pkgs_board_step() {
     wizard_say "could not make a temporary folder to download into."
     return "$WIZARD_STAGE_FAIL"
   }
-  name="cliban-$_PKGS_CLIBAN_VERSION-$target"
+  # The versionless alias of the latest release, and the checksums beside it
+  # on the same consent. The alias holds a versionless directory too, which is
+  # what lets the member be named here without knowing the version.
+  name="cliban-$target"
   member="$name/cliban"
-  url="$_PKGS_CLIBAN_BASE/$_PKGS_CLIBAN_VERSION/$name.tar.gz"
+  url="$_PKGS_CLIBAN_BASE/$name.tar.gz"
   archive="$work/$name.tar.gz"
+  sums="$work/SHA256SUMS"
 
   wizard_download "may I download cliban, the project board program?" \
-    "$url" "$archive" "$_PKGS_CLIBAN_BYTES"
+    "$url" "$archive" "$_PKGS_CLIBAN_BYTES" "$_PKGS_CLIBAN_BASE/SHA256SUMS" "$sums"
   status=$?
   if [ "$status" = 3 ]; then
     rm -rf "$work" 2>/dev/null
@@ -1440,11 +1516,24 @@ _pkgs_board_step() {
     rm -rf "$work" 2>/dev/null
     wizard_say "cliban could not be downloaded, so there is no project board."
     wizard_say "Everything else ayeaye does is unaffected."
+    # The route cliban itself documents first, for whoever wants to do this by
+    # hand - with the one thing about it setup would never do on its own said
+    # out loud: the formula installs cliband, the multi-user server, as well.
+    if platform_has_brew; then
+      wizard_say "Homebrew on this computer can install it too, though that way"
+      wizard_say "also installs cliband, its multi-user server:"
+      wizard_say "  brew install lioralabs/tap/cliban"
+    fi
     _pkgs_cliban_cargo || return "$WIZARD_STAGE_FAIL"
     if found="$(_pkgs_find cliban)"; then
       _pkgs_cliban_ready "$found" || return "$WIZARD_STAGE_PENDING"
       return "$WIZARD_STAGE_OK"
     fi
+    return "$WIZARD_STAGE_FAIL"
+  fi
+
+  if ! _pkgs_verify_checksum "$archive" "$name.tar.gz" "$sums"; then
+    rm -rf "$work" 2>/dev/null
     return "$WIZARD_STAGE_FAIL"
   fi
 

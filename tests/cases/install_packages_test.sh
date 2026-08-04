@@ -493,7 +493,7 @@ test_the_plan_names_everything_before_any_of_it_happens() {
   plan="$(wizard_plan_show)"
   assert_contains "$plan" "what setup needs to fetch things: curl tar"
   assert_contains "$plan" "Claude Code, from claude.ai"
-  assert_contains "$plan" "cliban v0.1.0, for the project board"
+  assert_contains "$plan" "cliban (its latest release), for the project board"
   assert_contains "$plan" "a status line for Claude Code"
   assert_not_contains "$plan" "OpenAI Codex" "it was not chosen"
   wizard_plan_is_consequential \

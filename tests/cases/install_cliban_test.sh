@@ -30,6 +30,8 @@ setup() {
   WIZARD_INTERACTIVE=0
   WIZARD_AUTO_CONSENT="privileged download replace"
   stub_real tar gzip cmp
+  # Whichever of these the host has; the step needs one to compare checksums.
+  stub_real sha256sum shasum openssl
   wizard_remember step.install.packages.download 1
   wizard_remember step.install.packages.unpack 1
   wizard_remember answer.board 1
@@ -64,27 +66,40 @@ _machine() {
   platform_reset
 }
 
+# _curl_serves <payload> - curl serves the payload for the artifact URL, and a
+# SHA256SUMS naming it for the checksums URL, exactly the pair the release
+# page serves. Tests that want the sums wrong, or absent, edit or remove
+# $CURL_SUMS after calling this.
 _curl_serves() {
   CURL_PAYLOAD="$1"
-  export CURL_PAYLOAD
+  CURL_SUMS="$TEST_TMPDIR/served-SHA256SUMS"
+  export CURL_PAYLOAD CURL_SUMS
+  python3 -c \
+    'import hashlib,sys;print("%s  %s" % (hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest(), sys.argv[1].rsplit("/",1)[-1]))' \
+    "$1" > "$CURL_SUMS"
   stub_script curl <<'SH'
 dest=""
+url=""
 prev=""
 for arg in "$@"; do
   [ "$prev" = "-o" ] && dest="$arg"
+  case "$arg" in http://*|https://*) url="$arg" ;; esac
   prev="$arg"
 done
 [ -n "$dest" ] || exit 0
-cp "$CURL_PAYLOAD" "$dest"
+case "$url" in
+  *SHA256SUMS) cp "$CURL_SUMS" "$dest" ;;
+  *)           cp "$CURL_PAYLOAD" "$dest" ;;
+esac
 SH
 }
 
-# The release archive, laid out exactly the way upstream's is: a directory
-# named after the release, holding the program, the multi-user server, and two
-# text files.
+# The release archive, laid out exactly the way upstream's versionless alias
+# is: a directory named after the artifact, holding the program, the
+# multi-user server, and two text files.
 _release_archive() {
   local target="$1" name dir out
-  name="cliban-v0.1.0-$target"
+  name="cliban-$target"
   dir="$TEST_TMPDIR/build"
   out="$TEST_TMPDIR/$name.tar.gz"
   rm -rf "$dir"
@@ -165,7 +180,7 @@ test_the_release_for_this_computer_is_the_one_that_is_fetched() {
     _curl_serves "$(_release_archive "$target")"
     _run_step
     assert_stub_called_with curl \
-      "https://github.com/LioraLabs/cliban/releases/download/v0.1.0/cliban-v0.1.0-$target.tar.gz" \
+      "https://github.com/LioraLabs/cliban/releases/latest/download/cliban-$target.tar.gz" \
       "the release built for $target and no other"
     assert_file_exists "$(_installed)"
     rm -f "$(_installed)"
@@ -200,14 +215,82 @@ test_a_real_archive_holding_the_wrong_thing_is_refused_too() {
   local dir out
   dir="$TEST_TMPDIR/wrong"
   out="$TEST_TMPDIR/wrong.tar.gz"
-  mkdir -p "$dir/cliban-v0.1.0-x86_64-unknown-linux-musl"
-  printf 'nothing here\n' > "$dir/cliban-v0.1.0-x86_64-unknown-linux-musl/README.md"
-  ( cd "$dir" && tar -czf "$out" "cliban-v0.1.0-x86_64-unknown-linux-musl" )
+  mkdir -p "$dir/cliban-x86_64-unknown-linux-musl"
+  printf 'nothing here\n' > "$dir/cliban-x86_64-unknown-linux-musl/README.md"
+  ( cd "$dir" && tar -czf "$out" "cliban-x86_64-unknown-linux-musl" )
   _curl_serves "$out"
   _run_step
   assert_file_missing "$(_installed)"
   assert_contains "$STEP_OUT" "not the cliban release it should be"
   assert_status 12 "$STEP_STATUS"
+}
+
+test_the_download_is_compared_against_the_published_checksum() {
+  _machine Linux x86_64
+  _curl_serves "$(_release_archive x86_64-unknown-linux-musl)"
+  _an_env_file
+  _run_step
+  assert_status 0 "$STEP_STATUS"
+  assert_contains "$STEP_OUT" "matches the checksum"
+}
+
+test_bytes_that_do_not_match_the_checksum_are_never_unpacked() {
+  # The gate the checksums exist for: the archive would unpack cleanly and
+  # holds a working program, and it is still not the bytes cliban published.
+  _machine Linux x86_64
+  _curl_serves "$(_release_archive x86_64-unknown-linux-musl)"
+  printf '%s  %s\n' \
+    "1111111111111111111111111111111111111111111111111111111111111111" \
+    "cliban-x86_64-unknown-linux-musl.tar.gz" > "$CURL_SUMS"
+  _run_step
+  assert_file_missing "$(_installed)"
+  assert_contains "$STEP_OUT" "not what cliban published"
+  assert_status 12 "$STEP_STATUS"
+}
+
+test_checksums_that_do_not_arrive_are_said_out_loud_not_assumed() {
+  # The sums fetch is best-effort on the same consent; a release page that
+  # serves the artifact and drops the sums still installs, and the run says
+  # exactly what protected the download instead of implying it was checked.
+  _machine Linux x86_64
+  _curl_serves "$(_release_archive x86_64-unknown-linux-musl)"
+  rm -f "$CURL_SUMS"
+  _an_env_file
+  _run_step
+  assert_status 0 "$STEP_STATUS"
+  assert_contains "$STEP_OUT" "did not arrive"
+  assert_file_exists "$(_installed)"
+}
+
+test_sums_that_say_nothing_about_this_artifact_are_not_a_match() {
+  # An entry for some other artifact is "nothing to compare", never "verified".
+  _machine Linux x86_64
+  _curl_serves "$(_release_archive x86_64-unknown-linux-musl)"
+  printf '%s  %s\n' \
+    "1111111111111111111111111111111111111111111111111111111111111111" \
+    "something-else.tar.gz" > "$CURL_SUMS"
+  _an_env_file
+  _run_step
+  assert_status 0 "$STEP_STATUS"
+  assert_contains "$STEP_OUT" "say"
+  assert_contains "$STEP_OUT" "nothing about cliban-x86_64-unknown-linux-musl.tar.gz"
+  assert_not_contains "$STEP_OUT" "matches the checksum"
+}
+
+test_a_machine_that_cannot_digest_says_not_checked_rather_than_nothing() {
+  # Silence after a download reads as "verified". A computer with no way to
+  # work out a sha256 still installs - the release is real - but says out loud
+  # that nothing was compared.
+  _machine Linux x86_64
+  _curl_serves "$(_release_archive x86_64-unknown-linux-musl)"
+  _an_env_file
+  stub_command sha256sum --exit 127
+  stub_command shasum --exit 127
+  stub_command openssl --exit 127
+  _run_step
+  assert_status 0 "$STEP_STATUS"
+  assert_contains "$STEP_OUT" "not checked"
+  assert_file_exists "$(_installed)"
 }
 
 test_the_multi_user_server_is_never_put_on_this_computer() {
@@ -364,7 +447,7 @@ test_without_a_rust_toolchain_the_long_way_is_only_described() {
   _machine Linux armv7l
   stub_command curl
   _run_step
-  assert_contains "$STEP_OUT" "cargo install --git https://github.com/LioraLabs/cliban cliban"
+  assert_contains "$STEP_OUT" "cargo install cliban"
   assert_contains "$STEP_OUT" "https://rustup.rs"
 }
 
@@ -376,8 +459,7 @@ test_a_chosen_build_runs_exactly_the_command_upstream_documents() {
   # yes to building it, and yes to the consent question that shows the command
   printf 'y\ny\n' > "$TEST_TMPDIR/yes"
   _pkgs_board_step < "$TEST_TMPDIR/yes" >/dev/null 2>&1
-  assert_stub_called_with cargo \
-    "cargo install --git https://github.com/LioraLabs/cliban cliban"
+  assert_stub_called_with cargo "cargo install cliban"
 }
 
 # ------------------------------------------- and now the whole run, for real
@@ -411,11 +493,11 @@ test_the_whole_run_says_what_it_will_fetch_before_it_fetches_it() {
   _seed_answer answer.board 1
   run_install --defaults --yes --no-systemd
   _assert_before "$RUN_STDOUT" \
-    "cliban v0.1.0, for the project board" \
+    "cliban (its latest release), for the project board" \
     "cliban could not be downloaded"
   _assert_before "$RUN_STDOUT" \
     "Before anything changes, here is all of it:" \
-    "cliban v0.1.0, for the project board"
+    "cliban (its latest release), for the project board"
 }
 
 test_a_board_that_could_not_be_installed_leaves_the_run_finished_anyway() {
@@ -467,7 +549,7 @@ test_settings_that_could_not_be_copied_are_not_changed_either() {
 test_a_program_that_will_not_start_is_not_called_installed() {
   _machine Linux x86_64
   local dir out name
-  name="cliban-v0.1.0-x86_64-unknown-linux-musl"
+  name="cliban-x86_64-unknown-linux-musl"
   dir="$TEST_TMPDIR/broken"
   out="$TEST_TMPDIR/broken.tar.gz"
   mkdir -p "$dir/$name"
@@ -487,7 +569,7 @@ test_an_archive_naming_something_that_only_starts_the_same_way_is_refused() {
   # "<release>/cliban-notes" is not an archive containing "<release>/cliban".
   _machine Linux x86_64
   local dir out name
-  name="cliban-v0.1.0-x86_64-unknown-linux-musl"
+  name="cliban-x86_64-unknown-linux-musl"
   dir="$TEST_TMPDIR/nearly"
   out="$TEST_TMPDIR/nearly.tar.gz"
   mkdir -p "$dir/$name"
