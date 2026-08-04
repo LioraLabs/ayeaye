@@ -168,6 +168,34 @@ test_a_granted_download_asks_curl_for_exactly_that_url() {
   assert_stub_called_with curl "$TEST_TMPDIR/model.bin"
 }
 
+test_a_download_and_the_file_beside_it_ride_on_one_consent() {
+  # The optional pair is for a release's checksums: one thing to agree to,
+  # fetched with the artifact, and asked about exactly once.
+  WIZARD_AUTO_CONSENT="download"
+  stub_command curl
+  wizard_download "may I fetch the board program?" \
+    "https://example.invalid/x.tar.gz" "$TEST_TMPDIR/x.tar.gz" 100 \
+    "https://example.invalid/SHA256SUMS" "$TEST_TMPDIR/SHA256SUMS"
+  assert_status 0 "$?"
+  assert_stub_called_with curl "https://example.invalid/x.tar.gz"
+  assert_stub_called_with curl "https://example.invalid/SHA256SUMS"
+  assert_eq 1 "$(wizard_consent_ledger | grep -c 'may I fetch the board program?')" \
+    "two fetches, one question, one ledger line"
+}
+
+test_a_beside_file_that_fails_does_not_fail_the_download() {
+  # Best-effort, and nothing left behind: the caller decides what an artifact
+  # without its checksums means, and must never find half a checksum file.
+  WIZARD_AUTO_CONSENT="download"
+  stub_command curl --exit 1
+  stub_when curl "*https://example.invalid/x.tar.gz" --exit 0
+  wizard_download "may I fetch it?" \
+    "https://example.invalid/x.tar.gz" "$TEST_TMPDIR/x.tar.gz" 100 \
+    "https://example.invalid/SHA256SUMS" "$TEST_TMPDIR/SHA256SUMS"
+  assert_status 0 "$?" "the artifact arrived; the sums are the caller's problem"
+  assert_file_missing "$TEST_TMPDIR/SHA256SUMS"
+}
+
 test_a_download_with_no_fetcher_says_so_rather_than_pretending() {
   WIZARD_AUTO_CONSENT="download"
   assert_command_absent curl

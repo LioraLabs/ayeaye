@@ -57,7 +57,7 @@
 #   wizard_firewall   <question> <command-string>
 #   wizard_trust      <question> <command-string>
 #   wizard_may_expose <question> [detail]…   the kind with nothing to run
-#   wizard_download   <question> <url> <destination> [bytes]
+#   wizard_download   <question> <url> <destination> [bytes] [beside-url] [beside-dest]
 #   wizard_replace    <path> [question]     -> 0 when the caller may now write
 #   wizard_install_packages <logical>…      -> the package layer, with consent
 #   wizard_backup     <path>                -> the backup path on stdout
@@ -394,16 +394,31 @@ wizard_may_expose() {
 }
 wizard_trust()      { _wizard_do trust      "${1:-}" "${2:-}"; }
 
-# wizard_download <question> <url> <destination> [bytes]
+# wizard_download <question> <url> <destination> [bytes] [beside-url] [beside-destination]
 #
 # curl is the one fetcher this project will use: it is already a logical
 # package name the platform layer knows, and every supported platform either
 # ships it or can install it. A machine with none says so rather than reporting
 # a download that never happened - the seam the bootstrap ticket builds on.
+#
+# The optional pair is for the small file a release publishes beside its
+# artifact - its checksums - and it rides on the same consent, the same way the
+# bootstrap's one question covers the release and the SHA256SUMS next to it:
+# they are one thing to agree to, and asking twice would teach people to say
+# yes without reading. It is best-effort, and it leaves nothing behind on
+# failure: the caller decides what an artifact without its checksums means,
+# and a half-fetched checksum file must never be the thing it is compared to.
 wizard_download() {
-  local question="${1:-}" url="${2:-}" dest="${3:-}" bytes="${4:-}" dir status
+  local question="${1:-}" url="${2:-}" dest="${3:-}" bytes="${4:-}"
+  local beside_url="${5:-}" beside_dest="${6:-}" dir status
   [ -n "$url" ] && [ -n "$dest" ] || return 2
-  wizard_consent download "$question" "GET $url -> $dest"
+  [ -z "$beside_url" ] || [ -n "$beside_dest" ] || return 2
+  if [ -n "$beside_url" ]; then
+    wizard_consent download "$question" "GET $url -> $dest" \
+      "GET $beside_url -> $beside_dest"
+  else
+    wizard_consent download "$question" "GET $url -> $dest"
+  fi
   status=$?
   [ "$status" = 2 ] && return 2
   [ "$status" = 0 ] || return "$WIZARD_REFUSED"
@@ -422,6 +437,15 @@ wizard_download() {
     rm -f "$dest" 2>/dev/null
     return 1
   }
+  if [ -n "$beside_url" ]; then
+    dir="${beside_dest%/*}"
+    [ "$dir" = "$beside_dest" ] || mkdir -p "$dir" 2>/dev/null || dir=""
+    wizard_detail "downloading $beside_url to $beside_dest"
+    if [ -z "$dir" ] || ! curl -fsSL --retry 2 -o "$beside_dest" "$beside_url"; then
+      rm -f "$beside_dest" 2>/dev/null
+      wizard_detail "could not fetch $beside_url; carrying on without it"
+    fi
+  fi
   return 0
 }
 
