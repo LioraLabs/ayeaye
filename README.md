@@ -112,15 +112,6 @@ Three processes:
 
 ## Install
 
-> **The one-liner below does not work yet.** It fetches a pinned release, and
-> no release has been published: there is no `v0.1.0` tag and nothing under
-> `releases/download/v0.1.0/`, so the fetch 404s and setup stops without
-> changing anything. Cutting that release — tagging it, uploading
-> `ayeaye-v0.1.0.tar.gz` and `SHA256SUMS`, and filling in `AYEAYE_SHA256` at
-> the top of `install.sh` — is the repository owner's call, not something the
-> installer can do on anybody's behalf. **Until then, clone and run
-> `./install.sh`** ([Setup](#setup)). `install.sh --help` says the same thing.
-
 One command, on a machine that has no copy of ayeaye on it:
 
 ```sh

@@ -329,12 +329,13 @@ test_the_closing_screen_says_rerunning_is_how_anything_is_changed() {
   assert_contains "$RUN_STDOUT" "you switch between the four ways of reaching ayeaye."
 }
 
-# ============================================ the one-liner that does not work yet
+# ======================================================= the public one-liner
 
-test_help_does_not_pretend_the_public_one_liner_works_today() {
+test_help_quotes_the_public_one_liner_and_no_stale_caveat() {
+  # There used to be a caveat here saying the release did not exist. The
+  # release exists, so the caveat itself would now be the false claim.
   run_script "$REPO_ROOT/install.sh" --help
   assert_status 0 "$RUN_STATUS"
   assert_contains "$RUN_STDOUT" "curl -fsSL"
-  assert_contains "$RUN_STDOUT" "has not been published"
-  assert_contains "$RUN_STDOUT" "git clone https://github.com/LioraLabs/ayeaye"
+  assert_not_contains "$RUN_STDOUT" "has not been published"
 }

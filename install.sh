@@ -114,32 +114,6 @@ That asks before it downloads anything, fetches ayeaye $AYEAYE_VERSION into
 and then does exactly what running it from a copy does. Add arguments to it
 with -s --, for example: | bash -s -- --yes
 BOOTSTRAP
-  _release_caveat
-}
-
-# _release_caveat - said wherever the one-liner is quoted, for as long as it is
-# not true.
-#
-# The command above fetches a pinned release, and no release has been
-# published: there is no $AYEAYE_VERSION tag and nothing under
-# releases/download/$AYEAYE_VERSION/, so the fetch would 404. Cutting a release
-# is a decision for whoever owns the repository and not something setup can do
-# on their behalf, so the honest thing available here is to say so out loud
-# rather than to print a command that does not work and let somebody find out.
-#
-# When the release exists, delete this function and its two callers, and fill
-# in AYEAYE_SHA256 at the top of this file.
-_release_caveat() {
-  cat <<CAVEAT
-
-Not yet, though: ayeaye $AYEAYE_VERSION has not been published. Until somebody
-tags it and uploads ayeaye-$AYEAYE_VERSION.tar.gz and SHA256SUMS to that
-release, the command above has nothing to fetch and will fail. Clone the
-repository and run ./install.sh from it instead:
-
-  git clone https://github.com/LioraLabs/ayeaye
-  cd ayeaye && ./install.sh
-CAVEAT
 }
 
 for arg in "$@"; do
@@ -553,8 +527,6 @@ _bootstrap() {
       _boot_err "the download did not work, so nothing has been changed here."
       _boot_err "check the connection and run it again - what did arrive is kept,"
       _boot_err "and the next run carries on from where this one stopped."
-      # And the likeliest reason of all, while that is still true.
-      _release_caveat >&2
       exit 1
     fi
   fi

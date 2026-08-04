@@ -34,18 +34,14 @@ test_the_readme_no_longer_lists_the_picker_as_needing_anything() {
 
 # ------------------------------------------------- the onboarding the milestone built
 
-test_the_readme_does_not_promise_a_release_that_does_not_exist() {
-  # The public one-liner fetches a pinned release and no release has been
-  # published, so the command in the README 404s. Whoever cuts the release
-  # deletes this caveat and this test together; until then, a README that
-  # printed the command with nothing beside it would be sending people at a
-  # wall.
+test_the_readme_quotes_the_one_liner_without_hedging() {
+  # The release exists now, so the caveat that used to sit beside the
+  # one-liner would itself be the false claim. The command is quoted, and
+  # nothing beside it says it does not work.
   local readme
   readme="$(cat "$REPO_ROOT/README.md")"
   assert_contains "$readme" "curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh"
-  assert_contains "$readme" "does not work yet" \
-    "the one-liner is quoted, so the caveat has to be quoted with it"
-  assert_contains "$readme" "clone and run"
+  assert_not_contains "$readme" "does not work yet"
 }
 
 test_the_readme_describes_the_four_ways_in_and_the_rule_under_them() {
