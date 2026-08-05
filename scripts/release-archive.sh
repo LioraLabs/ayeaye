@@ -28,8 +28,27 @@ version="$(git show "$commit:install.sh" \
 # The artifact is built from a commit, so a dirty tree means it does not
 # contain what is on screen. Not fatal while developing - `cook publish` is
 # where it has to be clean - but it must not pass silently.
-if [ "$commit" = HEAD ] && ! git diff-index --quiet HEAD -- 2>/dev/null; then
-  echo "note: the working tree is dirty; this artifact is HEAD, not what you see" >&2
+#
+# One kind of dirt is fatal: an uncommitted version bump. The archive takes
+# its content from HEAD and its name from the bumped Cookfile, so building
+# through it would mint a tarball whose installer disagrees with its own
+# filename - and `cook stamp` would then checksum that mislabeled artifact
+# into install.sh as if it were the release. Refused here, where the lie
+# would be minted, rather than caught three steps later by a checker.
+if [ "$commit" = HEAD ]; then
+  tree_version="$(bash scripts/release-version.sh)"
+  if [ "$tree_version" != "$version" ]; then
+    cat >&2 <<EOF
+the version bump is not committed: the working tree says $tree_version, HEAD
+says $version, and the artifact is archived from HEAD. Commit the bump first -
+it is the commit the release is built from and the one the tag will point at -
+then run cook dist again.
+EOF
+    exit 1
+  fi
+  if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+    echo "note: the working tree is dirty; this artifact is HEAD, not what you see" >&2
+  fi
 fi
 
 mkdir -p "$(dirname "$out")"

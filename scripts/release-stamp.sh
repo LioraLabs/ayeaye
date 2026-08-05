@@ -43,4 +43,5 @@ trap - EXIT
 rm -f "$tmp"
 
 printf 'stamped %s with %s\n' "$target" "$sum"
-printf 'commit this, then tag the commit the artifact was built from.\n'
+printf 'commit this and push; cook publish verifies the pair and tags the\n'
+printf 'build commit itself.\n'

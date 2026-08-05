@@ -12,10 +12,10 @@
 #
 # Cutting a release is two commits, in this order:
 #
-#   cook bump v0.2.0    then commit           (the build commit)
+#   cook bump v0.2.1    then commit           (the build commit)
 #   cook dist
 #   cook stamp          then commit and push  (the stamp commit)
-#   cook publish v0.2.0
+#   cook publish v0.2.1
 #
 # The tag lands on the build commit, not the stamp commit: the artifact is
 # archived from it, and publish reads that commit back out of the tarball and
@@ -47,6 +47,12 @@ probe fixtures
 probe commit
     { git rev-parse HEAD }
 
+# The release scripts are how the artifacts get made, so a changed script must
+# remake them: without this, an edited release-archive.sh replays yesterday's
+# tarball out of the store and the edit looks like it did nothing.
+probe scripts
+    files { "scripts/*.sh" }
+
 # --- the suite ----------------------------------------------------------
 # One unit per case file, so editing one test re-runs one test. The whole
 # suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
@@ -58,6 +64,7 @@ recipe suite
     seal app
     seal harness
     seal fixtures
+    seal scripts
     test { bash tests/run.sh $<in.stem> }
 
 # --- release gates ------------------------------------------------------
@@ -65,7 +72,8 @@ recipe suite
 recipe release-version
     ingredients "scripts/check-release-version.sh"
     seal wizard
-    test { bash scripts/check-release-version.sh v0.2.0 }
+    seal scripts
+    test { bash scripts/check-release-version.sh v0.2.1 }
 
 # --- the artifacts ------------------------------------------------------
 # Gated on the suite: a red test blocks the tarball rather than shipping it.
@@ -74,13 +82,14 @@ recipe release-version
 
 recipe dist: suite release-version
     seal commit
-    cook "dist/ayeaye-v0.2.0.tar.gz" { bash scripts/release-archive.sh $<out> }
+    seal scripts
+    cook "dist/ayeaye-v0.2.1.tar.gz" { bash scripts/release-archive.sh $<out> }
     cook "dist/SHA256SUMS" { bash scripts/release-checksums.sh $<in> $<out> }
 
 # No source, so it always runs: the question is not "did the inputs change"
 # but "is the thing on disk right now something the bootstrap can install".
 recipe release-installable: dist
-    test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.2.0.tar.gz }
+    test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.2.1.tar.gz }
 
 # --- publishing ---------------------------------------------------------
 # Chores, not recipes: they mutate a tracked file and talk to GitHub, and
@@ -93,9 +102,10 @@ chore stamp: dist
 # stamp commit moves it, so a publish that rebuilt dist would upload a tarball
 # the stamp in install.sh does not describe. Publish takes the artifact on
 # disk and verifies it against the stamp itself; the suite and version gates
-# still stand in the way of a red tree.
-chore publish version="v0.2.0": suite release-version
-    git diff-index --quiet HEAD -- || { echo "working tree is dirty - commit before publishing" >&2; exit 1; }
+# still stand in the way of a red tree. The dirty-tree refusal lives in the
+# script, which can tell an uncommitted stamp from ordinary dirt and say
+# "commit it and go" rather than only "no".
+chore publish version="v0.2.1": suite release-version
     bash scripts/release-publish.sh $<version>
 
 chore bump version

@@ -16,6 +16,33 @@ expected="$(bash scripts/release-version.sh)"
   exit 1
 }
 
+# A dirty tree cannot be published - main must end up describing what
+# shipped. But the flow's own last step dirties the tree: cook stamp writes
+# the checksum into install.sh, and committing it is what the person is in
+# the middle of doing. Saying "dirty" to that person, in the same words as
+# to one with half an edit open, is what made this feel like a chicken and
+# egg - so the one kind of dirt the flow itself creates is named as the next
+# step instead of an obstacle.
+if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+  others="$(git diff HEAD --name-only | grep -v '^install\.sh$' || true)"
+  stamp_only=""
+  if [ -z "$others" ] \
+     && ! git diff HEAD -- install.sh | grep '^[+-]' | grep -v '^[+-][+-]' \
+          | grep -qv 'AYEAYE_SHA256='; then
+    stamp_only=1
+  fi
+  if [ -n "$stamp_only" ]; then
+    cat >&2 <<'EOF'
+one thing left: the stamp cook stamp wrote is not committed yet. Commit it,
+push, and publish again - the tag lands on the build commit either way, so
+the stamp commit is safe to make.
+EOF
+  else
+    echo "the working tree is dirty - commit before publishing" >&2
+  fi
+  exit 1
+fi
+
 artifact="dist/ayeaye-$version.tar.gz"
 sums="dist/SHA256SUMS"
 for f in "$artifact" "$sums"; do

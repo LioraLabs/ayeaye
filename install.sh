@@ -32,8 +32,8 @@ set -euo pipefail
 #                   published beside the artifact instead. With neither, the
 #                   run says out loud that nothing was compared, rather than
 #                   letting silence imply that it was.
-AYEAYE_VERSION="v0.2.0"
-AYEAYE_SHA256="e0d0f22d9f021385cc18b67318eb234fc1f96387529504c1738da3fa5aa478bf"
+AYEAYE_VERSION="v0.2.1"
+AYEAYE_SHA256="e036470ff2dbdfff7760f743c9397d1d6d86abfe3c4c065168b444f866316bb1"
 
 # The published one-liner, quoted in --help and in README.md. It fetches this
 # script, and this script pins the release above.
