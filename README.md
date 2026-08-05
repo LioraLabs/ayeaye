@@ -502,7 +502,7 @@ The template documents every variable with its default; the highlights:
 | `AYEAYE_TOKEN` | generated | auth token; unset = generated 0600 in `$XDG_STATE_HOME/ayeaye/token` |
 | `AYEAYE_ALLOWED_HOSTS` | unset | extra allowed `Host` values (your https front), comma separated |
 | `AYEAYE_SHARE` | auto | dir holding `app.html`; defaults to the repo's `share/` |
-| `AYEAYE_LINES` | `24` | history lines above the visible screen in the terminal view |
+| `AYEAYE_LINES` | `500` | history lines above the visible screen in the terminal view |
 | `AYEAYE_FIT_TTL` | `12` | seconds an auto-fit lease survives without the pane being polled |
 | `VOICE_TX_ROWS` | `200` | transcript entries sent on connect |
 | `VOICE_IDLE_AFTER` | `300` | seconds before an agent reads as idle |

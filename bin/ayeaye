@@ -13,10 +13,11 @@ which also gives it a real certificate, and browsers only allow microphone
 access from a secure origin.
 """
 import glob
+import hashlib
 import hmac
 import http.cookies
 import json
-from collections import deque
+from collections import OrderedDict, deque
 import os
 import re
 import secrets
@@ -145,7 +146,10 @@ MANIFEST = os.path.join(SHARE_DIR, "manifest.webmanifest")
 ICON_SVG = os.path.join(SHARE_DIR, "icon.svg")
 BIND = _env("BIND", "127.0.0.1")
 PORT = int(_env("PORT", "8911"))
-PANE_LINES = int(_env("LINES", "24"))
+# History above the visible screen in the terminal view. 500 lines is ~5 ms
+# of capture-pane, and /api/pane resends only what changed since the client
+# last asked, so depth costs server memory, not the phone's radio.
+PANE_LINES = int(_env("LINES", "500"))
 # Display name for the "host" field of /api/panes and /api/overview.
 # Overridable so screenshots need not reveal the machine's real hostname.
 HOST_NAME = _env("NAME").strip() or os.uname().nodename
@@ -1613,25 +1617,111 @@ def voice_available():
 _SGR = re.compile(r"\x1b\[[0-9;:]*m")
 
 
-def pane_view(pane_id, lines):
-    """The pane as displayed: full visible screen plus `lines` of history,
-    with colours, and the grid size so the client can render at the width
-    tmux actually wrapped for.
+def _pane_capture(pane_id, lines):
+    """The raw material of the terminal view: the capture, and the grid size
+    so the client can render at the width tmux actually wrapped for.
 
-    -e keeps the escapes; the browser turns them into styled spans. The whole
-    capture is returned rather than the last N rows -- trimming decapitates a
-    full-screen TUI, whose top box is as important as its bottom. Lines with
-    escapes keep their trailing spaces: they may be painted background.
+    -e keeps the escapes; the browser turns them into styled spans. Lines
+    with escapes keep their trailing spaces: they may be painted background.
+    One capture for history and screen together, not one each -- the pane
+    scrolls between two calls, and a line that moved in the gap would appear
+    twice or not at all.
     """
     raw = tmux("capture-pane", "-p", "-e", "-t", pane_id, "-S", "-%d" % lines)
     kept = [ln if "\x1b" in ln else ln.rstrip() for ln in raw.splitlines()]
-    while kept and not _SGR.sub("", kept[-1]).strip():
-        kept.pop()
     size = tmux("display-message", "-p", "-t", pane_id,
                 "#{pane_width}\t#{pane_height}").strip().split("\t")
     cols, rows = (int(size[0]), int(size[1])) \
         if len(size) == 2 and all(s.isdigit() for s in size) else (0, 0)
+    return kept, cols, rows
+
+
+def pane_view(pane_id, lines):
+    """The pane as one block of text, for clients that do not speak the diff
+    protocol below. The whole capture is returned rather than the last N
+    rows -- trimming decapitates a full-screen TUI, whose top box is as
+    important as its bottom."""
+    kept, cols, rows = _pane_capture(pane_id, lines)
+    while kept and not _SGR.sub("", kept[-1]).strip():
+        kept.pop()
     return {"text": "\n".join(kept), "cols": cols, "rows": rows}
+
+
+# ------------------------------------------------------------ pane diffs
+# The capture is two things with very different lives glued together: the
+# scrollback above the screen, which tmux never rewrites and only appends
+# to, and the visible screen, which a TUI repaints constantly but which is
+# only ever `rows` lines. Split there, most polls need almost nothing sent:
+# an unchanged pane is a token match, a repaint is the screen alone, and a
+# scroll is the screen plus the few lines that crossed into history.
+#
+# The client holds the history window it was last sent, named by a hash the
+# server minted. The server keeps recently-served windows here, keyed by
+# that hash, so the next request's patch can be computed against the exact
+# lines the client holds. The cache is small on purpose: a miss only means
+# one full send, and a restart costs the same.
+_PANE_CACHE = OrderedDict()          # (pane_id, hist hash) -> hist lines
+_PANE_CACHE_MAX = 32
+_pane_cache_lock = threading.Lock()
+
+
+def _pane_hash(text):
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
+
+
+def pane_view_diff(pane_id, lines, had_hist, had_screen):
+    """What changed since the capture the client says it holds.
+
+    Every response carries the grid and two tokens {hh, sh} naming the
+    history window and screen it describes. Beyond that it is one of:
+
+      {same: 1}                    both tokens matched; render nothing
+      {drop, add, screen}          shed `drop` lines from the front of the
+                                   history window, append `add`, replace the
+                                   screen
+      {hist, screen}               full send: the client's token named a
+                                   window this server no longer remembers
+
+    The patch is found by sliding: the old window and the new one are both
+    windows onto the same append-only scrollback, so the new one is the old
+    one shifted by k with fresh lines behind it. Any k with
+    old[k:] == new[:len(old)-k] reconstructs to exactly `new` when applied
+    -- the equation is the guarantee, not the intent behind the match -- so
+    a coincidental overlap is harmless and the smallest k is merely the
+    smallest payload. k = len(old) always satisfies it, which is why the
+    loop cannot fail: a resize that rewrapped every line degrades to a full
+    send in patch clothing, not an error.
+    """
+    kept, cols, rows = _pane_capture(pane_id, lines)
+    if rows and len(kept) > rows:
+        hist, screen = kept[:-rows], kept[-rows:]
+    else:
+        hist, screen = [], kept
+    while screen and not _SGR.sub("", screen[-1]).strip():
+        screen.pop()
+    screen_text = "\n".join(screen)
+    hh = _pane_hash("\n".join(hist))
+    sh = _pane_hash(screen_text)
+    out = {"cols": cols, "rows": rows, "hh": hh, "sh": sh}
+
+    with _pane_cache_lock:
+        prev = _PANE_CACHE.get((pane_id, had_hist)) if had_hist else None
+        _PANE_CACHE[(pane_id, hh)] = hist
+        _PANE_CACHE.move_to_end((pane_id, hh))
+        while len(_PANE_CACHE) > _PANE_CACHE_MAX:
+            _PANE_CACHE.popitem(last=False)
+
+    if had_hist == hh and had_screen == sh:
+        out["same"] = 1
+        return out
+    if prev is not None:
+        for k in range(len(prev) + 1):
+            if prev[k:] == hist[:len(prev) - k]:
+                out.update({"drop": k, "add": hist[len(prev) - k:],
+                            "screen": screen_text})
+                return out
+    out.update({"hist": hist, "screen": screen_text})
+    return out
 
 
 # ---------------------------------------------------------------- fit leases
@@ -1955,10 +2045,18 @@ class Handler(BaseHTTPRequestHandler):
                 # "nothing matching" for a question already moved on from.
                 return self._json({"projects": [], "superseded": True})
         if path == "/api/pane":
-            pane = self._query().get("id", [""])[0]
+            q = self._query()
+            pane = q.get("id", [""])[0]
             if not pane:
                 return self._json({"error": "no pane"}, 400)
             fit_touch(pane)
+            # df=1 opts in to the diff protocol; its absence keeps the old
+            # whole-text shape, so a page cached from before the protocol
+            # existed still renders rather than showing nothing.
+            if q.get("df"):
+                return self._json(pane_view_diff(
+                    pane, PANE_LINES,
+                    q.get("hh", [""])[0], q.get("sh", [""])[0]))
             return self._json(pane_view(pane, PANE_LINES))
 
         if path == "/api/prompt":

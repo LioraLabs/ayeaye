@@ -62,10 +62,19 @@ fi
 # 5. Reproducible. Build it again and compare: if the same commit does not
 #    produce the same bytes, the checksum in install.sh is a number nobody can
 #    re-derive, and verification is theatre.
-again="$work/again.tar.gz"
-bash "$root/scripts/release-archive.sh" "$again" >/dev/null 2>&1
-[ "$(sha256sum < "$artifact" | cut -d' ' -f1)" = "$(sha256sum < "$again" | cut -d' ' -f1)" ]
-check "byte-identical when built a second time" $?
+#
+#    From the commit the tarball itself names, not from HEAD: git archive
+#    writes its source commit into the tar, so the artifact carries the only
+#    answer to "the same as what?" that stays right after HEAD moves on -
+#    which it does, by design, the moment the stamp is committed.
+src="$(gzip -dc "$artifact" | git -C "$root" get-tar-commit-id || true)"
+[ -n "$src" ]; check "the tarball names the commit it was built from" $?
+if [ -n "$src" ]; then
+  again="$work/again.tar.gz"
+  bash "$root/scripts/release-archive.sh" "$again" "$src" >/dev/null 2>&1
+  [ "$(sha256sum < "$artifact" | cut -d' ' -f1)" = "$(sha256sum < "$again" | cut -d' ' -f1)" ]
+  check "byte-identical when rebuilt from $(git -C "$root" rev-parse --short "$src")" $?
+fi
 
 [ "$fail" = 0 ] || exit 1
 printf 'the artifact is installable: %s\n' "$artifact"

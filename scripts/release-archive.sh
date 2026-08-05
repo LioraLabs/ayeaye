@@ -12,16 +12,23 @@
 #   gzip -n      omits the filename and timestamp it would otherwise embed
 set -euo pipefail
 
-out="${1:?usage: release-archive.sh <out.tar.gz>}"
+out="${1:?usage: release-archive.sh <out.tar.gz> [commit]}"
+commit="${2:-HEAD}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-version="$(bash scripts/release-version.sh)"
+# The version the archived commit claims, not the working tree's: rebuilding
+# an old release's artifact after a version bump must reproduce the old
+# bytes, prefix included, or the reproducibility check would compare a
+# v0.1.0 tarball against a v0.2.0 rebuild and blame the wrong thing.
+version="$(git show "$commit:install.sh" \
+  | sed -n 's/^AYEAYE_VERSION="\([^"]*\)".*$/\1/p' | head -1)"
+[ -n "$version" ] || { echo "no AYEAYE_VERSION in $commit:install.sh" >&2; exit 1; }
 
-# The artifact is built from HEAD, so a dirty tree means it does not contain
-# what is on screen. Not fatal while developing - `cook publish` is where it
-# has to be clean - but it must not pass silently.
-if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+# The artifact is built from a commit, so a dirty tree means it does not
+# contain what is on screen. Not fatal while developing - `cook publish` is
+# where it has to be clean - but it must not pass silently.
+if [ "$commit" = HEAD ] && ! git diff-index --quiet HEAD -- 2>/dev/null; then
   echo "note: the working tree is dirty; this artifact is HEAD, not what you see" >&2
 fi
 
@@ -32,10 +39,10 @@ trap 'rm -f "$tmp"' EXIT
 # One top-level directory, which is what the bootstrap's unpack expects to
 # find. It takes whatever that directory is called, but naming it after the
 # release is what makes a downloaded tarball self-describing.
-git archive --format=tar --prefix="ayeaye-$version/" HEAD \
+git archive --format=tar --prefix="ayeaye-$version/" "$commit" \
   | gzip -n -9 > "$tmp"
 
 mv "$tmp" "$out"
 trap - EXIT
 
-printf 'built %s from %s (%s)\n' "$out" "$(git rev-parse --short HEAD)" "$version"
+printf 'built %s from %s (%s)\n' "$out" "$(git rev-parse --short "$commit")" "$version"

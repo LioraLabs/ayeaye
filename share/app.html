@@ -1443,15 +1443,51 @@ function setMode(m){
   if(m==='term') autoFit(); else releaseFit();
 }
 
+// The poll refetches every 2s, and /api/pane speaks a diff protocol: this
+// side holds the history window it was last sent plus two opaque tokens
+// {hh, sh} naming it, echoes the tokens back, and applies what returns. An
+// idle pane answers {same} and costs nothing; a TUI repaint carries the
+// screen alone; a scroll adds only the lines that crossed into history.
+// Patches are trusted blindly because the server computed them against the
+// exact window the token names -- applying {drop, add} reproduces its
+// window byte for byte. A response without tokens is an old server still
+// sending whole text, and is rendered as such.
+let outHist = [], outScreen = '', outHH = '', outSH = '', outPane = null;
+// The render is keyed on what it depends on -- pane, text, and whether the
+// ticket-link table had arrived yet -- so re-parsing hundreds of history
+// lines into spans happens only when a poll actually changed something,
+// scroll position included.
+let lastOutSig = null;
 async function loadOut(){
   if(!sel) return;
   try{
-    const r = await fetch('/api/pane?id='+encodeURIComponent(sel));
+    if(sel !== outPane){
+      outPane = sel; outHist = []; outScreen = ''; outHH = ''; outSH = '';
+    }
+    const r = await fetch('/api/pane?id='+encodeURIComponent(sel)+'&df=1'
+      +(outHH ? '&hh='+outHH+'&sh='+outSH : ''));
     const d = await r.json();
+    if(sel !== outPane) return;   // switched panes while this was in flight
     const out = $('#out');
-    const stuck = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
-    out.innerHTML = ansiHTML(d.text || '(empty)');
-    if(stuck) out.scrollTop = out.scrollHeight;
+    if(d.hh){
+      if(!d.same){
+        if(d.hist !== undefined) outHist = d.hist;
+        else outHist = outHist.slice(d.drop||0).concat(d.add||[]);
+        outScreen = d.screen;
+      }
+      outHH = d.hh; outSH = d.sh;
+    }else if(d.text !== undefined){
+      outHist = []; outScreen = d.text; outHH = ''; outSH = '';
+    }
+    const text = (outHist.length ? outHist.join('\n')+'\n' : '')
+                 + (outScreen || (outHist.length ? '' : '(empty)'));
+    const outSig = (KEYS_RE?'k':'') + sel + '\n' + text;
+    if(outSig !== lastOutSig){
+      lastOutSig = outSig;
+      const stuck = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+      out.innerHTML = ansiHTML(text);
+      if(stuck) out.scrollTop = out.scrollHeight;
+    }
     // Drift check: if the window is not the size we hold it at -- lease lost
     // to a server restart, or something resized it underneath us -- while
     // this view is the one watching, re-assert. Damped so two viewers
