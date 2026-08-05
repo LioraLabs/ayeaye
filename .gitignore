@@ -8,3 +8,4 @@ token
 assets/*.png
 dist/
 .worktrees/
+.cook
