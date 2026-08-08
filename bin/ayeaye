@@ -1046,6 +1046,19 @@ _OPT = re.compile(r"^\s*[›❯>]?\s*(\d+)\.\s+(.*\S)\s*$")
 _CONFIRM = re.compile(r"press enter to confirm|esc to cancel|\(esc\)"
                       r"|enter to select|arrow keys", re.I)
 _RULE = re.compile(r"^[─━═\-_╌┈]{8,}$")
+# A prompt whose options carry previews is drawn in two columns: the list on
+# the left, a box holding the focused option's preview on the right. The box
+# occupies the same rows as the options, so every row of the list ends in a
+# slice of it, and the part of the row that belongs to the prompt is what
+# stands to the left. Anchored on the run of spaces that separates the
+# columns, because a label may legitimately contain a dash.
+_PREVIEW_COL = re.compile(r"\s\s+[─━│┃┌┐└┘├┤┬┴┼╌┈✂]")
+
+
+def _left_column(line):
+    """One screen row with the preview column, if there is one, cut away."""
+    m = _PREVIEW_COL.search(line)
+    return (line[:m.start()] if m else line).rstrip()
 
 
 def pane_prompt(pane_id, window=30):
@@ -1053,30 +1066,77 @@ def pane_prompt(pane_id, window=30):
 
     Same shape for both agents: numbered options with a selection marker and
     a confirm/escape hint below them.
+
+    Claude draws that shape two ways, and the difference is not cosmetic.
+    Options carrying previews are laid out in two columns, with a preview box
+    to the right of the list that is taller than the list and keeps drawing
+    below the last option. So neither the labels nor the end of the block can
+    be read off whole screen rows: the labels are the left column, and what
+    ends the block is the hint rather than the last option.
     """
     lines = [l.rstrip() for l in
              tmux("capture-pane", "-p", "-t", pane_id).splitlines()]
     while lines and not lines[-1].strip():
         lines.pop()                        # trailing blanks hide the block
     tail = lines[-window:]
+    # Read the left column throughout. With previews on, the box art shares
+    # rows with the options and would otherwise be parsed as part of them --
+    # an option would reach the phone labelled "Explicit range ┌────────┐".
+    col = [_left_column(l) for l in tail]
 
-    idx = [i for i, l in enumerate(tail) if _OPT.match(l)]
+    idx = [i for i, l in enumerate(col) if _OPT.match(l)]
     if len(idx) < 2 or not any(_CONFIRM.search(l) for l in tail[idx[0]:]):
         return None
-    for l in tail[idx[-1] + 1:]:
-        if l.strip() and not _CONFIRM.search(l):
-            return None
-    options = [{"key": _OPT.match(tail[i]).group(1),
-                "label": _OPT.match(tail[i]).group(2)[:90]} for i in idx]
+    # The prompt must still be the last thing on screen. Once the agent moves
+    # on, its output lands below the old block -- without this, answered
+    # prompts keep reporting "blocked" until they scroll away.
+    #
+    # Two endings, because the layouts differ in what follows the last option.
+    # A plain prompt has nothing under it but the hint. One with previews has
+    # a box taller than the list, and the notes and "chat about this" rows
+    # under that -- all of it above the hint, which the TUI draws last. So
+    # where the plain shape asks what follows the options, this one asks
+    # whether the hint is still the bottom of the screen.
+    after = [l for l in tail[idx[-1] + 1:] if l.strip()]
+    if not all(_CONFIRM.search(l) for l in after) \
+            and not _CONFIRM.search(tail[-1]):
+        return None
 
+    options = []
+    for n, i in enumerate(idx):
+        m = _OPT.match(col[i])
+        label, indent = [m.group(2)], len(col[i]) - len(col[i].lstrip())
+        # A label too wide for the column wraps onto the rows beneath it,
+        # indented past its number. Those rows match nothing and used to be
+        # dropped, which silently truncated exactly the options worth reading
+        # in full -- "(Recommended)" is the first thing to fall off the end.
+        for l in col[i + 1:idx[n + 1] if n + 1 < len(idx) else len(col)]:
+            s = l.strip()
+            if not s or _RULE.match(s) or _CONFIRM.search(s):
+                break
+            if len(l) - len(l.lstrip()) <= indent:
+                break
+            label.append(s)
+        options.append({"key": m.group(1), "label": " ".join(label)[:90]})
+
+    # Blank lines interleave the question block in both agents, so skip them
+    # rather than stopping. End at the bullet that starts the agent's turn,
+    # or at a rule -- Claude draws one between its prose and the prompt, and
+    # without that the walk-back runs on into the startup banner.
     q = []
-    for l in reversed(tail[:idx[0]]):
-        s = l.strip()
+    for i in range(idx[0] - 1, -1, -1):
+        s = col[i].strip()
         if not s:
+            # Cutting the preview column blanks a row that held nothing but
+            # box art, which is what should happen -- but it would blank an
+            # indented rule too, and a rule is the one thing that must stop
+            # the walk-back rather than be skipped over.
+            if _RULE.match(tail[i].strip()):
+                break
             continue
         if _RULE.match(s):
             break
-        q.append(s.lstrip("•·●○◆▪ "))
+        q.append(s.lstrip("•·●○◆▪☐☑ "))
         if s[0] in "•·●○◆▪" or len(q) >= 8:
             break
     return {"question": " ".join(reversed(q))[:400], "options": options}

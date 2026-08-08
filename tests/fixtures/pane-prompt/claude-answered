@@ -1,0 +1,30 @@
+│                                                    │ Ask Claude to create a… │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliabil… │
+│   Opus 5 (1M context) with high… · Claude Max ·    │ Added gateway spend-li… │
+│   you@example.com's Organization                   │ Added a workspace trus… │
+│              /…/scratchpad/fixturebox              │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 2 MCP servers need authentication · run /mcp
+
+❯ Use the AskUserQuestion tool right now to ask me whether I prefer tabs or
+  spaces for indentation. Give exactly three options, plain labels, and do NOT
+  attach previews to any option. Ask the question and nothing else.
+
+● User answered Claude's questions:
+  ⎿  · Do you prefer tabs or spaces for indentation? → Tabs
+
+● Noted — tabs.
+
+✻ Churned for 4s
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  /home/you/scratch/fixturebox
+  ⟪cc:00000000⟫
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+
