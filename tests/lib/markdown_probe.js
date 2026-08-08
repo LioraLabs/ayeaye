@@ -81,6 +81,11 @@ for(const required of [
   '.file-modal', 'overflow:auto', '@media (max-width: 520px)',
   'white-space:pre', 'textContent = line.number'
 ]) includes(html, required, 'preview UI contract');
+
+for(const required of [
+  'id="messagePage"', 'view full message', "location.pathname==='/message'",
+  "fetch('/api/message?'", 'messageBody.innerHTML = markdownHTML(d.text)'
+]) includes(html, required, 'full transcript message contract');
 if(/innerHTML\s*=.*svg/i.test(html.slice(html.indexOf('function renderFilePreview'))))
   throw new Error('preview renderer may inject SVG markup');
 

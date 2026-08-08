@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/mascot-dark.svg">
-    <img src="assets/readme/mascot-light.svg" width="128" alt="the aye-aye">
-  </picture>
+  <img src="assets/readme/mascot.png" width="128" alt="the aye-aye">
 </p>
 
 # Aye, Aye
@@ -95,6 +92,7 @@ the phone and no agent-side plugin.
 | the pane list | `tmux list-panes` |
 | what an agent said | the agent's own JSONL transcript, tailed live |
 | which session a pane is running | see [Session mapping](#session-mapping) |
+| what it's doing | see [States](#states) |
 | pending permission prompts | `tmux capture-pane`; they exist only in the TUI |
 | sending text and keys | `tmux send-keys` |
 | speech to text | `whisper.cpp` server, held resident on the GPU |
@@ -387,9 +385,26 @@ of work.
 
 The hard part: given a tmux pane, which agent conversation is it?
 
-**Claude** advertises it. Its statusline command receives `session_id` on
-stdin, so print a short marker and `capture-pane` can read it back. Add this
-to your statusline script (full example in `examples/statusline-command.sh`):
+A pane is an agent session because an agent is *running* in it, so the process
+behind the pane is asked first and the pane's text only after. That order is
+what keeps a session that has exited — or been cleared and started again —
+from reading as a live agent through text it left in the scrollback.
+
+**Claude** keeps a file per live session at `~/.claude/sessions/<pid>.json`,
+naming the session id, so the claude process under the pane is the whole
+lookup. The recorded start time is checked against the process's own, so a
+file orphaned by a crash cannot hand a recycled pid someone else's
+conversation.
+
+**Claude, older versions** advertise it in the statusline instead. Its
+statusline command receives `session_id` on stdin, so print a short marker and
+`capture-pane` can read it back. This is the fallback now, and it is worth
+knowing why it cannot be the first answer: the statusline is painted into the
+live screen and reaches the scrollback only as later output pushes it off, and
+while a question dialog is up it is not painted at all — so a young session
+that stops to ask has no marker anywhere in the pane, which is exactly the
+pane this app exists to surface. Add this to your statusline script (full
+example in `examples/statusline-command.sh`):
 
 ```sh
 session_id=$(echo "$input" | jq -r '.session_id // empty')
@@ -411,15 +426,50 @@ it gets truncated the moment the working directory is long, and a clipped
 marker fails silently: the pane still works, the transcript button just
 goes quiet.
 
-**Codex** has no statusline, so it's matched by **process start time**:
-find the codex process in the pane, read its `cwd` and start time, then pick
+**Codex** has no statusline, so it is asked which file it **has open**: find
+the codex process in the pane and read its open rollout straight out of the
+descriptor table. Codex holds its subagents' rollouts open too, so the ones it
+keeps on another thread's behalf are skipped — a spawned thread records the
+parent it came from, and the session in the pane is the one that came from
+nobody.
+
+Failing that (older codex did not reliably hold the file open) it is matched
+by **process start time**: read the process's `cwd` and start time, then pick
 the rollout whose filename timestamp lands within a couple of seconds of it.
-That lookup is the one platform-specific corner in the server -- `/proc` on
-Linux, `ps` and `lsof` on macOS -- behind a single internal interface. That stays exact with two codex agents in one directory, and
-works however codex was launched.
+That stays exact with two codex agents in one directory. It cannot find a
+*resumed* session, whose rollout was written days before the process that
+reopened it — which is what the descriptor answers and no clock can.
+
+Both lookups are the one platform-specific corner in the server — `/proc` on
+Linux, `ps` and `lsof` on macOS — behind a single internal interface, and both
+work however codex was launched.
 
 Codex hooks are *not* used. They do fire, but only on the first turn, by
 which point the transcript exists and the timing match already works.
+
+## States
+
+Every state answers one question: **who is this session waiting on?**
+
+| state | waiting on | what it looks like |
+|---|---|---|
+| `needs you` | you, right now | a permission prompt or question on screen, read from the pane |
+| `waiting on you` | you | the last thing in the transcript is the agent speaking — the turn is yours |
+| `working` | itself | mid tool call |
+| `agents working` | agents it launched | see below |
+
+There is no `idle`. How long a session has been quiet is the age shown beside
+the state, not a state of its own — a session that handed you the turn three
+hours ago is still waiting on you, and calling that "idle" only hid which of
+the two situations it was. Cards go quiet visually after five minutes; they do
+not change what they say.
+
+**Delegating** is read from the transcript, per agent. Claude gets an
+acknowledgement the instant it launches a background agent and the real answer
+much later, as a `<task-notification>` turn naming the tool call it answers —
+so launches and completions pair up by id however many are in flight. Codex
+blocks in a `wait_agent` tool instead, on a short timeout in a loop, so what
+is asked is whether the last tool it reached for was a wait.
 
 ## Exposure
 
@@ -505,7 +555,6 @@ The template documents every variable with its default; the highlights:
 | `AYEAYE_LINES` | `500` | history lines above the visible screen in the terminal view |
 | `AYEAYE_FIT_TTL` | `12` | seconds an auto-fit lease survives without the pane being polled |
 | `VOICE_TX_ROWS` | `200` | transcript entries sent on connect |
-| `VOICE_IDLE_AFTER` | `300` | seconds before an agent reads as idle |
 | `VOICE_SEND_DELAY` | `0.4` | gap between typing text and Enter |
 | `VOICE_PROBE_TTL` | `30` | seconds the voice probe result is cached |
 | `VOICE_WHISPER_SERVER` | `127.0.0.1:8910` | probed at runtime; unreachable = text-only |

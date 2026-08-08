@@ -106,6 +106,23 @@ def write_uptime(root, seconds):
         fh.write("%s 9876.54\n" % seconds)
 
 
+def write_fds(root, pid, *targets):
+    """/proc/<pid>/fd: one numbered symlink per open file.
+
+    Real ones point at anything -- sockets, pipes, deleted files -- and are
+    named by descriptor number, which is why the numbering starts where a
+    process's first open file really would rather than at zero.
+    """
+    d = os.path.join(write_proc(root, pid), "fd")
+    os.makedirs(d, exist_ok=True)
+    for n, target in enumerate(targets, start=3):
+        link = os.path.join(d, str(n))
+        if os.path.islink(link):
+            os.unlink(link)
+        os.symlink(target, link)
+    return d
+
+
 def write_environ(root, pid, **env):
     """/proc/<pid>/environ: NUL-separated, NUL-terminated, no newline.
 
@@ -185,6 +202,39 @@ class LinuxProcTest(TempTree):
     def test_cwd_is_none_when_it_cannot_be_read(self):
         write_proc(self.tmp, 42)
         self.assertIsNone(self.linux().cwd(42))
+
+    def test_open_files_reads_every_descriptor_symlink(self):
+        write_fds(self.tmp, 42, "/home/someone/one.jsonl",
+                  "/home/someone/two.jsonl")
+        self.assertEqual({"/home/someone/one.jsonl", "/home/someone/two.jsonl"},
+                         set(self.linux().open_files(42)))
+
+    def test_open_files_keeps_a_path_with_a_space_in_it_whole(self):
+        write_fds(self.tmp, 42, "/home/someone/My Sessions/one.jsonl")
+        self.assertEqual(["/home/someone/My Sessions/one.jsonl"],
+                         self.linux().open_files(42))
+
+    def test_open_files_is_empty_for_a_process_that_is_gone(self):
+        self.assertEqual([], self.linux().open_files(4242))
+
+    def test_a_descriptor_closing_mid_walk_does_not_empty_the_answer(self):
+        # The process under inspection is running, so files close while the
+        # directory is being read. Answering "holds nothing open" there would
+        # send the pane to the fallback for no reason.
+        write_fds(self.tmp, 42, "/home/someone/one.jsonl")
+        os.symlink("/home/someone/two.jsonl",
+                   os.path.join(self.tmp, "42", "fd", "9"))
+        real = os.readlink
+
+        def vanishing(path, *a, **kw):
+            if path.endswith("/fd/9"):
+                raise OSError("closed while we looked")
+            return real(path, *a, **kw)
+
+        os.readlink = vanishing
+        self.addCleanup(setattr, os, "readlink", real)
+        self.assertEqual(["/home/someone/one.jsonl"],
+                         self.linux().open_files(42))
 
     def test_comm_is_the_stripped_contents(self):
         write_proc(self.tmp, 42, name="codex")
@@ -335,10 +385,16 @@ class LinuxProcTest(TempTree):
 # ------------------------------------------------------------------- codex
 
 class FakeProcessInfo(object):
-    """A process tree with no processes in it."""
+    """A process tree with no processes in it.
 
-    def __init__(self, pid=None, started=None, cwd=None):
+    `holds` defaults to nothing, which is what a codex too old to keep its
+    rollout open looks like -- so every test that does not set it is testing
+    the fallback, deliberately.
+    """
+
+    def __init__(self, pid=None, started=None, cwd=None, holds=()):
         self._pid, self._started, self._cwd = pid, started, cwd
+        self._holds = list(holds)
         self.asked = []
 
     def descendant(self, pid, name, depth=3):
@@ -350,6 +406,9 @@ class FakeProcessInfo(object):
 
     def cwd(self, pid):
         return self._cwd
+
+    def open_files(self, pid):
+        return list(self._holds)
 
 
 class CodexSessionTest(TempTree):
@@ -471,6 +530,102 @@ class CodexSessionTest(TempTree):
     def test_a_started_process_with_nothing_written_yet_has_no_session(self):
         got, _ = self.resolve()
         self.assertIsNone(got)
+
+
+class CodexHeldRolloutTest(CodexSessionTest):
+    """The rollout codex is holding open, which beats guessing from a clock.
+
+    Everything the timestamp match infers, an open descriptor states: the
+    kernel is asked which file this process has. The case that makes it worth
+    having is a resumed session, whose rollout was written days before the
+    process that reopened it and therefore sits outside any window around a
+    start time.
+    """
+
+    def held(self, *paths, **kw):
+        """Resolve with those paths held open, and a start time far from all
+        of them so nothing can pass by the timestamp route instead."""
+        info = FakeProcessInfo(pid="991", started=self.started + 86400,
+                               cwd="/home/someone/dev/thing", holds=paths, **kw)
+        return ayeaye.codex_session_for("900", proc=info), info
+
+    def subagent(self, stamp, sid, parent="0123abcd-dead-beef"):
+        """A rollout codex is keeping open on a spawned thread's behalf."""
+        return self.rollout(stamp, "/home/someone/dev/thing", sid=sid,
+                            first=json.dumps({
+                                "type": "session_meta",
+                                "payload": {"id": sid, "session_id": parent,
+                                            "parent_thread_id": parent,
+                                            "thread_source": "subagent",
+                                            "cwd": "/home/someone/dev/thing"}}))
+
+    def test_a_held_rollout_resolves_a_session_older_than_its_process(self):
+        # `codex resume`: the file is a week old and the process is minutes
+        # old. No window around a start time will ever contain it.
+        path = self.rollout("2026-02-25T11-30-00", "/home/someone/dev/thing")
+        got, _ = self.held(path)
+        self.assertEqual({"kind": "codex", "id": "0123abcd", "path": path}, got)
+
+    def test_a_rollout_held_for_a_subagent_is_not_this_pane_session(self):
+        # Codex keeps the rollouts of the threads it spawned open alongside
+        # its own. The session in the pane is the one with no parent.
+        child = self.subagent("2026-03-04T14-19-02", "ffffffff-sub")
+        mine = self.rollout("2026-03-04T09-00-02", "/home/someone/dev/thing")
+        got, _ = self.held(child, mine)
+        self.assertEqual(mine, got["path"])
+        self.assertEqual("0123abcd", got["id"])
+
+    def test_holding_nothing_but_subagents_is_not_a_session(self):
+        child = self.subagent("2026-03-04T14-19-02", "ffffffff-sub")
+        got, _ = self.held(child)
+        self.assertIsNone(got)
+
+    def test_a_file_held_outside_the_sessions_tree_is_not_a_rollout(self):
+        # A codex agent has files of its own open all day. Only what is under
+        # the sessions directory can be a transcript.
+        outside = os.path.join(self.tmp, "rollout-2026-03-04T09-00-02-ffff.jsonl")
+        with open(outside, "w") as fh:
+            fh.write(json.dumps({"payload": {"id": "ffffffff-nope"}}) + "\n")
+        got, _ = self.held(outside)
+        self.assertIsNone(got)
+
+    def test_an_ordinary_file_in_the_sessions_tree_is_not_a_rollout(self):
+        stray = os.path.join(self.sessions, "notes.jsonl")
+        os.makedirs(self.sessions, exist_ok=True)
+        with open(stray, "w") as fh:
+            fh.write(json.dumps({"payload": {"id": "ffffffff-nope"}}) + "\n")
+        got, _ = self.held(stray)
+        self.assertIsNone(got)
+
+    def test_the_last_written_wins_when_two_could_be_this_session(self):
+        old = self.rollout("2026-03-04T09-00-02", "/home/someone/dev/thing",
+                           sid="aaaaaaaa-old")
+        new = self.rollout("2026-03-04T09-00-03", "/home/someone/dev/thing",
+                           sid="bbbbbbbb-new")
+        os.utime(old, (1_700_000_000, 1_700_000_000))
+        os.utime(new, (1_700_000_900, 1_700_000_900))
+        # Both orders: which descriptor comes back first is the kernel's
+        # business, and an answer that depends on it is not an answer.
+        for order in ((old, new), (new, old)):
+            got, _ = self.held(*order)
+            self.assertEqual(new, got["path"], "order %s" % (order,))
+
+    def test_the_timestamp_match_still_answers_when_nothing_is_held(self):
+        # An older codex did not reliably hold the rollout open, and the
+        # fallback is the whole reason it is still there.
+        path = self.rollout("2026-03-04T09-00-02", "/home/someone/dev/thing")
+        got, _ = self.resolve()
+        self.assertEqual(path, got["path"])
+
+    def test_a_held_rollout_that_cannot_be_read_falls_back(self):
+        held = self.rollout("2026-02-25T11-30-00", "/home/someone/dev/thing",
+                            sid="dddddddd-unreadable", first="{ not json")
+        near = self.rollout("2026-03-04T09-00-02", "/home/someone/dev/thing",
+                            sid="eeeeeeee-near")
+        info = FakeProcessInfo(pid="991", started=self.started,
+                               cwd="/home/someone/dev/thing", holds=[held])
+        got = ayeaye.codex_session_for("900", proc=info)
+        self.assertEqual(near, got["path"])
 
 
 # ------------------------------------------------------------------ darwin
@@ -640,6 +795,39 @@ class DarwinProcTest(TempTree):
         info = self.darwin({"lsof": fixture("lsof/darwin-cwd-spaces")})
         self.assertEqual("/Users/someone/My Projects/thing", info.cwd(702))
 
+    def test_open_files_comes_from_every_name_record(self):
+        info = self.darwin({"lsof -p": fixture("lsof/darwin-open-files")})
+        got = info.open_files(702)
+        self.assertIn("/Users/someone/.codex/sessions/2026/03/04/"
+                      "rollout-2026-03-04T09-00-02-0123abcd-dead-beef.jsonl", got)
+        # The cwd and the executable are names too. lsof does not sort them
+        # out and neither does this -- the caller is looking for one path.
+        self.assertIn("/Users/someone/dev/thing", got)
+        self.assertIn("/opt/homebrew/bin/codex", got)
+
+    def test_an_open_path_containing_a_space_survives(self):
+        info = self.darwin({"lsof -p": fixture("lsof/darwin-open-files")})
+        self.assertIn("/Users/someone/My Sessions/notes.jsonl",
+                      info.open_files(702))
+
+    def test_open_files_is_empty_when_lsof_is_missing_or_says_nothing(self):
+        self.assertEqual([], self.darwin({}).open_files(702))
+        self.assertEqual([], self.darwin({"lsof -p": ""}).open_files(702))
+        self.assertEqual([], self.darwin(
+            {"lsof -p": fixture("lsof/darwin-denied")}).open_files(702))
+
+    def test_the_open_files_query_is_not_narrowed_to_one_descriptor(self):
+        # `-d cwd` is what cwd() above needs and what this must not inherit:
+        # with it, the only file ever reported is the working directory.
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return ""
+
+        ayeaye._DarwinProcessInfo(run=run).open_files(702)
+        self.assertEqual(["lsof", "-p", "702", "-Fn"], seen[0])
+
     # ------------------------------------------- the two client questions
 
     def test_a_pid_ps_reports_back_exists(self):
@@ -767,11 +955,38 @@ class DarwinEndToEndTest(TempTree):
         info = ayeaye._DarwinProcessInfo(run=canned({
             "ps -axww": fixture("ps/darwin-codex-tree"),
             "ps -ww": fixture("ps/darwin-lstart"),
-            "lsof": fixture("lsof/darwin-cwd"),
+            "lsof -a -d cwd": fixture("lsof/darwin-cwd"),
         }))
         got = ayeaye.codex_session_for("801", proc=info)
         self.assertEqual({"kind": "codex", "id": "77778888",
                           "path": self.path}, got)
+
+    def test_a_macos_pane_resolves_the_rollout_its_codex_holds_open(self):
+        """The same walk again, arriving by the descriptor instead.
+
+        The rollout is a fortnight older than the process, so the timestamp
+        match cannot reach it and only lsof can -- which is the resumed
+        session, on the platform that has no /proc to ask instead.
+
+        The output is built rather than read from a fixture only because the
+        path is this run's temporary directory; it is shaped exactly as
+        tests/fixtures/lsof/darwin-open-files is.
+        """
+        held = os.path.join(self.sessions, "2026", "02", "18",
+                            "rollout-2026-02-18T22-40-00-99990000-cccc-dddd.jsonl")
+        os.makedirs(os.path.dirname(held))
+        with open(held, "w") as fh:
+            fh.write(json.dumps({"payload": {
+                "id": "99990000-cccc-dddd",
+                "cwd": "/Users/someone/dev/thing"}}) + "\n")
+        info = ayeaye._DarwinProcessInfo(run=canned({
+            "ps -axww": fixture("ps/darwin-codex-tree"),
+            "ps -ww": fixture("ps/darwin-lstart"),
+            "lsof -a -d cwd": fixture("lsof/darwin-cwd"),
+            "lsof -p": "p803\nfcwd\nn/Users/someone/dev/thing\nf3\nn%s\n" % held,
+        }))
+        got = ayeaye.codex_session_for("801", proc=info)
+        self.assertEqual({"kind": "codex", "id": "99990000", "path": held}, got)
 
     def test_a_macos_pane_with_no_tools_at_all_resolves_to_nothing(self):
         info = ayeaye._DarwinProcessInfo(run=lambda argv, **kw: None)
@@ -884,7 +1099,7 @@ class SharedModuleTest(unittest.TestCase):
     def test_the_interface_is_the_whole_of_what_either_command_asks(self):
         for backend in (ayeaye._LinuxProcessInfo, ayeaye._DarwinProcessInfo):
             for method in ("children", "comm", "start_time", "cwd",
-                           "exists", "ssh_peer_ip", "descendant"):
+                           "open_files", "exists", "ssh_peer_ip", "descendant"):
                 self.assertTrue(callable(getattr(backend, method, None)),
                                 "%s.%s" % (backend.__name__, method))
 
@@ -907,7 +1122,15 @@ class SharedModuleTest(unittest.TestCase):
 
 
 class ClaudeMarkerTest(TempTree):
-    """The claude path must not care what platform it is on."""
+    """The statusline marker, which is the fallback rather than the answer.
+
+    What it still does: resolve a claude old enough to keep no session file.
+    What it cannot do alone, and never could, is say whether the session it
+    names is still there -- the text stays in the scrollback after the agent
+    exits, and after /clear it names a conversation that has been replaced. So
+    it is read for a pane that is running claude now, and only once the
+    process has failed to answer.
+    """
 
     def setUp(self):
         TempTree.setUp(self)
@@ -917,45 +1140,219 @@ class ClaudeMarkerTest(TempTree):
                                  "1a2b3c4d-5555-6666-7777-888899990000.jsonl")
         with open(self.path, "w") as fh:
             fh.write("{}\n")
-        saved = ayeaye.CLAUDE_PROJECTS
-        ayeaye.CLAUDE_PROJECTS = self.projects
-        self.addCleanup(setattr, ayeaye, "CLAUDE_PROJECTS", saved)
+        # No session file anywhere: this is the older claude the marker is
+        # here for.
+        for name, value in (("CLAUDE_PROJECTS", self.projects),
+                            ("CLAUDE_SESSIONS", os.path.join(self.tmp, "none"))):
+            self.addCleanup(setattr, ayeaye, name, getattr(ayeaye, name))
+            setattr(ayeaye, name, value)
 
-    def patch_tmux(self, pane_text, command="bash"):
+    def patch_tmux(self, pane_text, command="claude"):
         def tmux(*args):
             if args[0] == "capture-pane":
                 return pane_text
-            return command + "\n"
+            return "%s\t900\n" % command
         saved = ayeaye.tmux
         ayeaye.tmux = tmux
         self.addCleanup(setattr, ayeaye, "tmux", saved)
 
-    def explode(self):
-        """Make process inspection unusable, to prove it is never reached."""
-        class Exploding(object):
-            def descendant(self, *a, **kw):
-                raise AssertionError("the claude path inspected a process")
-
+    def patch_processes(self, pid="991"):
+        """A claude under the pane, or None for a pane that has none."""
         saved = ayeaye.PROCESS_INFO
-        ayeaye.PROCESS_INFO = Exploding()
+        ayeaye.PROCESS_INFO = FakeProcessInfo(pid=pid)
         self.addCleanup(setattr, ayeaye, "PROCESS_INFO", saved)
 
-    def test_a_marker_in_the_pane_resolves_a_transcript_with_no_processes(self):
-        self.explode()
+    def test_a_marker_resolves_a_pane_whose_claude_keeps_no_session_file(self):
         self.patch_tmux("some output\n⟪cc:1a2b3c4d⟫\n$ ")
+        self.patch_processes()
         got = ayeaye.pane_session("%1")
         self.assertEqual({"kind": "claude", "id": "1a2b3c4d",
                           "path": self.path}, got)
 
     def test_a_marker_with_no_transcript_behind_it_resolves_to_nothing(self):
-        self.explode()
         self.patch_tmux("⟪cc:deadbeef⟫\n")
+        self.patch_processes()
         self.assertIsNone(ayeaye.pane_session("%1"))
 
     def test_a_plain_shell_pane_is_not_an_agent(self):
-        self.explode()
-        self.patch_tmux("$ ls\nfoo bar\n$ ")
+        self.patch_tmux("$ ls\nfoo bar\n$ ", command="fish")
+        self.patch_processes(pid=None)
         self.assertIsNone(ayeaye.pane_session("%1"))
+
+    def test_a_marker_left_behind_by_an_agent_that_exited_is_not_a_session(self):
+        # The pane is back at a shell and the marker is still in its
+        # scrollback. Reading the text first, this pane reported a live agent
+        # and streamed a conversation nobody was having.
+        self.patch_tmux("⟪cc:1a2b3c4d⟫\nBye!\n$ ", command="fish")
+        self.patch_processes(pid=None)
+        self.assertIsNone(ayeaye.pane_session("%1"))
+
+
+class ClaudeSessionTest(TempTree):
+    """Which transcript belongs to a claude pane with no marker in it.
+
+    A marker is not something a pane always has. Claude paints the statusline
+    into the live screen and it reaches the scrollback only as later output
+    pushes it off, and none is painted at all while a question dialog is up --
+    so a young session that stops to ask has the marker nowhere in the pane,
+    and that is precisely the pane this app has to show. The session file
+    claude keeps per live process is what answers instead.
+    """
+
+    def setUp(self):
+        TempTree.setUp(self)
+        self.projects = os.path.join(self.tmp, "projects")
+        self.sessions = os.path.join(self.tmp, "sessions")
+        os.makedirs(os.path.join(self.projects, "-home-someone-dev-thing"))
+        os.makedirs(self.sessions)
+        for name, value in (("CLAUDE_PROJECTS", self.projects),
+                            ("CLAUDE_SESSIONS", self.sessions)):
+            self.addCleanup(setattr, ayeaye, name, getattr(ayeaye, name))
+            setattr(ayeaye, name, value)
+        self.sid = "1a2b3c4d-5555-6666-7777-888899990000"
+        self.path = os.path.join(self.projects, "-home-someone-dev-thing",
+                                 self.sid + ".jsonl")
+        with open(self.path, "w") as fh:
+            fh.write("{}\n")
+        self.started = time.mktime(time.strptime("2026-03-04T09-00-00",
+                                                 "%Y-%m-%dT%H-%M-%S"))
+
+    def session_file(self, pid="991", body=None, **over):
+        """The file claude writes for a live session, or any body at all."""
+        if body is None:
+            entry = {"pid": int(pid), "sessionId": self.sid,
+                     "cwd": "/home/someone/dev/thing", "kind": "interactive",
+                     "startedAt": int(self.started * 1000)}
+            entry.update(over)
+            body = json.dumps(entry)
+        with open(os.path.join(self.sessions, "%s.json" % pid), "w") as fh:
+            fh.write(body)
+
+    def resolve(self, pid="991", started=-1):
+        info = FakeProcessInfo(
+            pid=pid, started=self.started if started == -1 else started)
+        return ayeaye.claude_session_for("900", proc=info), info
+
+    def test_a_live_claude_resolves_the_transcript_its_file_names(self):
+        self.session_file()
+        got, _ = self.resolve()
+        self.assertEqual({"kind": "claude", "id": "1a2b3c4d",
+                          "path": self.path}, got)
+
+    def test_the_agent_is_looked_for_below_the_pane_shell(self):
+        self.session_file()
+        _, info = self.resolve()
+        self.assertEqual([("descendant", "900", "claude")], info.asked)
+
+    def test_no_claude_below_the_pane_means_no_session(self):
+        self.session_file()
+        got, _ = self.resolve(pid=None)
+        self.assertIsNone(got)
+
+    def test_a_claude_that_wrote_no_session_file_resolves_to_nothing(self):
+        # An older claude than the one that keeps these. The marker path is
+        # still there for it; nothing here may raise on its absence.
+        got, _ = self.resolve()
+        self.assertIsNone(got)
+
+    def test_a_session_file_that_is_not_json_resolves_to_nothing(self):
+        self.session_file(body="{half a line")
+        got, _ = self.resolve()
+        self.assertIsNone(got)
+
+    def test_a_recycled_pid_does_not_inherit_the_previous_conversation(self):
+        # The file outlived a crash and the system handed the pid out again.
+        # The start times are what tell the two processes apart.
+        self.session_file()
+        got, _ = self.resolve(started=self.started + 3600)
+        self.assertIsNone(got)
+
+    def test_the_start_time_window_edges_are_inclusive(self):
+        self.session_file()
+        skew = ayeaye.CLAUDE_START_SKEW
+        for delta in (-skew, skew):
+            self.assertIsNotNone(self.resolve(started=self.started + delta)[0],
+                                 "delta %s" % delta)
+
+    def test_a_start_time_that_cannot_be_read_means_no_session(self):
+        self.session_file()
+        got, _ = self.resolve(started=None)
+        self.assertIsNone(got)
+
+    def test_a_file_with_no_start_time_in_it_means_no_session(self):
+        self.session_file(startedAt=None)
+        got, _ = self.resolve()
+        self.assertIsNone(got)
+
+    def test_a_session_that_has_written_nothing_yet_resolves_to_nothing(self):
+        # Claude writes the transcript when the first message is sent, so a
+        # session file can name one that does not exist for minutes.
+        os.remove(self.path)
+        self.session_file()
+        got, _ = self.resolve()
+        self.assertIsNone(got)
+
+    def test_a_session_id_that_is_not_a_uuid_is_refused(self):
+        # The id is pasted into a glob. A file claiming this one must not be
+        # able to aim that glob out of the projects directory.
+        self.session_file(sessionId="../../../../etc/*")
+        got, _ = self.resolve()
+        self.assertIsNone(got)
+
+    def patch_tmux(self, command, on_capture=None):
+        """A pane running `command`, whose text is nobody's business here.
+
+        Both fields come back from the one query pane_session makes, tab
+        separated, which is what pins the pane's pid reaching the walk.
+        """
+        def tmux(*args):
+            if args[0] == "capture-pane":
+                return (on_capture or (lambda: "no statusline down here\n"))()
+            return "%s\t900\n" % command
+        self.addCleanup(setattr, ayeaye, "tmux", ayeaye.tmux)
+        ayeaye.tmux = tmux
+
+    def patch_processes(self, pid="991"):
+        self.addCleanup(setattr, ayeaye, "PROCESS_INFO", ayeaye.PROCESS_INFO)
+        ayeaye.PROCESS_INFO = FakeProcessInfo(pid=pid, started=self.started)
+
+    def test_a_markerless_claude_pane_resolves_through_pane_session(self):
+        self.session_file()
+        self.patch_tmux("claude")
+        self.patch_processes()
+        self.assertEqual({"kind": "claude", "id": "1a2b3c4d",
+                          "path": self.path}, ayeaye.pane_session("%1"))
+        self.assertEqual([("descendant", "900", "claude")],
+                         ayeaye.PROCESS_INFO.asked)
+
+    def test_the_pane_text_is_never_read_once_the_session_file_answered(self):
+        # Reading it is not merely wasted work: what it says can disagree,
+        # and the file is the one that knows which conversation is current.
+        def explode():
+            raise AssertionError("the pane text was read anyway")
+
+        self.session_file()
+        self.patch_tmux("claude", on_capture=explode)
+        self.patch_processes()
+        self.assertEqual(self.path, ayeaye.pane_session("%1")["path"])
+
+    def test_a_pane_running_neither_agent_is_never_walked(self):
+        # The walk is the expensive half and most panes are not agents, so the
+        # pane's own command has to gate it.
+        self.session_file()
+        self.patch_tmux("fish")
+        self.patch_processes()
+        self.assertIsNone(ayeaye.pane_session("%1"))
+        self.assertEqual([], ayeaye.PROCESS_INFO.asked)
+
+    def test_a_codex_pane_goes_to_the_codex_resolver(self):
+        # Same dispatch, both agents: the pane's command picks the resolver
+        # and the pane's pid is what it is given.
+        self.patch_tmux("codex")
+        self.patch_processes(pid=None)
+        self.assertIsNone(ayeaye.pane_session("%1"))
+        self.assertEqual([("descendant", "900", "codex")],
+                         ayeaye.PROCESS_INFO.asked)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ The gates, as bin/ayeaye has them:
     Host        checked on every request, against a list. Not on it: 403.
     auth        checked on /api/* only. Missing or wrong: 401. The credential
                 is the X-Voice-Token header or the voice_token cookie.
-    the pages   /, /board, /icon.svg and the manifest are served to anybody.
+    the pages   /, /board, the icons and the manifest are served to anybody.
                 They contain no data and never carry the key.
 
     behaviours (each one a way for a real deployment to be broken):
@@ -102,8 +102,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/board", "/board.html"):
             return self._send(200, "<!doctype html><title>board</title>",
                               "text/html; charset=utf-8")
-        if path == "/icon.svg":
-            return self._send(200, "<svg/>", "image/svg+xml")
+        if path == "/favicon.ico":
+            return self._send(200, "\x00", "image/x-icon")
+        if path in ("/icon-64.png", "/icon-180.png",
+                    "/icon-192.png", "/icon-512.png",
+                    "/icon-maskable-192.png", "/icon-maskable-512.png"):
+            return self._send(200, "\x89PNG", "image/png")
 
         if path.startswith("/api/"):
             if "open-api" not in ARGS.behaviour:

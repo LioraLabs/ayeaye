@@ -7,8 +7,9 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <title>Aye, Aye</title>
 <style>
@@ -18,7 +19,7 @@
     --line:#2c2f44; --line2:#3b3f58;
     --fg:#cad3f5; --muted:#8087a2; --faint:#5b6078;
     --green:#a6da95; --orange:#f5a97f; --yellow:#eed49f;
-    --red:#ed8796; --blue:#8aadf4;
+    --red:#ed8796; --blue:#8aadf4; --mauve:#c6a0f6;
     --r-s:8px; --r-m:12px; --r-l:16px;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,
            "Helvetica Neue",Arial,sans-serif;
@@ -181,6 +182,18 @@
   .m summary{color:var(--muted);font:12px/1.5 var(--mono);cursor:pointer;
              list-style-position:outside}
   .m details[open] summary{color:var(--fg)}
+  .m .full-message{display:inline-block;margin-top:8px;color:var(--blue);
+                   font-size:12px;text-decoration:none}
+
+  #messagePage{display:none;flex:1;overflow:auto;padding:18px 14px 48px}
+  body.message-open{display:block;max-width:760px}
+  body.message-open>*:not(#messagePage){display:none!important}
+  body.message-open #messagePage{display:block}
+  .message-nav{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+  .message-nav a{color:var(--blue);text-decoration:none}
+  .message-nav span{color:var(--muted);font-size:11px;text-transform:uppercase;
+                    letter-spacing:.05em}
+  #messageBody{font:15px/1.65 var(--sans);overflow-wrap:anywhere}
 
   /* ---- sessions overview ------------------------------------------------- */
   #ov{flex:1;overflow:auto;padding:8px 14px 32px;display:none;
@@ -228,7 +241,11 @@
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
     overflow:hidden;
   }
-  .card.idle .who,.card.gone .who{color:var(--muted);font-weight:550}
+  /* Nothing is "idle" any more -- a state says what a session is doing and
+     the age beside it says for how long. This is the recession that used to
+     ride on the idle state, moved onto the age it was really about, so a
+     board of long-quiet sessions still reads at a glance. */
+  .card.stale .who,.card.gone .who{color:var(--muted);font-weight:550}
   .badge{
     flex:none;font-size:10px;font-weight:600;letter-spacing:.04em;
     text-transform:uppercase;padding:2px 7px;border-radius:999px;
@@ -246,12 +263,25 @@
               background:rgba(166,218,149,.07)}
   .st.working i{animation:breathe 1.8s var(--ease) infinite}
   @keyframes breathe{0%,100%{opacity:1}50%{opacity:.35}}
+  /* Yellow, which is already what a tool row is in the transcript below --
+     the same thing in both places. Breathing like `working`, slower: a call
+     that is out is one thing happening, not a stream of them. */
+  .st.running{color:var(--yellow);border-color:rgba(238,212,159,.28);
+              background:rgba(238,212,159,.08)}
+  .st.running i{animation:breathe 2.4s var(--ease) infinite}
   .st.waiting{color:var(--blue);border-color:rgba(138,173,244,.28);
               background:rgba(138,173,244,.08)}
   .st.blocked{color:var(--orange);border-color:rgba(245,169,127,.35);
               background:rgba(245,169,127,.1)}
   .st.blocked i{animation:breathe 1.4s var(--ease) infinite}
-  .st.idle,.st.gone{color:var(--faint)}
+  /* Breathing like `working`, because work is happening -- just not here.
+     Its own colour rather than a shade of the orange that means "needs you",
+     which is the one thing delegating never means. */
+  .st.delegating{color:var(--mauve);border-color:rgba(198,160,246,.28);
+                 background:rgba(198,160,246,.08)}
+  .st.delegating i{animation:breathe 2.4s var(--ease) infinite}
+  .st.gone{color:var(--faint)}
+  .card.stale .st:not(.blocked){opacity:.72}
 
   /* the prompt card: the hero moment */
   .ask{
@@ -449,9 +479,14 @@
 </head>
 <body>
 
+<main id="messagePage">
+  <div class="message-nav"><a href="/">← transcript</a><span id="messageMeta"></span></div>
+  <article id="messageBody" class="md">loading message…</article>
+</main>
+
 <header>
   <span class="brand">
-    <img src="/icon.svg" width="20" height="20" alt="" aria-hidden="true">
+    <img src="/icon-64.png" width="20" height="20" alt="" aria-hidden="true">
     <b id="host">…</b>
   </span>
   <span id="conn"><span class="dot" id="dot"></span><span id="connlbl">connecting</span></span>
@@ -979,8 +1014,30 @@ function card(row){
     const body = document.createElement('div');
     body.className = 'md'; body.innerHTML = markdownHTML(row.text);
     el.appendChild(body);
+    if(row.clipped && row.ref){
+      const full = document.createElement('a');
+      full.className = 'full-message'; full.textContent = 'view full message';
+      full.href = '/message?pane='+encodeURIComponent(sel)+'&ref='+encodeURIComponent(row.ref);
+      el.appendChild(full);
+    }
   }
   return el;
+}
+
+async function loadFullMessage(){
+  document.body.classList.add('message-open');
+  const query = new URLSearchParams(location.search);
+  const messageBody = $('#messageBody');
+  try{
+    const r = await fetch('/api/message?'+query.toString());
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || 'message not found');
+    $('#messageMeta').textContent = d.label + (d.ts ? ' · '+d.ts : '');
+    messageBody.innerHTML = markdownHTML(d.text);
+    document.title = d.label + ' · transcript';
+  }catch(e){
+    messageBody.textContent = e.message;
+  }
 }
 
 $('#txrows').addEventListener('click',ev=>{
@@ -1108,6 +1165,12 @@ function buildAsk(p, prompt){
   return ask;
 }
 
+// Seconds of quiet after which a card recedes. Purely how it looks: the
+// server has no such state, and a session that has been waiting on you all
+// afternoon still says so. This only stops a long board from shouting every
+// line at once.
+const STALE_AFTER = 300;
+
 async function loadOverview(){
   let d;
   try{
@@ -1122,15 +1185,17 @@ async function loadOverview(){
   d.panes.forEach(p=>{
     const el = document.createElement('div');
     el.className = 'card' + (p.id===sel ? ' cur' : '') +
-                   (p.state ? ' '+p.state : '');
+                   (p.state ? ' '+p.state : '') +
+                   (p.age !== null && p.age > STALE_AFTER ? ' stale' : '');
     // Keyboard path onto a clickable card; the buttons inside remain their
     // own tab stops.
     el.tabIndex = 0;
     el.setAttribute('role', p.prompt ? 'group' : 'button');
     el.setAttribute('aria-label', 'open ' + paneLabel(p));
     const agent = `<span class="badge">${esc(p.kind || 'shell')}</span>`;
-    const label = {working:'working', waiting:'waiting on you',
-                   idle:'idle', blocked:'needs you', gone:'gone'};
+    const label = {working:'working', running:'tool running',
+                   waiting:'waiting on you', delegating:'agents working',
+                   blocked:'needs you', gone:'gone'};
     const st = p.state ? `<span class="st ${esc(p.state)}"><i></i>${label[p.state]||esc(p.state)}</span>` : '';
     // The badge already names the agent; repeating the pane command next to
     // it says the same thing twice.
@@ -1753,16 +1818,20 @@ document.addEventListener('visibilitychange', ()=>{
   else if(mode==='tx'){ startStream(); pollPrompt(); }
 });
 
-loadKeys();
-updateFooter();
-loadPanes().then(loadSession);
-loadOverview();
-setMode('ov');          // open on the sessions list, not a single pane
-loadOut();
-setInterval(loadPanes, 10000);
-// Only poll the pane while it is the visible view.
-pollTimer = setInterval(()=>{ if(!busy && !rec && mode==='term') loadOut(); }, 2000);
-setInterval(()=>{ if(mode!=='tx') loadSession(); }, 15000);
+if(location.pathname==='/message'){
+  loadFullMessage();
+}else{
+  loadKeys();
+  updateFooter();
+  loadPanes().then(loadSession);
+  loadOverview();
+  setMode('ov');          // open on the sessions list, not a single pane
+  loadOut();
+  setInterval(loadPanes, 10000);
+  // Only poll the pane while it is the visible view.
+  pollTimer = setInterval(()=>{ if(!busy && !rec && mode==='term') loadOut(); }, 2000);
+  setInterval(()=>{ if(mode!=='tx') loadSession(); }, 15000);
+}
 document.addEventListener('visibilitychange', ()=>{
   // Coming back after a long lock, the sweeper may have restored the window
   // already; autoFit re-acquires rather than assuming the lease survived.

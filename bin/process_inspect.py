@@ -21,10 +21,10 @@ both of them carry. It has a .py extension precisely
 because the commands beside it do not: in bin/, an extension means "import
 me", not "run me". There is no package here and nothing to install.
 
-Six questions are ever asked -- who are this process's children, what is each
-one called, when did it start, where is it running, is it still there, and
-what address was it reached from -- so that is the whole interface, and the
-walk that uses them is shared.
+Seven questions are ever asked -- who are this process's children, what is
+each one called, when did it start, where is it running, what has it got open,
+is it still there, and what address was it reached from -- so that is the whole
+interface, and the walk that uses them is shared.
 
 None means "could not find out", never an exception: this runs inside a
 request handler, and a pane whose agent cannot be identified is an ordinary
@@ -132,6 +132,28 @@ class _LinuxProcessInfo(_ProcessInfo):
         except OSError:
             return None
 
+    def open_files(self, pid):
+        """Every path this process has open, in no particular order.
+
+        /proc/<pid>/fd is a directory of symlinks and the answer is what they
+        point at. A descriptor closing while the directory is being walked is
+        ordinary -- the process is running -- so a link that will not read is
+        dropped rather than emptying the answer, which would otherwise say
+        "holds nothing open" about a busy process.
+        """
+        d = "%s/%s/fd" % (self.proc, pid)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return []
+        out = []
+        for name in names:
+            try:
+                out.append(os.readlink("%s/%s" % (d, name)))
+            except OSError:
+                continue
+        return out
+
     def exists(self, pid):
         return os.path.exists("%s/%s" % (self.proc, pid))
 
@@ -234,6 +256,17 @@ class _DarwinProcessInfo(_ProcessInfo):
             if line.startswith("n"):
                 return line[1:]
         return None
+
+    def open_files(self, pid):
+        """The same field output, without the -d filter that narrows it to one.
+
+        Every `n` record is a name, so this returns the cwd and the executable
+        and any socket alongside the files -- lsof does not sort those out and
+        neither does this. The caller is looking for one known path among them,
+        not taking an inventory of the process.
+        """
+        out = self.run(["lsof", "-p", str(pid), "-Fn"]) or ""
+        return [line[1:] for line in out.splitlines() if line.startswith("n")]
 
     def exists(self, pid):
         """Whether the process is still there.

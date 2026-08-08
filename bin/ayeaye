@@ -12,6 +12,7 @@ Bound to loopback on purpose. Put it on the tailnet with:
 which also gives it a real certificate, and browsers only allow microphone
 access from a secure origin.
 """
+import calendar
 import glob
 import hashlib
 import hmac
@@ -143,7 +144,17 @@ SHARE_DIR = (_env("SHARE", None)
 APP_HTML = os.path.join(SHARE_DIR, "app.html")
 BOARD_HTML = os.path.join(SHARE_DIR, "board.html")
 MANIFEST = os.path.join(SHARE_DIR, "manifest.webmanifest")
-ICON_SVG = os.path.join(SHARE_DIR, "icon.svg")
+# Raster icon set: favicon.ico + the small header mark use the simplified
+# small-size art; the touch/manifest sizes use the full-detail art.
+ICON_FILES = {
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
+    "/icon-64.png": ("icon-64.png", "image/png"),
+    "/icon-180.png": ("icon-180.png", "image/png"),
+    "/icon-192.png": ("icon-192.png", "image/png"),
+    "/icon-512.png": ("icon-512.png", "image/png"),
+    "/icon-maskable-192.png": ("icon-maskable-192.png", "image/png"),
+    "/icon-maskable-512.png": ("icon-maskable-512.png", "image/png"),
+}
 BIND = _env("BIND", "127.0.0.1")
 PORT = int(_env("PORT", "8911"))
 # History above the visible screen in the terminal view. 500 lines is ~5 ms
@@ -551,22 +562,42 @@ CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 
 
 def pane_session(pane_id):
-    """Which agent transcript belongs to this pane, if any."""
-    text = tmux("capture-pane", "-p", "-t", pane_id, "-S", "-200")
+    """Which agent transcript belongs to this pane, if any.
 
+    A pane is an agent session because an agent is running in it, so the
+    process is asked first and the pane text only after. The order is worth
+    more than the subprocess it saves: the marker outlives the session that
+    printed it, and a pane whose agent has exited -- or that was cleared and
+    started again -- reads through the marker alone as an agent, and as the
+    wrong one. Asking the process first cannot say that, because a process
+    that is not there answers nothing.
+
+    Both commands come back in one query. Two round trips to tmux for two
+    fields of the same pane is a race as well as a cost: between them the pane
+    may have been closed and its id reused.
+    """
+    cmd, _, pane_pid = tmux("display-message", "-p", "-t", pane_id,
+                            "#{pane_current_command}\t#{pane_pid}"
+                            ).strip().partition("\t")
+    if cmd == "codex":
+        return codex_session_for(pane_pid)
+    if cmd != "claude":
+        return None
+
+    sess = claude_session_for(pane_pid)
+    if sess:
+        return sess
+
+    # A claude too old to keep a session file. The statusline marker is what
+    # it had instead, and it still resolves a pane this version cannot -- but
+    # only for a pane that is running claude now, which is the check the
+    # marker on its own has never been able to make.
+    text = tmux("capture-pane", "-p", "-t", pane_id, "-S", "-200")
     m = CLAUDE_MARKER.search(text)
     if m:
         hit = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", m.group(1) + "*.jsonl"))
         if hit:
             return {"kind": "claude", "id": m.group(1), "path": hit[0]}
-
-    # Codex has no statusline hook to carry a marker, so fall back to matching
-    # the pane's directory against the cwd recorded in each rollout's
-    # session_meta, newest first.
-    cmd = tmux("display-message", "-p", "-t", pane_id, "#{pane_current_command}").strip()
-    if cmd == "codex":
-        pane_pid = tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
-        return codex_session_for(pane_pid)
     return None
 
 
@@ -593,22 +624,153 @@ _make_process_info = process_inspect._make_process_info
 PROCESS_INFO = process_inspect.PROCESS_INFO
 
 
+# Claude keeps one of these per live session, named for the process that owns
+# it: session id, cwd and start time, written at startup and removed when the
+# session exits. Verified on 2.1.226.
+CLAUDE_SESSIONS = os.path.expanduser("~/.claude/sessions")
+# A session id is a uuid, and it is pasted straight into a glob below. Matched
+# rather than trusted, so a file that says something else about itself cannot
+# aim that glob outside the projects directory.
+CLAUDE_SESSION_ID = re.compile(r"\A[0-9a-f]{8}[0-9a-f-]*\Z")
+# How far the start time recorded in that file may sit from the process's own.
+# Claude stamps it a moment after exec and macOS start times are truncated to
+# the second, so the gap is small but never zero. A wider one is a different
+# process wearing a recycled pid.
+CLAUDE_START_SKEW = 60
+
+
+def claude_session_for(pane_pid, proc=None):
+    """Match a claude process to its transcript through its session file.
+
+    The marker in the pane is the fast path, and this is what happens when it
+    is not there -- which is more often than "the statusline is not
+    installed". Claude paints the statusline into the live screen, and it
+    reaches the scrollback only as later output pushes it off; while a
+    question dialog is up, it paints no statusline at all. So a session that
+    asks something in its first screenful has the marker nowhere in the pane,
+    and a pane blocked on a question is the exact thing this app exists to
+    surface.
+
+    Claude's own per-session file is the way out: it names the session id
+    outright, and it is keyed by pid, so the descendant walk that the codex
+    path already does is the whole lookup. No guessing from cwd and mtime,
+    and nothing to install.
+    """
+    proc = proc or PROCESS_INFO
+    pid = proc.descendant(pane_pid, "claude")
+    if not pid:
+        return None
+    try:
+        with open(os.path.join(CLAUDE_SESSIONS, "%s.json" % pid)) as fh:
+            entry = json.load(fh)
+    except (OSError, ValueError):
+        return None                    # a claude too old to write one, or gone
+
+    # A file that outlived a crash names a pid the system is free to hand out
+    # again, and the next holder of it must not inherit a stranger's
+    # conversation.
+    started = proc.start_time(pid)
+    recorded = entry.get("startedAt")
+    if started is None or not isinstance(recorded, (int, float)):
+        return None
+    if abs(recorded / 1000.0 - started) > CLAUDE_START_SKEW:
+        return None
+
+    sid = entry.get("sessionId") or ""
+    if not CLAUDE_SESSION_ID.match(sid):
+        return None
+    # Globbed by id rather than built from the cwd: how a project path becomes
+    # a directory name under ~/.claude/projects is claude's business, and the
+    # marker path has never had to know it either.
+    hit = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", sid + "*.jsonl"))
+    if not hit:
+        return None                    # started, nothing written yet
+    return {"kind": "claude", "id": sid[:8], "path": hit[0]}
+
+
+def codex_meta(path):
+    """The session_meta payload a rollout opens with, or None.
+
+    Anything at all can be sitting in a file this server did not write, so the
+    read is total: an unfinished first line, a directory, bytes that are not
+    json. None means "this tells us nothing", which is not the same answer as
+    a payload that happens to be empty.
+    """
+    try:
+        with open(path) as fh:
+            meta = json.loads(fh.readline()).get("payload", {})
+    except Exception:
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def codex_open_rollout(pid, proc):
+    """The rollout this codex process is holding open, if it is holding one.
+
+    This is preferred over the timestamp match below because it is a fact
+    about the process rather than an inference about it: the kernel is asked
+    which file it has, so nothing has to be assumed about how soon after
+    starting the file appeared. A resumed session is where that shows -- its
+    rollout was written days before the process that reopened it, and no
+    window around a start time will ever contain it.
+
+    Codex holds its subagents' rollouts open too, so the ones it is keeping on
+    someone else's behalf are put aside: a spawned thread records the parent it
+    came from, and the session sitting in the pane is the one that came from
+    nobody.
+    """
+    prefix = CODEX_SESSIONS.rstrip(os.sep) + os.sep
+    best = None
+    for path in proc.open_files(pid):
+        if not path.startswith(prefix) or not path.endswith(".jsonl"):
+            continue
+        if not os.path.basename(path).startswith("rollout-"):
+            continue
+        meta = codex_meta(path)
+        if meta is None:
+            continue
+        if meta.get("parent_thread_id") or meta.get("thread_source") == "subagent":
+            continue
+        sid = meta.get("id") or ""
+        if not sid:
+            continue
+        # More than one survivor is not expected. Deciding between them by
+        # last write rather than by whichever descriptor came back first is
+        # what keeps the answer the same on two machines.
+        try:
+            when = os.path.getmtime(path)
+        except OSError:
+            continue
+        if best is None or when > best[0]:
+            best = (when, path, sid)
+    if not best:
+        return None
+    return {"kind": "codex", "id": best[2][:8], "path": best[1]}
+
+
 def codex_session_for(pane_pid, proc=None):
-    """Match a codex process to its rollout by start time and cwd.
+    """Which rollout belongs to the codex process behind this pane.
 
     Codex hooks would be the clean route, but SessionStart never fires in an
     interactive session on 0.145.0 (openai/codex#17532) -- verified with a
-    valid regex matcher and trust granted, and SessionEnd is dead too. Nor
-    does codex reliably hold the rollout open, so /proc/<pid>/fd is no good.
-    What is reliable: a rollout is created within a second or two of the
-    process starting, and its filename carries that timestamp. Pair that with
-    cwd and two codex agents in one directory stay distinct -- and it works
-    however codex was launched, not just from this app.
+    valid regex matcher and trust granted, and SessionEnd is dead too.
+
+    So there are two answers here, in the order they deserve. What the process
+    has open is asked first: it is exact, and 0.146.0 does hold the rollout.
+    Older codex did not do so reliably, which is why the second answer stays --
+    a rollout is created within a second or two of the process starting and
+    its filename carries that timestamp, and pairing that with cwd keeps two
+    codex agents in one directory distinct. Both work however codex was
+    launched, not just from this app.
     """
     proc = proc or PROCESS_INFO
     pid = proc.descendant(pane_pid, "codex")
     if not pid:
         return None
+    held = codex_open_rollout(pid, proc)
+    if held:
+        return held
+
     started = proc.start_time(pid)
     if started is None:
         return None                                # gone before we looked
@@ -632,10 +794,8 @@ def codex_session_for(pane_pid, proc=None):
             continue
         if best is not None and abs(delta) >= abs(best[0]):
             continue
-        try:
-            with open(r) as fh:
-                meta = json.loads(fh.readline()).get("payload", {})
-        except Exception:
+        meta = codex_meta(r)
+        if meta is None:
             continue
         if meta.get("cwd") == cwd:
             best = (delta, r, meta.get("id") or "")
@@ -670,6 +830,11 @@ def rows_codex(d):
     kind, ts = p.get("type"), (d.get("timestamp") or "")[11:19]
     if kind == "agent_message" and p.get("message"):
         return [("assistant", ts, "codex", p["message"])]
+    if kind == "message" and p.get("role") == "assistant":
+        txt = " ".join(c.get("text", "") for c in p.get("content") or []
+                       if isinstance(c, dict) and c.get("type") == "output_text")
+        if txt.strip():
+            return [("assistant", ts, "codex", txt)]
     if kind == "message" and p.get("role") == "user":
         txt = " ".join(c.get("text", "") for c in p.get("content") or []
                        if isinstance(c, dict))
@@ -685,6 +850,13 @@ def rows_codex(d):
     return []
 
 
+# How a finished background agent reports in: a plain turn, but addressed to
+# the agent rather than sent by you. It arrives as the same shape as something
+# typed, and left at that it becomes "the last thing either of you said" --
+# which puts raw markup on the card of every session that delegates.
+_TASK_NOTIFICATION = re.compile(r"\A\s*<task-notification>")
+
+
 def rows_claude(d):
     """Rows for one parsed Claude transcript line.
 
@@ -698,7 +870,14 @@ def rows_claude(d):
     ts = (d.get("timestamp") or "")[11:19]
     content = (d.get("message") or {}).get("content")
     if isinstance(content, str):
-        return [("user", ts, "you", content)] if content.strip() else []
+        if not content.strip():
+            return []
+        if _TASK_NOTIFICATION.match(content):
+            # An answer coming back to the agent, so: the same class as any
+            # other result. It also means the turn is the agent's again,
+            # which is exactly what has just become true.
+            return [("result", ts, "agent", content)]
+        return [("user", ts, "you", content)]
 
     out = []
     for b in content or []:
@@ -723,15 +902,80 @@ def rows_claude(d):
     return out
 
 
+def _stamp(d):
+    """When a transcript line says it happened, in epoch seconds, or None.
+
+    Both agents write ISO-8601 in UTC with a trailing Z. Parsed as UTC rather
+    than handed to the local zone: this is compared against the clock, and a
+    transcript written in one timezone and read in another would otherwise be
+    hours out -- in whichever direction made the session look freshest.
+    """
+    ts = d.get("timestamp")
+    if not isinstance(ts, str) or len(ts) < 19:
+        return None
+    try:
+        return calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def rows_from(d, kind):
+    """Display rows for one already-parsed JSONL line.
+
+    Split from rows_for so a caller that has to read the same line for
+    something else -- session_status, which also asks it what the session is
+    waiting on -- can parse the json once rather than per question.
+    """
+    rows = rows_codex(d) if kind == "codex" else rows_claude(d)
+    return [{"cls": c, "ts": ts, "label": lb, "text": _clip(tx)}
+            for c, ts, lb, tx in rows]
+
+
 def rows_for(raw, kind):
     """Parse one JSONL line into zero or more display rows."""
     try:
         d = json.loads(raw)
     except Exception:
         return []
-    rows = rows_codex(d) if kind == "codex" else rows_claude(d)
-    return [{"cls": c, "ts": ts, "label": lb, "text": _clip(tx)}
-            for c, ts, lb, tx in rows]
+    return rows_from(d, kind)
+
+
+def transcript_rows(raw, kind, line_number):
+    """Clipped stream rows carrying a stable reference to their source line."""
+    rows = rows_for(raw, kind)
+    for item_number, row in enumerate(rows):
+        row["ref"] = "%d:%d" % (line_number, item_number)
+        row["clipped"] = len(row["text"]) > MAX_BLOCK
+    return rows
+
+
+def transcript_message(sess, reference):
+    """Return one original, unclipped conversational transcript row."""
+    match = re.fullmatch(r"(0|[1-9][0-9]*):(0|[1-9][0-9]*)", reference or "")
+    if not match:
+        return None
+    line_number, item_number = map(int, match.groups())
+    try:
+        with open(sess["path"], "rb") as fh:
+            raw = next((line for number, line in enumerate(fh)
+                        if number == line_number), None)
+    except OSError:
+        return None
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except (TypeError, ValueError):
+        return None
+    rows = rows_codex(parsed) if sess["kind"] == "codex" else rows_claude(parsed)
+    if item_number >= len(rows):
+        return None
+    cls, ts, label, text = rows[item_number]
+    if cls not in ("assistant", "user"):
+        return None
+    if not isinstance(text, str):
+        text = json.dumps(text) if text is not None else ""
+    return {"cls": cls, "ts": ts, "label": label, "text": text}
 
 
 def stream_transcript(wfile, sess, stop_after=None):
@@ -753,8 +997,10 @@ def stream_transcript(wfile, sess, stop_after=None):
         offset = data.rfind(b"\n") + 1
 
     backlog = []
-    for raw in data[:offset].splitlines():
-        backlog.extend(rows_for(raw.decode("utf-8", "replace"), kind))
+    complete = data[:offset].splitlines()
+    for line_number, raw in enumerate(complete):
+        backlog.extend(transcript_rows(raw.decode("utf-8", "replace"), kind,
+                                       line_number))
 
     send("init", {"kind": kind, "id": sess["id"],
                   "total": len(backlog), "shown": min(len(backlog), BACKLOG)})
@@ -763,6 +1009,7 @@ def stream_transcript(wfile, sess, stop_after=None):
     send("ready", {})
 
     idle = 0
+    next_line = len(complete)
     while stop_after is None or idle < stop_after:
         try:
             size = os.path.getsize(path)
@@ -774,9 +1021,12 @@ def stream_transcript(wfile, sess, stop_after=None):
                 chunk = fh.read(size - offset)
             cut = chunk.rfind(b"\n") + 1
             if cut:
-                for raw in chunk[:cut].splitlines():
-                    for row in rows_for(raw.decode("utf-8", "replace"), kind):
+                for line_number, raw in enumerate(chunk[:cut].splitlines(),
+                                                  next_line):
+                    for row in transcript_rows(raw.decode("utf-8", "replace"),
+                                               kind, line_number):
                         send("row", row)
+                next_line += len(chunk[:cut].splitlines())
                 offset += cut
             idle = 0
         else:
@@ -787,8 +1037,6 @@ def stream_transcript(wfile, sess, stop_after=None):
             wfile.flush()
         time.sleep(1)
 
-
-IDLE_AFTER = int(os.environ.get("VOICE_IDLE_AFTER", "300"))   # seconds
 
 # A pending approval lives only in the TUI. Codex logs the exec_command it
 # wants to run but never an approval event, so the transcript looks like work
@@ -815,19 +1063,12 @@ def pane_prompt(pane_id, window=30):
     idx = [i for i, l in enumerate(tail) if _OPT.match(l)]
     if len(idx) < 2 or not any(_CONFIRM.search(l) for l in tail[idx[0]:]):
         return None
-    # The prompt must still be the last thing on screen. Once the agent moves
-    # on, its output lands below the old options -- without this, answered
-    # prompts keep reporting "blocked" until they scroll away.
     for l in tail[idx[-1] + 1:]:
         if l.strip() and not _CONFIRM.search(l):
             return None
     options = [{"key": _OPT.match(tail[i]).group(1),
                 "label": _OPT.match(tail[i]).group(2)[:90]} for i in idx]
 
-    # Blank lines interleave the question block in both agents, so skip them
-    # rather than stopping. End at the bullet that starts the agent's turn,
-    # or at a rule -- Claude draws one between its prose and the prompt, and
-    # without that the walk-back runs on into the startup banner.
     q = []
     for l in reversed(tail[:idx[0]]):
         s = l.strip()
@@ -865,17 +1106,140 @@ def answer_prompt(pane_id, key):
     return {"error": "bad key"}
 
 
+# --------------------------------------------------------------- delegation
+# An agent that has handed its work to agents of its own is neither working
+# nor waiting on you, and on a board whose whole question is "who needs me"
+# those are both the wrong answer. It used to read as the worst one: a long
+# fan-out writes nothing to the parent transcript for minutes at a time, so
+# the orchestrator -- the one pane genuinely making progress -- was the one
+# that went quiet and dropped to the bottom.
+#
+# Both agents say what they are waiting on, in their own way, and neither
+# needs anything installed to say it.
+
+# Claude's subagent tools. Task is what Agent was called before; transcripts
+# written by either are still on disk and still worth reading.
+CLAUDE_AGENT_TOOLS = {"Agent", "Task"}
+# What comes back the instant a background agent is launched. It acknowledges
+# the launch and says nothing about the work, so the call that produced it is
+# still outstanding -- unlike a synchronous agent, whose result IS the work.
+_ASYNC_LAUNCH = re.compile(r"async agent launched", re.I)
+# How the real answer arrives, minutes or hours later: an ordinary user turn
+# naming the tool call it belongs to.
+_NOTIFIED = re.compile(r"<tool-use-id>([^<>]+)</tool-use-id>")
+# Codex tools whose entire purpose is to block on a thread it spawned.
+CODEX_WAIT_TOOLS = {"wait_agent", "wait"}
+
+
+def _result_text(block):
+    """The text of a tool_result block, whichever shape it arrived in."""
+    c = block.get("content")
+    if isinstance(c, list):
+        return " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    return c if isinstance(c, str) else ""
+
+
+class Delegation(object):
+    """Whether this session is waiting on agents it launched.
+
+    Fed every line of the tail in order, because pairing a launch with the
+    thing that ends it is the only honest way to answer. Each agent needs a
+    different pairing:
+
+    Claude gets an acknowledgement back the moment it launches a background
+    agent and the real answer much later, as a `<task-notification>` turn --
+    and that turn names the tool call it answers, so any number of agents in
+    flight stay matched up by id.
+
+    Codex blocks in a tool instead, on a short timeout, in a loop: whether a
+    wait call is outstanding *at this instant* flickers on and off every few
+    seconds, which is no use to a card someone is looking at. What does not
+    flicker is which tool it keeps reaching for, so the question asked here is
+    whether the last thing it called was a wait.
+
+    The tail is the horizon, deliberately. A launch old enough to have
+    scrolled out of it is forgotten -- and a session busy enough to push it
+    out is not one sitting still waiting for an answer.
+    """
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.pending = set()        # claude: launches with nothing back yet
+        self.last_call_was_wait = False    # codex: the loop above
+
+    def feed(self, d):
+        (self._codex if self.kind == "codex" else self._claude)(d)
+
+    def outstanding(self):
+        return bool(self.pending) or self.last_call_was_wait
+
+    def _codex(self, d):
+        p = d.get("payload") or {}
+        if p.get("type") not in ("function_call", "custom_tool_call"):
+            return
+        self.last_call_was_wait = p.get("name") in CODEX_WAIT_TOOLS
+
+    def _claude(self, d):
+        if d.get("type") not in ("user", "assistant"):
+            return
+        content = (d.get("message") or {}).get("content")
+        if isinstance(content, str):
+            # A plain turn, which is the only thing a completion arrives as.
+            # Tool output is a list of blocks and never reaches here, which is
+            # what stops a transcript that merely quotes a notification --
+            # this file greps for them -- from cancelling a live one.
+            for m in _NOTIFIED.finditer(content):
+                self.pending.discard(m.group(1))
+            return
+        for b in content or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("name") in CLAUDE_AGENT_TOOLS:
+                if b.get("id"):
+                    self.pending.add(b["id"])
+            elif b.get("type") == "tool_result":
+                tid = b.get("tool_use_id")
+                if tid in self.pending and not _ASYNC_LAUNCH.search(_result_text(b)):
+                    self.pending.discard(tid)   # a synchronous agent, returned
+
+
 def session_status(sess, tail_bytes=200_000):
     """What is this agent doing right now?
 
     Derived from the tail of the transcript rather than a hook, so it works
-    the same for claude and codex and needs nothing installed. The last row
-    type is the tell: an agent that just spoke has handed the turn back;
-    one whose last event is a tool call or its result is mid-turn.
+    the same for claude and codex and needs nothing installed.
+
+    Four answers, and the question behind all of them is who the session is
+    waiting on. Its own agents: `delegating`, work is happening and none of it
+    is yours. You: `waiting`, because the last thing in the transcript is the
+    agent speaking, which is how a turn is handed back. A tool it called:
+    `running`, the call is out and nothing has come back. Itself: `working`,
+    thinking with everything it needs already in hand.
+
+    `running` is split out of `working` for the same reason `delegating` was:
+    both are the session waiting on something that is not you, and lumping
+    them under "working" hides the one number that matters when it goes wrong.
+    A tool call is the one place a session can hang for an hour -- a test
+    suite, a fetch against something unreachable, a command sitting at a
+    prompt this side of the pane -- and `running` next to `age` says that out
+    loud, where `working` reads as a model that is merely being thorough.
+
+    There is deliberately no state for "quiet for a while". How long it has
+    been quiet is what `age` is, and the card carries it next to the state: a
+    session that handed you the turn three hours ago is still waiting on you,
+    and calling that idle only hid which of the two it was.
+
+    Which puts the whole weight of "how long" on `age`, so it is read from the
+    conversation and not from the file. A live claude touches its transcript
+    long after it stops writing to it -- four days after, on this machine --
+    so mtime dated every quiet session to a few minutes ago and floated it to
+    the top of the board. The timestamp on the last thing that actually
+    happened cannot say that. mtime is kept only for a tail that carries no
+    timestamp at all, where it is the only answer there is.
     """
     try:
         size = os.path.getsize(sess["path"])
-        age = time.time() - os.path.getmtime(sess["path"])
+        touched = os.path.getmtime(sess["path"])
     except OSError:
         return {"state": "gone", "age": None, "last": ""}
 
@@ -885,19 +1249,44 @@ def session_status(sess, tail_bytes=200_000):
             fh.readline()                      # discard the partial first line
         chunk = fh.read()
 
-    rows = []
+    # Parsed once and read twice: the rows say whose turn it is, and the same
+    # lines say what the session is waiting on. Doing it twice would mean
+    # parsing every pane's tail twice on every poll.
+    kind = sess["kind"]
+    rows, delegation, latest = [], Delegation(kind), None
     for raw in chunk.splitlines():
-        rows.extend(rows_for(raw.decode("utf-8", "replace"), sess["kind"]))
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        fresh = rows_from(d, kind)
+        if fresh:
+            # Only a line that carries conversation dates the session. The
+            # bookkeeping around it -- modes, titles, hook summaries -- is
+            # written whether or not anything happened, and taking the newest
+            # of those is how mtime got it wrong in the first place.
+            #
+            # Newest rather than last: claude interleaves an attachment line
+            # timestamped before the turn it belongs to, and reading in file
+            # order would let one of those wind the clock back.
+            at = _stamp(d)
+            if at is not None and (latest is None or at > latest):
+                latest = at
+        rows.extend(fresh)
+        delegation.feed(d)
+
+    # A clock that disagrees with the transcript must not read as the future.
+    age = max(0.0, time.time() - (touched if latest is None else latest))
 
     last = rows[-1] if rows else None
-    if age > IDLE_AFTER:
-        state = "idle"
-    elif last is None:
-        state = "idle"
-    elif last["cls"] == "assistant":
-        state = "waiting"                      # turn handed back to you
+    if delegation.outstanding():
+        state = "delegating"                   # its agents are the holdup
+    elif last is None or last["cls"] == "assistant":
+        state = "waiting"                      # turn handed back, or not begun
+    elif last["cls"] == "tool":
+        state = "running"                      # a call is out, nothing back yet
     else:
-        state = "working"                      # mid tool call, or you just sent
+        state = "working"                      # a result landed, or you just sent
 
     # The most recent thing either of you actually said, which is more useful
     # on a card than whatever tool happened to run last.
@@ -1957,7 +2346,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._login()
         if path.startswith("/api/") and not self._authed():
             return self._unauthorized()
-        if path in ("/", "/index.html"):
+        if path in ("/", "/index.html", "/message"):
             try:
                 with open(APP_HTML, "rb") as fh:
                     return self._send(200, fh.read(), "text/html; charset=utf-8")
@@ -1980,10 +2369,11 @@ class Handler(BaseHTTPRequestHandler):
                                       "application/manifest+json")
             except OSError:
                 return self._json({"error": "not found"}, 404)
-        if path == "/icon.svg":
+        if path in ICON_FILES:
+            fname, ctype = ICON_FILES[path]
             try:
-                with open(ICON_SVG, "rb") as fh:
-                    return self._send(200, fh.read(), "image/svg+xml")
+                with open(os.path.join(SHARE_DIR, fname), "rb") as fh:
+                    return self._send(200, fh.read(), ctype)
             except OSError:
                 return self._json({"error": "not found"}, 404)
         if path == "/api/cliban/projects":
@@ -2074,6 +2464,15 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._json({"kind": None})
             return self._json({"kind": sess["kind"], "id": sess["id"]})
+
+        if path == "/api/message":
+            query = self._query()
+            pane = query.get("pane", [""])[0]
+            reference = query.get("ref", [""])[0]
+            sess = pane_session(pane) if pane else None
+            message = transcript_message(sess, reference) if sess else None
+            return self._json(message or {"error": "message not found"},
+                              200 if message else 404)
 
         if path == "/api/stream":
             pane = self._query().get("pane", [""])[0]

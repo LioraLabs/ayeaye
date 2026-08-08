@@ -78,8 +78,18 @@ test_the_backend_is_chosen_by_platform_and_never_raises() {
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
 }
 
-test_the_claude_marker_never_inspects_a_process() {
+test_the_claude_marker_resolves_a_pane_the_session_file_cannot() {
   run_proc_tests ClaudeMarkerTest
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
+test_a_claude_pane_with_no_marker_resolves_through_its_session_file() {
+  run_proc_tests ClaudeSessionTest
+  assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
+}
+
+test_a_codex_rollout_held_open_beats_guessing_from_a_start_time() {
+  run_proc_tests CodexHeldRolloutTest
   assert_status 0 "$RUN_STATUS" "$RUN_OUTPUT"
 }
 
