@@ -570,7 +570,7 @@ The template documents every variable with its default; the highlights:
 | `VOICE_NTFY_URL` | unset | ntfy topic URL; empty disables notifications |
 | `VOICE_NTFY_CLICK` | unset | URL opened when a notification is tapped |
 | `VOICE_NOTIFY_EVERY` | `10` | seconds between checks for blocked agents |
-| `VOICE_NOTIFY_STATES` | `blocked` | comma separated; `waiting` is noisy |
+| `VOICE_NOTIFY_STATES` | `blocked,waiting` | comma separated; states that mean the turn is yours |
 | `VOICE_CLIBAN` | auto | path to the cliban binary for `/board` |
 | `VOICE_BIND` | `127.0.0.1` | voice-agent bind address (client device) |
 | `VOICE_PORT` | `8787` | voice-agent port |
@@ -604,9 +604,24 @@ or at `~/.cargo/bin/cliban`; override with `VOICE_CLIBAN`.
 An agent that stops to ask for permission is the whole reason you'd look at
 your phone, so `ayeaye` can push when that happens.
 
-It polls its own overview and fires on the **transition** into `blocked`,
-keyed on the pane plus the question: a new prompt in the same pane notifies
-again, the same prompt sitting unanswered stays quiet.
+It polls its own overview and fires on the **transition into** a state that
+means the turn is yours — `blocked`, stopped at a prompt, and `waiting`, the
+turn handed back. Only the arrival notifies, which is what keeps it useful:
+
+- A session left waiting on you notifies **once**, not every ten seconds for
+  as long as you ignore it.
+- Replying moves the pane to `working`, and nothing subscribes to `working`,
+  so you are never notified about your own message.
+- An agent getting on with its work flickers between `working`, `running`
+  and `delegating` all day and never says a word.
+
+`blocked` additionally carries the question, so a second prompt in the same
+pane notifies again while the same prompt sitting unanswered stays quiet.
+
+The first sweep after a restart only seeds — otherwise restarting the service
+would page you about every session already on the board.
+
+Narrow it with `VOICE_NOTIFY_STATES=blocked` for prompts alone.
 
 Delivery is [ntfy](https://ntfy.sh). Self-host it and nothing leaves your
 network:

@@ -172,11 +172,13 @@ SEND_ENTER_DELAY = float(os.environ.get("VOICE_SEND_DELAY", "0.4"))
 NTFY_URL = os.environ.get("VOICE_NTFY_URL", "")
 NTFY_CLICK = os.environ.get("VOICE_NTFY_CLICK", "")   # opened when tapped
 NOTIFY_EVERY = int(os.environ.get("VOICE_NOTIFY_EVERY", "10"))
-# Which states are worth a notification. "blocked" is an agent stopped at a
-# prompt. "waiting" fires after every completed turn, which is constant for an
-# active agent, so it is off unless you ask for it.
+# Which states are worth a notification -- the ones that mean it is your
+# turn. "blocked" is an agent stopped at a prompt; "waiting" is an agent that
+# has handed the turn back. Both fire on the way in and only on the way in,
+# so a session that has been waiting for an hour is silent, and so is one you
+# have just replied to.
 NOTIFY_STATES = set(filter(None, os.environ.get(
-    "VOICE_NOTIFY_STATES", "blocked").split(",")))
+    "VOICE_NOTIFY_STATES", "blocked,waiting").split(",")))
 
 
 # ---------------------------------------------------------------------- auth
@@ -1967,11 +1969,61 @@ def notify(title, body, tags=("warning",), priority=4, click=""):
         sys.stderr.write("notify failed: %s\n" % exc)
 
 
-def watch_and_notify():
-    """Fire once when an agent starts needing you, not repeatedly.
+# How each state reads once it is the thing that just happened. Both mean the
+# turn is yours; `blocked` is louder because a session at a prompt cannot make
+# progress without you, where one that has handed back has at least finished.
+_STATE_NOTE = {
+    "blocked": ("needs you", ("warning",), 4),
+    "waiting": ("finished its turn", ("bell",), 3),
+}
 
-    Keyed on the pane plus the question, so a fresh prompt in the same pane
-    notifies again while the same prompt sitting unanswered stays quiet.
+
+def _notify_key(row):
+    """What makes this pane worth one notification, or None for a pane that
+    can never be worth any -- a plain shell has no state to change.
+
+    The state, plus the question while blocked. Including the question means
+    a second prompt in a pane already blocked is fresh news; excluding it
+    everywhere else means the sentences an agent writes while it works are
+    not mistaken for changes of state.
+    """
+    state = row.get("state")
+    if state is None:
+        return None
+    question = (row.get("prompt") or {}).get("question") or ""
+    return (state, question[:120] if state == "blocked" else "")
+
+
+def notify_changes(rows, seen):
+    """The panes that just became your problem, and the state to compare next.
+
+    A notification marks a transition *into* a state and never the state
+    itself. That distinction is the whole of it: an agent that has been
+    waiting on you for an hour is not news, and neither is one you have just
+    replied to -- that is a move to `working`, which nothing subscribes to.
+    Only the arrival is, and it happens once.
+
+    A pane with no previous state is recorded and left alone, which is what
+    makes the first sweep after a restart silent rather than a broadside of
+    everything already on the board.
+    """
+    fresh, current = [], {}
+    for r in rows:
+        key = _notify_key(r)
+        if key is None:
+            continue
+        current[r["id"]] = key
+        was = seen.get(r["id"])
+        if was is not None and was != key and key[0] in NOTIFY_STATES:
+            fresh.append(r)
+    return fresh, current
+
+
+def watch_and_notify():
+    """Tell you when a session starts needing you, once per change.
+
+    The decision is in notify_changes; this is the loop around it and the
+    wording of what gets sent.
     """
     seen = {}
     while True:
@@ -1979,27 +2031,24 @@ def watch_and_notify():
         try:
             rows = overview()
         except Exception:
+            # `seen` is left untouched, so the next sweep still compares
+            # against the last state actually observed rather than losing it.
             continue
-        current = {}
-        for r in rows:
-            if r.get("state") not in NOTIFY_STATES:
-                continue
-            prompt = r.get("prompt") or {}
-            question = prompt.get("question") or r.get("last") or ""
-            key = (r["id"], question[:120])
-            current[r["id"]] = key
-            if seen.get(r["id"]) == key:
-                continue                      # already told you about this one
+        fresh, seen = notify_changes(rows, seen)
+        for r in fresh:
             where = "%s:%s" % (r["session"], r["window"])
             agent = r.get("kind") or r.get("cmd") or "agent"
+            prompt = r.get("prompt") or {}
+            question = prompt.get("question") or ""
+            note, tags, priority = _STATE_NOTE.get(
+                r["state"], ("needs you", ("bell",), 3))
             opts = prompt.get("options") or []
-            body = question[:300] or "is waiting for you"
+            body = question[:300] or r.get("last") or "is waiting for you"
             if opts:
                 body += "\n\n" + "\n".join(
                     "%s. %s" % (o["key"], o["label"][:60]) for o in opts[:4])
-            notify("%s · %s needs you" % (where, agent), body,
-                   click=NTFY_CLICK)
-        seen = current                        # drop panes that are no longer blocked
+            notify("%s · %s %s" % (where, agent, note), body,
+                   tags=tags, priority=priority, click=NTFY_CLICK)
 
 
 # ------------------------------------------------------------- voice probe
