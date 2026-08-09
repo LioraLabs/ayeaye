@@ -92,24 +92,6 @@
   .seg a.on{background:var(--panel);color:var(--fg);
             box-shadow:0 1px 3px rgba(0,0,0,.35)}
 
-  /* ---- pane strip -------------------------------------------------------- */
-  #panes{display:flex;gap:8px;overflow-x:auto;padding:10px 14px;flex:none;
-         scrollbar-width:none}
-  #panes:empty{display:none}
-  #panes::-webkit-scrollbar{display:none}
-  .pane{
-    flex:none;padding:7px 12px;border:1px solid var(--line);
-    border-radius:999px;background:var(--panel2);color:var(--muted);
-    font-size:12.5px;font-weight:550;white-space:nowrap;cursor:pointer;
-    text-align:left;
-    transition:border-color .15s var(--ease),color .15s var(--ease),
-               background .15s var(--ease);
-  }
-  .pane.sel{border-color:var(--line2);background:var(--panel);color:var(--fg)}
-  .pane small{color:var(--muted);margin-left:6px;font-size:11px;
-              font-family:var(--mono);font-weight:400}
-  .pane.sel small{color:var(--muted)}
-
   /* ---- view tabs --------------------------------------------------------- */
   #modes{display:flex;align-items:center;gap:8px;padding:2px 14px 10px;flex:none}
   .tabs{display:flex;flex:none;background:var(--panel2);
@@ -497,7 +479,6 @@
   </nav>
 </header>
 
-<div id="panes"></div>
 <div id="modes">
   <div class="tabs">
     <button class="mode sel" id="mOv">sessions</button>
@@ -717,7 +698,7 @@ async function loadPanes(){
     // a target tmux no longer has; fall through to the active pane instead.
     if(sel && !panes.some(p=>p.id===sel)){ sel = null; msg('selected pane closed'); }
     if(!sel && panes.length) sel = (panes.find(p=>p.active)||panes[0]).id;
-    renderPanes();
+    syncTarget();
   }catch(e){
     connUI(false, 'offline');
     ovError('cannot reach the server', 'retrying automatically');
@@ -741,23 +722,12 @@ function updateFooter(){
   $('#talk').disabled = !has || !voiceOK;
 }
 
-function renderPanes(){
-  const box = $('#panes'); box.innerHTML='';
-  panes.forEach(p=>{
-    const el = document.createElement('button');
-    el.type = 'button';
-    el.className = 'pane' + (p.id===sel?' sel':'');
-    if(p.id===sel) el.setAttribute('aria-current', 'true');
-    el.innerHTML = `${esc(paneLabel(p))}<small>${esc(p.cmd)}</small>`;
-    el.onclick = ()=>{
-      sel=p.id; msg(''); renderPanes(); loadOut();
-      if(mode==='term') autoFit();       // moves the fit to the new pane
-      // Switching pane means a different session: re-resolve, and restart the
-      // stream if we are watching one.
-      loadSession().then(()=>{ if(mode==='tx'){ startStream(); pollPrompt(); } });
-    };
-    box.appendChild(el);
-  });
+// There used to be a strip of pane chips above this, one per pane, scrolling
+// sideways. It said nothing the sessions list below it did not say better --
+// the list has the state, the age and the question, where a chip had only a
+// name -- so it cost a row of screen on a phone to duplicate the page you
+// were already looking at. Selecting a pane is the list's job now.
+function syncTarget(){
   const p = panes.find(x=>x.id===sel);
   $('#target').textContent = p ? `${paneLabel(p)} ${p.cmd}` : '';
   updateFooter();
@@ -1230,7 +1200,7 @@ async function loadOverview(){
       // An uncovered kill button means the tap is about the reveal, not the
       // pane: put the card back rather than navigating under the thumb.
       if(swipeOpen){ closeSwipe(); return; }
-      sel = p.id; msg(''); renderPanes(); loadOut();
+      sel = p.id; msg(''); syncTarget(); loadOut();
       loadSession().then(()=> setMode(p.kind ? 'tx' : 'term'));
     };
     el.onkeydown = ev=>{
@@ -1324,7 +1294,7 @@ async function killPane(id, label){
     if(d.error) return msg(d.error, true);
     closeSwipe();
     // The dead pane may have been the footer's target.
-    if(sel === id){ sel = null; updateFooter(); renderPanes(); }
+    if(sel === id){ sel = null; syncTarget(); }
     msg('killed ' + label);
     loadPanes(); loadOverview();
   }catch(e){ msg('failed: ' + e.message, true); }
@@ -1368,7 +1338,7 @@ async function answer(pane, opt){
   // "tell it what to do differently" leaves the agent waiting for text, so
   // select that pane and open the composer ready to say it.
   if(/differently|tell .* what|type something|chat about/i.test(opt.label)){
-    sel = pane.id; renderPanes(); loadOut();
+    sel = pane.id; syncTarget(); loadOut();
     await loadSession();
     $('#draft').classList.add('show');
     $('#actions').classList.add('show');
@@ -1428,7 +1398,7 @@ async function spawn(p){
     msg(`${agent} started · new ${d.created} in ${d.session}`);
     togglePicker(false);
     sel = d.pane;
-    await loadPanes(); renderPanes(); loadOut();
+    await loadPanes(); syncTarget(); loadOut();
     // A fresh agent has no transcript yet, so start on the terminal and let
     // the transcript button enable itself once there is something to show.
     await loadSession(); setMode('term');
