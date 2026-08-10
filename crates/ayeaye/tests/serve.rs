@@ -51,6 +51,15 @@ impl Server {
         let listener = ayeaye::server::listen(&settings)
             .await
             .expect("the settings should describe a bindable address");
+        Server::serving(listener, settings)
+    }
+
+    /// Serve on a listener the caller has already had the server bind.
+    ///
+    /// Split out for the one test that has to know the port *before* the server
+    /// starts: it cannot ask afterwards, and it cannot bind for itself without
+    /// racing every other test in this binary for the port it borrowed.
+    fn serving(listener: TcpListener, settings: Settings) -> Server {
         let port = listener.local_addr().expect("a bound address").port();
         let settings = Arc::new(settings);
         tokio::spawn(async move {
@@ -187,15 +196,36 @@ async fn a_browser_gets_the_panel_from_a_real_socket() {
 async fn the_server_listens_on_the_port_it_was_configured_with() {
     // Borrow a port from the kernel and hand it back, so the number below is
     // one that was free a moment ago rather than one that was hoped for.
-    let scout = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("port 0 should always bind");
-    let chosen = scout.local_addr().expect("a bound address").port();
-    drop(scout);
+    //
+    // Between handing it back and the server taking it, any other test in this
+    // binary asking for port 0 can be given the same number — so this is tried
+    // a few times rather than once. The claim is about which port the server
+    // binds; losing a race for a port is not that claim failing, and a test
+    // that cannot tell the two apart goes red for reasons nobody can act on.
+    let mut refusals = Vec::new();
+    for _ in 0..8 {
+        let scout = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("port 0 should always bind");
+        let chosen = scout.local_addr().expect("a bound address").port();
+        drop(scout);
 
-    let server = Server::start(settings_on_port(chosen)).await;
-    assert_eq!(server.port, chosen, "the server moved to a different port");
-    assert_eq!(server.get("/").await.status, 200);
+        let settings = settings_on_port(chosen);
+        // The server's own bind, as `Server::start` uses — the port has to be
+        // known before it starts, and this is the only way to know it.
+        let listener = match ayeaye::server::listen(&settings).await {
+            Ok(listener) => listener,
+            Err(why) => {
+                refusals.push(format!("{chosen}: {why}"));
+                continue;
+            }
+        };
+        let server = Server::serving(listener, settings);
+        assert_eq!(server.port, chosen, "the server moved to a different port");
+        assert_eq!(server.get("/").await.status, 200);
+        return;
+    }
+    panic!("no borrowed port was still free when the server reached for it: {refusals:?}");
 }
 
 // AYEAYE-42 — the board, the manifest and the icons are what turn the panel
@@ -483,6 +513,10 @@ async fn the_pane_list_comes_back_over_a_socket_with_every_id_qualified() {
 // to render on all of them.
 #[tokio::test]
 async fn a_machine_with_no_tmux_server_answers_an_empty_list() {
+    if !common::have_tmux() {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    }
     let server = Server::started().await;
     let answer = server
         .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])

@@ -122,13 +122,23 @@ fn log_in(settings: &Settings, query: &Query) -> Response {
 /// reason*, at 200 rather than 500. The panel polls this every couple of
 /// seconds and has to keep rendering; what it must never do is show an empty
 /// list that means "nothing needs you" when the truth is "I could not look".
+///
+/// **Nothing reads that field yet.** `share/app.html` checks only that `panes`
+/// is an array, so today the reason reaches the journal and no further; the
+/// panel learning to render it is a change to a file the Python daemon is still
+/// serving, and belongs to the ticket that retires that daemon. The field is
+/// here now because the alternative — adding it later — means every endpoint
+/// written in between decides for itself what a failure looks like.
 async fn panes(settings: &Settings) -> Response {
     let here = settings.peers.here().name();
     let body = match settings.tmux.panes(here).await {
         Ok(panes) => ayeaye_core::tmux::panes_body(here, &panes, None),
         Err(trouble) => {
-            // Also on stderr: the panel shows the reason to whoever is holding
-            // the phone, and the journal is where whoever fixes it will look.
+            // On stderr as well, because that is where it is read today. The
+            // panel polls, so a machine with no tmux at all writes this line
+            // every couple of seconds per client: worth a rate limit once
+            // something else reads the field, not worth state on `Settings`
+            // while the journal is the only reader there is.
             eprintln!("ayeaye: {trouble}");
             ayeaye_core::tmux::panes_body(here, &[], Some(&trouble.to_string()))
         }

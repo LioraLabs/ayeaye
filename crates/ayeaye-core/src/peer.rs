@@ -84,7 +84,8 @@ impl PaneId {
         })
     }
 
-    /// Read one back, splitting on the **first** separator.
+    /// Read one back, splitting on the **first** separator, which is what the
+    /// multi-host design specifies.
     ///
     /// An id with no separator is refused rather than assumed to be local:
     /// "bare means here" is the conditional this type exists to delete.
@@ -341,9 +342,9 @@ mod tests {
         assert_eq!(PaneId::parse("Alex's Mac/%3"), Ok(spaced));
     }
 
-    // AYEAYE-43 — the split is on the *first* separator, as `docs/multi-host.md`
-    // specifies: the host is everything before it and the rest is carried
-    // whole. Splitting on the last would read the host of `a/b/%12` as `a/b`,
+    // AYEAYE-43 — the split is on the *first* separator, which is what the
+    // multi-host design specifies: the host is everything before it and the
+    // rest is carried whole. Splitting on the last would read the host of `a/b/%12` as `a/b`,
     // which is not a name any peer can be registered under.
     #[test]
     fn a_qualified_id_splits_on_the_first_separator() {

@@ -58,6 +58,10 @@ async fn the_panes_of_a_real_tmux_come_back_qualified() {
 // would put an error in the panel on every one of them.
 #[tokio::test]
 async fn a_socket_with_no_server_has_no_panes_and_no_complaint() {
+    if !common::have_tmux() {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    }
     assert_eq!(
         common::nowhere("nobody").panes(&host()).await,
         Ok(Vec::new())

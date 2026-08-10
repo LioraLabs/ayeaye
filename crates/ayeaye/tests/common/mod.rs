@@ -72,6 +72,16 @@ impl Drop for Private {
     }
 }
 
+/// Whether this machine has a tmux for a test to ask at all.
+///
+/// Every case here skips rather than fails without one, and that has to be the
+/// whole file's answer or it is nobody's: a suite where two cases skip and two
+/// fail on the same machine is telling you two different things about the same
+/// missing program.
+pub fn have_tmux() -> bool {
+    Command::new("tmux").arg("-V").output().is_ok()
+}
+
 /// A tmux pointed at a socket nobody has started a server on.
 ///
 /// What a machine with no sessions looks like — and what a test that does not
