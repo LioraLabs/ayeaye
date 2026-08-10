@@ -6,11 +6,12 @@
 //! test can reach without starting a process.
 //!
 //! There is no route table here either. Everything under `/api/` reaches this
-//! through the server's one handler, which has already applied the Host gate,
-//! the origin gate and the token gate; a path that does not match below is
-//! `None` and becomes the server's 404. That is deliberate — an endpoint
-//! mounted on the router directly would skip all three, and nothing would say
-//! so.
+//! through the server's one handler, which has already applied the Host gate
+//! and the token gate; a path that does not match below is `None` and becomes
+//! the server's 404. That is deliberate — an endpoint mounted on the router
+//! with `.route(…)` would skip both, and nothing would say so. Every endpoint
+//! here is a GET and none of them writes, so the gates that judge a write do
+//! not come into it.
 
 use axum::http::StatusCode;
 use ayeaye_core::board as shape;

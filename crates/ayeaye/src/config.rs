@@ -173,14 +173,30 @@ pub fn choose_cliban(
 /// The one effectful wrapper, beside [`load_token`], and called once at startup
 /// rather than per request.
 pub fn locate_cliban() -> String {
-    choose_cliban(
-        |name| std::env::var(name).ok(),
-        |path| {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path)
-                .is_ok_and(|found| found.is_file() && found.permissions().mode() & 0o111 != 0)
-        },
-    )
+    choose_cliban(|name| std::env::var(name).ok(), runnable)
+}
+
+/// Whether a path names something this process could run.
+///
+/// Two small differences from `shutil.which`, both narrowing. An empty `PATH`
+/// entry is skipped rather than read as the current directory, so a stray
+/// colon cannot make `./cliban` the board tool; and the bit is the file's own
+/// executable bit rather than `access(X_OK)`, so a file only another user may
+/// run is not chosen and then refused at spawn.
+#[cfg(unix)]
+fn runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|found| found.is_file() && found.permissions().mode() & 0o111 != 0)
+}
+
+/// Everywhere else there is no executable bit to read, so being a file is the
+/// whole of what can be asked. Present for the same reason `service.rs` keeps
+/// its pair: the daemon is a Unix daemon, and a crate that only compiles on
+/// one platform hides that behind a build failure rather than stating it.
+#[cfg(not(unix))]
+fn runnable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|found| found.is_file())
 }
 
 fn parse_port(value: &str) -> Result<u16, ConfigError> {
@@ -328,6 +344,20 @@ mod tests {
                 |_| true
             ),
             "/opt/cliban"
+        );
+        // And the current name wins over the legacy one, which is the order
+        // every other setting here is read in. Both are honoured because the
+        // env file, the README and the installer all still write the legacy
+        // one, and the cutover ticket is where that changes.
+        assert_eq!(
+            super::choose_cliban(
+                env(vec![
+                    ("AYEAYE_CLIBAN", "/opt/new"),
+                    ("VOICE_CLIBAN", "/opt/old")
+                ]),
+                |_| true
+            ),
+            "/opt/new"
         );
         // Then PATH, in order, taking the first entry that is executable.
         assert_eq!(

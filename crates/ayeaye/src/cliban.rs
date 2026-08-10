@@ -76,10 +76,17 @@ impl Cliban {
             return Err(match finished.status.code() {
                 Some(code) => format!("cliban exited {code}"),
                 // No code means a signal, which is the shape a `kill` or an
-                // out-of-memory takes; "exited 0" would be a lie about both.
+                // out-of-memory takes. The daemon says "cliban exited -15"
+                // here, because Python reports a signal as a negative return
+                // code; this says what happened instead, since the reason is
+                // read by a person looking at a board that did not load.
                 None => "cliban was killed before it answered".to_string(),
             });
         }
-        Ok(String::from_utf8_lossy(&finished.stdout).into_owned())
+        // Taken whole when it is already text, which is every real answer:
+        // `from_utf8_lossy` would copy a couple of hundred kilobytes of board
+        // on every request to prove what the bytes already are.
+        Ok(String::from_utf8(finished.stdout)
+            .unwrap_or_else(|not_text| String::from_utf8_lossy(not_text.as_bytes()).into_owned()))
     }
 }
