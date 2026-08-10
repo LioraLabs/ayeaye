@@ -239,6 +239,23 @@ async fn handle(
             Ok(bytes) => answered(crate::agent::kill(&settings, &bytes).await),
             Err(response) => response,
         },
+        // A POST, like every write — though this one writes nothing: the
+        // reference is free text out of a transcript, and free text belongs
+        // in a body. Gated by the POST rule either way.
+        Route::FilesResolve if method == Method::POST => match read_body(body).await {
+            Ok(asked) => {
+                let (status, body) = crate::files::resolve(&settings, &asked).await;
+                body_of(status, body)
+            }
+            Err(refusal) => refusal,
+        },
+        Route::FilesPreview if method == Method::GET || method == Method::HEAD => preview(
+            &settings,
+            query.pane.as_deref().unwrap_or(""),
+            query.path.as_deref().unwrap_or(""),
+            query.line.as_deref().unwrap_or(""),
+        )
+        .await,
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
@@ -252,6 +269,8 @@ async fn handle(
         | Route::Kill
         | Route::Dictate
         | Route::Voice
+        | Route::FilesResolve
+        | Route::FilesPreview
         | Route::Api
         | Route::NotFound
         | Route::Login
@@ -490,7 +509,7 @@ const MAX_RESIZE_BODY: usize = 64 * 1024;
 /// two. The alternative is re-deriving the "not a scratch session, not dead"
 /// rule a second time inside a `display-message` format, and two spellings of
 /// one rule drift.
-async fn local_pane(settings: &Settings, asked: &str) -> Option<PaneId> {
+pub(crate) async fn local_pane(settings: &Settings, asked: &str) -> Option<PaneId> {
     let (peer, id) = settings.peers.route(asked).ok()?;
     if !peer.is_here() {
         return None;
@@ -888,6 +907,42 @@ fn body_of(status: StatusCode, text: String) -> Response {
     })
 }
 
+/// One tracked file's preview, whichever of its shapes it took.
+///
+/// The image headers are the daemon's, to the letter. `nosniff` because the
+/// bytes are whatever is in somebody's repository and the label must be
+/// believed over the content; `inline` so a download manager does not treat a
+/// preview as a delivery; and for SVG — an image that is also a document that
+/// can carry script — a `Content-Security-Policy` that sandboxes it into
+/// inertness.
+async fn preview(settings: &Settings, pane: &str, path: &str, line: &str) -> Response {
+    match crate::files::preview(settings, pane, path, line).await {
+        crate::files::Preview::Json(status, body) => body_of(status, body),
+        crate::files::Preview::Bytes {
+            content_type,
+            body,
+            svg,
+        } => build(
+            StatusCode::OK,
+            content_type,
+            Body::from(body),
+            |response| {
+                let response = response
+                    .header(header::CONTENT_DISPOSITION, "inline")
+                    .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+                if svg {
+                    response.header(
+                        header::CONTENT_SECURITY_POLICY,
+                        "sandbox; default-src 'none'",
+                    )
+                } else {
+                    response
+                }
+            },
+        ),
+    }
+}
+
 /// A file compiled into the binary.
 fn serve_asset(asset: Asset) -> Response {
     match assets::bytes(asset.file) {
@@ -977,6 +1032,11 @@ struct Query {
     q: Option<String>,
     /// The container the clip is in, as the recorder named it.
     ext: Option<String>,
+    /// The tracked path a preview is about.
+    path: Option<String>,
+    /// The line a preview should centre on, still text: the validation is the
+    /// endpoint's, and it distinguishes "absent" from "nonsense".
+    line: Option<String>,
 }
 
 impl Query {
@@ -991,6 +1051,8 @@ impl Query {
             pane: None,
             q: None,
             ext: None,
+            path: None,
+            line: None,
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             if value.is_empty() {
@@ -1009,6 +1071,8 @@ impl Query {
                 "pane" if query.pane.is_none() => query.pane = Some(value.into_owned()),
                 "q" if query.q.is_none() => query.q = Some(value.into_owned()),
                 "ext" if query.ext.is_none() => query.ext = Some(value.into_owned()),
+                "path" if query.path.is_none() => query.path = Some(value.into_owned()),
+                "line" if query.line.is_none() => query.line = Some(value.into_owned()),
                 _ => {}
             }
         }

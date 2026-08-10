@@ -16,6 +16,7 @@ pub mod board;
 pub mod chat;
 pub mod cleanup;
 pub mod dictation;
+pub mod files;
 pub mod fit;
 pub mod health;
 pub mod http;
