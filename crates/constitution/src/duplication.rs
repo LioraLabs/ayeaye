@@ -156,6 +156,16 @@ pub fn runs(sources: &[CrateSource], window: usize) -> Vec<Finding> {
                 if covered.contains(&(file_a, start_a, file_b, start_b)) {
                     continue;
                 }
+                // A hash agreeing is a seed, not a proof: confirm the lines
+                // really match before reporting, so a 64-bit collision cannot
+                // convict two crates of a copy neither of them made.
+                if files[file_a].lines[start_a..start_a + window]
+                    .iter()
+                    .zip(&files[file_b].lines[start_b..start_b + window])
+                    .any(|(line_a, line_b)| line_a.text != line_b.text)
+                {
+                    continue;
+                }
                 let (run_a, run_b, length) =
                     extend(&files[file_a], start_a, &files[file_b], start_b, window);
                 for offset in 0..=(length - window) {
@@ -451,6 +461,40 @@ mod tests {
             6,
         );
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    // AYEAYE-64 — the boundary itself, in files longer than the window: a
+    // 5-line overlap with window 6 is clean, and growing it by one line is
+    // the whole difference. An off-by-one in the window loop, or a rule that
+    // only skipped short files, survives the test above and dies here.
+    #[test]
+    fn five_shared_lines_are_clean_and_six_are_found_at_window_six() {
+        let shared_five = "    let a = read(input);\n    let b = parse(a);\n    \
+                           let c = rank(b);\n    let d = emit(c);\n    finish(d);\n";
+        let in_low = |shared: &str| {
+            format!("fn low_one() {{}}\nfn low_two() {{}}\nfn low_go() {{\n{shared}}}\n")
+        };
+        let in_high = |shared: &str| {
+            format!("fn high_one() {{}}\nfn high_go() {{\n{shared}}}\nfn high_two() {{}}\n")
+        };
+        let five = runs(
+            &[
+                source("low", "crates/low/src/lib.rs", &in_low(shared_five)),
+                source("high", "crates/high/src/lib.rs", &in_high(shared_five)),
+            ],
+            6,
+        );
+        assert!(five.is_empty(), "{five:?}");
+
+        let shared_six = format!("{shared_five}    close(d);\n");
+        let six = runs(
+            &[
+                source("low", "crates/low/src/lib.rs", &in_low(&shared_six)),
+                source("high", "crates/high/src/lib.rs", &in_high(&shared_six)),
+            ],
+            6,
+        );
+        assert_eq!(six.len(), 1, "{six:?}");
     }
 
     // AYEAYE-64 — a run copied twice within one crate is that crate's own

@@ -100,6 +100,11 @@ pub fn string_literals(source: &str) -> Vec<Literal> {
 /// the item is found on the [`code_only`] view, so a `{` inside a string
 /// cannot derail the brace count and a `#[cfg(test)]` quoted in a comment is
 /// prose.
+///
+/// Only the exact spelling `#[cfg(test)]` is recognized. Test code reached
+/// through `#[cfg(all(test, …))]` or `#[cfg_attr(test, …)]` stays in scope —
+/// the loud direction: at worst a duplication rule fires on a test and
+/// somebody waives it, never the other way round.
 pub fn without_test_blocks(source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
     let stripped: Vec<char> = code_only(source).chars().collect();
@@ -141,11 +146,20 @@ pub fn without_test_blocks(source: &str) -> String {
 /// The char index just past the item an attribute at `from` governs, on the
 /// stripped view: through the matching `}` of its first brace, or through the
 /// `;` of a braceless item, whichever comes first.
+///
+/// A `,` also ends it, and a `}` ends it *without* being consumed: the
+/// attribute may sit on a struct field or an enum variant, and scanning past
+/// the enclosing item's close brace would blank whatever shipped code comes
+/// next — a silent exemption, which is the one failure shape this crate is
+/// built to refuse. A `;` or `,` inside the field's own type (`[u8; 2]`,
+/// `Map<K, V>`) makes this stop early and leave a mangled tail in scope; that
+/// errs loud — at worst a false positive somebody can see — never silent.
 fn item_end(stripped: &[char], from: usize) -> usize {
     let mut i = from;
     while i < stripped.len() {
         match stripped[i] {
-            ';' => return i + 1,
+            ';' | ',' => return i + 1,
+            '}' => return i,
             '{' => {
                 let mut depth = 0usize;
                 while i < stripped.len() {
@@ -196,7 +210,7 @@ fn segments(chars: &[char]) -> Vec<Segment> {
     let mut code_start = 0usize;
     let mut i = 0usize;
 
-    let mut close_code = |segments: &mut Vec<Segment>, code_start: usize, at: usize| {
+    let close_code = |segments: &mut Vec<Segment>, code_start: usize, at: usize| {
         if at > code_start {
             segments.push(Segment {
                 kind: Kind::Code,
@@ -516,5 +530,29 @@ mod tests {
         let source = "// mentions #[cfg(test)] in prose\nfn shipped() {}\n";
         let out = without_test_blocks(source);
         assert!(out.contains("fn shipped()"), "{out}");
+    }
+
+    // AYEAYE-64 — the attribute may sit on a struct field, which ends at a
+    // comma. Scanning past the struct's close brace would blank whatever
+    // shipped item comes next: a silent exemption, the failure shape this
+    // whole crate exists to refuse.
+    #[test]
+    fn a_cfg_test_field_does_not_swallow_the_item_after_the_struct() {
+        let source =
+            "struct S {\n    #[cfg(test)]\n    probe: u8,\n}\nfn shipped() { real_work(); }\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("real_work"), "{out}");
+        assert!(!out.contains("probe"), "{out}");
+    }
+
+    // AYEAYE-64 — a last field with no trailing comma ends at the struct's
+    // own `}`, which belongs to the struct and must survive.
+    #[test]
+    fn a_cfg_test_field_without_a_trailing_comma_leaves_the_brace() {
+        let source = "struct S {\n    #[cfg(test)]\n    probe: u8\n}\nfn shipped() {}\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("fn shipped()"), "{out}");
+        assert!(!out.contains("probe"), "{out}");
+        assert_eq!(out.matches('}').count(), source.matches('}').count());
     }
 }
