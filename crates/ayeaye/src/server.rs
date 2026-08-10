@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 
@@ -19,6 +19,7 @@ use ayeaye_core::http::{auth, login, route};
 
 use crate::assets;
 use crate::config::Settings;
+use crate::projects;
 
 /// Build the router.
 ///
@@ -27,7 +28,37 @@ use crate::config::Settings;
 /// for every endpoint the rest of this milestone adds, and the one that was
 /// forgotten would be the hole.
 pub fn router(settings: Arc<Settings>) -> Router {
-    Router::new().fallback(handle).with_state(settings)
+    Router::new()
+        .fallback(handle)
+        .with_state(App::over(settings))
+}
+
+/// Everything the handler needs: what the server was told to be, and the
+/// things it is running.
+///
+/// The picker is built here rather than handed in, so `router`'s signature is
+/// unchanged and every server — every test — gets a registry of its own: two
+/// tests searching at once must not supersede each other.
+#[derive(Clone)]
+pub struct App {
+    settings: Arc<Settings>,
+    projects: Arc<projects::Picker>,
+}
+
+impl App {
+    fn over(settings: Arc<Settings>) -> App {
+        App {
+            settings,
+            projects: Arc::new(projects::Picker::new(projects::Settings::from_env())),
+        }
+    }
+}
+
+/// So the handler can still ask for the settings on their own.
+impl FromRef<App> for Arc<Settings> {
+    fn from_ref(app: &App) -> Arc<Settings> {
+        Arc::clone(&app.settings)
+    }
 }
 
 /// Bind the address the settings resolved to.
@@ -50,12 +81,8 @@ pub async fn serve(
     axum::serve(listener, router(settings)).await
 }
 
-async fn handle(
-    State(settings): State<Arc<Settings>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
+async fn handle(State(app): State<App>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let settings = &app.settings;
     // The Host gate comes first and applies to everything, pages included:
     // it is what stops a page on an attacker's origin, resolving their name to
     // this address, from talking to this server at all.
@@ -81,10 +108,24 @@ async fn handle(
         // The handshake is a GET. The daemon has no `do_POST` route for
         // /login, so a POST there falls through to 404 — answering one with a
         // Set-Cookie would be a divergence nobody asked for.
-        Route::Login if method == Method::GET => log_in(&settings, &query),
+        Route::Login if method == Method::GET => log_in(settings, &query),
         Route::Asset(asset) if method == Method::GET || method == Method::HEAD => {
             serve_asset(asset)
         }
+        // Which endpoint answers is decided here rather than in the core's
+        // route table: the table's job is the *gate*, and by this line the
+        // request has already passed it. What is left is which effect to have,
+        // and effects are this crate's.
+        Route::Api if method == Method::GET => match uri.path() {
+            "/api/projects" => {
+                let body = app
+                    .projects
+                    .body(query.q.as_deref().unwrap_or(""), projects::DEFAULT_LIMIT)
+                    .await;
+                owned_json(StatusCode::OK, body)
+            }
+            _ => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
+        },
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
@@ -138,6 +179,11 @@ fn json(status: StatusCode, body: &'static str) -> Response {
     build(status, "application/json", Body::from(body), |r| r)
 }
 
+/// The same, for a body that was computed rather than written down.
+fn owned_json(status: StatusCode, body: String) -> Response {
+    build(status, "application/json", Body::from(body), |r| r)
+}
+
 /// Every response goes through here, so every response carries `no-store`.
 ///
 /// The pages and the API both describe live state; a cached one is a lie about
@@ -172,12 +218,15 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
 struct Query {
     token: Option<String>,
     next: Option<String>,
+    /// The picker's search term.
+    q: Option<String>,
 }
 
 impl Query {
     fn of(raw: Option<&str>) -> Query {
         let mut token = None;
         let mut next = None;
+        let mut q = None;
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             if value.is_empty() {
                 continue;
@@ -186,9 +235,10 @@ impl Query {
             match key.as_ref() {
                 "token" if token.is_none() => token = Some(value.into_owned()),
                 "next" if next.is_none() => next = Some(value.into_owned()),
+                "q" if q.is_none() => q = Some(value.into_owned()),
                 _ => {}
             }
         }
-        Query { token, next }
+        Query { token, next, q }
     }
 }

@@ -177,7 +177,7 @@ pub fn load_token() -> Result<String, ConfigError> {
 }
 
 /// Where the daemon keeps its state, or `None` if there is no home to look in.
-fn state_dir() -> Option<PathBuf> {
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|value| !value.trim().is_empty())
