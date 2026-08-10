@@ -56,3 +56,73 @@ pub trait Processes: Source {
         ayeaye_core::process::descendant(self, pid, name, depth)
     }
 }
+
+/// The backend for the machine this was built for.
+///
+/// Chosen by target rather than by trying something and catching what happens:
+/// the Linux backend on a Mac would find no `/proc` and answer nothing about
+/// every pane, silently, which is the failure mode this whole module exists to
+/// remove.
+pub fn here() -> Box<dyn Processes> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(darwin::Darwin::here())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(linux::Linux::here())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::here;
+
+    // AYEAYE-44 — the seven questions, asked of the one process this suite is
+    // allowed to inspect: itself. Everything else here is a fixture or a tree
+    // the test built, so this is the only place the backend this platform
+    // actually selected is observed answering about a real process. Read-only,
+    // and about nothing it did not start.
+    #[test]
+    fn this_platforms_backend_answers_about_this_process() {
+        let processes = here();
+        let ours = std::process::id();
+
+        assert!(processes.exists(ours), "the test process is running");
+        assert!(!processes.exists(u32::MAX), "and that pid is not");
+
+        let name = processes.comm(ours).expect("this process has a name");
+        assert!(
+            !name.is_empty(),
+            "a name, whatever the test binary is called"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs_f64();
+        let started = processes.start_time(ours).expect("this process began");
+        assert!(
+            started > 0.0 && started <= now + 1.0,
+            "{started} is not a moment at or before {now}"
+        );
+
+        let cwd = processes.cwd(ours).expect("this process is somewhere");
+        assert!(cwd.starts_with('/'), "an absolute path: {cwd}");
+
+        assert!(
+            !processes.open_files(ours).is_empty(),
+            "every process holds at least its own streams open"
+        );
+
+        // Nothing to assert about the address except that asking is safe: a
+        // suite run over SSH has one and a suite run at the machine does not.
+        let _ = processes.ssh_peer(ours);
+
+        assert_eq!(
+            processes.descendant(ours, "ayeaye-no-such-agent", 3),
+            None,
+            "nothing by that name is running under this test"
+        );
+    }
+}
