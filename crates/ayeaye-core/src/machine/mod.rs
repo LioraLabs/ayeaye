@@ -14,6 +14,7 @@ pub mod platform;
 pub mod share;
 pub mod size;
 mod text;
+pub mod tier;
 
 // The rule for this list: the *types* a consumer names, and nothing else. The
 // parsers keep their module paths — `graphics::classify` and `network::classify`
@@ -24,6 +25,7 @@ pub use graphics::{Acceleration, Graphics};
 pub use network::Network;
 pub use platform::{Family, Homebrew, Os, PackageManager, Packaging, Platform, ServiceManager};
 pub use share::{Limit, Limits, Share};
+pub use tier::{Cause, Tier, Usability, Verdict};
 
 /// The captured probe output the shell suite reads, reaching a pure crate the
 /// only way it may: at compile time.
