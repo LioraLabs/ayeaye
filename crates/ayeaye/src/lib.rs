@@ -25,3 +25,4 @@ pub mod recorder;
 pub mod server;
 pub mod session;
 pub mod tmux;
+pub mod transcript;

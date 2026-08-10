@@ -271,7 +271,10 @@ async fn api(settings: &Settings, uri: &Uri) -> Option<(StatusCode, String)> {
     if let Some(answered) = board::answer(settings, uri.path(), uri.query()).await {
         return Some(answered);
     }
-    session::answer(settings, uri.path(), uri.query()).await
+    if let Some(answered) = session::answer(settings, uri.path(), uri.query()).await {
+        return Some(answered);
+    }
+    crate::transcript::answer(settings, uri.path(), uri.query()).await
 }
 
 /// An answer one of the write endpoints decided on.
