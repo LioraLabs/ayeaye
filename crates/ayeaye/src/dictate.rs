@@ -22,6 +22,7 @@ use ayeaye_core::cleanup::{Cleaned, Policy, settle};
 use ayeaye_core::dictation::{self, Capability, Outcome, State, is_hallucination};
 use ayeaye_core::model::residency::Policy as Residency;
 use ayeaye_core::model::settings::ModelSettings;
+use ayeaye_infer::backend::Selection;
 use ayeaye_infer::{LanguageSlot, SpeechSlot};
 
 use crate::audio;
@@ -162,7 +163,7 @@ struct Resident<S: Slot, L: Slot> {
 }
 
 impl Voice {
-    /// A voice on this machine.
+    /// A voice on this machine, its models bound to one device decision.
     ///
     /// `policy` arrives resolved rather than being assembled here, for the same
     /// reason the token and cliban do on [`crate::config::Settings`]: it is read
@@ -172,19 +173,27 @@ impl Voice {
     /// default prompt's echo phrases, which `Policy::resolve` exists to prevent,
     /// and leaves `CLEANUP_TEMPLATE` and `CLEANUP_MAX_TOKENS` reading nothing at
     /// all.
+    ///
+    /// `selection` arrives made rather than being probed here, and that is
+    /// AYEAYE-73's criterion in a signature: the process decides once, in
+    /// `main`, and the same value feeds the banner it prints and both slots
+    /// here — so the acceleration the daemon reports and the acceleration its
+    /// models run on are readings of one value, not two calls that happened to
+    /// agree.
     pub fn new(
         store: PathBuf,
         settings: ModelSettings,
         policy: Policy,
         converter: String,
+        selection: Selection,
     ) -> Voice {
         Voice::with_slots(
             store,
             settings,
             policy,
             converter,
-            SpeechSlot::empty(),
-            LanguageSlot::empty(),
+            SpeechSlot::on(selection.clone()),
+            LanguageSlot::on(selection),
         )
     }
 }

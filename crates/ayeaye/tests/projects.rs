@@ -166,6 +166,7 @@ async fn the_picker_answers_over_a_socket() {
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
     };
     let listener = ayeaye::server::listen(&settings)

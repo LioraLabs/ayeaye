@@ -271,6 +271,7 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
     }
 }
@@ -2838,6 +2839,7 @@ fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictat
             .expect("a readable configuration"),
         ayeaye_core::cleanup::Policy::default(),
         converter.to_string(),
+        ayeaye_infer::backend::select(),
     )
 }
 
