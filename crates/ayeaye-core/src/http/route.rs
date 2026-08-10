@@ -40,6 +40,13 @@ pub enum Route {
     Dictate,
     /// What this machine can do about a dictation.
     Voice,
+    /// A transcript's file reference, resolved against one pane's tracked
+    /// files. A POST: the reference is free text out of a transcript, and free
+    /// text belongs in a body rather than a query string.
+    FilesResolve,
+    /// A bounded preview of one tracked file: text around a line, or image
+    /// bytes.
+    FilesPreview,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -101,6 +108,13 @@ const DICTATE: &str = "/api/dictate";
 /// write: two tickets landing in one handler is a merge nobody needs, and the
 /// answer is one `Capability` either way — see `ayeaye_core::dictation`.
 const VOICE: &str = "/api/voice";
+
+/// Resolving a file reference. A POST, and gated as every POST is.
+const FILES_RESOLVE: &str = "/api/files/resolve";
+
+/// Previewing one tracked file. A GET, and the one endpoint whose 200 is not
+/// always JSON: an image answers as its own bytes.
+const FILES_PREVIEW: &str = "/api/files/preview";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -171,6 +185,8 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
             KILL => Route::Kill,
             DICTATE => Route::Dictate,
             VOICE => Route::Voice,
+            FILES_RESOLVE => Route::FilesResolve,
+            FILES_PREVIEW => Route::FilesPreview,
             _ => Route::Api,
         };
     }
@@ -212,7 +228,9 @@ pub fn gate(method: &str, route: Route) -> Gate {
         | Route::Spawn
         | Route::Kill
         | Route::Dictate
-        | Route::Voice => Gate::Token,
+        | Route::Voice
+        | Route::FilesResolve
+        | Route::FilesPreview => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -469,6 +487,35 @@ mod tests {
             assert_eq!(resolve(&format!("{path}/extra"), false), Route::Api);
             assert_eq!(resolve(&format!("{path}2"), false), Route::Api);
         }
+    }
+
+    // AYEAYE-52 — the two file paths, each a route of its own rather than one
+    // more unknown path under `/api/`. Both are gated by every method: the
+    // resolve reads a repository's file list, and the preview serves the bytes
+    // of somebody's tracked files.
+    #[test]
+    fn the_file_paths_are_routes_and_every_method_needs_a_token() {
+        for (path, expected) in [
+            ("/api/files/resolve", Route::FilesResolve),
+            ("/api/files/preview", Route::FilesPreview),
+        ] {
+            assert_eq!(resolve(path, false), expected);
+            // A token in the query does not turn one into a login.
+            assert_eq!(resolve(path, true), expected);
+            for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+                assert_eq!(
+                    gate(method, resolve(path, false)),
+                    Gate::Token,
+                    "{method} {path} must need a token"
+                );
+            }
+            // Only that path, so a new endpoint cannot arrive by accident under
+            // a name that merely starts with an old one.
+            assert_eq!(resolve(&format!("{path}/extra"), false), Route::Api);
+            assert_eq!(resolve(&format!("{path}2"), false), Route::Api);
+        }
+        // And `/api/files` itself is nobody's: only the two named paths exist.
+        assert_eq!(resolve("/api/files", false), Route::Api);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at
