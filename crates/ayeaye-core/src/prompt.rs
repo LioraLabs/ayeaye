@@ -11,6 +11,10 @@
 //! Nothing here runs `capture-pane`. The shell above captures the screen and
 //! hands the text over, which is what lets this be held to screens really
 //! captured from real sessions rather than to screens somebody typed out.
+//!
+//! It also holds what may be sent *back*: [`press`] and [`typed`]. Reading the
+//! question and answering it are one subject, and the allow-list belongs beside
+//! the thing it is an allow-list for.
 
 use crate::json;
 
@@ -56,6 +60,13 @@ pub const QUESTION_LIMIT: usize = 400;
 /// the last option. So neither the labels nor the end of the block can be read
 /// off whole screen rows: the labels are the left column, and what ends the
 /// block is the hint rather than the last option.
+///
+/// Rows are split on newlines and nothing else, where python's `splitlines`
+/// would also have broken on a form feed, a vertical tab, and four of the
+/// unicode separators. `capture-pane -p` writes one row per newline, so the
+/// difference is only reachable through a character an agent *drew* — and a
+/// form feed inside a label inventing a screen row is the wrong answer, not
+/// the right one. It is a divergence from the daemon all the same.
 pub fn read(screen: &str) -> Option<Prompt> {
     let mut lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
     // Trailing blank rows hide the block: `capture-pane` pads to the pane's
@@ -92,11 +103,12 @@ pub fn read(screen: &str) -> Option<Prompt> {
     //
     // Asked of `tail` rather than of `column`: what follows the options is
     // output, and output is a whole row.
-    let below = tail[last + 1..]
+    let below_is_all_hint = tail[last + 1..]
         .iter()
-        .filter(|line| !line.trim().is_empty());
-    if !below.clone().all(|line| confirms(line)) && !tail.last().is_some_and(|line| confirms(line))
-    {
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| confirms(line));
+    let hint_is_the_bottom = tail.last().is_some_and(|line| confirms(line));
+    if !below_is_all_hint && !hint_is_the_bottom {
         return None;
     }
 
@@ -210,8 +222,12 @@ struct Numbered<'a> {
 /// `^\s*[›❯>]?\s*(\d+)\.\s+(.*\S)\s*$`, spelled out.
 ///
 /// Only ASCII digits, where python's `\d` would also have taken the digits of
-/// other alphabets. That is deliberate: the number is pressed as a key, and a
-/// key nothing on a keyboard produces is not an option anyone can pick.
+/// other alphabets. That is deliberate but it is not free, and the cost is
+/// bigger here than in [`press`]: a row numbered in another alphabet is not an
+/// option row at all, so it leaves the list — and if that takes the count under
+/// two, the whole prompt disappears rather than one option. The trade is that
+/// the number is what gets pressed, and a key no terminal emits is an option
+/// nobody could have picked from the phone anyway.
 fn option(line: &str) -> Option<Numbered<'_>> {
     let mut rest = line.trim_start();
     if let Some(marker) = rest.chars().next()
@@ -342,6 +358,27 @@ pub fn press(key: &str) -> Option<Press> {
         })
 }
 
+/// The text a pane may be sent, or `None` if it is not text at all.
+///
+/// **A control character is refused, and a newline most of all.** The criterion
+/// this endpoint exists to meet is that typing sends text *without submitting
+/// it* — the phone types, looks at what it typed, and presses Enter as a
+/// separate act. A newline in the text is a submit, so text carrying one is a
+/// submit the caller did not ask for and the user did not see. The rest of the
+/// control characters go with it: `send-keys -l` writes the bytes straight to
+/// the pane's terminal, where an escape byte is the start of a sequence the
+/// agent's TUI will act on rather than show.
+///
+/// Stricter than the daemon this replaces, which types whatever it is handed.
+/// Every key worth pressing on purpose is on [`NAV_KEYS`] and goes through
+/// [`press`], so nothing legitimate is refused here.
+pub fn typed(text: &str) -> Option<&str> {
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text)
+}
+
 /// The named keys the remote may press, and what tmux calls each.
 ///
 /// An allow-list, transcribed from `bin/ayeaye`'s `NAV_KEYS`. Between these and
@@ -391,7 +428,7 @@ const HINTS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{Choice, NAV_KEYS, Prompt, body, press, read};
+    use super::{Choice, NAV_KEYS, Prompt, body, press, read, typed};
 
     /// An `AskUserQuestion` whose options carry previews.
     ///
@@ -698,5 +735,50 @@ mod tests {
             "{answered}"
         );
         assert_eq!(body(read(ANSWERED).as_ref()), r#"{"prompt":null}"#);
+    }
+
+    // AYEAYE-48 — "typing sends text without submitting it" is an acceptance
+    // criterion, and a newline in the text is a submit. `send-keys -l` writes
+    // the bytes straight to the pane's terminal, so a newline there submits a
+    // shell command or a composer draft that nobody looked at first — which is
+    // the one thing this endpoint must not be able to do by accident.
+    #[test]
+    fn text_that_would_submit_itself_is_not_text_a_pane_may_be_sent() {
+        for submits in ["ls -la\n", "\n", "a\r\nb", "first\rsecond"] {
+            assert_eq!(typed(submits), None, "{submits:?} submits itself");
+        }
+        // And the rest of the control characters with it: an escape byte is the
+        // start of a sequence the agent's TUI acts on rather than shows.
+        for hostile in [
+            "\u{1b}[2J",
+            "a\u{1b}]0;title\u{7}b",
+            "a\u{0}b",
+            "a\u{7f}b",
+            "a\u{9b}b",
+            "\t",
+            "",
+        ] {
+            assert_eq!(typed(hostile), None, "{hostile:?} is not text");
+        }
+    }
+
+    // AYEAYE-48 — and everything somebody would actually dictate goes through
+    // untouched. Nothing is quoted, escaped or trimmed: `-l --` hands the text
+    // to the pane as itself, and a rule that rewrote it would type something the
+    // user did not say.
+    #[test]
+    fn text_a_person_would_dictate_arrives_as_itself() {
+        for said in [
+            "ls -la",
+            "  spaced  ",
+            "--force",
+            "say \"hi\"",
+            "$(id)",
+            "rm -rf /tmp/x; echo done",
+            "café ✓ 🚀",
+            "-t %0",
+        ] {
+            assert_eq!(typed(said), Some(said));
+        }
     }
 }

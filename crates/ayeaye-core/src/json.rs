@@ -213,9 +213,12 @@ impl Reader<'_> {
             self.at += 1;
         }
         // Delegated to the standard library rather than spelled out. It is a
-        // slightly wider grammar than JSON's — it would take `1.` — and that is
-        // a deliberate trade: nothing here routes on a number, and a hand-rolled
-        // float grammar is a much better place for a bug than a laxity.
+        // wider grammar than JSON's: `1.`, `.5`, `00`, `+1` and `-0.` are all
+        // taken here and all refused by a strict reader. That is a deliberate
+        // trade, and it is safe only because nothing in this daemon routes on
+        // a number — every decision is made on a string or a boolean. A
+        // hand-rolled float grammar is a much better place for a bug than a
+        // laxity nobody reads.
         let digits = core::str::from_utf8(&self.bytes[from..self.at]).map_err(|_| self.here())?;
         match digits.parse::<f64>() {
             Ok(number) if number.is_finite() => Ok(Value::Number(number)),
@@ -293,9 +296,14 @@ impl Reader<'_> {
                     self.escape(&mut out)?;
                     from = self.at;
                 }
-                // A raw control character is not legal inside a JSON string, and
-                // is refused rather than carried: the strings here end up in a
-                // pane id and in text typed at somebody's terminal.
+                // A raw control character is not legal inside a JSON string,
+                // so it is refused here. **This is grammar conformance and
+                // not a safety check**, and the difference matters: a
+                // backslash-u escape of the same code point is legal JSON and
+                // decodes to that very byte a moment later. What may be typed
+                // at somebody's terminal is a decision about the text and not
+                // about its spelling, and it belongs to whoever does the
+                // typing: see `prompt::typed`.
                 byte if byte < 0x20 => return Err(BadJson::Malformed(self.at)),
                 _ => self.at += 1,
             }
