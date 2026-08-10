@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ayeaye_core::service::{
-    Definition, Install, Layout, Operation, Session, Unavailable, plan_install,
+    Definition, Install, Layout, Manager, Operation, Session, Unavailable, plan_install,
 };
 
 /// What running a command came to.
@@ -251,10 +251,15 @@ impl<R: Runner> Services<R> {
         // launchd's bootstrap is the enable, and it needs the plist itself:
         // there is no equivalent of a unit name it could look up.
         let path = self.session.definition_path(name, &self.layout)?;
-        // Bootstrapping a label launchd already knows fails outright, which
-        // would turn every second run into an error and make repairing a broken
-        // agent impossible.
-        self.unregister(name);
+        // Booting out first, and only on launchd: bootstrapping a label launchd
+        // already knows fails outright, which would turn every second run into
+        // an error and make repairing a broken agent impossible. systemd needs
+        // no such thing — `enable --now` on a unit that is already both is a
+        // no-op — and disabling it first would stop a service somebody is using
+        // in order to tell them it will start at login.
+        if self.session.manager == Manager::Launchd {
+            self.unregister(name);
+        }
         self.check(self.session.command(name, Operation::Enable, Some(&path))?)
     }
 
@@ -304,15 +309,14 @@ impl<R: Runner> Services<R> {
     /// again, and a label it already knows has to be booted out first or the
     /// bootstrap fails outright.
     pub fn restart(&self, name: &str) -> Result<(), Failed> {
-        match self.session.command(name, Operation::Reload, None) {
-            // systemd: reload exists here, so stop-then-start is available too.
-            Ok(_) => {
+        match self.session.manager {
+            Manager::Systemd => {
                 // A stop that fails is a service that was not running, which is
                 // not a reason to refuse to start it.
                 let _ = self.stop(name);
                 self.start(name)
             }
-            Err(_) => self.enable(name),
+            Manager::Launchd => self.enable(name),
         }
     }
 
@@ -390,8 +394,9 @@ mod tests {
     use super::{Failed, Outcome, Runner, Services};
     use ayeaye_core::service::{Definition, Install, Layout, Session};
     use std::cell::RefCell;
-    use std::fs;
+    use std::fs::{self, FileTimes};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     /// The unit the shell installer leaves behind, as
     /// `tests/fixtures/units/ayeaye-systemd` has it. The migration case is
@@ -578,6 +583,26 @@ mod tests {
         let first = services
             .install(&definition(), "stamp")
             .expect("an install");
+
+        // Asserted on the file's own timestamp rather than on the reported
+        // action. `Unchanged` is what this returns whether or not it wrote the
+        // same bytes over the top, and writing them is exactly what must not
+        // happen: a rewritten unit is a new mtime, and somebody reading `ls -l`
+        // to find out when their service last changed is told a lie.
+        let long_ago = SystemTime::now() - Duration::from_secs(86_400);
+        let handle = fs::File::options()
+            .write(true)
+            .open(&first.path)
+            .expect("the unit");
+        handle
+            .set_times(
+                FileTimes::new()
+                    .set_accessed(long_ago)
+                    .set_modified(long_ago),
+            )
+            .expect("an older timestamp");
+        drop(handle);
+
         let again = services
             .install(&definition(), "stamp")
             .expect("an install");
@@ -585,9 +610,17 @@ mod tests {
         assert_eq!(again.action, Install::Unchanged);
         assert_eq!(again.backup, None);
         assert_eq!(
+            fs::metadata(&first.path)
+                .expect("metadata")
+                .modified()
+                .expect("an mtime"),
+            long_ago,
+            "an unchanged definition must not be rewritten"
+        );
+        assert_eq!(
             listing(first.path.parent().expect("a directory")),
             vec!["ayeaye.service"],
-            "an unchanged definition must not leave a backup behind"
+            "and must not leave a backup or a temporary file behind"
         );
     }
 
@@ -701,6 +734,34 @@ mod tests {
                 .runner
                 .ran("systemctl --user disable --now ayeaye.service")
         );
+    }
+
+    // AYEAYE-61 — `systemctl --user enable --now` on a unit that is already
+    // enabled and running is a no-op. Booting it out first, the way launchd
+    // has to be, would stop a service somebody is using in order to tell them
+    // it will start at login.
+    #[test]
+    fn enabling_a_running_systemd_service_does_not_stop_it_first() {
+        let scratch = Scratch::new("enable-running");
+        let services = systemd(&scratch, Fake::running());
+        services
+            .install(&definition(), "stamp")
+            .expect("an install");
+
+        services.enable("ayeaye").expect("enable");
+
+        assert!(
+            services
+                .runner
+                .ran("systemctl --user enable --now ayeaye.service")
+        );
+        assert!(
+            !services
+                .runner
+                .ran("systemctl --user disable --now ayeaye.service"),
+            "enable must not disable first on systemd"
+        );
+        assert!(!services.runner.ran("systemctl --user stop ayeaye.service"));
     }
 
     // AYEAYE-61 — a running service does not pick up a rewritten definition by
