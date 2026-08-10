@@ -139,27 +139,36 @@ mod tests {
         );
     }
 
-    // AYEAYE-43 — a program that outruns its limit is killed and said to have
-    // been. Abandoning it would leave the process running and the caller
-    // waiting for a future that never resolves.
+    // AYEAYE-43, AYEAYE-70 — a program that outruns its limit is killed and
+    // said to have been. Abandoning it would leave the process running and the
+    // caller waiting for a future that never resolves.
     #[tokio::test]
     async fn a_program_that_outruns_its_limit_is_killed() {
-        // A duration nothing else on the machine would be sleeping for.
+        // A duration nothing else on the machine would be sleeping for, and
+        // long enough that no scheduler stall short of a minute can push a
+        // 200 ms wait past it. AYEAYE-70: the bound used to be a fixed 5 s,
+        // and heavy parallel load violated it — the elapsed assertion below
+        // compares against this sleep instead, because "came back before the
+        // child could possibly have exited on its own" is the actual claim.
+        const SLEEP_SECS: &str = "67.31";
+        let sleeps_for = Duration::from_secs_f64(SLEEP_SECS.parse().expect("a number"));
+
         let started = Instant::now();
-        let outcome = run(&["sleep", "7.31"], Duration::from_millis(200)).await;
+        let outcome = run(&["sleep", SLEEP_SECS], Duration::from_millis(200)).await;
         assert_eq!(
             outcome.unwrap_err(),
             Failed::TimedOut(Duration::from_millis(200))
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < sleeps_for,
             "the limit is what was waited for, not the sleep"
         );
 
         // And it is dead, not merely let go of. `pgrep` is asked only when the
         // machine has it; where it does not, the timing above is all this can
         // prove.
-        let found = run(&["pgrep", "-f", "sleep 7.31"], Duration::from_secs(5)).await;
+        let pattern = format!("sleep {SLEEP_SECS}");
+        let found = run(&["pgrep", "-f", pattern.as_str()], Duration::from_secs(5)).await;
         if let Ok(found) = found {
             assert!(
                 found.stdout.trim().is_empty(),
