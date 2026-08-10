@@ -14,6 +14,17 @@
 //! `\'` as escapes and POSIX honours neither, so one backslash away the two
 //! read the same bytes differently or refuse them outright. A quoting function
 //! that cannot say no would have to pick a shell and be wrong on the other.
+//!
+//! **The shells in scope are POSIX ones and fish, and nothing else.** That is
+//! the daemon's existing reach and it is not widened here. A shell whose single
+//! quotes are not POSIX's is out: nushell, for one, reads neither this `'\''`
+//! nor `shlex.quote`'s `'"'"'` as an apostrophe, so a prompt containing one has
+//! never worked there and does not start working now. Naming the boundary is
+//! the point — the premise of this module is that the shell on the other end is
+//! whichever one the user runs, and a premise like that has to say where it
+//! stops.
+
+use core::fmt;
 
 /// One word, quoted so a shell reads it back as exactly this text.
 ///
@@ -37,6 +48,30 @@ pub fn quote(text: &str) -> Result<String, Unquotable> {
     }
     out.push('\'');
     Ok(out)
+}
+
+impl fmt::Display for Unquotable {
+    /// The sentence the person who typed the prompt is shown.
+    ///
+    /// Written here rather than at the call site: the shell above knows a
+    /// prompt was refused, and this is the only layer that knows why, so the
+    /// wording has to come from the same place as the rule. It says what to do
+    /// about it, because the only person who can fix it is the one reading it.
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unquotable::Control(character) => write!(
+                out,
+                "that prompt carries a control character (U+{:04X}) — \
+                 it cannot be typed into a shell, so take it out",
+                *character as u32
+            ),
+            Unquotable::Backslash => write!(
+                out,
+                "that prompt carries a backslash — shells disagree about what \
+                 one means inside quotes, so take it out"
+            ),
+        }
+    }
 }
 
 /// Why a string cannot be quoted.
@@ -106,9 +141,36 @@ mod tests {
         );
         assert_eq!(quote("a\u{0}b").unwrap_err(), Unquotable::Control('\u{0}'));
         assert_eq!(quote("a\tb").unwrap_err(), Unquotable::Control('\t'));
+        // Not only the ASCII ones. DEL and the C1 block are what a mis-decoded
+        // byte leaves behind, and a terminal acts on several of them.
+        assert_eq!(
+            quote("a\u{7f}b").unwrap_err(),
+            Unquotable::Control('\u{7f}')
+        );
+        assert_eq!(
+            quote("a\u{9b}b").unwrap_err(),
+            Unquotable::Control('\u{9b}')
+        );
         // Ordinary spaces are not control characters and are the reason the
-        // text needed quoting in the first place.
+        // text needed quoting in the first place. Nor is every exotic space:
+        // a non-breaking space is a character somebody's keyboard really types.
         assert!(quote("a b  c").is_ok());
+        assert!(quote("a\u{a0}b").is_ok());
+    }
+
+    // AYEAYE-51 — the refusal is shown to whoever typed the prompt, so it has
+    // to say which prompt-shaped thing was wrong and what to do about it. The
+    // wording lives with the rule rather than at the call site, because the
+    // caller knows only that quoting failed.
+    #[test]
+    fn a_refusal_says_what_is_wrong_and_what_to_do_about_it() {
+        let control = Unquotable::Control('\u{1b}').to_string();
+        assert!(control.contains("U+001B"), "{control}");
+        assert!(control.contains("take it out"), "{control}");
+
+        let backslash = Unquotable::Backslash.to_string();
+        assert!(backslash.contains("backslash"), "{backslash}");
+        assert!(backslash.contains("take it out"), "{backslash}");
     }
 
     // AYEAYE-51 — the reason this API is fallible at all. `bin/ayeaye` quotes

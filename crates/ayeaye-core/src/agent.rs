@@ -5,22 +5,49 @@
 //! called, which subcommand makes the pane, and what gets typed into it — and
 //! the shell above turns the answers into subprocesses.
 
+use crate::peer::PaneId;
 use crate::{json, shell};
 
-/// The programs that may be started, and the command each one is.
+/// One agent this daemon knows how to start.
 ///
-/// An allowlist rather than a name interpolated out of the request. This
+/// There is no way to make one but [`agent`], and no way to make that answer
+/// with something that is not on [`AGENTS`]. That is the whole design: this
 /// endpoint starts processes on the user's machine at the word of anything
-/// holding the token, and the difference between a table and a string is the
-/// difference between "start claude" and "start whatever this says".
-pub const AGENTS: &[(&str, &str)] = &[("claude", "claude"), ("codex", "codex")];
+/// holding the token, so "which program" must not be a string any caller can
+/// spell. A function taking `&str` would have left the allowlist a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Agent {
+    name: &'static str,
+    command: &'static str,
+}
 
-/// The command that starts this agent, if it is one we start at all.
-pub fn agent_command(name: &str) -> Option<&'static str> {
-    AGENTS
-        .iter()
-        .find(|(agent, _)| *agent == name)
-        .map(|(_, command)| *command)
+impl Agent {
+    /// What the panel calls it, which is also what the request asked for.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The program that starts it.
+    pub fn command(&self) -> &'static str {
+        self.command
+    }
+}
+
+/// The agents that may be started, and the command each one is.
+pub const AGENTS: &[Agent] = &[
+    Agent {
+        name: "claude",
+        command: "claude",
+    },
+    Agent {
+        name: "codex",
+        command: "codex",
+    },
+];
+
+/// The agent this name asks for, if it is one we start at all.
+pub fn agent(name: &str) -> Option<Agent> {
+    AGENTS.iter().copied().find(|agent| agent.name == name)
 }
 
 /// What the tmux session for a project is called.
@@ -40,14 +67,16 @@ pub fn session_name(dir: &str, tmux_yaml: Option<&str>) -> String {
     // came out of a JSON body should not be read one way here and another way
     // on the machine that will `cd` into it.
     let trimmed = dir.trim_end_matches('/');
-    let mut name = match trimmed.rsplit('/').next().unwrap_or("") {
+    let from_dir = match trimmed.rsplit('/').next().unwrap_or_default() {
         "" => "root",
         last => last,
     };
-    if let Some(declared) = tmux_yaml.and_then(declared_name) {
-        name = declared;
-    }
-    name.replace('.', "_")
+    // A dot is a window separator to tmux — `work.1` is window 1 of `work` —
+    // so it cannot survive into a session name whichever half named it.
+    tmux_yaml
+        .and_then(declared_name)
+        .unwrap_or(from_dir)
+        .replace('.', "_")
 }
 
 /// The `session_name:` a project declares, if it declares one.
@@ -63,13 +92,37 @@ fn declared_name(tmux_yaml: &str) -> Option<&str> {
         .filter(|declared| !declared.is_empty())
 }
 
+/// What appeared when the pane was made.
+///
+/// Two values, so it is two values everywhere. The panel says "new {created}
+/// in {session}", and a free-form label would let a caller announce a window it
+/// did not make — which is the same failure [`Create`] bundles the argv and the
+/// label to prevent, one layer further out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The project had no session, so this made one.
+    Session,
+    /// The project's session was already there, so this made a window in it.
+    Window,
+}
+
+impl Created {
+    /// What the panel calls it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Created::Session => "session",
+            Created::Window => "window",
+        }
+    }
+}
+
 /// How to make the pane, and what to call what was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Create {
     /// The tmux arguments, after the program itself.
     pub argv: Vec<String>,
-    /// `"window"` or `"session"` — what the panel is told appeared.
-    pub created: &'static str,
+    /// What the panel is told appeared.
+    pub created: Created,
 }
 
 /// Make a pane for this project: a window in its session, or the session.
@@ -89,7 +142,7 @@ pub fn create(session: &str, dir: &str, session_exists: bool) -> Create {
                 "-t".to_string(),
                 format!("={session}"),
             ],
-            "window",
+            Created::Window,
         )
     } else {
         (
@@ -99,7 +152,7 @@ pub fn create(session: &str, dir: &str, session_exists: bool) -> Create {
                 "-s".to_string(),
                 session.to_string(),
             ],
-            "session",
+            Created::Session,
         )
     };
     // `-c` starts it in the project; `-P -F` makes tmux print the pane it made,
@@ -117,12 +170,15 @@ pub fn create(session: &str, dir: &str, session_exists: bool) -> Create {
 /// it. The prompt is collapsed to one line first — the daemon's
 /// `" ".join(prompt.split())` — because this is a *command line*, and then
 /// quoted, which is where a prompt that cannot be typed is refused.
-pub fn command_line(agent_command: &str, prompt: &str) -> Result<String, shell::Unquotable> {
+///
+/// The agent is an [`Agent`] rather than a command string: the program half of
+/// this line is the half that must never be spellable by a caller.
+pub fn command_line(agent: Agent, prompt: &str) -> Result<String, shell::Unquotable> {
     let collapsed = one_line(prompt);
     if collapsed.is_empty() {
-        return Ok(agent_command.to_string());
+        return Ok(agent.command.to_string());
     }
-    Ok(format!("{agent_command} {}", shell::quote(&collapsed)?))
+    Ok(format!("{} {}", agent.command, shell::quote(&collapsed)?))
 }
 
 /// Every run of whitespace becomes one space, and the ends lose theirs.
@@ -143,13 +199,17 @@ fn one_line(prompt: &str) -> String {
 /// `/api/panes` hands out carries its host, and `share/app.html` takes this
 /// field as its selection (`sel = d.pane`) and then compares it against those.
 /// A bare id would select a pane the panel could never find again.
-pub fn spawned_body(pane: &str, session: &str, created: &str, agent: &str) -> String {
+///
+/// Which is why the argument is a [`PaneId`] and not a string: the shell above
+/// holds the bare `%7` tmux printed, and handing that straight through has to
+/// be a thing it cannot do rather than a thing it must remember not to.
+pub fn spawned_body(pane: &PaneId, session: &str, created: Created, agent: Agent) -> String {
     format!(
         "{{\"pane\":{},\"session\":{},\"created\":{},\"agent\":{}}}",
-        json::string(pane),
+        json::string(&pane.qualified()),
         json::string(session),
-        json::string(created),
-        json::string(agent),
+        json::string(created.as_str()),
+        json::string(agent.name()),
     )
 }
 
@@ -162,24 +222,79 @@ pub fn killed_body() -> &'static str {
     r#"{"ok":true}"#
 }
 
+/// The sentences a spawn or a kill is refused with.
+///
+/// Transcribed from `bin/ayeaye` rather than reinvented. They are read by
+/// whoever is holding the phone — `share/app.html` puts `d.error` on screen
+/// unchanged — and the daemon's wording is what that person has been reading
+/// until now. Keeping them here rather than at the call site is also what
+/// makes them somebody's decision instead of a literal in a request handler.
+pub mod refused {
+    /// The agent named is not on the allowlist. `bin/ayeaye:1885`.
+    pub const UNKNOWN_AGENT: &str = "unknown agent";
+    /// The project path is not a directory. `bin/ayeaye:1887`.
+    pub const NO_SUCH_DIRECTORY: &str = "no such directory";
+    /// The body was not JSON, or was not an object. `bin/ayeaye:2686`.
+    pub const BAD_JSON: &str = "bad json";
+    /// A kill that named no pane at all. `bin/ayeaye:2690`.
+    pub const NO_PANE: &str = "no pane";
+    /// A kill naming a pane that is not in the list this server just read.
+    /// `bin/ayeaye:1934`. Deliberately the same answer for a pane that does not
+    /// exist, one that is hidden, and one on a machine we have never heard of:
+    /// the panel offers only panes it was given, so anything else is a caller
+    /// asking about a pane that is not theirs to ask about.
+    pub const NO_SUCH_PANE: &str = "no such pane";
+
+    /// tmux ran and made nothing. `bin/ayeaye:1902`.
+    pub fn nothing_was_created(created: super::Created) -> String {
+        format!("tmux would not create the {}", created.as_str())
+    }
+
+    /// tmux refused the kill, quoting what it said. `bin/ayeaye:1942`.
+    pub fn could_not_kill(said: &str) -> String {
+        let said = said.trim();
+        let said = if said.is_empty() {
+            "tmux refused the request"
+        } else {
+            said
+        };
+        format!("could not kill pane: {said}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_command, command_line, create, killed_body, session_name, spawned_body};
+    use super::{
+        Agent, Created, agent, command_line, create, killed_body, refused, session_name,
+        spawned_body,
+    };
+    use crate::peer::{HostName, PaneId};
     use crate::shell::Unquotable;
 
     fn argv(session: &str, dir: &str, exists: bool) -> Vec<String> {
         create(session, dir, exists).argv
     }
 
+    fn claude() -> Agent {
+        agent("claude").expect("claude is an agent")
+    }
+
+    fn pane(host: &str, pane: &str) -> PaneId {
+        PaneId::new(HostName::new(host).expect("a host name"), pane).expect("a pane id")
+    }
+
     // AYEAYE-51 — the agent is matched against a list, never interpolated: this
     // endpoint starts a process, and `bin/ayeaye` says so where it declares the
-    // same table. A name that is not on it is refused rather than tried.
+    // same table. A name that is not on it is refused rather than tried, and
+    // there is no other way to get an `Agent` — which is what makes the list a
+    // rule rather than a habit.
     #[test]
     fn only_the_agents_on_the_list_may_be_started() {
-        assert_eq!(agent_command("claude"), Some("claude"));
-        assert_eq!(agent_command("codex"), Some("codex"));
-        for refused in ["", "bash", "rm", "claude; rm -rf ~", "CLAUDE", " claude"] {
-            assert_eq!(agent_command(refused), None, "{refused:?} is not an agent");
+        assert_eq!(claude().command(), "claude");
+        assert_eq!(claude().name(), "claude");
+        assert_eq!(agent("codex").map(|it| it.command()), Some("codex"));
+        for spelling in ["", "bash", "rm", "claude; rm -rf ~", "CLAUDE", " claude"] {
+            assert!(agent(spelling).is_none(), "{spelling:?} is not an agent");
         }
     }
 
@@ -254,7 +369,7 @@ mod tests {
         );
         assert_eq!(
             create("ayeaye", "/home/alex/dev/ayeaye", false).created,
-            "session"
+            Created::Session
         );
     }
 
@@ -279,7 +394,7 @@ mod tests {
         );
         assert_eq!(
             create("ayeaye", "/home/alex/dev/ayeaye", true).created,
-            "window"
+            Created::Window
         );
     }
 
@@ -288,14 +403,23 @@ mod tests {
     // after it, whatever the prompt happens to contain.
     #[test]
     fn a_prompt_becomes_one_argument_and_no_prompt_becomes_none() {
-        assert_eq!(command_line("claude", "").unwrap(), "claude");
-        assert_eq!(command_line("claude", "   \n  ").unwrap(), "claude");
+        assert_eq!(command_line(claude(), "").unwrap(), "claude");
+        // A prompt of nothing but whitespace is no prompt. `bin/ayeaye` tests
+        // the *raw* prompt (`if prompt:`) and so types `claude ''` here — an
+        // empty argument the agent then has to interpret. This tests what is
+        // left after collapsing, which is the thing that was actually asked
+        // for. A deliberate divergence, and the better half of it.
+        assert_eq!(command_line(claude(), "   \n  ").unwrap(), "claude");
         assert_eq!(
-            command_line("claude", "fix the tests").unwrap(),
+            command_line(claude(), "fix the tests").unwrap(),
             "claude 'fix the tests'"
         );
         assert_eq!(
-            command_line("codex", "run $(id) && rm -rf ~; echo 'done'").unwrap(),
+            command_line(
+                agent("codex").unwrap(),
+                "run $(id) && rm -rf ~; echo 'done'"
+            )
+            .unwrap(),
             r"codex 'run $(id) && rm -rf ~; echo '\''done'\'''"
         );
     }
@@ -308,7 +432,7 @@ mod tests {
     #[test]
     fn a_prompt_written_over_several_lines_is_collapsed_into_one() {
         assert_eq!(
-            command_line("claude", "  fix\n  the\ttests \r\n please  ").unwrap(),
+            command_line(claude(), "  fix\n  the\ttests \r\n please  ").unwrap(),
             "claude 'fix the tests please'"
         );
     }
@@ -319,12 +443,51 @@ mod tests {
     #[test]
     fn a_prompt_that_cannot_be_typed_is_refused_with_its_reason() {
         assert_eq!(
-            command_line("claude", "fix \u{1b}[31mthe\u{1b}[0m tests").unwrap_err(),
+            command_line(claude(), "fix \u{1b}[31mthe\u{1b}[0m tests").unwrap_err(),
             Unquotable::Control('\u{1b}')
         );
         assert_eq!(
-            command_line("claude", r"escape the \n in the regex").unwrap_err(),
+            command_line(claude(), r"escape the \n in the regex").unwrap_err(),
             Unquotable::Backslash
+        );
+        // The one place the collapse and Python's `split()` disagree: Python
+        // counts the C0 separators as whitespace and would quietly turn this
+        // into a space. Here it survives the collapse and is refused, which is
+        // the safe direction and the reason the difference is acceptable.
+        assert_eq!(
+            command_line(claude(), "fix\u{1c}the tests").unwrap_err(),
+            Unquotable::Control('\u{1c}')
+        );
+    }
+
+    // AYEAYE-51 — the refusals, transcribed from `bin/ayeaye` rather than
+    // reinvented. They are put on screen unchanged by `share/app.html`, so they
+    // are the wording somebody has been reading until now; a fresh set would be
+    // a change to the product nobody asked for.
+    #[test]
+    fn a_refusal_says_what_the_daemon_says() {
+        assert_eq!(refused::UNKNOWN_AGENT, "unknown agent");
+        assert_eq!(refused::NO_SUCH_DIRECTORY, "no such directory");
+        assert_eq!(refused::BAD_JSON, "bad json");
+        assert_eq!(refused::NO_PANE, "no pane");
+        assert_eq!(refused::NO_SUCH_PANE, "no such pane");
+        assert_eq!(
+            refused::nothing_was_created(Created::Session),
+            "tmux would not create the session"
+        );
+        assert_eq!(
+            refused::nothing_was_created(Created::Window),
+            "tmux would not create the window"
+        );
+        assert_eq!(
+            refused::could_not_kill("can't find pane: %99\n"),
+            "could not kill pane: can't find pane: %99"
+        );
+        // tmux that failed and said nothing still has to produce a sentence,
+        // or the panel shows "could not kill pane: " and trails off.
+        assert_eq!(
+            refused::could_not_kill("  \n"),
+            "could not kill pane: tmux refused the request"
         );
     }
 
@@ -335,7 +498,7 @@ mod tests {
     #[test]
     fn a_spawn_answers_with_a_qualified_pane_and_what_was_made() {
         assert_eq!(
-            spawned_body("desktop/%7", "ayeaye", "window", "claude"),
+            spawned_body(&pane("desktop", "%7"), "ayeaye", Created::Window, claude()),
             concat!(
                 r#"{"pane":"desktop/%7","session":"ayeaye","#,
                 r#""created":"window","agent":"claude"}"#
@@ -345,7 +508,12 @@ mod tests {
         // name can hold a quote. It goes through the escaping like any other
         // text, or one oddly-named project answers with a body nothing parses.
         assert_eq!(
-            spawned_body("Alex's Mac/%1", r#"say "hi""#, "session", "codex"),
+            spawned_body(
+                &pane("Alex's Mac", "%1"),
+                r#"say "hi""#,
+                Created::Session,
+                agent("codex").expect("codex is an agent")
+            ),
             concat!(
                 r#"{"pane":"Alex's Mac/%1","session":"say \"hi\"","#,
                 r#""created":"session","agent":"codex"}"#
