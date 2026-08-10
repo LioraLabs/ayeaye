@@ -5,7 +5,7 @@
 //! called, which subcommand makes the pane, and what gets typed into it — and
 //! the shell above turns the answers into subprocesses.
 
-use crate::shell;
+use crate::{json, shell};
 
 /// The programs that may be started, and the command each one is.
 ///
@@ -136,9 +136,35 @@ fn one_line(prompt: &str) -> String {
     prompt.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
+/// What the panel is told after an agent has been started.
+///
+/// The pane id is **qualified** — `desktop/%7`, not `%7`. `bin/ayeaye` answers
+/// with the bare id because it has only ever had one machine; here every id
+/// `/api/panes` hands out carries its host, and `share/app.html` takes this
+/// field as its selection (`sel = d.pane`) and then compares it against those.
+/// A bare id would select a pane the panel could never find again.
+pub fn spawned_body(pane: &str, session: &str, created: &str, agent: &str) -> String {
+    format!(
+        "{{\"pane\":{},\"session\":{},\"created\":{},\"agent\":{}}}",
+        json::string(pane),
+        json::string(session),
+        json::string(created),
+        json::string(agent),
+    )
+}
+
+/// What the panel is told after a pane has been killed.
+///
+/// That it happened, and nothing about what is left. The panel re-reads the
+/// pane list afterwards, which is what makes "the panel reflects it" a fact
+/// about tmux rather than a claim made here.
+pub fn killed_body() -> &'static str {
+    r#"{"ok":true}"#
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_command, command_line, create, session_name};
+    use super::{agent_command, command_line, create, killed_body, session_name, spawned_body};
     use crate::shell::Unquotable;
 
     fn argv(session: &str, dir: &str, exists: bool) -> Vec<String> {
@@ -183,7 +209,10 @@ mod tests {
     #[test]
     fn a_project_that_names_itself_in_tmux_yaml_wins() {
         let yaml = "windows:\n  - editor\nsession_name: work.bench\nroot: .\n";
-        assert_eq!(session_name("/home/alex/dev/ayeaye", Some(yaml)), "work_bench");
+        assert_eq!(
+            session_name("/home/alex/dev/ayeaye", Some(yaml)),
+            "work_bench"
+        );
         // Only at the start of a line, and only the first one.
         assert_eq!(
             session_name(
@@ -223,7 +252,10 @@ mod tests {
                 "#{pane_id}"
             ]
         );
-        assert_eq!(create("ayeaye", "/home/alex/dev/ayeaye", false).created, "session");
+        assert_eq!(
+            create("ayeaye", "/home/alex/dev/ayeaye", false).created,
+            "session"
+        );
     }
 
     // AYEAYE-51 — and the `=`. Without it tmux resolves `-t ayeaye` as a
@@ -245,7 +277,10 @@ mod tests {
                 "#{pane_id}"
             ]
         );
-        assert_eq!(create("ayeaye", "/home/alex/dev/ayeaye", true).created, "window");
+        assert_eq!(
+            create("ayeaye", "/home/alex/dev/ayeaye", true).created,
+            "window"
+        );
     }
 
     // AYEAYE-51 — "spawn takes a project path, an agent, and an **optional**
@@ -291,5 +326,39 @@ mod tests {
             command_line("claude", r"escape the \n in the regex").unwrap_err(),
             Unquotable::Backslash
         );
+    }
+
+    // AYEAYE-51 — the body `share/app.html` reads after a spawn: it announces
+    // "new {created} in {session}" and then selects `d.pane`. The id is
+    // qualified, because that is what the pane list it will compare against
+    // hands out — a bare one would select a pane the panel can never find.
+    #[test]
+    fn a_spawn_answers_with_a_qualified_pane_and_what_was_made() {
+        assert_eq!(
+            spawned_body("desktop/%7", "ayeaye", "window", "claude"),
+            concat!(
+                r#"{"pane":"desktop/%7","session":"ayeaye","#,
+                r#""created":"window","agent":"claude"}"#
+            )
+        );
+        // A session name comes from a directory somebody made, and a directory
+        // name can hold a quote. It goes through the escaping like any other
+        // text, or one oddly-named project answers with a body nothing parses.
+        assert_eq!(
+            spawned_body("Alex's Mac/%1", r#"say "hi""#, "session", "codex"),
+            concat!(
+                r#"{"pane":"Alex's Mac/%1","session":"say \"hi\"","#,
+                r#""created":"session","agent":"codex"}"#
+            )
+        );
+    }
+
+    // AYEAYE-51 — a kill says only that it happened. The panel re-reads the
+    // pane list afterwards rather than being told what is left, which is what
+    // makes "the panel reflects it" a fact about tmux rather than a claim in
+    // this body.
+    #[test]
+    fn a_kill_answers_that_it_happened_and_nothing_else() {
+        assert_eq!(killed_body(), r#"{"ok":true}"#);
     }
 }

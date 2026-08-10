@@ -6,8 +6,11 @@
 //! reach nothing — and a pure crate whose whole job is "text and structs in,
 //! text and structs out" can spell a string literal itself.
 //!
-//! There is no reader here, and there should not be: nothing this daemon is
-//! handed arrives as JSON it has to parse.
+//! There is no reader here, and there should not be. The daemon *is* handed
+//! JSON now — a spawn or a kill arrives as a request body — but reading a
+//! hostile document is the one job worth a real parser, and this crate is the
+//! one place that cannot have one. So the shell parses, and hands this crate
+//! the strings it found.
 
 /// One JSON string literal, quotes included.
 ///
@@ -42,9 +45,22 @@ pub fn string(value: &str) -> String {
     out
 }
 
+/// The body every refusal answers with.
+///
+/// One shape for all of them, because `share/app.html` reads exactly one thing
+/// off a failed call — `if(d.error) return msg(d.error, true)` — and a refusal
+/// that spelled it differently would be a call the page thinks succeeded.
+///
+/// The reason is a *sentence*, not a code: it is put in front of whoever is
+/// holding the phone, and "no such directory" is worth more to them than any
+/// enumeration this could return instead.
+pub fn error(said: &str) -> String {
+    format!("{{\"error\":{}}}", string(said))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::string;
+    use super::{error, string};
 
     // AYEAYE-43 — a pane's window name is whatever somebody typed, and it lands
     // in a body the panel parses. A quote or a newline in it must escape rather
@@ -63,5 +79,19 @@ mod tests {
         // And nothing else is touched: text that is already UTF-8 stays as it
         // is rather than becoming six bytes of noise per accent.
         assert_eq!(string("café ✓"), "\"café ✓\"");
+    }
+
+    // AYEAYE-51 — every refusal answers in the one shape the page reads. The
+    // reason often quotes what tmux said, and what tmux said is not a string
+    // literal somebody chose — so it goes through the escaping like any other
+    // text, or the first refusal mentioning a quoted path is a body nothing
+    // can parse.
+    #[test]
+    fn a_refusal_is_a_sentence_in_the_shape_the_page_reads() {
+        assert_eq!(error("no such pane"), r#"{"error":"no such pane"}"#);
+        assert_eq!(
+            error("could not kill pane: can't find pane: \"%9\"\n"),
+            r#"{"error":"could not kill pane: can't find pane: \"%9\"\n"}"#
+        );
     }
 }

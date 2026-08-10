@@ -100,7 +100,10 @@ mod tests {
             quote("fix\nthe tests").unwrap_err(),
             Unquotable::Control('\n')
         );
-        assert_eq!(quote("\u{1b}[31m").unwrap_err(), Unquotable::Control('\u{1b}'));
+        assert_eq!(
+            quote("\u{1b}[31m").unwrap_err(),
+            Unquotable::Control('\u{1b}')
+        );
         assert_eq!(quote("a\u{0}b").unwrap_err(), Unquotable::Control('\u{0}'));
         assert_eq!(quote("a\tb").unwrap_err(), Unquotable::Control('\t'));
         // Ordinary spaces are not control characters and are the reason the
