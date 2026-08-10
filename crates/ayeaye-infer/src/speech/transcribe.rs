@@ -79,7 +79,7 @@ impl SpeechModel {
         let mel = audio::pcm_to_mel(&self.config, &padded, &self.filters);
         let bins = self.config.num_mel_bins;
         let frames = mel.len() / bins;
-        let mel = Tensor::from_vec(mel, (1, bins, frames), &self.selection.device)
+        let mel = Tensor::from_vec(mel, (1, bins, frames), self.selection.device())
             .map_err(SpeechError::inference)?;
         // `pcm_to_mel` pads its output past the window; the encoder wants
         // exactly the window.
@@ -105,7 +105,7 @@ impl SpeechModel {
         // makes a model that will not emit an end token still return.
         while tokens.len() < self.config.max_target_positions {
             let step = tokens.len() - prompt.len();
-            let input = Tensor::new(tokens.as_slice(), &self.selection.device)
+            let input = Tensor::new(tokens.as_slice(), self.selection.device())
                 .map_err(SpeechError::inference)?
                 .unsqueeze(0)
                 .map_err(SpeechError::inference)?;

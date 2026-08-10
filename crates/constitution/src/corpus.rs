@@ -54,12 +54,22 @@ pub struct Member {
 pub struct Corpus {
     /// The members, in the order the root manifest lists them.
     pub members: Vec<Member>,
+    /// The root manifest's own text.
+    ///
+    /// The root is not a member and has no sources, so nothing else here would
+    /// read it — and it declares dependencies, in `[workspace.dependencies]`.
+    /// A rule over "every member's manifest" would silently skip the one file
+    /// this workspace keeps candle in.
+    pub root_manifest: String,
 }
 
 impl Corpus {
     /// Read the workspace rooted at `root`.
     pub fn walk(root: &Path) -> Result<Self, String> {
-        let manifest = parse(&root.join("Cargo.toml"))?;
+        let root_path = root.join("Cargo.toml");
+        let root_manifest =
+            fs::read_to_string(&root_path).map_err(|e| format!("{}: {e}", root_path.display()))?;
+        let manifest = parse_text(&root_manifest, &root_path)?;
         let listed = manifest
             .get("workspace")
             .and_then(|w| w.get("members"))
@@ -82,7 +92,10 @@ impl Corpus {
             members.push(read_member(root, dir)?);
         }
 
-        Ok(Corpus { members })
+        Ok(Corpus {
+            members,
+            root_manifest,
+        })
     }
 
     /// How many source files the walk found, across every member.
@@ -212,12 +225,10 @@ fn read_source(root: &Path, path: &Path, out: &mut Vec<Source>) -> Result<(), St
     Ok(())
 }
 
-fn parse(path: &Path) -> Result<toml::Value, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse_text(&text, path)
-}
-
-/// The same, for a manifest whose text the caller already has and keeps.
+/// Parse a manifest whose text the caller already has, and keeps.
+///
+/// Every caller keeps it: rule 4's second half reads features out of the text
+/// rather than out of the parse, so reading and parsing are two steps.
 fn parse_text(text: &str, path: &Path) -> Result<toml::Value, String> {
     // Parsed as a document rather than as a value: a manifest is a table, and
     // `Value`'s own FromStr wants a single TOML value.

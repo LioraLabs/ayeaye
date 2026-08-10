@@ -180,12 +180,19 @@ feature-blind in **both** directions, and AYEAYE-57 measured both:
   `cargo:rustc-link-lib=dylib=cudart`; `bindgen_cuda` depends on `glob`,
   `num_cpus` and `rayon`, and on nothing that compiles C.
 
-So the paragraph above — "`cc` absent from the lockfile is a mechanical proof
-that nothing in the graph compiles C" — is true of every graph that reaches C
-*through a C compiler*, and false of one that reaches it through nvcc. It
+That is why the paragraph above is worded as narrowly as it is. `cc` absent
+proves no crate in the graph vendors C *for a C compiler to build*; it proves
+nothing about a build script that drives its own compiler. The first half
 remains the right rule for the cost it was written for. It simply cannot answer
-the question "does the default build need a toolchain" at all, in either
-direction, because the lockfile does not record what is on.
+"does the default build need a toolchain" at all, in either direction, because
+the lockfile does not record what is on.
+
+**The first half's mutation tests** plant `onig_sys` and `cc` in a synthetic
+lockfile. Against the real tree the proof runs the other way round: a planted
+package cannot be used, because cargo rewrites `Cargo.lock` before the test runs
+and drops any entry nothing depends on — so the test instead hands the rule a
+table naming `libc`, which the graph really does carry, and fails if the rule
+finds nothing.
 
 ### The second half: a feature that legitimately needs a toolchain
 
@@ -218,17 +225,28 @@ It refuses two shapes, because closing one leaves the other open:
 build-dependencies, so Metal costs no toolchain. Gating it would be a rule
 nobody could obey, since being on by default in an Apple build is the point.
 
-Both halves are `Rule::PureRustGraph`, because they are one rule: nothing the
-portable build needs may require a C, C++ or CUDA compiler. The mutation tests
-plant a `default` naming a gated feature, a `default` that reaches one through
-another of our own features, and a target table forcing one on — and assert
-that the same target table forcing `metal` on is clean.
+**A gated feature is rarely reachable only under its own name**, so `Gated`
+carries the other spellings that turn the same cost on. candle defines
+`cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, and `default =
+["candle-core/cudnn"]` pays for nvcc while naming nothing called `cuda`. Both
+are on the table; a rule that matched one keyword would be a filter, not a rule.
 
-The mutation tests plant `onig_sys` and `cc` in a synthetic lockfile. Against
-the real tree the proof runs the other way round: a planted package cannot be
-used, because cargo rewrites `Cargo.lock` before the test runs and drops any
-entry nothing depends on — so the test instead hands the rule a table naming
-`libc`, which the graph really does carry, and fails if the rule finds nothing.
+**The root manifest is judged too.** It is not a workspace member, it has no
+sources, and it declares dependencies under `[workspace.dependencies]` — which
+is where this workspace keeps candle, and therefore the most likely place a
+future acceleration edit lands. A rule over "every member's manifest" would skip
+exactly that file.
+
+Both halves are `Rule::PureRustGraph`, because they are one rule. The second
+half's mutation tests plant a `default` naming a gated feature, a `default` that
+reaches one through another of our own features, a `default` naming an implying
+spelling, a target table forcing one on, and a `[workspace.dependencies]` edge
+forcing one on — and assert that the same target table forcing `metal` on is
+clean. Against the real tree the proof runs the other way round again: there is
+no violation to leave planted, so the test hands the rule a table naming
+`metal`, which `ayeaye-infer` really does turn on for Apple builds, and fails if
+it finds nothing.
+
 
 ---
 

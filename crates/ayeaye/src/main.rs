@@ -65,9 +65,12 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
 /// One line naming the version and what this build can do *here*.
 ///
 /// `got()` and not `selected()`, which is the whole of AYEAYE-57 in one line: a
-/// build with cuda compiled into it that found no card is a processor build for
-/// the rest of its life, and a capability report that goes on claiming `cuda` is
-/// the silent degradation the ticket exists to refuse.
+/// capability report that goes on claiming `cuda` after finding no card is the
+/// silent degradation the ticket exists to refuse.
+///
+/// This reports the selection *this call* made. Making it the same one the
+/// resident models are on — one decision per process, handed to the slots — is
+/// AYEAYE-73, because the daemon's slot construction is not in this tree.
 fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
     ayeaye_core::Identity {
         version: ayeaye_core::VERSION,

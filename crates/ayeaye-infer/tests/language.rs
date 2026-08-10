@@ -275,6 +275,31 @@ fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
     assert!(why.contains("no Metal device is present"), "{why}");
 }
 
+// AYEAYE-57
+//
+// The twin of `a_slot_keeps_its_device_decision_across_an_unload_and_reload` in
+// tests/speech.rs. Both slots got the same wiring, so both need the same
+// hold-down: a `load` that re-probed the machine instead of using the decision
+// the slot already made would fail this.
+#[test]
+fn a_slot_keeps_its_device_decision_across_an_unload_and_reload() {
+    let dir = tiny_model("slot-keeps-its-device");
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Metal, |_| {
+        Err(candle_core::Error::Msg(
+            "no Metal device is present".to_string(),
+        ))
+    });
+    let mut slot = LanguageSlot::on(selection);
+
+    slot.load(dir.path()).expect("the first load");
+    assert!(slot.unload(), "there was a model to release");
+    slot.load(dir.path()).expect("the reload");
+
+    let why = slot.fallback().expect("the reason outlives the model");
+    assert!(why.contains("metal"), "{why}");
+    assert!(why.contains("no Metal device is present"), "{why}");
+}
+
 // -------------------------------------------------------------- generation
 
 // AYEAYE-55

@@ -1,17 +1,29 @@
-//! Rule 4: nothing in the dependency graph may need a C or C++ compiler.
+//! Rule 4: nothing the portable build needs may require a C, C++ or CUDA
+//! compiler.
+//!
+//! Two halves, because no single input answers it. [`check`] reads `Cargo.lock`
+//! and proves the graph carries no crate that vendors C for a C compiler to
+//! build. [`gated`] reads the manifests and proves the cost `cc` cannot see —
+//! a build script driving its own compiler, which is what the CUDA path does —
+//! stays out of the build nobody asked for.
 
 use crate::finding::{Finding, Rule};
 
 /// Packages whose presence means the build is no longer pure Rust.
 ///
-/// `cc` is the load-bearing one and the reason this rule is cheap to trust:
+/// `cc` is the load-bearing one and the reason this half is cheap to trust:
 /// **it is how a build script compiles C or C++ in this ecosystem.** A crate
 /// that vendors native sources takes `cc` as a build dependency, so `cc`
-/// absent from the lockfile is a mechanical proof that no native source is
-/// compiled anywhere in the graph — including inside crates nobody read.
-/// `cmake` and `bindgen` are the same argument for the two other shapes the
-/// cost takes, and `onig`/`onig_sys` are named because they are how it very
-/// nearly arrived: see the note in `crates/ayeaye-infer/Cargo.toml`.
+/// absent from the lockfile is a mechanical proof that no such crate is in the
+/// graph — including crates nobody read. `cmake` and `bindgen` are the same
+/// argument for the two other shapes that cost takes, and `onig`/`onig_sys`
+/// are named because they are how it very nearly arrived: see the note in
+/// `crates/ayeaye-infer/Cargo.toml`.
+///
+/// **It is not proof that nothing anywhere compiles C.** A build script that
+/// drives its own compiler needs no `cc`, and that is exactly the CUDA path:
+/// `candle-kernels` runs nvcc itself. That cost is [`gated`]'s to catch, not
+/// this table's.
 pub const FORBIDDEN: &[(&str, &str)] = &[
     (
         "cc",
@@ -47,6 +59,14 @@ pub const FORBIDDEN: &[(&str, &str)] = &[
 pub struct Gated {
     /// The feature name, as our manifests spell it.
     pub feature: &'static str,
+    /// Other feature names that turn the same cost on.
+    ///
+    /// A gated feature is rarely reachable only under its own name: candle
+    /// defines `cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, so
+    /// `default = ["candle-core/cudnn"]` pays for nvcc while naming nothing
+    /// called `cuda`. Every spelling that reaches the cost has to be here, or
+    /// the rule is a keyword filter rather than a rule.
+    pub also: &'static [&'static str],
     /// What building it needs that a default build does not.
     pub cost: &'static str,
     /// Which release artifact stops being a static portable binary.
@@ -63,6 +83,9 @@ pub struct Gated {
 /// rather than a violation.
 pub const GATED: &[Gated] = &[Gated {
     feature: "cuda",
+    // candle-core, candle-nn and candle-transformers all define these, and
+    // both of them list "cuda" among their own implied features.
+    also: &["cudnn", "nccl"],
     cost: "nvcc and a host C++ compiler at build time (candle-kernels' build \
            script compiles .cu sources with nvcc and links stdc++ and cudart)",
     artifact: "the x86_64 Linux NVIDIA build, which is glibc-dynamic rather than static musl",
@@ -105,20 +128,22 @@ pub fn gated(subject: &str, manifest: &str, gated: &[Gated]) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut seen = Vec::new();
     let mut note = |enabled: &str, how: &str, findings: &mut Vec<Finding>| {
+        // The bare name, or the tail of a `dep/feature` entry.
+        let spelling = enabled.rsplit('/').next().unwrap_or(enabled);
         let Some(entry) = gated
             .iter()
-            .find(|g| enabled == g.feature || enabled.ends_with(&format!("/{}", g.feature)))
+            .find(|g| spelling == g.feature || g.also.contains(&spelling))
         else {
             return;
         };
-        if seen.contains(&entry.feature) {
+        if seen.contains(&spelling.to_string()) {
             return;
         }
-        seen.push(entry.feature);
+        seen.push(spelling.to_string());
         findings.push(Finding {
             rule: Rule::PureRustGraph,
             subject: subject.to_string(),
-            what: entry.feature.to_string(),
+            what: spelling.to_string(),
             why: format!(
                 "{how}. Building it needs {}. That cost is why {} is the one release \
                  artifact that is not a static portable binary, and the portable build may \
@@ -171,6 +196,12 @@ fn default_closure(manifest: &toml::Value) -> Vec<String> {
 fn forced_on_a_dependency(manifest: &toml::Value) -> Vec<String> {
     let mut out = Vec::new();
     collect_dependency_features(manifest, &mut out);
+    // The root manifest declares dependencies too, under a table spelled
+    // differently from every other one — and it is where this workspace keeps
+    // candle, which makes it the most likely place a future edit lands.
+    if let Some(workspace) = manifest.get("workspace") {
+        collect_dependency_features(workspace, &mut out);
+    }
     if let Some(targets) = manifest.get("target").and_then(|t| t.as_table()) {
         for (_, table) in targets {
             collect_dependency_features(table, &mut out);
@@ -339,9 +370,41 @@ mod gated_tests {
 
     const CUDA: &[Gated] = &[Gated {
         feature: "cuda",
+        also: &["cudnn", "nccl"],
         cost: "nvcc and a host C++ compiler",
         artifact: "the x86_64 Linux NVIDIA build",
     }];
+
+    // AYEAYE-57 — a gated feature is not only reachable under its own name.
+    // candle-core defines `cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, so
+    // `default = ["candle-core/cudnn"]` puts nvcc in the portable build while
+    // naming nothing this rule was watching for. The final gate found this by
+    // planting it; the fix is that a gated feature carries the other spellings
+    // that turn it on.
+    #[test]
+    fn a_feature_that_implies_a_gated_one_is_the_same_finding() {
+        for spelling in ["cudnn", "nccl"] {
+            let manifest = format!("[features]\ndefault = [\"candle-core/{spelling}\"]\n");
+
+            let findings = gated("crates/x/Cargo.toml", &manifest, CUDA);
+
+            assert_eq!(findings.len(), 1, "{spelling}: {findings:?}");
+            assert_eq!(findings[0].what, spelling);
+        }
+    }
+
+    // AYEAYE-57 — the root manifest declares dependencies too, in a table
+    // spelled differently from every other one, and it is where this milestone
+    // put candle. A rule that only knew `[dependencies]` would pass it.
+    #[test]
+    fn a_workspace_dependency_forcing_a_gated_feature_is_a_finding() {
+        let manifest = "[workspace.dependencies]\n            candle-core = { version = \"0.9.1\", features = [\"cuda\"] }\n";
+
+        let findings = gated("Cargo.toml", manifest, CUDA);
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].what, "cuda");
+    }
 
     // AYEAYE-57 — the mutation. This is the shape that would put nvcc into the
     // portable build, and the lockfile half of rule 4 cannot see it: the graph

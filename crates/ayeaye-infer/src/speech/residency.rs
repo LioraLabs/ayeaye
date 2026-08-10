@@ -60,14 +60,6 @@ impl SpeechSlot {
         }
     }
 
-    /// The device decision this slot loads onto, once it has made one.
-    ///
-    /// `None` before the first load on a slot built by [`Self::empty`], because
-    /// nothing has asked the machine anything yet.
-    pub fn selection(&self) -> Option<&Selection> {
-        self.selection.as_ref()
-    }
-
     /// Why the resident model is not on the backend the build was compiled for.
     ///
     /// Read off the **model** when one is resident, and off the slot's own

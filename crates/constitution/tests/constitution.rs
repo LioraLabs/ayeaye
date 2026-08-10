@@ -190,6 +190,7 @@ fn no_default_build_turns_on_a_feature_that_needs_a_toolchain() {
     // for Apple builds through a target table, and it has to say so.
     let probe = &[toolchain::Gated {
         feature: "metal",
+        also: &[],
         cost: "nothing at all, which is why it is not really gated",
         artifact: "no artifact",
     }];
@@ -202,10 +203,15 @@ fn no_default_build_turns_on_a_feature_that_needs_a_toolchain() {
          it is not reading the manifests"
     );
 
+    // The root manifest as well as every member's. It is not a member, it has
+    // no sources, and it is where this workspace keeps candle — so "every
+    // member" would skip exactly the file a future acceleration edit lands in.
     let findings: Vec<_> = corpus
         .members
         .iter()
-        .flat_map(|member| toolchain::gated(&member.dir, &member.manifest, toolchain::GATED))
+        .map(|member| (member.dir.as_str(), member.manifest.as_str()))
+        .chain([("Cargo.toml", corpus.root_manifest.as_str())])
+        .flat_map(|(subject, manifest)| toolchain::gated(subject, manifest, toolchain::GATED))
         .collect();
 
     assert!(

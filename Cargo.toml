@@ -21,19 +21,15 @@ repository = "https://github.com/LioraLabs/ayeaye"
 ayeaye-core = { path = "crates/ayeaye-core" }
 ayeaye-infer = { path = "crates/ayeaye-infer" }
 
-# candle lives here rather than in `ayeaye-infer` because that crate names it
-# from two dependency tables — the generic one and the macOS one that turns
-# `metal` on — and two version requirements for one crate is a trap rather than
-# a duplication. Cargo does **not** intersect them: given `0.8` on one edge and
-# `0.9.1` on the other it resolves *both*, one per target, and locks two
-# candles. AYEAYE-57 measured that, and the 0.8 tree pulls `cc` — so the way
-# this goes wrong is the Apple release row quietly shipping a different candle
-# from every other row, with a C compiler in it, which is the single-binary
-# story failing silently rather than loudly.
+# candle lives here because `ayeaye-infer` names it from two dependency tables
+# and cargo does not intersect two requirements for one crate — it resolves
+# both. One requirement, `workspace = true` on both edges; the long version of
+# why, and of why it is 0.9 rather than 0.11, is in
+# `crates/ayeaye-infer/Cargo.toml`. **Read it before changing these lines.**
 #
-# One requirement, `workspace = true` on both edges. **Why it is 0.9 and not
-# 0.11 is load-bearing and is written out in `crates/ayeaye-infer/Cargo.toml`;
-# read it before changing this line.**
+# The constitution has an opinion about what may be turned on here:
+# `toolchain::gated` judges this table, because a `features = [...]` on one of
+# these edges is on for every crate in the workspace.
 candle-core = "0.9.1"
 candle-nn = "0.9.1"
 candle-transformers = "0.9.1"
