@@ -28,6 +28,7 @@ pub mod peer;
 pub mod process;
 pub mod prompt;
 pub mod service;
+pub mod setup;
 pub mod sha1;
 pub mod tmux;
 
