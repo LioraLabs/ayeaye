@@ -6,8 +6,10 @@
 //! needs to reach an https front end somebody put in front of ayeaye.
 //!
 //! **A machine with no curl is not a machine that passed.** It is said once at
-//! the top and every network check reports `unknown`, which is the truth — the
-//! shell says the same, in the same place, for the same reason.
+//! the top, and every network check that needed a request reports `unknown` —
+//! while what nobody asked for stays `skipped`, because "could not be asked"
+//! and "not asked for" are different facts and neither may wear the other's
+//! mark. The shell says the same, in the same place, for the same reason.
 //!
 //! # The key never touches a command line
 //!
@@ -98,29 +100,70 @@ impl<R: Runner> Asking<'_, R> {
         report.record(health::acceleration(self.build, &self.captured.machine()));
 
         if !curl {
-            // Said once, at the top, rather than five times underneath.
-            for (name, claim) in [
-                ("local", format!("ayeaye answers on {}", self.url)),
-                (
-                    "auth",
-                    "ayeaye refusing anyone without your key".to_string(),
-                ),
-                ("authorised", "your key opens the page".to_string()),
-                (
-                    "hosts",
-                    "ayeaye accepting the address you named".to_string(),
-                ),
-                ("https", "an https address your phone can open".to_string()),
-            ] {
-                report.record(Check {
-                    name,
-                    claim,
-                    verdict: Verdict::Unknown,
-                    detail: Some("this computer has no curl, so this could not be asked".into()),
-                    explains_itself: false,
-                });
+            // Said once, at the top, rather than underneath every request — but
+            // only for the questions that *needed* one. What is decidable
+            // without a request keeps its real verdict: nothing configured is
+            // still "you did not ask for this", because "could not be asked"
+            // and "not asked for" are different facts and neither may wear the
+            // other's mark. The verdicts stay the core's, fed the evidence
+            // there is — which is none.
+            let could_not = "this computer has no curl, so this could not be asked";
+            report.record(Check {
+                name: "local",
+                claim: format!("ayeaye answers on {}", self.url),
+                verdict: health::local(None),
+                detail: Some(could_not.to_string()),
+                explains_itself: false,
+            });
+            report.record_auth("ayeaye refuses anyone without your key", None);
+            if let Some(auth) = report.checks.last_mut() {
+                // The fused call owns the verdict and the alarm; only the
+                // explanation is this path's to give.
+                auth.detail = Some(could_not.to_string());
             }
+            report.record(Check {
+                name: "authorised",
+                claim: "your key opens the page".to_string(),
+                verdict: Verdict::Unknown,
+                detail: Some(
+                    if self.token.is_some() && self.state_dir.is_some() {
+                        could_not
+                    } else {
+                        "there is no key on this computer to try"
+                    }
+                    .to_string(),
+                ),
+                explains_itself: false,
+            });
+            let unasked: Vec<Option<u16>> = self.allowed_hosts.iter().map(|_| None).collect();
+            report.record(Check {
+                name: "hosts",
+                claim: self.hosts_claim(),
+                verdict: health::hosts(&unasked, None),
+                detail: (!unasked.is_empty()).then(|| could_not.to_string()),
+                explains_itself: false,
+            });
+            let host = self.allowed_hosts.first().map(String::as_str);
+            let asked_for = !self.allowed_hosts.is_empty() || !self.loopback_only;
+            report.record(Check {
+                name: "https",
+                claim: Self::https_claim(host),
+                verdict: health::https(asked_for, host, None),
+                detail: asked_for.then(|| could_not.to_string()),
+                explains_itself: false,
+            });
             report.record(self.mesh_check());
+            // The board needs the key over HTTP, so a cliban that is here could
+            // not be asked about — and one that is not here is skipped exactly
+            // as it is with curl, rather than a line that quietly vanishes.
+            let cliban = self.captured.has("cliban");
+            report.record(Check {
+                name: "board",
+                claim: "your ticket board on the phone".to_string(),
+                verdict: health::board(cliban, None),
+                detail: cliban.then(|| could_not.to_string()),
+                explains_itself: false,
+            });
             report.record(self.agents_check());
             return report;
         }
@@ -232,16 +275,29 @@ impl<R: Runner> Asking<'_, R> {
         }
     }
 
-    /// Host validation, asserted in both directions.
-    fn hosts_check(&self) -> Check {
-        let claim = if self.allowed_hosts.is_empty() {
+    /// What the host check claims — one wording, whether or not it can be asked.
+    fn hosts_claim(&self) -> String {
+        if self.allowed_hosts.is_empty() {
             "ayeaye accepting an address you named".to_string()
         } else {
             format!(
                 "ayeaye accepts {} and refuses anything else",
                 self.allowed_hosts.join(", ")
             )
-        };
+        }
+    }
+
+    /// What the https check claims, for whichever address there is.
+    fn https_claim(host: Option<&str>) -> String {
+        match host {
+            Some(host) => format!("https://{host}/ answers, which is what your phone opens"),
+            None => "an https address your phone can open".to_string(),
+        }
+    }
+
+    /// Host validation, asserted in both directions.
+    fn hosts_check(&self) -> Check {
+        let claim = self.hosts_claim();
         let configured: Vec<Option<u16>> = self
             .allowed_hosts
             .iter()
@@ -301,10 +357,7 @@ impl<R: Runner> Asking<'_, R> {
         let code = host.and_then(|host| self.code(&format!("https://{host}/"), &[]));
         Check {
             name: "https",
-            claim: match host {
-                Some(host) => format!("https://{host}/ answers, which is what your phone opens"),
-                None => "an https address your phone can open".to_string(),
-            },
+            claim: Self::https_claim(host.map(String::as_str)),
             verdict: health::https(asked_for, host.map(String::as_str), code),
             detail: code.map(|code| format!("it answered {code}")),
             explains_itself: false,
@@ -616,16 +669,28 @@ mod tests {
     }
 
     // AYEAYE-62 — a machine with no curl is not a machine that passed. Every
-    // network check reports unknown, said once at the top, which is the truth.
+    // check that needed a request reports unknown, said once at the top — and
+    // what nobody asked for stays skipped, because "could not be asked" and
+    // "not asked for" are different facts and neither may wear the other's
+    // mark, from either side.
     #[test]
     fn a_machine_with_no_curl_reports_unknown_and_never_ok() {
         let captured = machine_with(&["tmux"]);
         let report = asking(&captured, Answers::default()).run();
-        for name in ["local", "auth", "hosts", "https"] {
+        for name in ["local", "auth", "authorised"] {
             assert_eq!(
                 verdict(&report, name),
                 Verdict::Unknown,
                 "{name} could not be asked"
+            );
+        }
+        // Nothing configured and loopback only: the very verdicts the same
+        // machine gets with curl present, not a blanket unknown.
+        for name in ["hosts", "https", "board"] {
+            assert_eq!(
+                verdict(&report, name),
+                Verdict::Skipped,
+                "{name} was never asked for, curl or no curl"
             );
         }
         assert_eq!(report.outcome(), StepOutcome::Unfinished);
@@ -634,6 +699,21 @@ mod tests {
             Verdict::Passed,
             "that one is a PATH lookup"
         );
+
+        // And the other side of the same coin: what *was* asked for on a
+        // machine with no curl is unknown, never skipped, and never absent.
+        let with_board = machine_with(&["tmux", "cliban"]);
+        let mut exposed = asking(&with_board, Answers::default());
+        exposed.allowed_hosts = vec!["box.example".to_string()];
+        exposed.loopback_only = false;
+        let owed = exposed.run();
+        for name in ["hosts", "https", "board"] {
+            assert_eq!(
+                verdict(&owed, name),
+                Verdict::Unknown,
+                "{name} was asked for and could not be checked"
+            );
+        }
     }
 
     // AYEAYE-62 — and nothing is *run* to discover that. A run with no curl must
@@ -941,20 +1021,18 @@ mod tests {
         }
         assert_eq!(full.checks.len(), expected.len(), "and nothing twice");
 
-        // The no-curl path reports on every one of them too, as unknown rather
-        // than as absent — five network checks said once at the top, and the six
-        // that need nothing from the network answered properly.
+        // The no-curl path reports on every one of them too — a check that
+        // vanishes is a capability nobody is told about, which was exactly how
+        // the board line went missing here once.
         let without = machine_with(&[]);
         let bare = asking(&without, Answers::default()).run();
         for name in expected {
-            if name == "board" {
-                continue; // no cliban here, so it is skipped rather than asked
-            }
             assert!(
                 bare.checks.iter().any(|check| check.name == name),
                 "{name} vanished when there was no curl"
             );
         }
+        assert_eq!(bare.checks.len(), expected.len(), "and nothing twice");
     }
 
     // AYEAYE-62 — a mesh network and a ticket board are detected and verified and

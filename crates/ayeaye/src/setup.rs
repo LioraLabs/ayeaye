@@ -539,28 +539,15 @@ pub fn record_consent(state_dir: &Path, plan: &Plan, stamp: &str) -> Result<(), 
     Ok(())
 }
 
-/// One setting, as the running daemon would see it.
+/// One setting, as the running daemon sees it.
 ///
-/// **The environment wins, then the file, then the default** — the milestone's
-/// own decision, and the reason this exists rather than reading `config::env_var`
-/// alone. `Settings::resolve` reads the environment because a *unit* puts the
-/// file into it with `EnvironmentFile=`; anything asking the same question
-/// *outside* the service — `ayeaye check`, run from a shell, right after setup
-/// wrote the file — sees none of that. Without this the health checks would ask
-/// about the default port on a machine setup had just configured for another
-/// one, and report a perfectly healthy install as dead.
+/// **The environment wins, then the file, then the default** — and the first
+/// two layers are [`crate::config::env_then_file`], the very lookup `serve`
+/// hands `Settings::resolve`, so the health checks and the daemon cannot
+/// resolve the same name differently. All this adds is the default, because a
+/// check needs an address to ask at even on a machine nobody configured.
 pub fn effective(config_file: &Path, key: &str, default: &str) -> String {
-    if let Some(from_environment) = crate::config::env_var(key) {
-        return from_environment;
-    }
-    let text = std::fs::read_to_string(config_file).unwrap_or_default();
-    settings::parse_env_file(&text)
-        .into_iter()
-        .rev()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+    crate::config::env_then_file(config_file)(key).unwrap_or_else(|| default.to_string())
 }
 
 /// What this build runs inference on, as the core names it.

@@ -104,14 +104,26 @@ fn serve(args: &[String]) -> ExitCode {
     // is: both are the machine's answer rather than the caller's, and neither
     // should depend on which flags were typed.
     let cliban = ayeaye::cliban::Cliban::new(config::locate_cliban());
-    let settings =
-        match Settings::resolve(args, config::env_var, token, nodename(&Subprocess), cliban) {
-            Ok(settings) => settings,
-            Err(why) => {
-                eprintln!("ayeaye: {why}\n\n{USAGE}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // The environment first, then the settings file `ayeaye setup` owns, then
+    // the defaults. The file layer is what `manual_instructions` promises with
+    // "it reads the settings file by itself": the systemd unit injects the same
+    // file into the environment, but launchd and a hand-started server inject
+    // nothing, and on those paths a daemon reading only the environment would
+    // ignore what setup just wrote.
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+    let settings = match Settings::resolve(
+        args,
+        config::env_then_file(&config_file),
+        token,
+        nodename(&Subprocess),
+        cliban,
+    ) {
+        Ok(settings) => settings,
+        Err(why) => {
+            eprintln!("ayeaye: {why}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The runtime is built here rather than with `#[tokio::main]` so that the
     // banner and the argument errors above cost nothing to reach: they are the
@@ -398,11 +410,10 @@ fn check(
 ) -> Report {
     let bind = setup::effective(&places.config_file, "BIND", config::DEFAULT_BIND);
     let asking = ayeaye::health::Asking {
-        // Read the way the daemon would read it: the environment first, then
-        // the file setup wrote, then the default. `config::env_var` alone reads
-        // only the environment, which a *unit* fills from that file — so a check
-        // run from a shell, right after setup configured a port, would ask about
-        // the default one and call a healthy install dead.
+        // Read the way the daemon reads it: the environment first, then the
+        // file setup wrote, then the default — the same layers `serve` hands
+        // `Settings::resolve`, so the check and the daemon cannot disagree
+        // about which address is even being discussed.
         url: format!(
             "http://{}:{}",
             bind,
