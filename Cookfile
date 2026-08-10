@@ -7,12 +7,9 @@
 #   cook publish   tag and upload it  (refuses a dirty tree)
 #
 # The version lives in AYEAYE_VERSION at the top of install.sh, and
-# `release-version` fails if this file or the README has drifted from it.
-#
-# It is no longer the only place the tree claims a version: the Cargo
-# workspace carries one too, and neither `bump` nor `release-version` knows
-# about it yet. Teaching them is AYEAYE-59's, and until then a bump leaves the
-# crate manifest behind without anything saying so.
+# `release-version` fails if this file, the README, or the Cargo workspace
+# (Cargo.toml and its lockfile, which claim it without the v) has drifted
+# from it. `cook bump` moves every one of those claims together.
 #
 # Cutting a release is two commits, in this order:
 #
@@ -148,10 +145,17 @@ recipe rust-lint
 
 # --- release gates ------------------------------------------------------
 
+# The gate reads the crate manifest and its lockfile as version claims, so
+# they must reseal it: without this, a drifted Cargo.toml would replay the
+# cached green from before the drift.
+probe manifest
+    files { "Cargo.toml" "Cargo.lock" }
+
 recipe release-version
     ingredients "scripts/check-release-version.sh"
     seal wizard
     seal scripts
+    seal manifest
     test { bash scripts/check-release-version.sh v0.2.2 }
 
 # --- the artifacts ------------------------------------------------------

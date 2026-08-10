@@ -8,8 +8,9 @@ members = [
 ]
 
 # One version for the whole workspace. install.sh still owns the release
-# version; this repeats it, and the release-version gate is what will be
-# taught to compare the two.
+# version; this repeats it (without the v), and the release-version gate
+# refuses the pair drifting apart. `cook bump` moves both, and the lockfile
+# with them.
 [workspace.package]
 version = "0.2.2"
 edition = "2024"

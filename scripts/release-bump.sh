@@ -2,9 +2,15 @@
 # Move the release version everywhere it is written down, in one command.
 #
 # install.sh owns the version; the Cookfile repeats it because recipe output
-# paths are literals - four places, which is three too many to edit by hand
-# without one drifting. This rewrites all of them from the one value given,
-# and the release-version gate stays the check that nothing was missed.
+# paths are literals; the Cargo workspace claims it again in Cargo.toml, and
+# the lockfile repeats that once per workspace member - which the release
+# workflow's `--locked` verify turns into a red tag if it lags. This rewrites
+# all of them from the one value given, and the release-version gate stays
+# the check that nothing was missed.
+#
+# The lockfile edit touches only sourceless blocks - packages with no
+# `source =` line, which is how Cargo marks workspace-local crates - because
+# a dependency is allowed to share our version number and must not move.
 #
 # The stamp is cleared, not kept: between this bump and `cook stamp` the old
 # checksum describes an artifact this version will never be, and a stale sum
@@ -25,7 +31,9 @@ esac
 
 install_sh="$root/install.sh"
 cookfile="$root/Cookfile"
-for f in "$install_sh" "$cookfile"; do
+cargo_toml="$root/Cargo.toml"
+cargo_lock="$root/Cargo.lock"
+for f in "$install_sh" "$cookfile" "$cargo_toml" "$cargo_lock"; do
   [ -f "$f" ] || { echo "no $f to bump" >&2; exit 1; }
 done
 
@@ -38,7 +46,7 @@ fi
 
 # install.sh: the version, and the stamp it no longer has.
 tmp="$install_sh.tmp.$$"
-trap 'rm -f "$tmp" "$cookfile.tmp.$$"' EXIT
+trap 'rm -f "$tmp" "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"' EXIT
 sed -e 's|^AYEAYE_VERSION=".*"$|AYEAYE_VERSION="'"$version"'"|' \
     -e 's|^AYEAYE_SHA256=".*"$|AYEAYE_SHA256=""|' "$install_sh" > "$tmp"
 grep -q "^AYEAYE_VERSION=\"$version\"\$" "$tmp" \
@@ -55,13 +63,49 @@ if grep -q "$old" "$cookfile.tmp.$$"; then
   exit 1
 fi
 
+# Cargo.toml: the one version line inside [workspace.package], and nothing
+# else - the bare number can legitimately appear elsewhere in the manifest as
+# a dependency requirement.
+old_plain="${old#v}"
+new_plain="${version#v}"
+awk -v old="$old_plain" -v new="$new_plain" '
+  /^\[/ { wp = ($0 == "[workspace.package]") }
+  wp && $0 == "version = \"" old "\"" { print "version = \"" new "\""; next }
+  { print }
+' "$cargo_toml" > "$cargo_toml.tmp.$$"
+grep -q "^version = \"$new_plain\"\$" "$cargo_toml.tmp.$$" \
+  || { echo "could not write the version into $cargo_toml" >&2; exit 1; }
+
+# Cargo.lock: the workspace members repeat the manifest's claim, and cargo
+# refuses --locked over a lock that lags it. Only sourceless blocks move.
+awk -v old="$old_plain" -v new="$new_plain" '
+  function flush(   i, sourced, line) {
+    if (!n) return
+    sourced = 0
+    for (i = 1; i <= n; i++) if (buf[i] ~ /^source = /) sourced = 1
+    for (i = 1; i <= n; i++) {
+      line = buf[i]
+      if (!sourced && line == "version = \"" old "\"") line = "version = \"" new "\""
+      print line
+    }
+    n = 0
+  }
+  /^\[/ { flush(); inblock = ($0 == "[[package]]") }
+  { if (inblock) buf[++n] = $0; else print }
+  END { flush() }
+' "$cargo_lock" > "$cargo_lock.tmp.$$"
+grep -q "^version = \"$new_plain\"\$" "$cargo_lock.tmp.$$" \
+  || { echo "could not write the version into $cargo_lock" >&2; exit 1; }
+
 cat "$tmp" > "$install_sh"
 cat "$cookfile.tmp.$$" > "$cookfile"
+cat "$cargo_toml.tmp.$$" > "$cargo_toml"
+cat "$cargo_lock.tmp.$$" > "$cargo_lock"
 trap - EXIT
-rm -f "$tmp" "$cookfile.tmp.$$"
+rm -f "$tmp" "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"
 
 cat <<EOF
-bumped $old -> $version in install.sh and the Cookfile.
+bumped $old -> $version in install.sh, the Cookfile, Cargo.toml and Cargo.lock.
 The stamp was cleared; the release flow from here:
 
   commit this, then:

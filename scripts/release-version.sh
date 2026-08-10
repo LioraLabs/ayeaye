@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # Where the released version is written down: AYEAYE_VERSION at the top of
-# install.sh, which is also the value the bootstrap fetches by. The Cookfile
-# and the README derive from it, and the release-version gate checks that they
-# have not drifted.
-#
-# The Cargo workspace also claims a version, in Cargo.toml, and nothing here
-# knows about it: `cook bump` will not move it and this gate will not notice.
-# Teaching both is AYEAYE-59's, along with the fact that cargo writes it
-# without the `v` this file carries.
+# install.sh, which is also the value the bootstrap fetches by. The Cookfile,
+# the README and the Cargo workspace (Cargo.toml and its lockfile, both
+# without the `v` this file carries) all repeat it; `cook bump` moves every
+# claim and the release-version gate checks that none has drifted.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
