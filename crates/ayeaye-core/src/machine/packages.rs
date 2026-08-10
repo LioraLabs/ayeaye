@@ -136,11 +136,25 @@ pub fn blocker(
     None
 }
 
-/// What this machine would run to install those packages, or nothing at all.
+/// Why there is no command to give.
 ///
-/// `None` whenever this layer may not act, because an install command it is not
-/// allowed to run is worse than no command: somebody pastes it, it fails halfway
-/// or does not survive a reboot, and the reason was known here all along.
+/// The shell returns two different non-zero statuses here and writes a paragraph
+/// about why: `1` is a fact about the machine, `2` is a bug in the caller. They
+/// are kept apart because reporting a caller's mistake to a user as "your
+/// platform is unsupported" would send them looking in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCommand {
+    /// This machine cannot, and here is which of the five reasons.
+    Blocked(Blocker),
+    /// Nothing was named to install. A bug above this layer.
+    NothingNamed,
+}
+
+/// What this machine would run to install those packages, or why it cannot.
+///
+/// An install command this layer may not run is worse than no command: somebody
+/// pastes it, it fails halfway or does not survive a reboot, and the reason was
+/// known here all along.
 ///
 /// apt-get is handed `DEBIAN_FRONTEND=noninteractive` through `env`, because a
 /// debconf prompt in the middle of something that promised to be unattended is a
@@ -152,9 +166,12 @@ pub fn install_command(
     homebrew: Option<&Homebrew>,
     privilege: Privilege,
     logical: &[&str],
-) -> Option<String> {
-    if logical.is_empty() || blocker(platform, packaging, homebrew, privilege).is_some() {
-        return None;
+) -> Result<String, NoCommand> {
+    if logical.is_empty() {
+        return Err(NoCommand::NothingNamed);
+    }
+    if let Some(blocker) = blocker(platform, packaging, homebrew, privilege) {
+        return Err(NoCommand::Blocked(blocker));
     }
     let names: Vec<String> = logical
         .iter()
@@ -176,8 +193,13 @@ pub fn install_command(
         // installed in its prefix and not yet on `PATH` — which is where one
         // installed a minute ago lives — would produce a command line that dies
         // with command-not-found.
-        PackageManager::Brew => vec![homebrew?.invocation.as_str(), "install"],
-        PackageManager::None => return None,
+        PackageManager::Brew => match homebrew {
+            Some(brew) => vec![brew.invocation.as_str(), "install"],
+            // Unreachable through `blocker`, which answers NoHomebrew first;
+            // named rather than unwrapped so a future caller cannot reach it.
+            None => return Err(NoCommand::Blocked(Blocker::NoHomebrew)),
+        },
+        PackageManager::None => return Err(NoCommand::Blocked(Blocker::NoPackageManager)),
     };
     let mut words: Vec<String> = Vec::new();
     if needs_root(packaging.manager) && privilege == Privilege::Sudo {
@@ -185,7 +207,7 @@ pub fn install_command(
     }
     words.extend(verb.into_iter().map(quote));
     words.extend(names);
-    Some(words.join(" "))
+    Ok(words.join(" "))
 }
 
 /// What to tell a person, when this layer will not do it for them.
@@ -208,8 +230,8 @@ pub fn manual_hint(
     };
     let first = match blocker(platform, packaging, homebrew, privilege) {
         None => match install_command(platform, packaging, homebrew, privilege, logical) {
-            Some(command) => format!("install them with: {command}"),
-            None => format!("install them with {}.", packaging.manager.as_str()),
+            Ok(command) => format!("install them with: {command}"),
+            Err(_) => format!("install them with {}.", packaging.manager.as_str()),
         },
         Some(Blocker::ImageBased) => match platform.family {
             Family::Fedora => format!(
@@ -284,7 +306,9 @@ fn quote(word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blocker, Privilege, blocker, install_command, manual_hint, name, quote};
+    use super::{
+        Blocker, NoCommand, Privilege, blocker, install_command, manual_hint, name, quote,
+    };
     use crate::machine::fixture;
     use crate::machine::platform::{
         Family, Homebrew, Os, PackageManager, Packaging, Platform, identify, packaging,
@@ -332,7 +356,7 @@ mod tests {
     fn command(
         parts: &(Platform, Packaging, Option<Homebrew>),
         privilege: Privilege,
-    ) -> Option<String> {
+    ) -> Result<String, NoCommand> {
         install_command(&parts.0, &parts.1, parts.2.as_ref(), privilege, LIST)
     }
 
@@ -359,20 +383,23 @@ mod tests {
             let parts = machine(os_release);
             assert_eq!(
                 command(&parts, Privilege::Sudo).as_deref(),
-                Some(golden.trim_end_matches('\n')),
+                Ok(golden.trim_end_matches('\n')),
                 "the generated command no longer matches its fixture for {}",
                 parts.0.id
             );
         }
         assert_eq!(
             command(&a_mac_with_brew(), Privilege::Sudo).as_deref(),
-            Some(fixture!("pkg-commands/macos").trim_end_matches('\n'))
+            Ok(fixture!("pkg-commands/macos").trim_end_matches('\n'))
         );
     }
 
     // AYEAYE-62 — the fixture directory is a reference, and a reference with a
-    // family missing from it reads as complete. A sixth family has to arrive
-    // with its file, and there is nowhere else that would say so.
+    // family missing from it reads as complete. The shell's equivalent
+    // enumerates the directory; a pure crate cannot, so the guard here is the
+    // compiler: a sixth family added to `Family` makes the match in `name`
+    // non-exhaustive, and its `include_str!` has to be written by hand below.
+    // This asserts only that each of the five really holds a command.
     #[test]
     fn every_family_this_layer_supports_has_a_command_fixture() {
         for golden in [
@@ -455,7 +482,10 @@ mod tests {
     #[test]
     fn a_session_that_cannot_become_root_gets_no_command_and_a_reason() {
         let debian = machine(fixture!("os-release/debian-12"));
-        assert_eq!(command(&debian, Privilege::None), None);
+        assert_eq!(
+            command(&debian, Privilege::None),
+            Err(NoCommand::Blocked(Blocker::NoRoot))
+        );
         assert_eq!(
             blocker(&debian.0, &debian.1, None, Privilege::None),
             Some(Blocker::NoRoot)
@@ -480,10 +510,38 @@ mod tests {
             blocker(&silverblue.0, &silverblue.1, None, Privilege::Sudo),
             Some(Blocker::ImageBased)
         );
-        assert_eq!(command(&silverblue, Privilege::Sudo), None);
+        assert_eq!(
+            command(&silverblue, Privilege::Sudo),
+            Err(NoCommand::Blocked(Blocker::ImageBased))
+        );
         assert!(
             manual_hint(&silverblue.0, &silverblue.1, None, Privilege::Sudo, LIST)[0]
                 .contains("rpm-ostree install"),
+        );
+    }
+
+    // AYEAYE-62 — the order the blockers are noticed in is the order the shell
+    // notices them in, and it is load-bearing rather than incidental. An
+    // image-based Mac with no Homebrew has two things wrong with it, and being
+    // told to install Homebrew — onto a system whose package manager cannot
+    // install into the running image anyway — is advice that cannot be followed.
+    #[test]
+    fn the_first_reason_reported_is_the_one_that_has_to_be_dealt_with_first() {
+        let mut immutable_mac = a_mac_with_brew();
+        immutable_mac.0.immutable = true;
+        assert_eq!(
+            blocker(&immutable_mac.0, &immutable_mac.1, None, Privilege::Sudo),
+            Some(Blocker::ImageBased),
+            "image-based comes before no-homebrew, as platform_pkg_blocker has it"
+        );
+        // And a platform with no name, whose package manager is therefore also
+        // missing: "ayeaye has never heard of this" is the useful half.
+        let stranger = identify(Some("ID=plan9\n"), Some("Linux"), Some("x86_64"), None);
+        let nothing = packaging(stranger.family, false, &[], None);
+        assert_eq!(
+            blocker(&stranger, &nothing, None, Privilege::None),
+            Some(Blocker::UnknownPlatform),
+            "unknown-platform comes before no-package-manager and no-root"
         );
     }
 
@@ -563,7 +621,16 @@ mod tests {
         let debian = machine(fixture!("os-release/debian-12"));
         assert_eq!(
             install_command(&debian.0, &debian.1, None, Privilege::Sudo, &[]),
-            None
+            Err(NoCommand::NothingNamed),
+            "a caller that named nothing is a bug above this layer, and must not \
+             be told its platform is unsupported"
+        );
+        // The distinction the shell writes a paragraph about, kept: the same
+        // call on a machine that genuinely cannot act answers differently.
+        assert_eq!(
+            install_command(&debian.0, &debian.1, None, Privilege::None, &[]),
+            Err(NoCommand::NothingNamed),
+            "a caller bug is a caller bug whatever the machine is"
         );
     }
 
@@ -580,6 +647,36 @@ mod tests {
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(quote("$(whoami)"), "'$(whoami)'");
         assert_eq!(quote("`id`"), "'`id`'");
+
+        // The set is `_platform_quote`'s, character for character. Pinned whole,
+        // because narrowing it only over-quotes and widening it is how a package
+        // name becomes a second command.
+        for safe in [
+            "a",
+            "Z",
+            "0",
+            ".",
+            "_",
+            "/",
+            "@",
+            "%",
+            "+",
+            ":",
+            "=",
+            "-",
+            "a.b_c/d@e%f+g:h=i-j",
+        ] {
+            assert_eq!(quote(safe), safe, "{safe} needs no quoting");
+        }
+        for unsafe_word in [
+            " ", "\t", "\n", "*", "?", "[", "]", "{", "}", "(", ")", "<", ">", "|", "&", ";", "!",
+            "#", "~", "^", "\\", "\"", "'", "$",
+        ] {
+            assert!(
+                quote(unsafe_word).starts_with('\''),
+                "{unsafe_word:?} must be quoted"
+            );
+        }
     }
 
     // AYEAYE-62 — and a name carrying a shell metacharacter really does come out

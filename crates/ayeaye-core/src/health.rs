@@ -124,6 +124,26 @@ impl Report {
         self.checks.push(check);
     }
 
+    /// Record the one check that can fail the whole step, from its evidence.
+    ///
+    /// The verdict and the alarm come from one call because they are one
+    /// decision. Recording the check and setting [`Report::insecure`] as two
+    /// steps is a step that can be forgotten, and forgetting it turns "anybody
+    /// who can reach this address can run commands on this computer" into
+    /// "something is unfinished" — the distinction the module doc calls one exit
+    /// code wide.
+    pub fn record_auth(&mut self, claim: &str, code: Option<u16>) -> Verdict {
+        let (verdict, insecure) = unauthenticated(code);
+        self.insecure |= insecure;
+        self.record(Check {
+            name: "auth",
+            claim: claim.to_string(),
+            verdict,
+            detail: code.map(|code| format!("an unauthenticated request answered {code}")),
+        });
+        verdict
+    }
+
     /// How many came out that way.
     pub fn count(&self, verdict: Verdict) -> usize {
         self.checks
@@ -166,31 +186,35 @@ impl Report {
 /// can reach that address can run commands on this computer, which is the worst
 /// thing this project can do to somebody.
 pub fn insecure_warning(url: &str) -> Vec<String> {
-    [
-        "STOP. Something answered a request that carried no key, and",
-        "answered it in full. Whatever is on {url} can be",
-        "driven by anybody who can reach that address, and driving",
-        "ayeaye means running commands on this computer.",
-        "Either something else is listening on that port, or the key",
-        "has been switched off. Do not open this from your phone until",
-        "you know which.",
+    vec![
+        "STOP. Something answered a request that carried no key, and".to_string(),
+        format!("answered it in full. Whatever is on {url} can be"),
+        "driven by anybody who can reach that address, and driving".to_string(),
+        "ayeaye means running commands on this computer.".to_string(),
+        "Either something else is listening on that port, or the key".to_string(),
+        "has been switched off. Do not open this from your phone until".to_string(),
+        "you know which.".to_string(),
     ]
-    .iter()
-    .map(|line| line.replace("{url}", url))
-    .collect()
 }
 
 /// Is the service running?
 ///
-/// `asked` is what the manager's own status command exited with, and `None` is
-/// "there was no command to run" — which is the answer on a machine with no
-/// service manager, and is [`Verdict::Skipped`] rather than a failure: ayeaye
-/// started by hand is a supported way to use it.
-pub fn service(asked: Option<bool>) -> Verdict {
-    match asked {
-        None => Verdict::Skipped,
-        Some(true) => Verdict::Passed,
-        Some(false) => Verdict::Failed,
+/// Four answers, as `_health_check_service` has four, and they are not three:
+///
+/// - **no manager** (`has_manager` false) — skipped. A machine with no user
+///   service manager is not a machine with a broken service; ayeaye started by
+///   hand is a supported way to use it.
+/// - **a manager, and no command to run** (`asked` is `None`) — unknown. This is
+///   reachable: a Mac whose `id` would not answer has a launchd and no domain to
+///   address, so `Session::command` refuses. Something was asked for and setup
+///   could not tell, which is not the same as nothing having been asked for.
+/// - **the command ran** — passed or failed.
+pub fn service(has_manager: bool, asked: Option<bool>) -> Verdict {
+    match (has_manager, asked) {
+        (false, _) => Verdict::Skipped,
+        (true, None) => Verdict::Unknown,
+        (true, Some(true)) => Verdict::Passed,
+        (true, Some(false)) => Verdict::Failed,
     }
 }
 
@@ -274,12 +298,21 @@ pub fn hosts(configured: &[Option<u16>], stranger: Option<u16>) -> Verdict {
 /// its job is to say whether the result answers. A refusal counts as an answer:
 /// without a key ayeaye is supposed to refuse, and a refusal proves the address
 /// reaches it.
-pub fn https(host: Option<&str>, code: Option<u16>) -> Verdict {
-    if host.is_none_or(str::is_empty) {
+pub fn https(asked_for: bool, host: Option<&str>, code: Option<u16>) -> Verdict {
+    if !asked_for {
         return Verdict::Skipped;
+    }
+    // Asked for, and setup cannot tell which address to try. Not "you did not
+    // ask for this": somebody configured a front end and this could not check
+    // it, which is the floor of the whole step broken from the other side.
+    if host.is_none_or(str::is_empty) {
+        return Verdict::Unknown;
     }
     match code {
         None => Verdict::Unknown,
+        // A refusal counts. Without a key ayeaye is supposed to refuse, and a
+        // refusal proves the address reaches it — `_health_is_answer` is
+        // `2*|3*|401|403` and this is that list.
         Some(code) if (200..400).contains(&code) || code == 401 || code == 403 => Verdict::Passed,
         Some(_) => Verdict::Failed,
     }
@@ -326,24 +359,18 @@ pub fn tmux(present: bool) -> Verdict {
 /// the case that matters: `machine::tier` detects and names the card and reports
 /// [`Usability::Unsupported`] because candle has no ROCm backend, and this
 /// repeats that verdict in its own words rather than inventing a cheerier one.
-pub fn acceleration(build: &str, machine: &Machine) -> Check {
+pub fn acceleration(build: Acceleration, machine: &Machine) -> Check {
     let (verdict, claim, detail) = match (machine.usability(), machine.acceleration()) {
-        (Usability::Usable, Acceleration::Cuda) if build != "cuda" => (
+        // Usable acceleration this build was not compiled for. One arm for both
+        // kinds, because the fact is the same fact and the card names itself.
+        (Usability::Usable, found) if found != build => (
             Verdict::Failed,
             "this build is using the graphics card in this machine".to_string(),
             Some(format!(
-                "there is a usable {} here and this is a {build} build, so \
+                "there is a usable {} here and this is a {} build, so \
                  transcription runs on the processor and will be slow",
-                machine.gpu_name().unwrap_or("NVIDIA card")
-            )),
-        ),
-        (Usability::Usable, Acceleration::Metal) if build != "metal" => (
-            Verdict::Failed,
-            "this build is using the graphics card in this machine".to_string(),
-            Some(format!(
-                "there is a usable {} here and this is a {build} build, so \
-                 transcription runs on the processor and will be slow",
-                machine.gpu_name().unwrap_or("Apple GPU")
+                machine.gpu_name().unwrap_or(found.as_str()),
+                build.as_str()
             )),
         ),
         (Usability::Usable, _) => (
@@ -414,7 +441,7 @@ mod tests {
         Check, Outcome, Report, Verdict, acceleration, agents, hosts, https, insecure_warning,
         local, service, service_claim, tmux, unauthenticated,
     };
-    use crate::machine::{Machine, Probes, Usability};
+    use crate::machine::{Acceleration, Machine, Probes, Usability};
 
     /// The captured probe output, reaching this crate the only way it may.
     ///
@@ -510,6 +537,13 @@ mod tests {
         assert_eq!(unauthenticated(Some(200)), (Verdict::Failed, true));
         assert_eq!(unauthenticated(Some(204)), (Verdict::Failed, true));
         assert_eq!(unauthenticated(Some(500)), (Verdict::Failed, false));
+        // A redirect is not "answered it in full". The shell's window is `2*`
+        // and this is that window: widening it would raise the loudest alarm
+        // this program has over a 302, which is how an alarm stops being
+        // believed.
+        assert_eq!(unauthenticated(Some(302)), (Verdict::Failed, false));
+        assert_eq!(unauthenticated(Some(399)), (Verdict::Failed, false));
+        assert_eq!(unauthenticated(Some(299)), (Verdict::Failed, true));
         assert_eq!(unauthenticated(None), (Verdict::Unknown, false));
     }
 
@@ -523,10 +557,31 @@ mod tests {
         unfinished.record(check("b", Verdict::Unknown));
         assert_eq!(unfinished.outcome(), Outcome::Unfinished);
 
+        // Through the one door, so the verdict and the alarm cannot come apart.
         let mut insecure = Report::default();
-        insecure.record(check("auth", Verdict::Failed));
-        insecure.insecure = true;
+        assert_eq!(
+            insecure.record_auth("the lock is on", Some(200)),
+            Verdict::Failed
+        );
         assert_eq!(insecure.outcome(), Outcome::Insecure);
+        assert!(
+            insecure.checks[0].detail.is_some(),
+            "the status is the evidence"
+        );
+
+        let mut locked = Report::default();
+        assert_eq!(
+            locked.record_auth("the lock is on", Some(401)),
+            Verdict::Passed
+        );
+        assert_eq!(locked.outcome(), Outcome::Done);
+
+        let mut unasked = Report::default();
+        assert_eq!(
+            unasked.record_auth("the lock is on", None),
+            Verdict::Unknown
+        );
+        assert_eq!(unasked.outcome(), Outcome::Unfinished, "and never Done");
         assert!(
             insecure_warning("http://127.0.0.1:8912")
                 .join(" ")
@@ -584,12 +639,31 @@ mod tests {
     // and a refusal proves the address reaches it.
     #[test]
     fn an_https_front_end_is_verified_and_a_refusal_proves_it_answers() {
-        assert_eq!(https(None, Some(200)), Verdict::Skipped);
-        assert_eq!(https(Some(""), Some(200)), Verdict::Skipped);
-        assert_eq!(https(Some("box.example"), Some(200)), Verdict::Passed);
-        assert_eq!(https(Some("box.example"), Some(401)), Verdict::Passed);
-        assert_eq!(https(Some("box.example"), Some(502)), Verdict::Failed);
-        assert_eq!(https(Some("box.example"), None), Verdict::Unknown);
+        // Nobody asked for a front end. The mode that keeps ayeaye on this
+        // computer has none by design.
+        assert_eq!(https(false, None, Some(200)), Verdict::Skipped);
+        assert_eq!(
+            https(false, Some("box.example"), Some(200)),
+            Verdict::Skipped
+        );
+        // Asked for, and there is no address to try. `_health_check_https`
+        // answers unknown here, and it matters: somebody *did* ask for this, and
+        // rendering it as "you did not ask" is the criterion's floor broken from
+        // the other side.
+        assert_eq!(https(true, None, Some(200)), Verdict::Unknown);
+        assert_eq!(https(true, Some(""), Some(200)), Verdict::Unknown);
+
+        assert_eq!(https(true, Some("box.example"), Some(200)), Verdict::Passed);
+        assert_eq!(https(true, Some("box.example"), Some(302)), Verdict::Passed);
+        // Both refusals count, and for the same reason: `_health_is_answer` is
+        // `2*|3*|401|403`, because a refusal proves the address reaches ayeaye.
+        // A reverse proxy answering 403 to an unauthenticated request is a
+        // working front end, not a broken one.
+        assert_eq!(https(true, Some("box.example"), Some(401)), Verdict::Passed);
+        assert_eq!(https(true, Some("box.example"), Some(403)), Verdict::Passed);
+        assert_eq!(https(true, Some("box.example"), Some(502)), Verdict::Failed);
+        assert_eq!(https(true, Some("box.example"), Some(404)), Verdict::Failed);
+        assert_eq!(https(true, Some("box.example"), None), Verdict::Unknown);
     }
 
     // AYEAYE-62 — a machine with no service manager is skipped and not failed:
@@ -597,9 +671,19 @@ mod tests {
     // what AYEAYE-61 left for this ticket.
     #[test]
     fn a_machine_with_no_service_manager_is_skipped_and_not_failed() {
-        assert_eq!(service(None), Verdict::Skipped);
-        assert_eq!(service(Some(true)), Verdict::Passed);
-        assert_eq!(service(Some(false)), Verdict::Failed);
+        assert_eq!(service(false, None), Verdict::Skipped);
+        assert_eq!(
+            service(false, Some(false)),
+            Verdict::Skipped,
+            "there is no manager, so nothing it might have answered matters"
+        );
+        assert_eq!(service(true, Some(true)), Verdict::Passed);
+        assert_eq!(service(true, Some(false)), Verdict::Failed);
+        // A manager, and no command to run against it. Reachable: a Mac whose
+        // `id` will not answer has a launchd and no domain to address, so
+        // Session::command refuses. Something was asked for and setup could not
+        // tell — which is not the same fact as nothing having been asked for.
+        assert_eq!(service(true, None), Verdict::Unknown);
     }
 
     // AYEAYE-62 — and what a pass is worth differs by platform, so the sentence
@@ -649,16 +733,79 @@ mod tests {
         });
         assert_eq!(machine.usability(), Usability::Usable);
 
-        let said = acceleration("cpu", &machine);
+        let said = acceleration(Acceleration::Cpu, &machine);
         assert_eq!(said.verdict, Verdict::Failed);
         let detail = said.detail.expect("it must name the card");
         assert!(detail.contains("NVIDIA GeForce RTX 4090"), "{detail}");
         assert!(detail.contains("slow"), "{detail}");
 
         // The same machine, built for it, has nothing to report.
-        let matched = acceleration("cuda", &machine);
+        let matched = acceleration(Acceleration::Cuda, &machine);
         assert_eq!(matched.verdict, Verdict::Passed);
         assert!(matched.claim.contains("RTX 4090"), "{}", matched.claim);
+
+        // And a build compiled for the *other* card is just as wrong as a
+        // processor build: what matters is that the acceleration this machine
+        // has is not the acceleration this binary can use.
+        let mismatched = acceleration(Acceleration::Metal, &machine);
+        assert_eq!(mismatched.verdict, Verdict::Failed);
+        assert!(
+            mismatched
+                .detail
+                .is_some_and(|detail| detail.contains("metal build")),
+            "it must name the build, or nobody knows which artifact to replace"
+        );
+    }
+
+    // AYEAYE-62 — the same criterion the other way round: an Apple machine
+    // whose build cannot use its graphics.
+    #[test]
+    fn a_cpu_build_on_an_apple_machine_says_so_too() {
+        let machine = Machine::read(&Probes {
+            uname_s: Some("Darwin"),
+            uname_m: Some("arm64"),
+            sw_vers: Some(fixture!("sw_vers/macos-15.1")),
+            system_profiler: Some(fixture!("system_profiler/apple-m3-24gb")),
+            df_pk: Some(fixture!("df/roomy")),
+            ..Probes::default()
+        });
+        assert_eq!(machine.acceleration(), Acceleration::Metal);
+        assert_eq!(
+            acceleration(Acceleration::Cpu, &machine).verdict,
+            Verdict::Failed
+        );
+        assert_eq!(
+            acceleration(Acceleration::Metal, &machine).verdict,
+            Verdict::Passed
+        );
+    }
+
+    // AYEAYE-62 — a card that would not say how big it is. Not a kind of "too
+    // small": telling somebody their card is too small when what happened is
+    // that a command did not answer is a lie about their hardware. This is the
+    // one place in the module where "setup could not tell" is about the machine
+    // rather than about a request.
+    #[test]
+    fn a_card_that_would_not_say_its_size_is_unknown_and_not_declined() {
+        let machine = Machine::read(&Probes {
+            os_release: Some(fixture!("os-release/debian-12")),
+            uname_s: Some("Linux"),
+            uname_m: Some("x86_64"),
+            meminfo: Some(fixture!("meminfo/64gb")),
+            lscpu: Some(fixture!("lscpu/x86_64-8core")),
+            df_pk: Some(fixture!("df/roomy")),
+            nvidia_smi: Some("NVIDIA GeForce RTX 4090, [N/A]\n"),
+            ..Probes::default()
+        });
+        assert_eq!(machine.usability(), Usability::Unsized);
+        let said = acceleration(Acceleration::Cpu, &machine);
+        assert_eq!(said.verdict, Verdict::Unknown);
+        assert!(
+            said.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("would not say")),
+            "{said:?}"
+        );
     }
 
     // AYEAYE-62 — AMD, which is AYEAYE-60's deliberate departure carried
@@ -678,7 +825,7 @@ mod tests {
             rocminfo: Some(fixture!("rocminfo/gfx1100")),
             ..Probes::default()
         });
-        let said = acceleration("cpu", &machine);
+        let said = acceleration(Acceleration::Cpu, &machine);
         assert_eq!(said.verdict, Verdict::Skipped);
         assert!(
             said.claim
@@ -709,7 +856,7 @@ mod tests {
             nvidia_smi: Some(fixture!("nvidia-smi/gtx-1050")),
             ..Probes::default()
         });
-        let said = acceleration("cpu", &machine);
+        let said = acceleration(Acceleration::Cpu, &machine);
         assert_eq!(said.verdict, Verdict::Skipped);
         assert!(said.claim.contains("too small"), "{}", said.claim);
         assert!(
@@ -723,7 +870,7 @@ mod tests {
     // nagged about it.
     #[test]
     fn a_machine_with_no_card_is_not_told_it_is_missing_one() {
-        let said = acceleration("cpu", &Machine::read(&Probes::default()));
+        let said = acceleration(Acceleration::Cpu, &Machine::read(&Probes::default()));
         assert_eq!(said.verdict, Verdict::Passed);
         assert_eq!(said.detail, None);
     }

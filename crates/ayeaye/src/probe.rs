@@ -184,8 +184,17 @@ pub struct Captured {
 }
 
 impl Captured {
-    /// What the core reads, borrowed from what was captured.
-    pub fn probes(&self) -> Probes<'_> {
+    /// What the core reads, borrowed from what was captured — **without the
+    /// commands on `PATH`**.
+    ///
+    /// Private, and it has to stay private. `available_commands` is a slice of
+    /// `&str` that cannot be built inside this method and outlive it, so it is
+    /// left empty here and filled by [`Captured::machine`]. A caller reaching
+    /// for this directly would silently be told there is no package manager, no
+    /// service manager and no Homebrew — exactly the class of wrong answer
+    /// `Probes`' own doc ("`None` is never the same as an empty answer") exists
+    /// to prevent. Ask [`Captured::machine`] instead.
+    fn probes(&self) -> Probes<'_> {
         Probes {
             os_release: self.os_release.as_deref(),
             uname_s: self.uname_s.as_deref(),
@@ -223,11 +232,10 @@ impl Captured {
 
     /// The whole machine, judged.
     ///
-    /// The borrowed `available_commands` cannot be built inside [`probes`] — it
-    /// is a slice of `&str` and would not outlive the call — so it is assembled
-    /// here and the verdict is taken while it is alive.
-    ///
-    /// [`probes`]: Captured::probes
+    /// The borrowed `available_commands` cannot be built inside `probes` — it is
+    /// a slice of `&str` and would not outlive the call — so it is assembled
+    /// here and the verdict is taken while it is alive. That is the whole reason
+    /// this is the only door.
     pub fn machine(&self) -> ayeaye_core::Machine {
         let names: Vec<&str> = self.available.iter().map(String::as_str).collect();
         ayeaye_core::Machine::read(&Probes {
@@ -388,8 +396,12 @@ pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
     }
 
     // macOS only, and asked last so the two cheap `uname` calls have already
-    // said whether this is a Mac. `sw_vers` on anything else is a process
-    // started to be told it does not exist.
+    // said whether this is a Mac. The one gated probe, because it is the one
+    // whose *absence* the platform layer reads as a fact: `identify` falls back
+    // to `uname` when `sw_vers` says nothing, so running it on a Linux would be
+    // a process started to be told it does not exist. The other single-platform
+    // probes are ungated because a failure and an absence are the same answer to
+    // them — `None`.
     if captured.uname_s.as_deref().map(str::trim) == Some("Darwin") {
         captured.sw_vers = said(sources, &["sw_vers"]);
     }
@@ -778,6 +790,102 @@ mod tests {
 
         let mac_without_launchctl = Fake::default().says("uname -s", "Darwin\n");
         assert_eq!(session(&mac_without_launchctl), None);
+    }
+
+    // AYEAYE-62 — a container is judged on its share and not on the host it is
+    // running on, and every one of the four marks it leaves is read. None is
+    // reliable alone, which is why only their disjunction is a judgement worth
+    // making — so each is checked on its own here.
+    #[test]
+    fn a_container_is_detected_by_any_of_its_marks_and_judged_on_its_share() {
+        let host = |mark: &str| {
+            Fake::default()
+                .holds(
+                    "/etc/os-release",
+                    include_str!("../../../tests/fixtures/os-release/debian-12"),
+                )
+                .holds(
+                    "/proc/meminfo",
+                    include_str!("../../../tests/fixtures/meminfo/64gb"),
+                )
+                .holds(mark, "")
+                .holds(
+                    "/sys/fs/cgroup/memory.max",
+                    include_str!("../../../tests/fixtures/cgroup/memory-max-1g"),
+                )
+                .holds(
+                    "/sys/fs/cgroup/cpu.max",
+                    include_str!("../../../tests/fixtures/cgroup/cpu-max-two-cores"),
+                )
+                .says("uname -s", "Linux\n")
+                .says(
+                    "env LC_ALL=C lscpu",
+                    include_str!("../../../tests/fixtures/lscpu/x86_64-8core"),
+                )
+        };
+        for mark in [
+            "/.dockerenv",
+            "/run/.containerenv",
+            "/run/systemd/container",
+        ] {
+            let machine = capture(&host(mark), "/tmp/models").machine();
+            assert_eq!(machine.cores, Some(2), "{mark}: lscpu sees eight");
+            assert_eq!(machine.ram_mb, Some(1024), "{mark}: meminfo sees 64 GB");
+        }
+
+        // The fourth mark is an environment variable and nothing on disk, which
+        // is how podman and systemd-nspawn say it.
+        let mut by_variable = host("/nowhere");
+        by_variable
+            .environment
+            .insert("container".to_string(), "podman".to_string());
+        let machine = capture(&by_variable, "/tmp/models").machine();
+        assert_eq!(machine.ram_mb, Some(1024));
+
+        // A machine under a limit is judged on that limit whether or not it
+        // left a container mark: a systemd slice bounds an ordinary process just
+        // as a container runtime bounds one, and the marks say what this is, not
+        // what it may use.
+        let unmarked = capture(&host("/nowhere"), "/tmp/models").machine();
+        assert_eq!(unmarked.cores, Some(2));
+
+        // And with no limit to read anywhere, the whole machine is the answer.
+        let unlimited = Fake::default()
+            .holds(
+                "/proc/meminfo",
+                include_str!("../../../tests/fixtures/meminfo/64gb"),
+            )
+            .says("uname -s", "Linux\n")
+            .says(
+                "env LC_ALL=C lscpu",
+                include_str!("../../../tests/fixtures/lscpu/x86_64-8core"),
+            );
+        let whole = capture(&unlimited, "/tmp/models").machine();
+        assert_eq!(whole.cores, Some(8));
+        assert_eq!(whole.ram_mb, Some(64263));
+    }
+
+    // AYEAYE-62 — the limit that is really in force is the one at the path
+    // `/proc/self/cgroup` names, and the fixed path is a fallback rather than
+    // the answer: under a shared cgroup namespace `/sys/fs/cgroup/memory.max` is
+    // the *host's* root and says `max`, while the derived path carries the limit
+    // this process is actually under.
+    #[test]
+    fn a_containers_limit_is_read_where_its_own_cgroup_says_it_is() {
+        let nested = Fake::default()
+            .holds("/proc/self/cgroup", "0::/payload/leaf\n")
+            .holds("/sys/fs/cgroup/memory.max", "max\n")
+            .holds(
+                "/sys/fs/cgroup/payload/leaf/memory.max",
+                include_str!("../../../tests/fixtures/cgroup/memory-max-1g"),
+            )
+            .holds("/.dockerenv", "")
+            .holds(
+                "/proc/meminfo",
+                include_str!("../../../tests/fixtures/meminfo/64gb"),
+            )
+            .says("uname -s", "Linux\n");
+        assert_eq!(capture(&nested, "/tmp/models").machine().ram_mb, Some(1024));
     }
 
     // AYEAYE-62 — a name nobody captured would answer `false` for ever, which
