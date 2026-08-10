@@ -760,7 +760,7 @@ fn field(body: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("no {name} in {body}"))
         .1;
     let value = after
-        .split_once(|c| c == ',' || c == '}')
+        .split_once([',', '}'])
         .map_or(after, |(value, _)| value);
     value.trim_matches('"').to_string()
 }
