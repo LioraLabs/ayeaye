@@ -116,6 +116,231 @@ impl View {
     pub fn screen_text(&self) -> String {
         self.screen.join("\n")
     }
+
+    /// The history window as one block, which is what its token names.
+    pub fn hist_text(&self) -> String {
+        self.hist.join("\n")
+    }
+}
+
+/// What a diff answer says beyond the grid and the two tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Both tokens matched. The client renders nothing and the poll cost a
+    /// header.
+    Same,
+    /// Shed `drop` lines from the front of the history window the client holds,
+    /// append `add`, and replace the screen.
+    Patch {
+        /// How many lines have scrolled off the front of the window.
+        drop: usize,
+        /// The lines that have arrived at the back of it.
+        add: Vec<String>,
+        /// The screen, whole. It is only ever `rows` lines and a TUI rewrites
+        /// all of it, so there is nothing to diff.
+        screen: String,
+    },
+    /// Everything, because the client's token named a window this server no
+    /// longer remembers.
+    Full {
+        /// The history window entire.
+        hist: Vec<String>,
+        /// The screen, whole.
+        screen: String,
+    },
+}
+
+/// One answer to `/api/pane?df=1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diff {
+    /// The grid the capture was taken at, so the client renders at the width
+    /// tmux actually wrapped for.
+    pub cols: u16,
+    /// The grid's height.
+    pub rows: u16,
+    /// The token naming the history window this answer leaves the client
+    /// holding.
+    pub hh: String,
+    /// The token naming the screen it leaves the client holding.
+    pub sh: String,
+    /// What changed.
+    pub answer: Answer,
+}
+
+impl Diff {
+    /// The body, in `bin/ayeaye`'s own field order.
+    ///
+    /// The order is not decoration: it is what lets one daemon's answer be
+    /// compared to the other's byte for byte while both exist.
+    pub fn body(&self) -> String {
+        let mut body = format!(
+            "{{\"cols\":{},\"rows\":{},\"hh\":{},\"sh\":{}",
+            self.cols,
+            self.rows,
+            json::string(&self.hh),
+            json::string(&self.sh)
+        );
+        match &self.answer {
+            // `1` rather than `true`, because that is the value the daemon
+            // sends and `share/app.html` tests it for truth either way.
+            Answer::Same => body.push_str(",\"same\":1"),
+            Answer::Patch { drop, add, screen } => {
+                body.push_str(&format!(",\"drop\":{drop},\"add\":"));
+                push_lines(&mut body, add);
+                body.push_str(&format!(",\"screen\":{}", json::string(screen)));
+            }
+            Answer::Full { hist, screen } => {
+                body.push_str(",\"hist\":");
+                push_lines(&mut body, hist);
+                body.push_str(&format!(",\"screen\":{}", json::string(screen)));
+            }
+        }
+        body.push('}');
+        body
+    }
+}
+
+fn push_lines(body: &mut String, lines: &[String]) {
+    body.push('[');
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&json::string(line));
+    }
+    body.push(']');
+}
+
+/// The history windows recently served, so the next patch can be computed
+/// against the exact lines a client says it holds.
+///
+/// **Keyed on the pane and the token the client supplies**, never on who asked.
+/// That is what makes the endpoint free to proxy in the multi-host milestone:
+/// there is no per-client state to move, a miss costs one full send, and a
+/// restart costs the same. It is deliberately small for the same reason.
+#[derive(Debug, Clone)]
+pub struct Cache {
+    /// Oldest first, so eviction is from the front. Thirty-two entries is a
+    /// list, not a map: every operation here is one linear scan of it, and a
+    /// hash map with an insertion order beside it would be more machinery than
+    /// the thing it holds.
+    held: Vec<((String, String), Vec<String>)>,
+    max: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Cache {
+        Cache::new(Cache::DEFAULT_MAX)
+    }
+}
+
+impl Cache {
+    /// How many windows are remembered at once, as `bin/ayeaye` remembers them.
+    pub const DEFAULT_MAX: usize = 32;
+
+    /// One that holds `max` windows.
+    pub fn new(max: usize) -> Cache {
+        Cache {
+            held: Vec::new(),
+            max,
+        }
+    }
+
+    /// How many windows are held. For the suite, and for anyone wondering
+    /// whether the bound is doing anything.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// What changed since the capture the client says it holds.
+    ///
+    /// The patch is found by sliding. The old window and the new one are both
+    /// windows onto the same append-only scrollback, so the new one is the old
+    /// one shifted by `k` with fresh lines behind it. Any `k` with
+    /// `old[k..] == new[..old.len() - k]` reconstructs to exactly `new` when
+    /// applied — **the equation is the guarantee, not the intent behind the
+    /// match** — so a coincidental overlap is harmless and the smallest `k` is
+    /// merely the smallest payload. `k = old.len()` always satisfies it, which
+    /// is why this cannot fail: a resize that rewrapped every line degrades to a
+    /// full send in patch clothing rather than to an error.
+    pub fn diff(
+        &mut self,
+        pane: &str,
+        view: &View,
+        cols: u16,
+        rows: u16,
+        had_hist: &str,
+        had_screen: &str,
+    ) -> Diff {
+        let screen = view.screen_text();
+        let hh = token(&view.hist_text());
+        let sh = token(&screen);
+
+        // Looked up before the insert, because a client that is up to date names
+        // the window this call is about to store and the two would be the same
+        // entry. A client that names nothing gets no lookup at all.
+        let prev = if had_hist.is_empty() {
+            None
+        } else {
+            self.recall(pane, had_hist)
+        };
+        self.remember(pane, &hh, &view.hist);
+
+        let answer = if had_hist == hh && had_screen == sh {
+            Answer::Same
+        } else if let Some(prev) = prev {
+            let (drop, add) = patch(&prev, &view.hist);
+            Answer::Patch { drop, add, screen }
+        } else {
+            Answer::Full {
+                hist: view.hist.clone(),
+                screen,
+            }
+        };
+        Diff {
+            cols,
+            rows,
+            hh,
+            sh,
+            answer,
+        }
+    }
+
+    fn recall(&self, pane: &str, hh: &str) -> Option<Vec<String>> {
+        self.held
+            .iter()
+            .find(|((held_pane, held_hh), _)| held_pane == pane && held_hh == hh)
+            .map(|(_, lines)| lines.clone())
+    }
+
+    fn remember(&mut self, pane: &str, hh: &str, hist: &[String]) {
+        self.held
+            .retain(|((held_pane, held_hh), _)| held_pane != pane || held_hh != hh);
+        self.held
+            .push(((pane.to_string(), hh.to_string()), hist.to_vec()));
+        while self.held.len() > self.max {
+            self.held.remove(0);
+        }
+    }
+}
+
+/// How to get from the window the client holds to the one it should hold.
+///
+/// Returns how many lines to shed from the front and what to append. See
+/// [`Cache::diff`] for why this cannot fail.
+fn patch(prev: &[String], hist: &[String]) -> (usize, Vec<String>) {
+    for shed in 0..=prev.len() {
+        let kept = prev.len() - shed;
+        if kept <= hist.len() && prev[shed..] == hist[..kept] {
+            return (shed, hist[kept..].to_vec());
+        }
+    }
+    (prev.len(), hist.to_vec())
 }
 
 /// The whole capture as one block, for a client that does not speak the diff
@@ -144,10 +369,38 @@ pub fn whole_body(text: &str, cols: u16, rows: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{View, blank, lines, token, whole, whole_body};
+    use super::{Answer, Cache, Diff, View, blank, lines, token, whole, whole_body};
 
     fn owned(list: &[&str]) -> Vec<String> {
         list.iter().map(|line| line.to_string()).collect()
+    }
+
+    /// A view with a history window and a one-line screen.
+    fn view(hist: &[&str], screen: &[&str]) -> View {
+        View {
+            hist: owned(hist),
+            screen: owned(screen),
+        }
+    }
+
+    /// What a client holding `hist` would send back after being given `diff`,
+    /// and what it would then hold.
+    ///
+    /// This is `share/app.html`'s own rule — `outHist.slice(drop).concat(add)`
+    /// — written once so every case below can be asserted by *applying* the
+    /// patch rather than by reading `drop` and `add` back out of it. A test
+    /// that only checked the numbers would agree with a patch that reconstructs
+    /// the wrong window.
+    fn applied(held: &[String], diff: &Diff) -> Vec<String> {
+        match &diff.answer {
+            Answer::Same => held.to_vec(),
+            Answer::Full { hist, .. } => hist.clone(),
+            Answer::Patch { drop, add, .. } => {
+                let mut next = held[(*drop).min(held.len())..].to_vec();
+                next.extend(add.iter().cloned());
+                next
+            }
+        }
     }
 
     // AYEAYE-47 — a line that is blank apart from its colouring is blank. tmux
@@ -267,6 +520,231 @@ mod tests {
         assert_eq!(
             whole_body("\u{1b}[31mred\"", 0, 0),
             r#"{"text":"\u001b[31mred\"","cols":0,"rows":0}"#
+        );
+    }
+
+    // AYEAYE-47 — a client that is up to date is told so and nothing else. This
+    // is the common case by a long way: a pane nobody is typing into is polled
+    // every two seconds for as long as it is watched.
+    #[test]
+    fn matching_tokens_answer_same_and_carry_no_text() {
+        let mut cache = Cache::default();
+        let now = view(&["h1", "h2"], &["s1"]);
+        let first = cache.diff("desktop/%1", &now, 80, 24, "", "");
+        assert!(matches!(first.answer, Answer::Full { .. }));
+
+        let again = cache.diff("desktop/%1", &now, 80, 24, &first.hh, &first.sh);
+        assert_eq!(again.answer, Answer::Same);
+        assert_eq!(again.hh, first.hh);
+        assert_eq!(again.sh, first.sh);
+        assert_eq!(
+            again.body(),
+            format!(
+                r#"{{"cols":80,"rows":24,"hh":"{}","sh":"{}","same":1}}"#,
+                first.hh, first.sh
+            )
+        );
+    }
+
+    // AYEAYE-47 — a TUI repainting itself changes the screen and nothing above
+    // it, and that is the case the split exists for: the answer carries the
+    // screen alone and sheds nothing.
+    #[test]
+    fn a_repaint_carries_the_screen_alone() {
+        let mut cache = Cache::default();
+        let before = view(&["h1", "h2"], &["frame one"]);
+        let first = cache.diff("desktop/%1", &before, 80, 24, "", "");
+
+        let after = view(&["h1", "h2"], &["frame two"]);
+        let diff = cache.diff("desktop/%1", &after, 80, 24, &first.hh, &first.sh);
+        assert_eq!(
+            diff.answer,
+            Answer::Patch {
+                drop: 0,
+                add: Vec::new(),
+                screen: "frame two".to_string(),
+            }
+        );
+        assert_eq!(applied(&before.hist, &diff), after.hist);
+        assert_eq!(diff.hh, first.hh, "the history window did not move");
+    }
+
+    // AYEAYE-47 — a scroll carries only the lines that crossed into history.
+    // The window the client holds is capped, so old lines leave the front of it
+    // as new ones arrive at the back, and both ends have to be right or the
+    // client's transcript silently loses or repeats a line.
+    #[test]
+    fn a_scroll_carries_only_the_lines_that_crossed_into_history() {
+        let mut cache = Cache::default();
+        let before = view(&["h1", "h2", "h3"], &["s"]);
+        let first = cache.diff("desktop/%1", &before, 80, 24, "", "");
+
+        // Two lines scrolled off the top and two arrived at the bottom.
+        let after = view(&["h3", "h4", "h5"], &["s"]);
+        let diff = cache.diff("desktop/%1", &after, 80, 24, &first.hh, &first.sh);
+        assert_eq!(
+            diff.answer,
+            Answer::Patch {
+                drop: 2,
+                add: owned(&["h4", "h5"]),
+                screen: "s".to_string(),
+            }
+        );
+        assert_eq!(applied(&before.hist, &diff), after.hist);
+    }
+
+    // AYEAYE-47 — "a restart costs one full send". A client whose token names a
+    // window this server never minted, or minted for a different pane, gets
+    // everything rather than a patch computed against a guess.
+    #[test]
+    fn a_token_this_server_does_not_hold_costs_one_full_send() {
+        let mut cache = Cache::default();
+        let now = view(&["h1", "h2"], &["s"]);
+        let stale = cache.diff("desktop/%1", &now, 80, 24, "deadbeefcafe", "0123456789ab");
+        assert_eq!(
+            stale.answer,
+            Answer::Full {
+                hist: owned(&["h1", "h2"]),
+                screen: "s".to_string(),
+            }
+        );
+
+        // A token minted for another pane is another pane's window: the key is
+        // the pane *and* the token, or one pane's scrollback would be patched
+        // into another's. Keyed on the token alone, the call below would find
+        // %9's window and answer with a patch against it.
+        let mut fresh = Cache::default();
+        let theirs = fresh.diff("desktop/%9", &now, 80, 24, "", "");
+        let grown = view(&["h1", "h2", "h3"], &["s"]);
+        let mine = fresh.diff("desktop/%1", &grown, 80, 24, &theirs.hh, &theirs.sh);
+        assert!(
+            matches!(mine.answer, Answer::Full { .. }),
+            "{:?} came from another pane's window",
+            mine.answer
+        );
+
+        // And a restart costs *at most* one full send, then patches again: a
+        // fresh cache is exactly what a restarted process has. It costs nothing
+        // at all while the pane is unchanged, because both tokens are computed
+        // from the capture rather than remembered — which is the same property
+        // from the other side.
+        assert_eq!(
+            Cache::default()
+                .diff("desktop/%1", &now, 80, 24, &stale.hh, &stale.sh)
+                .answer,
+            Answer::Same,
+            "a restart with nothing changed costs nothing"
+        );
+        let restarted = &mut Cache::default();
+        let later = view(&["h1", "h2", "h3"], &["s"]);
+        let after_restart = restarted.diff("desktop/%1", &later, 80, 24, &stale.hh, &stale.sh);
+        assert!(matches!(after_restart.answer, Answer::Full { .. }));
+        let later_still = view(&["h1", "h2", "h3"], &["s2"]);
+        let next = restarted.diff(
+            "desktop/%1",
+            &later_still,
+            80,
+            24,
+            &after_restart.hh,
+            &after_restart.sh,
+        );
+        assert!(matches!(next.answer, Answer::Patch { .. }), "{next:?}");
+    }
+
+    // AYEAYE-47 — the sliding match is an equation, not a guess: any shift that
+    // reconstructs the new window is correct, and a window with no overlap at
+    // all degrades to a full send in patch clothing rather than to an error.
+    // A rewrap after a resize is exactly that case.
+    #[test]
+    fn a_window_with_nothing_in_common_still_reconstructs() {
+        let mut cache = Cache::default();
+        let before = view(&["a", "b", "c"], &["s"]);
+        let first = cache.diff("desktop/%1", &before, 80, 24, "", "");
+
+        let rewrapped = view(&["x", "y"], &["s"]);
+        let diff = cache.diff("desktop/%1", &rewrapped, 40, 24, &first.hh, &first.sh);
+        assert_eq!(applied(&before.hist, &diff), rewrapped.hist);
+        assert_eq!(diff.cols, 40, "the new grid comes back with it");
+
+        // Repeated lines are where a shorter shift than the true one exists.
+        // It is still correct — applying it reconstructs the window — which is
+        // the whole claim.
+        let mut repeated = Cache::default();
+        let held = view(&["x", "x", "x"], &["s"]);
+        let one = repeated.diff("desktop/%1", &held, 80, 24, "", "");
+        let grown = view(&["x", "x", "x", "x"], &["s"]);
+        let two = repeated.diff("desktop/%1", &grown, 80, 24, &one.hh, &one.sh);
+        assert_eq!(applied(&held.hist, &two), grown.hist);
+
+        // An emptied window and an emptied client both reconstruct.
+        let mut edges = Cache::default();
+        let none = edges.diff("desktop/%1", &view(&[], &["s"]), 80, 24, "", "");
+        let some = edges.diff("desktop/%1", &view(&["a"], &["s"]), 80, 24, &none.hh, &none.sh);
+        assert_eq!(applied(&[], &some), owned(&["a"]));
+        let gone = edges.diff("desktop/%1", &view(&[], &["s"]), 80, 24, &some.hh, &some.sh);
+        assert_eq!(applied(&owned(&["a"]), &gone), Vec::<String>::new());
+    }
+
+    // AYEAYE-47 — the cache is bounded, and the bound is what keeps a server
+    // watching many panes from remembering every window any of them ever had.
+    // Oldest out first; a miss is one full send, which is the price of the
+    // bound and the reason it can be this small.
+    #[test]
+    fn the_cache_is_bounded_and_evicts_the_oldest_first() {
+        let mut cache = Cache::new(2);
+        let first = cache.diff("desktop/%1", &view(&["a"], &["s"]), 80, 24, "", "");
+        let second = cache.diff("desktop/%2", &view(&["b"], &["s"]), 80, 24, "", "");
+        cache.diff("desktop/%3", &view(&["c"], &["s"]), 80, 24, "", "");
+        assert_eq!(cache.len(), 2);
+
+        // The second pane's window is still held; the first pane's is gone.
+        // Asked in that order, because each of these calls stores a window of
+        // its own and so evicts one more.
+        let kept = cache.diff(
+            "desktop/%2",
+            &view(&["b", "e"], &["s"]),
+            80,
+            24,
+            &second.hh,
+            "",
+        );
+        assert!(matches!(kept.answer, Answer::Patch { .. }), "{kept:?}");
+        let evicted = cache.diff("desktop/%1", &view(&["a", "d"], &["s"]), 80, 24, &first.hh, "");
+        assert!(matches!(evicted.answer, Answer::Full { .. }), "{evicted:?}");
+        assert_eq!(Cache::DEFAULT_MAX, 32);
+        assert!(Cache::default().is_empty());
+    }
+
+    // AYEAYE-47 — the bodies, field for field, in the order `bin/ayeaye` writes
+    // them and with every name `share/app.html` reads. A line is a JSON string,
+    // so the escape bytes a coloured capture is full of cannot end one.
+    #[test]
+    fn the_diff_bodies_carry_the_names_the_panel_reads() {
+        let mut cache = Cache::default();
+        let before = view(&["h1"], &["\u{1b}[31ms\""]);
+        let full = cache.diff("desktop/%1", &before, 80, 24, "", "");
+        assert_eq!(
+            full.body(),
+            format!(
+                concat!(
+                    r#"{{"cols":80,"rows":24,"hh":"{}","sh":"{}","#,
+                    r#""hist":["h1"],"screen":"\u001b[31ms\""}}"#
+                ),
+                full.hh, full.sh
+            )
+        );
+
+        let after = view(&["h1", "h2"], &["s"]);
+        let patch = cache.diff("desktop/%1", &after, 80, 24, &full.hh, &full.sh);
+        assert_eq!(
+            patch.body(),
+            format!(
+                concat!(
+                    r#"{{"cols":80,"rows":24,"hh":"{}","sh":"{}","#,
+                    r#""drop":0,"add":["h2"],"screen":"s"}}"#
+                ),
+                patch.hh, patch.sh
+            )
         );
     }
 
