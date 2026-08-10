@@ -10,8 +10,10 @@
 //! fails the build. The rules, and how to amend one, are in
 //! `crates/constitution/README.md`.
 
+pub mod audio;
 pub mod identity;
 
+pub use audio::Pcm16kMono;
 pub use identity::Identity;
 
 /// The version this build claims to be.
