@@ -52,6 +52,12 @@ pub trait Processes: Source {
     ///
     /// tmux hands out the pane's shell, never the thing running in it, so every
     /// caller starts one level too high.
+    ///
+    /// **This is the only cheap way to ask about more than one process.** The
+    /// two inherited questions cost a file read each on Linux and a whole `ps`
+    /// each on macOS, so a caller that walks a tree by hand pays a process per
+    /// node on the platform where starting them is slowest. This one pays
+    /// once.
     fn descendant(&self, pid: u32, name: &str, depth: usize) -> Option<u32> {
         ayeaye_core::process::descendant(self, pid, name, depth)
     }

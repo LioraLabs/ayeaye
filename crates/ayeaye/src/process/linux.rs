@@ -74,6 +74,13 @@ impl Source for Linux {
     /// Sorted, because the order directories come back in is arbitrary and the
     /// walk takes the first match at a level — an unsorted answer would resolve
     /// a shell with two agents under it to a different one on different runs.
+    ///
+    /// macOS deliberately does *not* sort: `ps` order is the order the machine
+    /// reported, which is information, where directory order is noise. So the
+    /// two platforms can pick different agents from a shell running two of the
+    /// same name. That is a real divergence and it is the lesser one: the
+    /// alternative is a platform that picks a different agent from the same
+    /// machine twice in a row.
     fn children(&self, pid: u32) -> Vec<u32> {
         if !self.exists(pid) {
             return Vec::new();
@@ -282,7 +289,39 @@ mod tests {
         tree.thread_children(100, 140, "103");
         let mut got = tree.backend().children(100);
         got.sort_unstable();
-        assert_eq!(got, [101, 102, 103]);
+        assert_eq!(got, [101, 102, 103], "no thread's children were missed");
+    }
+
+    // AYEAYE-44 — the walk takes the first match at a level, so the order
+    // decides which agent a shell running two of the same name resolves to. The
+    // kernel's own order across threads is directory order, which is arbitrary,
+    // so leaving it alone means answering differently on different runs of the
+    // same machine. One thread, listing out of order, because two threads would
+    // make this test agree by luck half the time.
+    #[test]
+    fn children_come_back_in_a_stable_order() {
+        let tree = Tree::new("stable");
+        tree.process(100, "bash", 1, 0);
+        tree.thread_children(100, 100, "103 101 102");
+        assert_eq!(tree.backend().children(100), [101, 102, 103]);
+    }
+
+    // AYEAYE-44 — a process with no children is the common case, and the
+    // fallback must not be what answers for it: a scan per childless pid, once
+    // per node per level of a walk, is the whole-machine cost this backend is
+    // arranged to avoid. An empty children file is an answer, not a silence.
+    #[test]
+    fn an_empty_children_file_is_an_answer_and_not_a_reason_to_scan() {
+        let tree = Tree::new("leaf");
+        tree.process(100, "bash", 1, 0);
+        tree.thread_children(100, 100, "");
+        // Only a scan could find this one, and its stat says 100 is its parent.
+        tree.process(101, "codex", 100, 0);
+        assert_eq!(
+            tree.backend().children(100),
+            [],
+            "the kernel said none, and nothing went looking anyway"
+        );
     }
 
     // AYEAYE-44 — the targeted read is the point of this backend: it costs two
@@ -316,10 +355,14 @@ mod tests {
         assert_eq!(tree.backend().children(100), [101]);
     }
 
-    // AYEAYE-44
+    // AYEAYE-44 — a pid that is not there is answered without looking at
+    // anything else. The tree here holds a process whose stat still names the
+    // gone pid as its parent, which a scan would find and report as a child of
+    // a process that no longer exists.
     #[test]
     fn a_process_that_is_gone_has_no_children_and_no_name() {
         let tree = Tree::new("gone");
+        tree.process(101, "codex", 4242, 0);
         assert_eq!(tree.backend().children(4242), []);
         assert_eq!(tree.backend().comm(4242), None);
     }

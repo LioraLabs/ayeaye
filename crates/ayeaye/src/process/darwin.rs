@@ -8,11 +8,16 @@
 //! The sixth, `start_time`, is the one that is neither: it comes from the
 //! process information structure the kernel keeps, through `sysinfo`, rather
 //! than through `ps -o lstart=`. That is not tidiness. `lstart` prints a local
-//! wall-clock string truncated to the second, and turning it back into an
-//! instant needs the machine's timezone — which the core may not read and which
-//! nothing in this crate should be reinventing. **There is deliberately no
-//! `lstart` command line**, and restoring one in the name of parity with the
-//! Python would be restoring the round trip this replaces.
+//! wall-clock string, and turning it back into a moment in time needs the
+//! machine's timezone — which the core may not read and which nothing in this
+//! crate should be reinventing. **There is deliberately no `lstart` command
+//! line**, and restoring one in the name of parity with the Python would be
+//! restoring the round trip this replaces.
+//!
+//! It is whole seconds, where Linux keeps the fraction. So does `lstart`, and
+//! in the same direction: a start time that can only be earlier than the true
+//! one moves a session away from the lower edge of the window it is matched
+//! inside rather than off it. Worth knowing before anyone narrows that window.
 
 use ayeaye_core::process::{Source, Tree, lsof, ps};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -70,13 +75,7 @@ impl<T: Tool> Processes for Darwin<T> {
     /// avoid, and none of the rest of it is wanted here.
     fn start_time(&self, pid: u32) -> Option<f64> {
         let pid = Pid::from_u32(pid);
-        let mut table = System::new();
-        table.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        Some(table.process(pid)?.start_time() as f64)
+        Some(only(pid).process(pid)?.start_time() as f64)
     }
 
     fn cwd(&self, pid: u32) -> Option<String> {
@@ -107,9 +106,25 @@ impl<T: Tool> Processes for Darwin<T> {
     }
 }
 
+/// A process table holding one process, and nothing else about it.
+///
+/// Its own function so a test can count what it holds. The tutorial call
+/// refreshes every process on the machine, which is the cost this whole module
+/// is arranged to avoid, and none of the rest of it — memory, disk, threads,
+/// the command line — is wanted for a start time.
+fn only(pid: Pid) -> System {
+    let mut table = System::new();
+    table.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    table
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Darwin;
+    use super::{Darwin, only};
     use crate::process::Processes;
     use crate::process::tool::Tool;
     use ayeaye_core::process::Source;
@@ -314,5 +329,18 @@ mod tests {
             backend.tool.asked()
         );
         assert_eq!(backend.start_time(u32::MAX), None, "no such process");
+    }
+
+    // AYEAYE-44 — "targeted at the process being asked about" is the whole
+    // difference between this and the call that walks the machine, and it is
+    // one word in the argument rather than anything visible in the answer.
+    #[test]
+    fn the_process_table_is_refreshed_for_one_pid_and_no_others() {
+        let table = only(sysinfo::Pid::from_u32(std::process::id()));
+        assert_eq!(
+            table.processes().len(),
+            1,
+            "every other process on this machine was refreshed too"
+        );
     }
 }

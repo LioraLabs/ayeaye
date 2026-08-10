@@ -12,7 +12,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Something that can be asked a question about the machine.
 pub trait Tool {
@@ -60,38 +60,43 @@ impl Tool for Subprocess {
             .ok()?;
 
         // Read on another thread: a tool that fills the pipe while nobody is
-        // draining it blocks, and then so does the wait below.
-        let mut pipe = child.stdout.take()?;
-        let reading = std::thread::spawn(move || {
+        // draining it blocks on the write, and then so does anything waiting
+        // for it to exit. `ps -axww` on a busy Mac is tens of kilobytes against
+        // a pipe that starts at sixteen.
+        let Some(mut pipe) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut said = Vec::new();
             let _ = pipe.read_to_end(&mut said);
-            said
+            let _ = finished.send(said);
         });
 
-        let deadline = Instant::now() + self.patience;
-        let finished = loop {
-            match child.try_wait() {
-                // The exit status is deliberately not read. A non-zero exit is
-                // ordinary here and the output is the answer regardless.
-                Ok(Some(_)) => break true,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Out of patience, or the wait itself failed. The only process
-                // this ever signals is one it started.
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-            }
-        };
+        // The deadline is on the *call*, not on the child, and the difference
+        // is the case it exists for: `lsof` forks to do the work that can block
+        // on an unresponsive mount, so the child can exit while its own child
+        // holds the pipe open. Waiting for the child would return promptly and
+        // then wait forever for an end-of-file nobody is going to send.
+        //
+        // The reader is left to itself when that happens. It is blocked on a
+        // pipe whose only writer is a process this is about to kill, and it
+        // ends when the process does.
+        let said = done.recv_timeout(self.patience);
+        // The only process this ever signals is one it started itself.
+        let _ = child.kill();
+        let _ = child.wait();
 
-        let said = reading.join().ok()?;
-        // Lossily: no filesystem enforces valid UTF-8 in a path, and a strict
-        // decode would turn one unrelated process into an empty tree for every
-        // pane at once.
-        finished.then(|| String::from_utf8_lossy(&said).into_owned())
+        // The exit status is deliberately not read. A non-zero exit is ordinary
+        // here — `lsof` exits 1 over a file it could still report on — and the
+        // output is the answer regardless.
+        //
+        // Decoded lossily: no filesystem enforces valid UTF-8 in a path, and a
+        // strict decode would turn one unrelated process into an empty tree for
+        // every pane at once.
+        Some(String::from_utf8_lossy(&said.ok()?).into_owned())
     }
 }
 
@@ -151,6 +156,36 @@ mod tests {
             said.contains('\u{fffd}'),
             "the odd byte is replaced: {said:?}"
         );
+    }
+
+    // AYEAYE-44 — `lsof` forks to do the work that can block on an
+    // unresponsive mount, which is the hang the deadline exists for. A
+    // deadline on the child alone does not cover it: the child exits, and the
+    // read waits for a pipe its grandchild still holds open.
+    #[test]
+    fn the_deadline_covers_the_whole_call_and_not_only_the_child() {
+        let impatient = Subprocess {
+            patience: Duration::from_millis(200),
+        };
+        let started = Instant::now();
+        let said = impatient.run(&argv(&["sh", "-c", "sleep 3 & echo parent-done"]));
+        assert_eq!(said, None, "the deadline passed, so nothing was learned");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it waited {:?} for a pipe the exited child's own child still held",
+            started.elapsed()
+        );
+    }
+
+    // AYEAYE-44 — `ps -axww` on a busy Mac is tens of kilobytes against a pipe
+    // that starts at sixteen. A tool nobody is draining blocks on the write,
+    // and then so does whatever is waiting for it to exit.
+    #[test]
+    fn a_tool_that_fills_the_pipe_is_still_read() {
+        let said = Subprocess::default()
+            .run(&argv(&["sh", "-c", "yes ayeaye | head -c 400000"]))
+            .expect("four hundred kilobytes");
+        assert_eq!(said.len(), 400_000);
     }
 
     // AYEAYE-44 — a tool blocked on an unresponsive mount otherwise holds the
