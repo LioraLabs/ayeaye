@@ -225,3 +225,27 @@ fn a_model_can_be_loaded_unloaded_and_loaded_again() {
     assert!(slot.is_loaded());
     assert!(!slot.transcribe(&support::tone(1.0)).unwrap().is_empty());
 }
+
+// AYEAYE-54
+//
+// The window every released Whisper actually has. The other transcription
+// tests use a one-second window to keep their arithmetic readable, which means
+// none of them would notice if the 3 000-frame path were wrong — and 3 000 is
+// exactly where `pcm_to_mel`'s padding rounds differently. A real 30-second
+// window, and a clip that runs past it.
+#[test]
+fn a_thirty_second_window_is_the_shape_a_real_whisper_asks_for() {
+    let dir = tiny_model("real-window", &support::real_window_config());
+    let mut model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    let transcript = model
+        .transcribe(&support::tone(31.0))
+        .expect("thirty-one seconds should transcribe");
+
+    let spans: Vec<(f32, f32)> = transcript
+        .segments
+        .iter()
+        .map(|s| (s.start_secs, s.end_secs))
+        .collect();
+    assert_eq!(spans, vec![(0.0, 30.0), (30.0, 31.0)]);
+}

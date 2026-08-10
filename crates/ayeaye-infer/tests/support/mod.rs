@@ -261,3 +261,20 @@ pub fn tone(secs: f32) -> ayeaye_core::Pcm16kMono {
             .collect(),
     )
 }
+
+/// A config with the audio window a real Whisper has.
+///
+/// Every other model here uses a one-second window so the windowing arithmetic
+/// is legible. That leaves the number every released Whisper actually uses —
+/// 1 500 encoder positions, 3 000 mel frames, thirty seconds — exercised by
+/// nothing, and the mel padding behaves differently there: `pcm_to_mel` rounds
+/// its output up to a multiple of 1 500 and then adds 1 500 more, so 3 000 is
+/// the one width where the amount of padding is not what a small window would
+/// lead you to expect. The rest of the model stays tiny.
+pub fn real_window_config() -> Config {
+    Config {
+        max_source_positions: 1_500,
+        max_target_positions: 8,
+        ..tiny_config(vec![])
+    }
+}
