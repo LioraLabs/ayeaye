@@ -148,6 +148,230 @@ impl Layout {
     }
 }
 
+// ---------------------------------------------------------------- the session
+//
+// What the service manager is asked to do, and how it is addressed. Commands
+// come back as argv rather than as a string, so nothing here needs a shell and
+// nothing needs quoting: a plist path with a space in it is one element of a
+// vector rather than a quoting rule somebody has to get right.
+
+/// Something a service manager can be asked to do.
+///
+/// `start` and `stop` are deliberately the "leave enablement alone" pair on
+/// both platforms, so that stop-then-start behaves the same either side. Under
+/// launchd that makes `stop` a signal rather than a bootout — bootout is the
+/// unregistering one, and it is what `disable` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    /// Re-read the definition files. systemd only.
+    Reload,
+    /// Install and start, and keep it that way across logins. Under launchd
+    /// this is bootstrap, which needs the path of the plist.
+    Enable,
+    /// The inverse of enable: stop it, and do not bring it back.
+    Disable,
+    /// Start it now, leaving enablement alone.
+    Start,
+    /// Stop it now, leaving enablement alone.
+    Stop,
+    /// What is it doing.
+    Status,
+}
+
+/// Why there is no command to give.
+///
+/// The two are worth telling apart. Reporting a caller's mistake to a user as
+/// "your platform is unsupported" would send them looking in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// A fact about this machine: an operation that does not exist here, or
+    /// something needed to address it that is not known.
+    Machine(&'static str),
+    /// The call was wrong — a bug above this layer.
+    Caller(&'static str),
+}
+
+/// Who the service manager is, and how it is addressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// The service manager this machine's user session has.
+    pub manager: Manager,
+    /// The uid that addresses a launchd domain. systemd never needs one; on a
+    /// Mac where `id` could not be run this is `None`, and every launchd
+    /// command refuses rather than addressing the malformed `gui//label`.
+    pub uid: Option<String>,
+    /// The reverse-DNS prefix for a launchd label.
+    pub launchd_prefix: String,
+}
+
+impl Session {
+    /// A systemd user session.
+    pub fn systemd() -> Self {
+        Session {
+            manager: Manager::Systemd,
+            uid: None,
+            launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
+        }
+    }
+
+    /// A launchd session in the `gui/<uid>` domain.
+    pub fn launchd(uid: &str) -> Self {
+        Session {
+            manager: Manager::Launchd,
+            uid: Some(uid.to_string()),
+            launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
+        }
+    }
+
+    /// What this platform calls that service.
+    ///
+    /// A name is reduced to the bare logical one first and then dressed in the
+    /// local convention, so that one name works everywhere: `ayeaye`,
+    /// `ayeaye.service` and `dev.ayeaye` all come out as `ayeaye.service` under
+    /// systemd and `dev.ayeaye` under launchd. Shared code holds one name; it
+    /// must not matter which one.
+    pub fn unit_name(&self, name: &str) -> Result<String, Unavailable> {
+        if name.is_empty() {
+            return Err(Unavailable::Caller("a service with no name"));
+        }
+        // Strip whichever platform's clothes it arrived in.
+        let bare = name
+            .strip_prefix(&format!("{}.", self.launchd_prefix))
+            .unwrap_or(name);
+        let bare = bare.strip_suffix(".service").unwrap_or(bare);
+        Ok(match self.manager {
+            Manager::Systemd => {
+                if bare.ends_with(".socket")
+                    || bare.ends_with(".timer")
+                    || bare.ends_with(".target")
+                {
+                    bare.to_string()
+                } else {
+                    format!("{bare}.service")
+                }
+            }
+            Manager::Launchd => label(bare, &self.launchd_prefix),
+        })
+    }
+
+    /// Where this platform keeps that service's definition.
+    pub fn definition_path(&self, name: &str, layout: &Layout) -> Result<String, Unavailable> {
+        let unit = self.unit_name(name)?;
+        Ok(match self.manager {
+            Manager::Systemd => format!("{}/{unit}", layout.unit_dir),
+            Manager::Launchd => format!("{}/{unit}.plist", layout.agent_dir),
+        })
+    }
+
+    /// The command for an operation, as argv, executing nothing.
+    ///
+    /// `unit_path` is only ever read by launchd's `enable`, which is a
+    /// bootstrap and needs the plist itself. Guessing one would be worse than
+    /// refusing.
+    pub fn command(
+        &self,
+        name: &str,
+        operation: Operation,
+        unit_path: Option<&str>,
+    ) -> Result<Vec<String>, Unavailable> {
+        let unit = self.unit_name(name)?;
+        match self.manager {
+            Manager::Systemd => Ok(systemd_command(operation, &unit)),
+            Manager::Launchd => {
+                // Every launchd command addresses a domain by uid. Without one
+                // the target would be the malformed `gui//label`, which is
+                // worse than saying this cannot be done.
+                let uid = self.uid.as_deref().ok_or(Unavailable::Machine(
+                    "no uid, so no launchd domain to address",
+                ))?;
+                launchd_command(operation, &unit, uid, unit_path)
+            }
+        }
+    }
+}
+
+fn systemd_command(operation: Operation, unit: &str) -> Vec<String> {
+    let words: Vec<&str> = match operation {
+        Operation::Reload => vec!["daemon-reload"],
+        Operation::Enable => vec!["enable", "--now", unit],
+        Operation::Disable => vec!["disable", "--now", unit],
+        Operation::Start => vec!["start", unit],
+        Operation::Stop => vec!["stop", unit],
+        Operation::Status => vec!["status", unit],
+    };
+    let mut argv = vec!["systemctl".to_string(), "--user".to_string()];
+    argv.extend(words.into_iter().map(str::to_string));
+    argv
+}
+
+fn launchd_command(
+    operation: Operation,
+    unit: &str,
+    uid: &str,
+    unit_path: Option<&str>,
+) -> Result<Vec<String>, Unavailable> {
+    let target = format!("gui/{uid}/{unit}");
+    let words: Vec<String> = match operation {
+        // launchd has no daemon-reload: a changed plist is re-read by being
+        // bootstrapped again, which is the enable step. Saying so beats
+        // inventing a command that does nothing.
+        Operation::Reload => {
+            return Err(Unavailable::Machine(
+                "launchd re-reads a plist by being bootstrapped again, not by reloading",
+            ));
+        }
+        Operation::Enable => {
+            let path = unit_path.ok_or(Unavailable::Machine(
+                "bootstrapping needs the path of the plist, and guessing one would be worse",
+            ))?;
+            vec![
+                "bootstrap".to_string(),
+                format!("gui/{uid}"),
+                path.to_string(),
+            ]
+        }
+        Operation::Disable => vec!["bootout".to_string(), target],
+        Operation::Start => vec!["kickstart".to_string(), target],
+        // A signal, not a bootout: stop must leave the service registered, the
+        // way `systemctl --user stop` does, or stop-then-start works on Linux
+        // and fails on a Mac with "Could not find service".
+        Operation::Stop => vec!["kill".to_string(), "SIGTERM".to_string(), target],
+        Operation::Status => vec!["print".to_string(), target],
+    };
+    let mut argv = vec!["launchctl".to_string()];
+    argv.extend(words);
+    Ok(argv)
+}
+
+// ------------------------------------------------------------- what to write
+
+/// What installing a rendered definition would do to the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    /// The definition on disk is already the generated one.
+    Unchanged,
+    /// There is nothing there yet.
+    Create,
+    /// Something is there and it differs. It is a generated file and this run
+    /// is going to replace it, but it may be an older version's or a person's,
+    /// so a copy is kept.
+    Replace,
+}
+
+/// What to do about a definition, given what is on disk and what was rendered.
+///
+/// Leaving an unchanged file alone is not an optimisation: it is the difference
+/// between repairing a service and disturbing one. No new timestamp, no backup
+/// of a file identical to its replacement, and a directory somebody has made
+/// read-only that already holds the right definition is not a failure.
+pub fn plan_install(existing: Option<&str>, rendered: &str) -> Install {
+    match existing {
+        None => Install::Create,
+        Some(text) if text == rendered => Install::Unchanged,
+        Some(_) => Install::Replace,
+    }
+}
+
 // ------------------------------------------------------------------ quoting
 //
 // Each format mangles a path in its own way, and both of them are silent about
@@ -358,7 +582,10 @@ fn label(name: &str, prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Definition, Layout, render_launchd, render_systemd, unrepresentable_in_systemd};
+    use super::{
+        DEFAULT_LAUNCHD_PREFIX, Definition, Install, Layout, Manager, Operation, Session,
+        Unavailable, plan_install, render_launchd, render_systemd, unrepresentable_in_systemd,
+    };
 
     /// The golden files the shell suite already compares against, brought in
     /// through the compiler because a pure crate may not open a file.
@@ -694,5 +921,261 @@ mod tests {
         assert!(agent.contains("<key>PATH</key>"));
         assert!(agent.contains("/opt/homebrew/bin"));
         assert!(agent.contains("/usr/local/bin"));
+    }
+
+    // --------------------------------------------------------- names and ops
+    //
+    // The expected strings below are the ones
+    // `tests/cases/platform_service_test.sh` already asserts, so the port can
+    // be read line against line. argv is joined with a space only to compare
+    // against the shell's spelling; nothing here is handed to a shell.
+
+    fn spelled(session: &Session, name: &str, operation: Operation) -> String {
+        session
+            .command(name, operation, None)
+            .expect("a command")
+            .join(" ")
+    }
+
+    // AYEAYE-61 — shared code holds one name for the service. It must not
+    // matter whether it was spelled the systemd way, the launchd way, or
+    // neither.
+    #[test]
+    fn one_name_works_whichever_platform_it_was_written_for() {
+        let systemd = Session::systemd();
+        for spelling in ["ayeaye", "ayeaye.service", "dev.ayeaye"] {
+            assert_eq!(
+                systemd.unit_name(spelling).expect("a unit"),
+                "ayeaye.service",
+                "{spelling} must not become anything else under systemd"
+            );
+        }
+        let launchd = Session::launchd("501");
+        for spelling in ["ayeaye", "ayeaye.service", "dev.ayeaye"] {
+            assert_eq!(
+                launchd.unit_name(spelling).expect("a label"),
+                "dev.ayeaye",
+                "{spelling} must not become anything else under launchd"
+            );
+        }
+    }
+
+    // AYEAYE-61 — a unit that is not a service keeps its own kind.
+    #[test]
+    fn a_unit_that_is_not_a_service_keeps_its_own_kind() {
+        let systemd = Session::systemd();
+        assert_eq!(
+            systemd.unit_name("ayeaye.socket").expect("a unit"),
+            "ayeaye.socket"
+        );
+        assert_eq!(
+            systemd.unit_name("ayeaye.timer").expect("a unit"),
+            "ayeaye.timer"
+        );
+        assert_eq!(
+            systemd.unit_name("ayeaye.target").expect("a unit"),
+            "ayeaye.target"
+        );
+    }
+
+    // AYEAYE-61 — the prefix is a tunable, and a name already carrying the new
+    // one is left alone rather than given it twice.
+    #[test]
+    fn the_launchd_prefix_is_a_tunable_and_really_is_used() {
+        let mut session = Session::launchd("501");
+        session.launchd_prefix = "com.example".to_string();
+        assert_eq!(
+            session.unit_name("ayeaye").expect("a label"),
+            "com.example.ayeaye"
+        );
+        assert_eq!(
+            session.unit_name("com.example.ayeaye").expect("a label"),
+            "com.example.ayeaye"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Start),
+            "launchctl kickstart gui/501/com.example.ayeaye"
+        );
+    }
+
+    // AYEAYE-61 — every systemd command, exactly as the shell spells it.
+    #[test]
+    fn systemd_generates_its_user_scoped_commands() {
+        let session = Session::systemd();
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Reload),
+            "systemctl --user daemon-reload"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Enable),
+            "systemctl --user enable --now ayeaye.service"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Disable),
+            "systemctl --user disable --now ayeaye.service"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Start),
+            "systemctl --user start ayeaye.service"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Stop),
+            "systemctl --user stop ayeaye.service"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Status),
+            "systemctl --user status ayeaye.service"
+        );
+    }
+
+    // AYEAYE-61 — this project installs a per-user service. Root is never
+    // right, and the system manager is a different thing entirely.
+    #[test]
+    fn every_systemd_command_is_user_scoped_and_none_asks_for_root() {
+        let session = Session::systemd();
+        for operation in [
+            Operation::Reload,
+            Operation::Enable,
+            Operation::Disable,
+            Operation::Start,
+            Operation::Stop,
+            Operation::Status,
+        ] {
+            let argv = session
+                .command("ayeaye", operation, None)
+                .expect("a command");
+            assert!(
+                argv.contains(&"--user".to_string()),
+                "{operation:?} left the user session"
+            );
+            assert!(
+                !argv.contains(&"sudo".to_string()),
+                "{operation:?} reached for root"
+            );
+        }
+    }
+
+    // AYEAYE-61 — every launchd command addresses a domain by uid.
+    #[test]
+    fn launchd_generates_domain_addressed_commands() {
+        let session = Session::launchd("501");
+        let plist = "/Users/John Smith/Library/LaunchAgents/dev.ayeaye.plist";
+        assert_eq!(
+            session
+                .command("ayeaye", Operation::Enable, Some(plist))
+                .expect("a command"),
+            vec!["launchctl", "bootstrap", "gui/501", plist],
+            "a path with a space in it is one element, not a quoting rule"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Disable),
+            "launchctl bootout gui/501/dev.ayeaye"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Start),
+            "launchctl kickstart gui/501/dev.ayeaye"
+        );
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Status),
+            "launchctl print gui/501/dev.ayeaye"
+        );
+    }
+
+    // AYEAYE-61 — bootout is the inverse of bootstrap, so mapping stop to it
+    // would make stop-then-start work on Linux and fail on a Mac with "Could
+    // not find service".
+    #[test]
+    fn stopping_leaves_the_service_registered_on_both_platforms() {
+        let session = Session::launchd("501");
+        assert_eq!(
+            spelled(&session, "ayeaye", Operation::Stop),
+            "launchctl kill SIGTERM gui/501/dev.ayeaye"
+        );
+        assert_ne!(
+            session.command("ayeaye", Operation::Stop, None),
+            session.command("ayeaye", Operation::Disable, None),
+            "stop and disable are different questions"
+        );
+    }
+
+    // AYEAYE-61 — the three refusals, and which kind each one is.
+    #[test]
+    fn a_refusal_says_whether_it_is_the_machine_or_the_caller() {
+        let launchd = Session::launchd("501");
+        assert!(
+            matches!(
+                launchd.command("ayeaye", Operation::Reload, None),
+                Err(Unavailable::Machine(_))
+            ),
+            "launchd has no reload and must not invent one"
+        );
+        assert!(
+            matches!(
+                launchd.command("ayeaye", Operation::Enable, None),
+                Err(Unavailable::Machine(_))
+            ),
+            "bootstrapping without a plist path would be a guess"
+        );
+
+        let no_uid = Session {
+            manager: Manager::Launchd,
+            uid: None,
+            launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
+        };
+        assert!(
+            matches!(
+                no_uid.command("ayeaye", Operation::Start, None),
+                Err(Unavailable::Machine(_))
+            ),
+            "gui//dev.ayeaye addresses nothing at all"
+        );
+
+        assert!(
+            matches!(
+                Session::systemd().command("", Operation::Start, None),
+                Err(Unavailable::Caller(_))
+            ),
+            "a missing name is a bug above this layer, not a fact about the machine"
+        );
+    }
+
+    // AYEAYE-61 — the path a definition lands at, which is also the path an
+    // install from a previous version of this program wrote to.
+    #[test]
+    fn a_definition_lands_where_the_previous_install_put_it() {
+        let layout = layout();
+        assert_eq!(
+            Session::systemd()
+                .definition_path("ayeaye", &layout)
+                .expect("a path"),
+            format!("{CONFIG_HOME}/systemd/user/ayeaye.service")
+        );
+        assert_eq!(
+            Session::launchd("501")
+                .definition_path("ayeaye", &layout)
+                .expect("a path"),
+            format!("{HOME}/Library/LaunchAgents/dev.ayeaye.plist")
+        );
+    }
+
+    // AYEAYE-61 — leaving an unchanged file alone is the difference between
+    // repairing a service and disturbing one.
+    #[test]
+    fn an_identical_definition_is_left_alone() {
+        let rendered = render_systemd(&ayeaye(), &layout());
+        assert_eq!(plan_install(None, &rendered), Install::Create);
+        assert_eq!(plan_install(Some(&rendered), &rendered), Install::Unchanged);
+        assert_eq!(
+            plan_install(Some("[Unit]\nDescription=something older\n"), &rendered),
+            Install::Replace
+        );
+        assert_eq!(
+            plan_install(
+                Some(&rendered.replace("RestartSec=5", "RestartSec=9")),
+                &rendered
+            ),
+            Install::Replace,
+            "one line different is different"
+        );
     }
 }
