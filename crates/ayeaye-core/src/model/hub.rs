@@ -53,14 +53,20 @@ pub const WANTED: &[Wanted] = &[
 ///
 /// Trailing slashes on the host are absorbed: a host configured as
 /// `https://example.test/` must not produce a URL with `//` in the middle of it.
-pub fn url(host: &str, id: &ModelId, file: &str) -> String {
+///
+/// `file` is a [`Wanted`] rather than a string, and that is the point: the
+/// files a model needs are a fixed list this crate owns, so there is no way to
+/// reach this with a name the hub supplied. The id's segments are already
+/// refused at [`ModelId::parse`] if they carry anything a path should not, so
+/// every part of the URL below is something this crate has already judged.
+pub fn url(host: &str, id: &ModelId, file: &Wanted) -> String {
     format!(
         "{}/{}/{}/resolve/{}/{}",
         host.trim_end_matches('/'),
         id.owner(),
         id.name(),
         id.revision(),
-        file
+        file.file
     )
 }
 
@@ -73,17 +79,25 @@ mod tests {
         ModelId::parse("openai/whisper-small.en").expect("a well-formed id")
     }
 
+    /// The entry for a named file, so a test reads like the caller does.
+    fn wanted(file: &str) -> &'static super::Wanted {
+        WANTED
+            .iter()
+            .find(|wanted| wanted.file == file)
+            .expect("the tests only ask for files a model needs")
+    }
+
     // AYEAYE-56 — the hub's own URL shape, which is what `curl` is handed.
     #[test]
     fn a_file_is_fetched_from_the_hubs_resolve_path() {
         assert_eq!(
-            url(DEFAULT_HOST, &whisper(), "config.json"),
+            url(DEFAULT_HOST, &whisper(), wanted("config.json")),
             "https://huggingface.co/openai/whisper-small.en/resolve/main/config.json"
         );
 
         let pinned = ModelId::parse("openai/whisper-small.en@a1b2c3d").expect("a pinned id");
         assert_eq!(
-            url(DEFAULT_HOST, &pinned, "model.safetensors"),
+            url(DEFAULT_HOST, &pinned, wanted("model.safetensors")),
             "https://huggingface.co/openai/whisper-small.en/resolve/a1b2c3d/model.safetensors"
         );
     }
@@ -93,7 +107,7 @@ mod tests {
     #[test]
     fn the_host_is_substitutable_and_a_trailing_slash_does_not_double_up() {
         assert_eq!(
-            url("file:///tmp/hub/", &whisper(), "config.json"),
+            url("file:///tmp/hub/", &whisper(), wanted("config.json")),
             "file:///tmp/hub/openai/whisper-small.en/resolve/main/config.json"
         );
     }

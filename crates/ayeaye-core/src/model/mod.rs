@@ -12,9 +12,14 @@
 //! the first transcription, after a download of hundreds of megabytes.
 
 pub mod architecture;
-pub mod config;
 pub mod hub;
 pub mod id;
+
+// Private on purpose. `json.rs` promises this crate holds no general JSON
+// reader and that `model::config` is a narrow exception; keeping the door shut
+// is what makes that a property rather than an intention. The way in is
+// [`architecture::in_config`].
+mod config;
 
 pub use architecture::{Architecture, Unsupported};
 pub use id::{BadModelId, ModelId};

@@ -70,10 +70,12 @@ impl Architecture {
     }
 
     fn entry(self) -> &'static Entry {
-        SUPPORTED
-            .iter()
-            .find(|entry| entry.architecture == self)
-            .expect("every Architecture is in SUPPORTED")
+        // Matched rather than searched, so "an architecture with no entry" is
+        // a shape the compiler refuses instead of a panic somebody has to
+        // trust will not fire.
+        match self {
+            Architecture::Whisper => &SUPPORTED[0],
+        }
     }
 }
 
@@ -83,16 +85,17 @@ impl Architecture {
 /// `architectures` array, or `model_type` — because a model that carries only
 /// the second is still identifiable and refusing it for the wrong reason would
 /// be a worse answer than the right one.
+///
+/// Compared exactly. These are class names written by an exporter, not
+/// something a person types, so matching loosely would only ever admit a name
+/// no real config carries — and it would do it silently.
 pub fn judge(found: &str) -> Result<Architecture, Unsupported> {
-    let name = found.trim();
     SUPPORTED
         .iter()
-        .find(|entry| {
-            entry.hf_name.eq_ignore_ascii_case(name) || entry.model_type.eq_ignore_ascii_case(name)
-        })
+        .find(|entry| entry.hf_name == found || entry.model_type == found)
         .map(|entry| entry.architecture)
         .ok_or_else(|| Unsupported {
-            found: Some(name.to_string()),
+            found: Some(found.to_string()),
         })
 }
 
@@ -130,10 +133,16 @@ mod tests {
         );
         // A file that identifies nothing is not a model either. The realistic
         // case is a hub serving an error page under the name `config.json`.
-        assert_eq!(
-            in_config("<!DOCTYPE html><title>404</title>").unwrap_err(),
-            Unsupported { found: None }
-        );
+        let nameless = in_config("<!DOCTYPE html><title>404</title>").unwrap_err();
+        assert_eq!(nameless, Unsupported { found: None });
+
+        // And that refusal has to read as something a person can act on, since
+        // "unsupported" about a file that is not a config at all sends them
+        // looking for the wrong problem.
+        let said = nameless.to_string();
+        assert!(said.contains("names no architecture"), "{said}");
+        assert!(said.contains("architectures"), "{said}");
+        assert!(said.contains("WhisperForConditionalGeneration"), "{said}");
     }
 
     // AYEAYE-56 — the refusal has to name what was found *and* what this build

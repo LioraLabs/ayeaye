@@ -104,6 +104,13 @@ impl ModelId {
     }
 
     /// The revision: a branch, a tag, or a commit.
+    ///
+    /// A revision carrying `/` is refused, because it is a path segment here
+    /// like the other two. That really does put some of the hub's names out of
+    /// reach — `refs/pr/1`, or a branch called `feature/x` — and pinning a
+    /// commit is the way to reach any of them. Admitting them would mean
+    /// letting a separator into a name a directory is created from, which is
+    /// the one thing [`BadModelId`] exists to stop.
     pub fn revision(&self) -> &str {
         &self.revision
     }
