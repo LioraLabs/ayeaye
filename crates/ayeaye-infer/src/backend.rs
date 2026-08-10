@@ -23,6 +23,22 @@ impl Backend {
             Backend::Metal => "metal",
         }
     }
+
+    /// Which backend a device is.
+    ///
+    /// This is how anything holding a device answers "where am I running",
+    /// rather than by asking [`selected`] again. The two are different
+    /// questions and they have different answers the moment a fallback
+    /// happens, so deriving the report from the device is what makes a report
+    /// that contradicts the device impossible to write rather than merely
+    /// discouraged.
+    pub fn of(device: &candle_core::Device) -> Backend {
+        match device {
+            candle_core::Device::Cpu => Backend::Cpu,
+            candle_core::Device::Cuda(_) => Backend::Cuda,
+            candle_core::Device::Metal(_) => Backend::Metal,
+        }
+    }
 }
 
 /// The backend this build was compiled with.
@@ -45,14 +61,78 @@ pub const fn selected() -> Backend {
     }
 }
 
-/// The candle device a backend runs on.
+/// Which device inference is actually running on, and why it is that one.
 ///
-/// One line per backend today, because a CPU build has one answer. AYEAYE-57
-/// owns turning this into a real selection — asking whether the device is
-/// actually there and falling back to the CPU with a stated reason — and this
-/// is the function it replaces. It lives here rather than beside either model
-/// so that there is one of it to replace.
-pub fn device(backend: Backend) -> candle_core::Result<candle_core::Device> {
+/// A build is compiled for one backend and runs on whatever the machine turned
+/// out to have, and those are two different facts. Keeping both is the point:
+/// "this build has cuda in it" and "this process is using a card" have
+/// different answers on a machine whose driver did not load, and reporting the
+/// first as though it were the second is the silent degradation the ticket
+/// exists to refuse.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    /// The backend this build was compiled for.
+    pub asked: Backend,
+    /// The device to build tensors on.
+    pub device: candle_core::Device,
+    /// Why the device is not the one asked for, in words a user can act on.
+    /// `None` exactly when nothing was given up.
+    pub fallback: Option<String>,
+}
+
+impl Selection {
+    /// The backend actually in use. Read off the device rather than stored,
+    /// so there is no second copy of the answer to fall out of step with it.
+    pub fn got(&self) -> Backend {
+        Backend::of(&self.device)
+    }
+}
+
+/// Pick a device for `asked`, falling back to the processor with a reason.
+///
+/// Total: there is no error type, because a card that will not open is not a
+/// reason to refuse to transcribe. Slower is not broken, and the milestone's
+/// whole claim is that a CPU build works everywhere — so a GPU build that
+/// cannot find its GPU should become that build, out loud.
+///
+/// `open` is an argument rather than a call, and that is what makes this
+/// testable at all: the machines that can exercise a real fallback are exactly
+/// the ones nobody develops on. See [`open`] for the one line it stands in for.
+pub fn choose<F>(asked: Backend, open: F) -> Selection
+where
+    F: FnOnce(Backend) -> candle_core::Result<candle_core::Device>,
+{
+    match open(asked) {
+        Ok(device) => Selection {
+            asked,
+            device,
+            fallback: None,
+        },
+        // A processor that will not open is not a fallback, it is a machine
+        // with no arithmetic on it. There is nowhere below this to go, so the
+        // reason is stated and the CPU device — which candle builds without
+        // asking anything of the system — is used regardless.
+        Err(why) => Selection {
+            asked,
+            device: candle_core::Device::Cpu,
+            fallback: (asked != Backend::Cpu).then(|| {
+                format!(
+                    "this build has {} compiled in, but no {} device would open ({why}); \
+                     running on the processor instead",
+                    asked.label(),
+                    asked.label(),
+                )
+            }),
+        },
+    }
+}
+
+/// Open the device a backend runs on.
+///
+/// The one effectful line, kept apart from the decision in [`choose`] so that
+/// the decision can be tested on a machine with neither card. It is also the
+/// only place that can fail: `Device::Cpu` is a value, not a resource.
+pub fn open(backend: Backend) -> candle_core::Result<candle_core::Device> {
     match backend {
         Backend::Cpu => Ok(candle_core::Device::Cpu),
         Backend::Cuda => candle_core::Device::new_cuda(0),
@@ -60,9 +140,48 @@ pub fn device(backend: Backend) -> candle_core::Result<candle_core::Device> {
     }
 }
 
+/// What this process should run inference on.
+///
+/// The whole of the runtime device decision, in one call, so that two models
+/// cannot make it two different ways.
+///
+/// **What this cannot cover, and it matters for the NVIDIA artifact.** A build
+/// with `cuda` in it is dynamically linked against `libcudart` — that link is
+/// emitted by `candle-kernels`' build script, not by anything here — so a
+/// machine with no CUDA runtime at all fails in the loader before `main` is
+/// reached. The fallback below covers a device that will not open: no card, a
+/// driver that did not load, a card already taken. It does not, and cannot,
+/// cover a missing CUDA runtime.
+pub fn select() -> Selection {
+    choose(selected(), open)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Backend, selected};
+    use super::{Backend, choose, selected};
+    use candle_core::Device;
+
+    /// An opener that refuses, the way a driver that is not there refuses.
+    fn refuses(message: &'static str) -> impl FnOnce(Backend) -> candle_core::Result<Device> {
+        move |_| Err(candle_core::Error::Msg(message.to_string()))
+    }
+
+    // AYEAYE-57 — the acceptance criterion, and the only way to watch it happen
+    // on a machine with no card: the effect is the argument.
+    #[test]
+    fn a_device_that_will_not_open_falls_back_to_the_processor_with_a_reason() {
+        let selection = choose(Backend::Cuda, refuses("no CUDA-capable device is detected"));
+
+        assert_eq!(selection.asked, Backend::Cuda);
+        assert_eq!(selection.got(), Backend::Cpu);
+        assert!(matches!(selection.device, Device::Cpu));
+        let why = selection.fallback.expect("a stated reason, not a silence");
+        assert!(why.contains("cuda"), "{why}");
+        assert!(
+            why.contains("no CUDA-capable device is detected"),
+            "the driver's own words are the useful half: {why}"
+        );
+    }
 
     // AYEAYE-41
     //
@@ -76,6 +195,35 @@ mod tests {
         assert_eq!(selected(), Backend::Metal);
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         assert_eq!(selected(), Backend::Cpu);
+    }
+
+    // AYEAYE-57 — the other half, and the one that stops the rule above being
+    // satisfied by a `choose` that always falls back.
+    //
+    // The opener hands back a CPU device while claiming to have opened a Metal
+    // one, which is a lie no real opener can tell. That is deliberate and it is
+    // the shape of the design: `got()` is read off the device, so a fake cannot
+    // forge it, and what is left to assert here is the only thing `choose`
+    // decides on its own — whether there is anything to explain. A `choose`
+    // that reported a fallback for a device that opened would fail here.
+    #[test]
+    fn a_device_that_opens_leaves_nothing_to_explain() {
+        let selection = choose(Backend::Metal, |_| Ok(Device::Cpu));
+
+        assert_eq!(selection.asked, Backend::Metal);
+        assert_eq!(selection.fallback, None, "nothing happened worth reporting");
+    }
+
+    // AYEAYE-57 — a CPU build has nowhere below it to go. Reporting a fallback
+    // there would be a warning about a degradation that did not happen, which
+    // is how a real one stops being read.
+    #[test]
+    fn a_processor_build_never_reports_falling_back_to_the_processor() {
+        let selection = choose(Backend::Cpu, refuses("something impossible"));
+
+        assert_eq!(selection.got(), Backend::Cpu);
+        assert!(matches!(selection.device, Device::Cpu));
+        assert_eq!(selection.fallback, None);
     }
 
     // AYEAYE-41

@@ -45,6 +45,9 @@ pub struct SpeechModel {
     pub(crate) tokenizer: Tokenizer,
     pub(crate) config: Config,
     pub(crate) device: Device,
+    /// Why the device is not the backend this build was compiled for. `None`
+    /// when nothing was given up; see [`crate::backend::choose`].
+    pub(crate) fallback: Option<String>,
     pub(crate) filters: Vec<f32>,
     pub(crate) tokens: SpecialTokens,
 }
@@ -74,7 +77,8 @@ impl SpeechModel {
     /// The directory is the caller's to choose and ayeaye's to read: acquiring
     /// what goes in it is AYEAYE-56's, and shipping weights is nobody's.
     pub fn load(dir: &Path) -> Result<Self, SpeechError> {
-        let device = device_for(backend::selected())?;
+        let selection = backend::select();
+        let device = selection.device.clone();
 
         let config_path = dir.join(CONFIG_FILE);
         let config_text = std::fs::read_to_string(&config_path)
@@ -118,14 +122,27 @@ impl SpeechModel {
             tokenizer,
             config,
             device,
+            fallback: selection.fallback,
             filters,
             tokens,
         })
     }
 
-    /// Where this model is running.
+    /// Where this model is really running.
+    ///
+    /// Read off the device it is holding, not off the build: on an artifact
+    /// with acceleration compiled in these differ exactly when [`Self::fallback`]
+    /// has something to say.
     pub fn backend(&self) -> Backend {
-        backend::selected()
+        Backend::of(&self.device)
+    }
+
+    /// Why this model is not on the backend the build was compiled for.
+    ///
+    /// `None` when it is — which is every CPU build, where there was nothing
+    /// to give up.
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
     }
 
     /// How many mel bins this model's config asks for.
@@ -247,15 +264,6 @@ fn check_shape(
     }
 
     Ok(())
-}
-
-/// The device this build's backend runs on.
-///
-/// The mapping itself moved to [`backend::device`] when a second model started
-/// needing it; this is the error type it wears here. AYEAYE-57 owns turning the
-/// mapping into a real selection.
-fn device_for(backend: Backend) -> Result<Device, SpeechError> {
-    backend::device(backend).map_err(SpeechError::inference)
 }
 
 #[cfg(test)]

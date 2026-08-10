@@ -95,6 +95,9 @@ pub struct LanguageModel {
     pub(crate) weights: Weights,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) device: Device,
+    /// Why the device is not the backend this build was compiled for. `None`
+    /// when nothing was given up; see [`crate::backend::choose`].
+    pub(crate) fallback: Option<String>,
     pub(crate) architecture: String,
     /// How many positions this model's rotary table was built for.
     pub(crate) window: usize,
@@ -109,7 +112,8 @@ impl LanguageModel {
     /// The directory is the caller's to choose and ayeaye's to read: acquiring
     /// what goes in it is AYEAYE-56's, and shipping weights is nobody's.
     pub fn load(dir: &Path) -> Result<Self, LanguageError> {
-        let device = backend::device(backend::selected()).map_err(LanguageError::inference)?;
+        let selection = backend::select();
+        let device = selection.device.clone();
 
         let weights_path = dir.join(WEIGHTS_FILE);
         // The file stays open and is read from as the tensors are pulled out,
@@ -168,15 +172,28 @@ impl LanguageModel {
             weights,
             tokenizer,
             device,
+            fallback: selection.fallback,
             architecture,
             window,
             eos,
         })
     }
 
-    /// Where this model is running.
+    /// Where this model is really running.
+    ///
+    /// Read off the device it is holding, not off the build: on an artifact
+    /// with acceleration compiled in these differ exactly when [`Self::fallback`]
+    /// has something to say.
     pub fn backend(&self) -> Backend {
-        backend::selected()
+        Backend::of(&self.device)
+    }
+
+    /// Why this model is not on the backend the build was compiled for.
+    ///
+    /// `None` when it is — which is every CPU build, where there was nothing
+    /// to give up.
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
     }
 
     /// What the file called itself.

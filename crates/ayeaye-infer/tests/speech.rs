@@ -120,6 +120,33 @@ fn a_clip_shorter_than_the_window_transcribes_in_one_segment() {
     );
 }
 
+// AYEAYE-57
+//
+// A model's `backend()` is a claim about the device it is holding, not about
+// the build it came out of, and those disagree exactly when a fallback
+// happened. The invariant is written as an equality between the two halves so
+// that it means something on every row of the release matrix: on this machine
+// it says "nothing was compiled in and nothing was reported"; on the NVIDIA
+// artifact, a `backend()` that returned the build's constant would keep
+// claiming `cuda` while `fallback()` explained why it was not — and this is
+// what fails. It cannot be watched fail on a machine with no card, so the
+// mutation run against it is a `backend()` that ignores `self`.
+#[test]
+fn a_loaded_model_reports_the_device_it_got_and_says_when_that_is_not_the_build() {
+    let dir = tiny_model("reports-its-device", &tiny_config(vec![]));
+    let model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    assert_eq!(
+        model.backend() == ayeaye_infer::backend::selected(),
+        model.fallback().is_none(),
+        "a model that fell back must say so, and one that did not must not: \
+         backend {:?}, compiled in {:?}, fallback {:?}",
+        model.backend(),
+        ayeaye_infer::backend::selected(),
+        model.fallback(),
+    );
+}
+
 // AYEAYE-54
 //
 // The window is one second in this toy model, so 2.5 seconds is three windows
