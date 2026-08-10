@@ -12,6 +12,7 @@
 pub mod deps;
 pub mod effect_budget;
 pub mod finding;
+pub mod strata;
 pub mod strip;
 
 pub use finding::{Finding, Rule, report};
