@@ -35,8 +35,8 @@ fn main() -> ExitCode {
 /// hand without one.
 fn service_verb(verb: Option<&str>) -> ExitCode {
     let services = Services {
-        session: session(&Subprocess),
-        layout: layout(),
+        session: session(&Subprocess, cfg!(target_os = "macos")),
+        layout: layout(from_environment),
         runner: Subprocess,
     };
     let program = match std::env::current_exe() {
@@ -117,13 +117,21 @@ fn complain(why: &str) -> ExitCode {
 }
 
 /// Where this machine keeps things, from the environment the shell hands over.
-fn layout() -> Layout {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let config_home =
-        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
-    let state_home =
-        std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{home}/.local/state"));
+///
+/// The lookup is an argument so the defaulting can be tested without a test
+/// mutating the process environment, which in this edition is `unsafe` and, with
+/// tests running in threads, wrong as well.
+fn layout(look_up: impl Fn(&str) -> Option<String>) -> Layout {
+    let home = look_up("HOME").unwrap_or_default();
+    let config_home = look_up("XDG_CONFIG_HOME").unwrap_or_else(|| format!("{home}/.config"));
+    let state_home = look_up("XDG_STATE_HOME").unwrap_or_else(|| format!("{home}/.local/state"));
     Layout::new(&home, &config_home, &state_home)
+}
+
+/// The process environment, as [`layout`] wants to ask about it. An empty
+/// value is not an answer: `HOME=` would put a unit at `/.config`.
+fn from_environment(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// Which service manager to talk to.
@@ -133,8 +141,12 @@ fn layout() -> Layout {
 /// cannot give — that a machine has *neither* manager, which a container and a
 /// stripped-down Linux both really are. AYEAYE-62 is where the two meet, and
 /// this should be replaced by that detector there rather than grown here.
-fn session(runner: &impl Runner) -> Session {
-    if !cfg!(target_os = "macos") {
+///
+/// Which platform this is arrives as an argument rather than as a `cfg!` read
+/// inside, so that both answers can be asked for on one machine. A branch that
+/// only exists on a Mac is a branch nobody here can test.
+fn session(runner: &impl Runner, macos: bool) -> Session {
+    if !macos {
         return Session::systemd();
     }
     // Every launchd command addresses a domain by uid, and `id` is where the
@@ -160,4 +172,106 @@ fn stamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs().to_string())
         .unwrap_or_else(|_| "backup".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{layout, session, stamp};
+    use crate::service::{Outcome, Runner};
+    use ayeaye_core::service::Manager;
+    use std::cell::RefCell;
+
+    /// A stand-in for `id`.
+    struct Answers {
+        outcome: Outcome,
+        asked: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Answers {
+        fn with(ok: bool, output: &str) -> Self {
+            Answers {
+                outcome: Outcome {
+                    ok,
+                    output: output.to_string(),
+                },
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Runner for Answers {
+        fn run(&self, argv: &[String]) -> Outcome {
+            self.asked.borrow_mut().push(argv.to_vec());
+            self.outcome.clone()
+        }
+    }
+
+    // AYEAYE-61 — every launchd command addresses a domain by uid, and `id` is
+    // where the shell has always read it from.
+    #[test]
+    fn a_mac_is_launchd_addressed_by_the_uid_id_reports() {
+        let runner = Answers::with(true, "501\n");
+        let session = session(&runner, true);
+        assert_eq!(session.manager, Manager::Launchd);
+        assert_eq!(session.uid.as_deref(), Some("501"));
+        assert_eq!(
+            runner.asked.borrow().as_slice(),
+            [vec!["id".to_string(), "-u".to_string()]]
+        );
+    }
+
+    // AYEAYE-61 — without a uid the target would be the malformed `gui//label`.
+    // No uid is better than a wrong one; the core refuses on it rather than
+    // addressing nothing.
+    #[test]
+    fn a_mac_with_no_answer_from_id_carries_no_uid() {
+        assert_eq!(session(&Answers::with(false, ""), true).uid, None);
+        assert_eq!(session(&Answers::with(true, " \n"), true).uid, None);
+    }
+
+    // AYEAYE-61 — and nothing is asked of `id` where nothing addresses a domain.
+    #[test]
+    fn anything_else_is_systemd_and_asks_nothing() {
+        let runner = Answers::with(true, "1000\n");
+        let session = session(&runner, false);
+        assert_eq!(session.manager, Manager::Systemd);
+        assert!(runner.asked.borrow().is_empty());
+    }
+
+    // AYEAYE-61 — the XDG defaults, which decide where a unit lands and which
+    // settings file it names.
+    #[test]
+    fn the_xdg_variables_win_and_their_defaults_hang_off_home() {
+        let bare = layout(|name| (name == "HOME").then(|| "/home/tester".to_string()));
+        assert_eq!(bare.env_file, "/home/tester/.config/ayeaye/env");
+        assert_eq!(bare.unit_dir, "/home/tester/.config/systemd/user");
+        assert_eq!(bare.state_home, "/home/tester/.local/state");
+        assert_eq!(bare.agent_dir, "/home/tester/Library/LaunchAgents");
+
+        let moved = layout(|name| {
+            Some(
+                match name {
+                    "HOME" => "/home/tester",
+                    "XDG_CONFIG_HOME" => "/elsewhere/config",
+                    _ => "/elsewhere/state",
+                }
+                .to_string(),
+            )
+        });
+        assert_eq!(moved.env_file, "/elsewhere/config/ayeaye/env");
+        assert_eq!(moved.unit_dir, "/elsewhere/config/systemd/user");
+        assert_eq!(moved.state_home, "/elsewhere/state");
+    }
+
+    // AYEAYE-61 — a stamp that is empty, or that a filename cannot hold, would
+    // take the naming of a kept copy with it.
+    #[test]
+    fn a_stamp_is_something_a_backup_can_be_named_after() {
+        let stamp = stamp();
+        assert!(!stamp.is_empty());
+        assert!(
+            stamp.chars().all(|c| c.is_ascii_digit()),
+            "a stamp goes in a filename: {stamp}"
+        );
+    }
 }
