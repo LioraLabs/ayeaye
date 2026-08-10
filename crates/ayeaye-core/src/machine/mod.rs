@@ -10,6 +10,7 @@
 
 pub mod graphics;
 pub mod platform;
+pub mod share;
 pub mod size;
 
 pub use graphics::{Acceleration, Graphics};
@@ -17,6 +18,7 @@ pub use platform::{
     Family, Os, PackageManager, Packaging, Platform, ServiceManager, brew_prefix_of, identify,
     packaging, service_manager,
 };
+pub use share::{Limit, Limits, Share};
 
 /// Everything the shell captured about this machine, exactly as it was printed.
 ///
@@ -55,4 +57,23 @@ pub struct Probes<'a> {
     pub rocminfo: Option<&'a str>,
     /// `sysctl -n machdep.cpu.brand_string`.
     pub sysctl_brand_string: Option<&'a str>,
+    /// True when any of `/.dockerenv`, `/run/.containerenv` or
+    /// `/run/systemd/container` exists, or the `container` environment variable
+    /// is set. Four marks, none reliable alone, and only their disjunction is a
+    /// judgement worth making.
+    pub container_marker: bool,
+    /// `/proc/1/cgroup`.
+    pub proc1_cgroup: Option<&'a str>,
+    /// `/proc/self/mountinfo`.
+    pub mountinfo: Option<&'a str>,
+    /// The version-two memory limit, read through [`share::cgroup_path`].
+    pub cgroup_memory_max: Option<&'a str>,
+    /// The version-one memory limit.
+    pub cgroup_memory_limit: Option<&'a str>,
+    /// The version-two processor limit: `<quota> <period>`.
+    pub cgroup_cpu_max: Option<&'a str>,
+    /// The version-one processor quota.
+    pub cgroup_cpu_quota: Option<&'a str>,
+    /// The version-one processor period.
+    pub cgroup_cpu_period: Option<&'a str>,
 }
