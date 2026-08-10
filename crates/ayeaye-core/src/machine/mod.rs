@@ -8,9 +8,11 @@
 //! It is a port of `lib/steps/20-hardware.sh` and `lib/platform.sh`, and it is
 //! held to the same corpus those two are tested against.
 
+pub mod graphics;
 pub mod platform;
 pub mod size;
 
+pub use graphics::{Acceleration, Graphics};
 pub use platform::{
     Family, Os, PackageManager, Packaging, Platform, ServiceManager, brew_prefix_of, identify,
     packaging, service_manager,
@@ -47,4 +49,10 @@ pub struct Probes<'a> {
     pub free_m: Option<&'a str>,
     /// `df -Pk` over the nearest existing ancestor of the model directory.
     pub df_pk: Option<&'a str>,
+    /// `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader`.
+    pub nvidia_smi: Option<&'a str>,
+    /// `rocminfo`.
+    pub rocminfo: Option<&'a str>,
+    /// `sysctl -n machdep.cpu.brand_string`.
+    pub sysctl_brand_string: Option<&'a str>,
 }
