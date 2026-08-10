@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-/// The rules this crate enforces. Tier 1 — the three that hold the pure core
-/// pure and the strata apart.
+/// The rules this crate enforces. Tier 1 — the four that hold the pure core
+/// pure, the strata apart, and a C toolchain out of the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// `ayeaye-core` may not reach outside itself.
