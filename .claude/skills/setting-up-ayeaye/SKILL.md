@@ -67,7 +67,7 @@ verdict cannot make:
   (`openai/whisper-small`), or `openai/whisper-large-v3-turbo` at the top
   tier. Model IDs are `owner/name`, and the architecture allowlist is checked
   at `pull` time, so trying one is cheap: an unsupported model is refused
-  before anything downloads, never at first inference.
+  before the weights download, never at first inference.
 - **The constraint names the fix.** A tier held back by `disk` rises after
   freeing space where models land and re-running setup; `ram` or `cores` is
   the machine's ceiling. Read the reason line rather than guessing.

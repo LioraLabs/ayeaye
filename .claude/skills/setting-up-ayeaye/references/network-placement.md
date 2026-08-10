@@ -26,8 +26,8 @@ someone's phone.
 
 ### 1. Loopback — the default, and a complete story
 
-`AYEAYE_BIND=127.0.0.1`, port 8912, which is what setup writes. Nothing to
-do, nothing exposed. From another machine, an SSH forward reaches it without
+`127.0.0.1:8912`, the binary's own default, which setup leaves in place.
+Nothing to do, nothing exposed. From another machine, an SSH forward reaches it without
 opening anything:
 
 ```sh
@@ -70,8 +70,9 @@ AYEAYE_ALLOWED_HOSTS=ayeaye.example.com
 
 That name is what the `hosts` check asserts **in both directions** — the named
 address must answer and a stranger's Host header must be refused with 403 —
-and what the `https` check dials. A proxy that forwards every Host header
-unfiltered will fail `hosts`, and it is the proxy to tighten, not the check.
+and what the `https` check dials. The gate doing the refusing is the daemon's
+own, and it reads the file at start: a `hosts` failure after editing the name
+usually means the daemon predates the edit — restart it.
 
 Show the proxy stanza before writing it, and write it only where the user
 points. The binary never touches proxy configuration; neither does this skill
