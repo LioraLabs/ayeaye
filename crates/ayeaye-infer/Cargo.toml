@@ -1,0 +1,17 @@
+[package]
+name = "ayeaye-infer"
+description = "Speech and language inference, in process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Acceleration is a compile-time choice, not a runtime one: both of these pull
+# a toolchain the portable build deliberately does not have.
+cuda = []
+metal = []
+
+[dependencies]

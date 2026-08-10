@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/ayeaye", "crates/ayeaye-core", "crates/ayeaye-infer"]
+
+# One version for the whole workspace. install.sh still owns the release
+# version; this repeats it, and the release-version gate is what will be
+# taught to compare the two.
+[workspace.package]
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/LioraLabs/ayeaye"
+
+[workspace.dependencies]
+ayeaye-core = { path = "crates/ayeaye-core" }
+ayeaye-infer = { path = "crates/ayeaye-infer" }
