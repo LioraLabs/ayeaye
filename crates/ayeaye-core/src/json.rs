@@ -7,9 +7,11 @@
 //! text and structs out" can spell a string literal itself.
 //!
 //! **This file used to say there was no reader here and should not be, because
-//! nothing the daemon was handed arrived as JSON.** Two tickets falsified that
-//! in the same wave, in different ways, and there are now two readers here for
-//! two different jobs. Keeping them apart is deliberate.
+//! nothing the daemon was handed arrived as JSON.** Three tickets falsified that
+//! in one wave, in three different ways. Two readers live here; a third lives in
+//! [`crate::model::config`]. Keeping them apart is a decision, and it is the
+//! kind of decision the duplication ratchet exists to re-examine — see
+//! AYEAYE-64.
 //!
 //! [`is_value`] and [`string_member`] scan **borrowed text and build nothing**.
 //! The board endpoints pass cliban's JSON through verbatim, so the only
@@ -26,7 +28,11 @@
 //! allocates nothing it was not shown, it refuses rather than guesses, and it
 //! will not recurse further than [`MAX_DEPTH`].
 //!
-//! The writer, [`string`], is shared by both halves.
+//! [`crate::model::config`] walks a model's `config.json` for one field before
+//! any weights are downloaded beside it. It is narrow on purpose, and stays an
+//! exception rather than becoming a parser by increments.
+//!
+//! The writer, [`string`], is shared.
 
 /// How deep a value may nest before the scanner refuses it.
 ///

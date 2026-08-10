@@ -330,7 +330,12 @@ fn fits_path() -> Option<PathBuf> {
 }
 
 /// Where the daemon keeps its state, or `None` if there is no home to look in.
-fn state_dir() -> Option<PathBuf> {
+///
+/// Public because the model store lives under it and `ayeaye model` has to
+/// agree with the token loader about which directory that is. Two answers to
+/// "where does this machine keep ayeaye's things" is how a pull lands somewhere
+/// a load does not look.
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|value| !value.trim().is_empty())
