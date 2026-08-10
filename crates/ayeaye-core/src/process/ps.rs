@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use super::Source;
+
 /// Every process on a Mac, and who its parent is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tree {
@@ -44,6 +46,19 @@ impl Tree {
     /// What this process is called, or `None` if `ps` did not list it at all.
     pub fn comm(&self, pid: u32) -> Option<&str> {
         self.names.get(&pid).map(String::as_str)
+    }
+}
+
+/// One `ps` snapshot answers a whole walk: three levels of ancestry would
+/// otherwise cost a process per node, on the platform where spawning them is
+/// slowest.
+impl Source for Tree {
+    fn children(&self, pid: u32) -> Vec<u32> {
+        Tree::children(self, pid).to_vec()
+    }
+
+    fn comm(&self, pid: u32) -> Option<String> {
+        Tree::comm(self, pid).map(str::to_string)
     }
 }
 

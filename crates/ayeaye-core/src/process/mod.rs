@@ -20,5 +20,7 @@
 //! state of the world.
 
 pub mod ps;
+mod walk;
 
 pub use ps::Tree;
+pub use walk::{DEPTH, Source, descendant};
