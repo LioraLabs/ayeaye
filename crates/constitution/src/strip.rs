@@ -156,8 +156,11 @@ pub fn without_test_blocks(source: &str) -> String {
 /// `[u8; 2]` field all blank to their real extent. Angle brackets are *not*
 /// tracked — `a < b` in an expression opens a depth that never closes — so a
 /// comma inside bare generics (`fn t<T, U>`) still stops this early and
-/// leaves a mangled tail in scope. That errs loud: at worst a false positive
-/// somebody can see, never a silent exemption.
+/// leaves a mangled tail in scope. The nesting count saturates rather than
+/// underflows, so an attribute on the *last* field of a tuple struct sees the
+/// struct's own `)` as a stray closer and consumes through the `;`, mangling
+/// the struct it sits in. Both err loud: at worst a false positive somebody
+/// can see, never a silent exemption.
 fn item_end(stripped: &[char], from: usize) -> usize {
     let mut nesting = 0usize;
     let mut i = from;
@@ -610,5 +613,8 @@ mod tests {
         assert!(out.contains("kept: u8"), "{out}");
         assert!(out.contains("fn shipped()"), "{out}");
         assert!(!out.contains("probe"), "{out}");
+        // The whole type blanks, not just up to the `;` inside the brackets —
+        // this is the assertion that dies on a scan with no nesting count.
+        assert!(!out.contains("2]"), "{out}");
     }
 }
