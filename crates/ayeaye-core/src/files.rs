@@ -113,11 +113,12 @@ pub fn mime(path: &str) -> Option<&'static str> {
 
 /// The `.ext` of a lowercased file name, or `""`.
 ///
-/// A leading dot is not an extension: `.bashrc` is a name, which is how the
-/// daemon's `splitext` reads it too.
+/// Leading dots are not extension separators: `.bashrc` and `..png` are
+/// names, which is how the daemon's `splitext` reads them too — an extension
+/// needs something that is not a dot in front of it.
 fn extension(name: &str) -> &str {
     match name.rfind('.') {
-        Some(at) if at > 0 => &name[at..],
+        Some(at) if name[..at].bytes().any(|byte| byte != b'.') => &name[at..],
         _ => "",
     }
 }
@@ -354,17 +355,28 @@ fn window(lines: Vec<(usize, &[u8])>, requested: usize, cut_short: bool) -> Vec<
     }
     // To half the line budget past the requested line, so the line shown has
     // the context that led to it above and some of what follows below.
-    let end = requested + (MAX_PREVIEW_LINES / 2 - 1);
+    let end = requested.saturating_add(MAX_PREVIEW_LINES / 2 - 1);
     let mut kept: std::collections::VecDeque<(usize, &[u8])> = std::collections::VecDeque::new();
     let mut retained = 0;
     for (number, line) in lines {
         if number > end {
             break;
         }
+        // Past the request, a line that would overflow the budget is cut to
+        // what is left and ends the window — never paid for by evicting from
+        // the front, which is what would evict the requested line itself the
+        // moment its context ran fat. Up *to* the request the opposite holds:
+        // older context pays for newer, because the line asked for must fit
+        // whatever sat above it.
+        if number > requested && retained + line.len() > MAX_TEXT_PREVIEW_BYTES {
+            let available = MAX_TEXT_PREVIEW_BYTES - retained;
+            if available > 0 {
+                kept.push_back((number, &line[..available]));
+            }
+            break;
+        }
         kept.push_back((number, line));
         retained += line.len();
-        // Older context pays for newer: the requested line must fit, whatever
-        // sat above it.
         while kept.len() > MAX_PREVIEW_LINES || retained > MAX_TEXT_PREVIEW_BYTES {
             let (_, dropped) = kept.pop_front().expect("retained lines exist to drop");
             retained -= dropped.len();
@@ -490,6 +502,12 @@ mod tests {
         assert_eq!(reference("a.txt:12x"), ("a.txt:12x".into(), None));
         // The *last* colon splits, so a stranger path keeps its earlier ones.
         assert_eq!(reference("a:b/c.txt:3"), ("a:b/c.txt".into(), Some(3)));
+        // A number no file has lines for stays part of the path — the one
+        // declared divergence from the daemon, whose integers do not overflow.
+        assert_eq!(
+            reference("a.txt:99999999999999999999999999"),
+            ("a.txt:99999999999999999999999999".into(), None)
+        );
     }
 
     // AYEAYE-52 — transcript markup comes off: a markdown link keeps its
@@ -529,12 +547,14 @@ mod tests {
         assert_eq!(Kind::of("README"), Kind::Text);
         assert_eq!(Kind::of("target/release/ayeaye"), Kind::Binary);
         assert_eq!(Kind::of("archive.tar.gz"), Kind::Binary);
-        // A leading dot is a name, not an extension.
+        // Leading dots are a name, not an extension.
         assert_eq!(Kind::of(".bashrc"), Kind::Binary);
+        assert_eq!(Kind::of("..png"), Kind::Binary);
+        assert_eq!(Kind::of("a..png"), Kind::Image);
     }
 
-    // AYEAYE-52 — the label an image is served under. `.jpg` is `image/jpg`
-    // because that is what the daemon sends, and the body shape is the page's.
+    // AYEAYE-52 — the label an image is served under, from the daemon's own
+    // table: both jpeg spellings answer `image/jpeg`.
     #[test]
     fn an_image_is_labelled_by_its_extension() {
         assert_eq!(mime("shot.png"), Some("image/png"));
@@ -642,6 +662,35 @@ mod tests {
         assert_eq!(rows.first().map(|row| row.number), Some(1));
         // To half the budget past line 3, and no further.
         assert_eq!(rows.last().map(|row| row.number), Some(3 + 99));
+    }
+
+    // AYEAYE-52 — the requested line survives fat context. Under byte
+    // pressure the context above pays, and the context *below* is cut and
+    // stopped rather than paid for by eviction — a window that evicted its
+    // own anchor would show the wrong region with no focus line in it.
+    #[test]
+    fn fat_context_never_evicts_the_requested_line() {
+        // 3KiB lines: the byte budget holds 85, so the window cannot reach 99
+        // past the request and must give up its tail, not its anchor.
+        let line = "y".repeat(3071) + "\n";
+        let text = line.repeat(200);
+        let rows = excerpt(text.as_bytes(), text.len() as u64, Some(100));
+        assert!(rows.iter().any(|row| row.number == 100), "the anchor is gone");
+        assert_eq!(rows.first().map(|row| row.number), Some(16));
+        assert_eq!(rows.last().map(|row| row.number), Some(101));
+        // The one line past the request is cut to what the budget had left.
+        assert_eq!(rows.last().map(|row| row.text.len()), Some(1024));
+
+        // The line right after the request is itself enormous: it arrives cut,
+        // and everything up to the request is still there.
+        let mut text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        text.push_str(&"z".repeat(MAX_TEXT_PREVIEW_BYTES + 10));
+        let rows = excerpt(text.as_bytes(), text.len() as u64, Some(100));
+        assert_eq!(rows.first().map(|row| row.number), Some(1));
+        assert_eq!(rows.last().map(|row| row.number), Some(101));
+        assert!(rows.iter().any(|row| row.number == 100));
+        let total: usize = rows.iter().map(|row| row.text.len()).sum();
+        assert!(total <= MAX_TEXT_PREVIEW_BYTES, "{total} bytes kept");
     }
 
     // AYEAYE-52 — a line beyond a fully-scanned file answers with the tail:
