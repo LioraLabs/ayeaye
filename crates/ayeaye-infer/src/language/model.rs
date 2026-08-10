@@ -141,13 +141,18 @@ impl LanguageModel {
         }
 
         let eos = content.metadata.get(EOS_KEY).and_then(|v| v.to_u32().ok());
-        let window = window_of(&architecture, &content);
-        if window == 0 {
-            return Err(LanguageError::malformed(
-                &weights_path,
-                "the file's context length is 0, so there is no position to decode at",
-            ));
-        }
+        let window = window_of(&architecture, &content, &weights_path)?;
+
+        // Before the weights, for the same reason the architecture is: a
+        // tokenizer is a few hundred kB and the weights are gigabytes, so
+        // reading it second means a missing or corrupt one costs a full
+        // `from_gguf` before anybody is told. Every fact knowable cheaply is
+        // established while it is still cheap.
+        let tokenizer_path = dir.join(TOKENIZER_FILE);
+        let tokenizer_bytes =
+            std::fs::read(&tokenizer_path).map_err(|e| LanguageError::read(&tokenizer_path, e))?;
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
+            .map_err(|e| LanguageError::malformed(&tokenizer_path, e))?;
 
         let weights = match architecture.as_str() {
             "qwen2" => quantized_qwen2::ModelWeights::from_gguf(content, &mut file, &device)
@@ -158,12 +163,6 @@ impl LanguageModel {
                 .map(Weights::Llama),
         }
         .map_err(|e| LanguageError::malformed(&weights_path, e))?;
-
-        let tokenizer_path = dir.join(TOKENIZER_FILE);
-        let tokenizer_bytes =
-            std::fs::read(&tokenizer_path).map_err(|e| LanguageError::read(&tokenizer_path, e))?;
-        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
-            .map_err(|e| LanguageError::malformed(&tokenizer_path, e))?;
 
         Ok(Self {
             weights,
@@ -200,15 +199,38 @@ impl LanguageModel {
 /// exactly that many. Either way a position past the table is an out-of-bounds
 /// index rather than a degradation, so the table is what a generation has to be
 /// bounded by.
-fn window_of(architecture: &str, content: &gguf_file::Content) -> usize {
-    match architecture {
+///
+/// The two ways this fails are different facts and get different sentences.
+/// A file that never says how long its context is has an absent key; a file that
+/// says zero has a nonsensical one. Reporting the second for the first sends
+/// somebody looking for a number that is not in their file.
+fn window_of(
+    architecture: &str,
+    content: &gguf_file::Content,
+    weights_path: &Path,
+) -> Result<usize, LanguageError> {
+    const QWEN2_CONTEXT_KEY: &str = "qwen2.context_length";
+
+    let window = match architecture {
         "qwen2" => content
             .metadata
-            .get("qwen2.context_length")
+            .get(QWEN2_CONTEXT_KEY)
             .and_then(|v| v.to_u32().ok())
-            .unwrap_or(0) as usize,
+            .ok_or_else(|| {
+                LanguageError::malformed(
+                    weights_path,
+                    format!("no {QWEN2_CONTEXT_KEY} in the file's metadata, so there is no window"),
+                )
+            })? as usize,
         _ => quantized_llama::MAX_SEQ_LEN,
+    };
+    if window == 0 {
+        return Err(LanguageError::malformed(
+            weights_path,
+            "the file's context length is 0, so there is no position to decode at",
+        ));
     }
+    Ok(window)
 }
 
 impl std::fmt::Debug for LanguageModel {

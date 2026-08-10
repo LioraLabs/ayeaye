@@ -32,9 +32,15 @@ const HEADS: usize = 2;
 /// One transformer block. The wiring is what is under test, not the depth.
 const BLOCKS: usize = 1;
 /// How many positions the model can hold, where the architecture reads that
-/// from its own metadata. Small on purpose: it is also the number a
-/// too-long-prompt refusal has to be provoked past.
-pub const WINDOW: usize = 128;
+/// from its own metadata.
+///
+/// Small enough that a too-long-prompt refusal can be provoked past it, and no
+/// smaller. `DEFAULT_SYSTEM_PROMPT` costs about 110 tokens through this
+/// whitespace-split vocabulary before a dictation is added, and that constant
+/// lives in another crate with nothing linking the two — so a window sized to
+/// the headroom of the day turns "somebody added a sentence to the prompt" into
+/// a window error in a test about something else.
+pub const WINDOW: usize = 512;
 
 /// The first id used by a special token; everything below is a word.
 const FIRST_SPECIAL: u32 = 60;
@@ -121,35 +127,44 @@ fn scratch(label: &str) -> PathBuf {
 
 /// Build a complete, loadable `llama` model directory.
 pub fn tiny_model(label: &str) -> ModelDir {
-    build(label, "llama", true)
+    build(label, "llama", true, true)
 }
 
-/// Build a complete, loadable model directory of a named supported
-/// architecture.
+/// Build a complete, loadable model directory of a named architecture.
 ///
-/// The two are not interchangeable files: `qwen2` carries attention biases that
-/// `llama` does not, and reads its window out of its own metadata. Building
-/// both here is what stops the second architecture being supported on paper.
+/// The architectures are not interchangeable files: `qwen2` carries attention
+/// biases that `llama` does not, and reads its window out of its own metadata.
+/// Building both here is what stops the second one being supported on paper.
+///
+/// A name nothing implements is allowed, and produces a file with `llama`'s
+/// metadata under a header claiming otherwise — which is exactly what the
+/// loader has to refuse before it reads any of it.
 pub fn tiny_model_named(label: &str, architecture: &str) -> ModelDir {
-    build(label, architecture, true)
+    build(label, architecture, true, true)
 }
 
-/// Build a model directory whose GGUF claims an architecture nothing runs.
-pub fn tiny_model_of_architecture(label: &str, architecture: &str) -> ModelDir {
-    build(label, architecture, true)
+/// Build a `qwen2` model directory whose GGUF never says how long its context
+/// is — the one architecture that reads its window from its own metadata.
+pub fn tiny_model_without_a_window(label: &str) -> ModelDir {
+    build(label, "qwen2", true, false)
 }
 
 /// Build a model directory whose GGUF is well-formed and short a tensor the
 /// architecture needs.
 pub fn tiny_model_missing_a_tensor(label: &str) -> ModelDir {
-    build(label, "llama", false)
+    build(label, "llama", false, true)
 }
 
-fn build(label: &str, architecture: &str, complete: bool) -> ModelDir {
+fn build(label: &str, architecture: &str, complete: bool, window: bool) -> ModelDir {
     let dir = ModelDir {
         path: scratch(label),
     };
-    write_gguf(&dir.path().join("model.gguf"), architecture, complete);
+    write_gguf(
+        &dir.path().join("model.gguf"),
+        architecture,
+        complete,
+        window,
+    );
     std::fs::write(dir.path().join("tokenizer.json"), tokenizer_json())
         .expect("writing the tokenizer");
     dir
@@ -157,7 +172,7 @@ fn build(label: &str, architecture: &str, complete: bool) -> ModelDir {
 
 /// Write the GGUF: the metadata `from_gguf` reads, then every tensor it asks
 /// for.
-fn write_gguf(path: &Path, architecture: &str, complete: bool) {
+fn write_gguf(path: &Path, architecture: &str, complete: bool, window: bool) {
     let device = Device::Cpu;
     let head_dim = EMBEDDING / HEADS;
 
@@ -202,10 +217,12 @@ fn write_gguf(path: &Path, architecture: &str, complete: bool) {
     if prefix == "qwen2" {
         // qwen2 builds its rotary table to exactly this many positions, so it
         // is the model's real window rather than a claim about it.
-        metadata.push((
-            "qwen2.context_length".to_string(),
-            gguf_file::Value::U32(WINDOW as u32),
-        ));
+        if window {
+            metadata.push((
+                "qwen2.context_length".to_string(),
+                gguf_file::Value::U32(WINDOW as u32),
+            ));
+        }
     } else {
         metadata.push((
             "llama.rope.dimension_count".to_string(),

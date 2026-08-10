@@ -54,11 +54,6 @@ impl LanguageSlot {
         self.model.is_some()
     }
 
-    /// The resident model, for a caller that wants to ask it something.
-    pub fn model(&self) -> Option<&LanguageModel> {
-        self.model.as_ref()
-    }
-
     /// Rewrite with the resident model, reporting what went wrong.
     ///
     /// [`LanguageError::NotLoaded`] when the slot is empty. It does not load

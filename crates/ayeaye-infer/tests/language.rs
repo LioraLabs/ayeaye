@@ -5,7 +5,7 @@ mod gguf;
 use ayeaye_core::cleanup::{Kept, Policy};
 use ayeaye_infer::language::{LanguageError, LanguageModel, LanguageSlot, SUPPORTED};
 use gguf::{
-    WINDOW, tiny_model, tiny_model_missing_a_tensor, tiny_model_named, tiny_model_of_architecture,
+    WINDOW, tiny_model, tiny_model_missing_a_tensor, tiny_model_named, tiny_model_without_a_window,
 };
 
 // AYEAYE-55
@@ -89,7 +89,7 @@ fn a_tokenizer_that_is_not_json_is_a_malformed_error_naming_it() {
 // the same list.
 #[test]
 fn an_architecture_this_build_cannot_run_is_refused_by_name() {
-    let dir = tiny_model_of_architecture("unsupported", "mamba");
+    let dir = tiny_model_named("unsupported", "mamba");
 
     let error =
         LanguageModel::load(dir.path()).expect_err("an unimplemented architecture cannot load");
@@ -147,6 +147,47 @@ fn each_architecture_reports_the_window_its_own_loader_built() {
         "llama ignores the file's context length: {}",
         llama.window()
     );
+}
+
+// AYEAYE-55
+//
+// Absent and zero are different facts, and the message has to assert the one
+// that is true: telling somebody their context length is 0 sends them looking
+// for a number that is not in their file at all.
+#[test]
+fn a_file_that_never_says_how_long_its_context_is_says_so_in_those_words() {
+    let dir = tiny_model_without_a_window("no-window");
+
+    let error = LanguageModel::load(dir.path()).expect_err("a model with no window cannot load");
+
+    let message = error.to_string();
+    assert!(
+        matches!(error, LanguageError::Malformed { .. }),
+        "expected a Malformed error, got {error:?}"
+    );
+    assert!(message.contains("qwen2.context_length"), "{message}");
+    assert!(
+        !message.contains(" 0,"),
+        "an absent key must not be reported as a zero: {message}"
+    );
+}
+
+// AYEAYE-55
+//
+// The other side of the window: an ordinary dictation has to fit, with the
+// default system prompt in front of it. The fixture's window and
+// `DEFAULT_SYSTEM_PROMPT` live in different crates with nothing linking them,
+// so without this the first person to add a sentence to the prompt gets a
+// window error from an unrelated test and no clue why.
+#[test]
+fn an_ordinary_dictation_fits_the_window_with_the_default_prompt_in_front_of_it() {
+    let dir = tiny_model_named("headroom", "qwen2");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+
+    let raw = "tell me what broke in the parser and then run the tests again please ".repeat(3);
+    slot.rewrite(&raw, &Policy::default())
+        .expect("a dictation of ordinary length has to fit");
 }
 
 // AYEAYE-55
@@ -292,11 +333,15 @@ fn a_loaded_model_generates_within_the_token_budget_and_stops() {
 
 // AYEAYE-55
 //
-// The assertion the pristine clone exists for, and the one a single-shot test
-// cannot make. candle 0.9's quantized_llama keeps a key-value cache inside every
-// layer with no way to clear it, so without a fresh copy per generation the
-// second dictation would attend to the first one's tokens — a wrong answer with
-// no symptom but a worse one.
+// The assertion a single-shot test cannot make, and the one holding up the
+// ticket's subtlest claim. Both loaders keep a key-value cache inside every
+// layer and neither offers a way to clear it; what clears it is starting a
+// generation at position zero, which each of them special-cases by dropping the
+// cache instead of concatenating onto it. Nothing in candle's API says so, so
+// this test is the only thing standing between us and one dictation attending
+// to the last — a wrong answer with no symptom but a worse one.
+//
+// Both architectures, because it is a property of each loader separately.
 #[test]
 fn two_dictations_through_one_loaded_model_do_not_bleed_into_each_other() {
     let policy = Policy {
