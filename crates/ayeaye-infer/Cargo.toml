@@ -27,10 +27,11 @@ default = []
 # **metal costs no toolchain**, measured against the resolved Apple graph rather
 # than the lockfile — the lockfile also lists `metal` 0.29 and `ug-metal`, and
 # neither is in it, because `candle-ug` is optional and off.
-# `cargo tree -e normal --target aarch64-apple-darwin` adds exactly
-# `candle-metal-kernels` and the `objc2` family, and
-# `cargo tree -e build --target aarch64-apple-darwin` returns the root alone:
-# **no build-dependency edges at all.** `candle-metal-kernels` declares
+# `cargo tree -e normal --target aarch64-apple-darwin` adds
+# `candle-metal-kernels` and the `objc2` family (others arrive on that target
+# too, from `gemm`, and are nothing to do with metal), and
+# `cargo tree -e build --target aarch64-apple-darwin` prints the workspace
+# members with no children: **no build-dependency edges at all.** `candle-metal-kernels` declares
 # `build = false`; the kernels are Metal source held in the binary and compiled
 # by the Metal runtime. `objc2` does carry a `build.rs`, but a pure-Rust one
 # with no build-dependencies. So nothing in an Apple build compiles C, and there

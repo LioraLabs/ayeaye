@@ -239,25 +239,41 @@ fn parse_text(text: &str, path: &Path) -> Result<toml::Value, String> {
     Ok(toml::Value::Table(table))
 }
 
-/// Every package a default build of the whole workspace resolves to.
+/// Every package a default build of the workspace resolves to, on any target.
 ///
 /// This is the one question about features that cannot be answered by reading
 /// files, and the reason it is worth a subprocess: feature resolution is
-/// cargo's, and every attempt to restate it has been wrong. Rule 4's manifest
-/// half has to know that `cudnn`, `nccl` and `flash-attn` all imply `cuda`, and
-/// that a feature can be forwarded across crates; cargo simply knows.
+/// cargo's, and every attempt to restate it here has been wrong. Rule 4's
+/// manifest half has to know that `cudnn`, `nccl` and `flash-attn` all imply
+/// `cuda`, and that a feature can be forwarded across crates; cargo knows.
 ///
-/// `--locked`, so this can never rewrite the lockfile as a side effect of
-/// asking a question. A lockfile that no longer matches the manifests fails
-/// here rather than being silently regenerated — which is the same thing
-/// `cargo test --locked` says, one gate earlier.
+/// Three flags, each load-bearing and each put there by a bypass someone
+/// planted:
+///
+/// - **`--target all`**, because "the portable build" is a five-row release
+///   matrix and the host is one row. A feature forwarded under
+///   `[target.'cfg(target_os = "macos")'.dependencies]` puts nvcc into both
+///   Apple rows and is invisible to a host resolution on Linux.
+/// - **`--edges normal,build`**, because a build dependency is the one edge
+///   kind that *definitionally* runs a compiler on the build machine, which is
+///   the cost this rule exists for. It is also how two of [`
+///   crate::toolchain::ACCELERATED`]'s entries are declared upstream —
+///   `bindgen_cuda` and `candle-flash-attn-build` are build-only, so a normal
+///   listing could never contain them. Dev edges stay out: a dev dependency is
+///   not in the artifact.
+/// - **`--locked`**, so asking a question can never rewrite the lockfile as a
+///   side effect. A lockfile that no longer matches the manifests fails here
+///   rather than being silently regenerated — the same thing
+///   `cargo test --locked` says, one gate earlier.
 pub fn default_build_packages(root: &Path) -> Result<Vec<String>, String> {
     let output = Command::new(env!("CARGO"))
         .args([
             "tree",
             "--workspace",
             "--edges",
-            "normal",
+            "normal,build",
+            "--target",
+            "all",
             "--locked",
             "--prefix",
             "none",
@@ -275,12 +291,13 @@ pub fn default_build_packages(root: &Path) -> Result<Vec<String>, String> {
     }
 
     let listing = String::from_utf8_lossy(&output.stdout);
+    // The first token of each line. With `--prefix none` there are no tree
+    // glyphs and no section headings; `(*)` marks a subtree cargo already
+    // printed, but it is a line *suffix*, so the name is still the first token
+    // and nothing needs filtering out.
     let mut packages: Vec<String> = listing
         .lines()
         .filter_map(|line| line.split_whitespace().next())
-        // `(*)` marks a subtree cargo already printed, and a bare `[dev-dependencies]`
-        // style heading is not a package.
-        .filter(|name| !name.starts_with('[') && *name != "(*)")
         .map(str::to_string)
         .collect();
     packages.sort();

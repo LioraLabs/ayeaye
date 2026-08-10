@@ -264,3 +264,44 @@ fn the_default_build_resolves_to_no_acceleration_package() {
         report(&findings)
     );
 }
+
+// AYEAYE-57 — the twin of `every_workspace_member_lives_under_crates`, and the
+// half that was missing.
+//
+// **Cargo treats a path dependency inside the workspace directory as a member
+// whether or not `[workspace] members` lists it.** The corpus walks the list,
+// so a crate under `crates/` that nobody added to it was built, resolved
+// features, and had rules 1, 2 and 3 applied to it not at all — the effect
+// budget never scanned it, the strata never placed it, the allowlist never read
+// it. Rule 4's package check catches what such a crate *pulls in*; nothing
+// caught the crate itself.
+#[test]
+fn every_crate_under_crates_is_a_listed_workspace_member() {
+    let root = workspace_root();
+    let listed: Vec<String> = corpus().members.iter().map(|m| m.dir.clone()).collect();
+
+    let entries = std::fs::read_dir(root.join("crates")).expect("crates/ should be readable");
+    let mut unlisted = Vec::new();
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if !path.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a directory name")
+            .to_string_lossy()
+            .into_owned();
+        let dir = format!("crates/{name}");
+        if !listed.contains(&dir) {
+            unlisted.push(dir);
+        }
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "these crates are under crates/ but not in [workspace] members, so cargo builds \
+         them and the constitution never reads them: {unlisted:?}. Add them to the member \
+         list, or move them out of the workspace directory"
+    );
+}

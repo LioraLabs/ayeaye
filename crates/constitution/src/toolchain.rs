@@ -1,11 +1,12 @@
 //! Rule 4: nothing the portable build needs may require a C, C++ or CUDA
 //! compiler.
 //!
-//! Two halves, because no single input answers it. [`check`] reads `Cargo.lock`
-//! and proves the graph carries no crate that vendors C for a C compiler to
-//! build. [`gated`] reads the manifests and proves the cost `cc` cannot see —
-//! a build script driving its own compiler, which is what the CUDA path does —
-//! stays out of the build nobody asked for.
+//! Three checks, because no single input answers it. [`check`] reads
+//! `Cargo.lock` and proves the graph carries no crate that vendors C for a C
+//! compiler to build. [`gated`] reads the manifests and *names* the feature and
+//! the file when one turns a toolchain on. [`in_default_build`] reads what
+//! **cargo** resolved, and is the one that holds, because it refuses packages
+//! rather than feature spellings.
 
 use crate::finding::{Finding, Rule};
 
@@ -22,8 +23,8 @@ use crate::finding::{Finding, Rule};
 ///
 /// **It is not proof that nothing anywhere compiles C.** A build script that
 /// drives its own compiler needs no `cc`, and that is exactly the CUDA path:
-/// `candle-kernels` runs nvcc itself. That cost is [`gated`]'s to catch, not
-/// this table's.
+/// `candle-kernels` runs nvcc itself. That cost is [`in_default_build`]'s to
+/// catch, not this table's.
 pub const FORBIDDEN: &[(&str, &str)] = &[
     (
         "cc",
@@ -53,8 +54,9 @@ pub const FORBIDDEN: &[(&str, &str)] = &[
 ///   The whole CUDA toolchain is invisible to a table of package names.
 ///
 /// So the question "is a toolchain in the default build" cannot be answered
-/// from the lockfile at all. It can be answered from the manifests, which are
-/// the only place that says what is *on* — and that is what [`gated`] reads.
+/// from the lockfile at all. The manifests say what is *on*, and that is what
+/// this table and [`gated`] read — but only cargo resolves them, so `gated` is
+/// the diagnosis and [`in_default_build`] is the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gated {
     /// The feature name, as our manifests spell it.
@@ -105,9 +107,18 @@ pub const GATED: &[Gated] = &[Gated {
 /// how an upstream spells the features that reach a toolchain — candle alone
 /// offers `cuda`, `cudnn`, `nccl` and `flash-attn`, and a crate of ours can
 /// forward any of them under a name of its own — and every version of that
-/// guess has been incomplete. A package cannot be spelled two ways. If any of
-/// these is in the default build's resolved graph, something turned
-/// acceleration on, whatever it called it.
+/// guess has been incomplete. A package cannot be spelled two ways, so if one
+/// of these is in the resolved graph, something turned acceleration on whatever
+/// it called it, on whatever target, through a normal or a build edge.
+///
+/// **This is still a hand-written list, and it is not complete either.** It
+/// names the CUDA toolchain, which is the cost this milestone accepted and
+/// wrote a release row for. It does **not** name candle's `mkl` or `accelerate`
+/// paths (`intel-mkl-src`, `accelerate-src`), which are a different toolchain
+/// nobody has asked for yet; `intel-mkl-src` is believed to reach `cc` and so
+/// to be [`FORBIDDEN`]'s to catch, but that has not been measured. The
+/// guarantee here is "no CUDA in the portable build", not "no native toolchain
+/// of any kind" — add a row and say so, rather than assuming one is covered.
 pub const ACCELERATED: &[(&str, &str)] = &[
     (
         "candle-kernels",
@@ -137,6 +148,12 @@ pub const ACCELERATED: &[(&str, &str)] = &[
 /// what makes it immune to the spelling of a feature, to a feature forwarded
 /// across crates, and to a crate cargo treats as a member that our own walk
 /// never listed.
+///
+/// **Immune within the scope of the listing it is handed**, which is every
+/// target and normal plus build edges — see
+/// [`crate::corpus::default_build_packages`] for why each of those is there and
+/// what a narrower listing let through. Dev edges are deliberately outside it:
+/// a dev dependency is not in the artifact.
 pub fn in_default_build(packages: &[String], accelerated: &[(&str, &str)]) -> Vec<Finding> {
     accelerated
         .iter()
@@ -569,5 +586,71 @@ mod gated_tests {
     #[test]
     fn a_manifest_that_does_not_parse_is_a_finding_rather_than_a_pass() {
         assert!(!gated("crates/x/Cargo.toml", "[features\ndefault =", CUDA).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod default_build_tests {
+    use super::{ACCELERATED, in_default_build};
+
+    fn packages(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    // AYEAYE-57 — the mutation. This is the shape every one of the five proven
+    // bypasses of the manifest half resolves to, whatever feature spelled it.
+    #[test]
+    fn an_acceleration_package_in_the_resolved_graph_is_a_finding() {
+        let resolved = packages(&["candle-core", "candle-kernels", "serde"]);
+
+        let findings = in_default_build(&resolved, ACCELERATED);
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].what, "candle-kernels");
+        assert!(findings[0].why.contains("nvcc"), "{}", findings[0].why);
+    }
+
+    // AYEAYE-57 — the build-only entries are reachable only because the
+    // listing includes build edges. If that flag is ever dropped these become
+    // decoration, so they are named here rather than assumed.
+    #[test]
+    fn the_build_only_packages_are_findings_too() {
+        for name in ["bindgen_cuda", "candle-flash-attn-build"] {
+            let findings = in_default_build(&packages(&["serde", name]), ACCELERATED);
+            assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+            assert_eq!(findings[0].what, name);
+        }
+    }
+
+    // AYEAYE-57 — every entry has to be able to fire, or the table is a list of
+    // names nobody checked.
+    #[test]
+    fn every_entry_on_the_table_can_fire() {
+        for (name, _) in ACCELERATED {
+            assert_eq!(
+                in_default_build(&packages(&[name]), ACCELERATED).len(),
+                1,
+                "{name} is on the table but does not produce a finding"
+            );
+        }
+    }
+
+    // AYEAYE-57 — the match is on the whole name. `candle-kernels-of-mine` is
+    // not `candle-kernels`, and a prefix match would make the rule fire on
+    // crates nobody named.
+    #[test]
+    fn a_package_whose_name_merely_contains_one_is_not_a_finding() {
+        let resolved = packages(&["candle-kernelsx", "xcudarc", "my-cudarc-wrapper"]);
+
+        assert!(in_default_build(&resolved, ACCELERATED).is_empty());
+    }
+
+    // AYEAYE-57 — a graph with nothing to say, and an empty table, both mean
+    // no finding rather than a panic.
+    #[test]
+    fn a_clean_graph_and_an_empty_table_are_both_silent() {
+        assert!(in_default_build(&packages(&["serde", "candle-core"]), ACCELERATED).is_empty());
+        assert!(in_default_build(&packages(&["candle-kernels"]), &[]).is_empty());
+        assert!(in_default_build(&[], ACCELERATED).is_empty());
     }
 }

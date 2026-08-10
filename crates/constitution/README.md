@@ -199,9 +199,11 @@ finds nothing.
 
 ### The second half: a feature that legitimately needs a toolchain
 
-The manifests are the only place that records what is *on*, so that is what the
-second half reads. `toolchain::gated(subject, manifest, gated)` judges one
-manifest's text against `GATED`:
+The manifests are where what is *on* is written down, so that is what the
+second half reads. It is the **diagnosis** — it names the feature and the file,
+which is what somebody needs in order to fix it — and the section after this is
+the proof. `toolchain::gated(subject, manifest, gated)` judges one manifest's
+text against `GATED`:
 
 | Feature | What building it costs | Which artifact stops being static |
 |---|---|---|
@@ -230,9 +232,11 @@ nobody could obey, since being on by default in an Apple build is the point.
 
 **A gated feature is rarely reachable only under its own name**, so `Gated`
 carries the other spellings that turn the same cost on. candle defines
-`cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, and `default =
-["candle-core/cudnn"]` pays for nvcc while naming nothing called `cuda`. Both
-are on the table; a rule that matched one keyword would be a filter, not a rule.
+`cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, and candle-transformers adds
+`flash-attn = ["cuda", …]`; `default = ["candle-core/cudnn"]` pays for nvcc
+while naming nothing called `cuda`. All three are on the table — and that list
+is a courtesy rather than a guarantee, because it describes an upstream's
+vocabulary and the upstream may add to it in any release.
 
 **The root manifest is judged too.** It is not a workspace member, it has no
 sources, and it declares dependencies under `[workspace.dependencies]` — which
@@ -262,7 +266,10 @@ restates cargo's feature resolution will keep being one release behind it:
    stops at the crate boundary.
 3. A crate under `crates/` that is not in `[workspace] members`. Cargo treats a
    path dependency inside the workspace as a member anyway; the corpus walk
-   reads the list, so **no** rule applied to it at all.
+   reads the list, so **no** rule applied to it at all. The package check below
+   catches what such a crate pulls *in*; catching the crate itself is a
+   separate test, `every_crate_under_crates_is_a_listed_workspace_member`,
+   which is the twin of the one asserting members live under `crates/`.
 
 So the question is asked of cargo instead. `corpus::default_build_packages`
 runs `cargo tree --workspace --edges normal --locked` and
@@ -271,9 +278,30 @@ that exist only to build acceleration — `candle-kernels`, `bindgen_cuda`,
 `candle-flash-attn`, `candle-flash-attn-build`, `cudarc`, `ug-cuda`.
 
 A feature can be spelled four ways and forwarded through three crates; a
-package cannot. All three bypasses above fail this check, and it needs to know
-nothing about what any of them was called. `--locked`, so asking the question
-can never rewrite the lockfile as a side effect.
+package cannot. All the bypasses above fail this check, and it needs to know
+nothing about what any of them was called.
+
+**Three flags, each put there by a bypass someone planted.** Two more were
+found after the first version of this section claimed to hold, which is why
+they are written down rather than assumed:
+
+- `--target all`, because "the portable build" is a five-row release matrix and
+  the host is one row. `[target.'cfg(target_os = "macos")'.dependencies]`
+  forwarding a feature put nvcc into both Apple rows while a host resolution on
+  Linux saw nothing.
+- `--edges normal,build`, because a build dependency is the one edge kind that
+  *definitionally* runs a compiler on the build machine. It is also how
+  `bindgen_cuda` and `candle-flash-attn-build` are declared upstream, so a
+  normal-only listing could never contain them and two rows of `ACCELERATED`
+  were unreachable. Dev edges stay out: a dev dependency is not in the artifact.
+- `--locked`, so asking the question can never rewrite the lockfile.
+
+**And `ACCELERATED` is a hand-written list too.** It names the CUDA toolchain,
+which is the cost this milestone accepted and wrote a release row for. It does
+not name candle's `mkl` or `accelerate` paths — a different toolchain nobody has
+asked for, where `intel-mkl-src` is *believed* to reach `cc` and so to be
+`FORBIDDEN`'s to catch, unmeasured. The guarantee is "no CUDA in the portable
+build", not "no native toolchain of any kind".
 
 This is the one rule that runs a subprocess, and it is worth it for exactly the
 reason the three bypasses give: feature resolution belongs to cargo, and every
