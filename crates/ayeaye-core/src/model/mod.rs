@@ -14,6 +14,7 @@
 pub mod architecture;
 pub mod hub;
 pub mod id;
+pub mod verify;
 
 // Private on purpose. `json.rs` promises this crate holds no general JSON
 // reader and that `model::config` is a narrow exception; keeping the door shut
