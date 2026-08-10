@@ -7,11 +7,14 @@
 //! that resolves correctly and a server that never binds would pass a unit
 //! test and fail a phone.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ayeaye::config::Settings;
 use ayeaye_core::http::hosts::AllowedHosts;
+use ayeaye_core::peer::{HostName, Peer, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -108,7 +111,18 @@ fn settings_on_port(port: u16) -> Settings {
         port,
         allowed_hosts: AllowedHosts::new("127.0.0.1", port, ""),
         token: TOKEN.to_string(),
+        peers: registry("desktop"),
+        // Pointed at a socket no server is on, so a test that does not care
+        // about panes still cannot read the panes of whoever is running the
+        // suite. The cases that do care point it at a server of their own.
+        tmux: common::nowhere("serve-nobody"),
     }
+}
+
+/// A deployment of one machine, under the name a test wants to see.
+fn registry(name: &str) -> Registry {
+    Registry::new(vec![Peer::here(HostName::new(name).expect("a host name"))])
+        .expect("one peer, and it is this machine")
 }
 
 fn parse(raw: &[u8]) -> Answer {
@@ -239,7 +253,7 @@ async fn every_page_manifest_and_icon_is_served_with_its_type() {
 #[tokio::test]
 async fn a_foreign_host_is_refused_even_for_the_panel() {
     let server = Server::started().await;
-    for path in ["/", "/board", "/favicon.ico", "/api/panes"] {
+    for path in ["/", "/board", "/favicon.ico", "/api/overview"] {
         let answer = server
             .request("GET", path, &[("Host", "evil.example")])
             .await;
@@ -262,18 +276,22 @@ async fn a_foreign_host_is_refused_even_for_the_panel() {
 async fn the_api_needs_a_token_by_header_or_by_cookie() {
     let server = Server::started().await;
 
-    let anonymous = server.get("/api/panes").await;
+    let anonymous = server.get("/api/overview").await;
     assert_eq!(anonymous.status, 401);
     assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
 
     let wrong = server
-        .request("GET", "/api/panes", &[("X-Voice-Token", "not-the-token")])
+        .request(
+            "GET",
+            "/api/overview",
+            &[("X-Voice-Token", "not-the-token")],
+        )
         .await;
     assert_eq!(wrong.status, 401, "a wrong token is not a token");
 
     // 404, not 401: the gate let it through and nothing answers there yet.
     let by_header = server
-        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .request("GET", "/api/overview", &[("X-Voice-Token", TOKEN)])
         .await;
     assert_eq!(by_header.status, 404);
     assert_eq!(by_header.body_text(), r#"{"error":"not found"}"#);
@@ -281,7 +299,7 @@ async fn the_api_needs_a_token_by_header_or_by_cookie() {
     let by_cookie = server
         .request(
             "GET",
-            "/api/panes",
+            "/api/overview",
             &[("Cookie", &format!("theme=dark; voice_token={TOKEN}"))],
         )
         .await;
@@ -405,7 +423,7 @@ async fn head_is_answered_where_get_is_and_gated_where_get_is() {
     assert_eq!(open.header("content-type"), Some("image/x-icon"));
     assert!(open.body.is_empty(), "HEAD must not return a body");
 
-    let gated = server.request("HEAD", "/api/panes", &[]).await;
+    let gated = server.request("HEAD", "/api/overview", &[]).await;
     assert_eq!(gated.status, 401, "HEAD is gated exactly where GET is");
 }
 
@@ -424,4 +442,78 @@ async fn the_login_handshake_is_not_reachable_by_post() {
         .await;
     assert_eq!(answer.status, 404);
     assert_eq!(answer.header("set-cookie"), None);
+}
+
+// AYEAYE-43 — the whole of it, from the seam a phone reads: a real socket, a
+// real tmux, and a pane list whose ids are already federation-shaped. The unit
+// tests prove the parse and the body; only this proves they are wired to the
+// route, with this machine's name on them.
+#[tokio::test]
+async fn the_pane_list_comes_back_over_a_socket_with_every_id_qualified() {
+    let Some(tmux) = common::Private::named("serve-live") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    tmux.tmux(&["new-window", "-t", "work", "-n", "cook", "-d", "/bin/sh"]);
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let answer = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("content-type"), Some("application/json"));
+    // Live state, so never cached — the same rule every other answer follows.
+    assert_eq!(answer.header("cache-control"), Some("no-store"));
+
+    let body = answer.body_text();
+    assert!(
+        body.starts_with(r#"{"host":"desktop","panes":[{"id":"desktop/%"#),
+        "the panel needs the host and qualified ids: {body}"
+    );
+    assert_eq!(body.matches(r#""session":"work""#).count(), 2, "{body}");
+    assert!(body.contains(r#""name":"cook""#), "{body}");
+    assert!(!body.contains("error"), "nothing failed: {body}");
+}
+
+// AYEAYE-43 — a machine with no tmux server answers an empty list rather than
+// an error. Most machines are in that state most of the time, and the panel has
+// to render on all of them.
+#[tokio::test]
+async fn a_machine_with_no_tmux_server_answers_an_empty_list() {
+    let server = Server::started().await;
+    let answer = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body_text(), r#"{"host":"desktop","panes":[]}"#);
+}
+
+// AYEAYE-43 — and it is gated like everything else under /api/, by header or by
+// the login cookie. A pane list names every session on the machine.
+#[tokio::test]
+async fn the_pane_list_needs_a_token() {
+    let server = Server::started().await;
+    assert_eq!(server.get("/api/panes").await.status, 401);
+    assert_eq!(
+        server
+            .request("GET", "/api/panes", &[("X-Voice-Token", "not-the-token")])
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/api/panes",
+                &[("Cookie", &format!("voice_token={TOKEN}"))]
+            )
+            .await
+            .status,
+        200,
+        "the login cookie should authenticate"
+    );
 }

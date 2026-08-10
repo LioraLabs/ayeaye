@@ -1,67 +1,16 @@
 //! The tmux layer, against a real tmux.
 //!
-//! Every test here starts its **own** tmux server on its own socket, with
-//! `-f /dev/null` so none of the machine's configuration reaches it, and kills
-//! that server on the way out whether the assertions passed or not. Nothing in
-//! this file may touch the default socket: that is where the person running the
-//! suite keeps their actual work, and a test that read it would be one mistyped
-//! subcommand from changing it.
+//! Every test here asks a tmux server of the suite's own — see `common` for why
+//! the default socket is off limits.
 
-use std::process::Command;
+mod common;
+
 use std::time::Duration;
 
 use ayeaye::tmux::{Tmux, Trouble};
 use ayeaye_core::peer::HostName;
 
-/// A tmux server of our own, killed when it goes out of scope.
-struct Private {
-    socket: String,
-}
-
-impl Private {
-    /// Start one, or say why the suite cannot have one.
-    fn named(what: &str) -> Option<Private> {
-        // The pid keeps two runs of the suite apart; the name keeps two tests
-        // in one run apart.
-        let socket = format!("ayeaye-43-{}-{what}", std::process::id());
-        let server = Private { socket };
-        server.tmux(&["new-session", "-d", "-s", "work", "-n", "editor", "/bin/sh"])?;
-        Some(server)
-    }
-
-    /// One tmux command against this server, or `None` if tmux is not here.
-    fn tmux(&self, args: &[&str]) -> Option<()> {
-        let ran = Command::new("tmux")
-            .args(["-f", "/dev/null", "-L", &self.socket])
-            .args(args)
-            .output()
-            .ok()?;
-        assert!(
-            ran.status.success(),
-            "the test's own tmux refused {args:?}: {}",
-            String::from_utf8_lossy(&ran.stderr)
-        );
-        Some(())
-    }
-
-    /// The layer under test, pointed at this server.
-    fn layer(&self) -> Tmux {
-        Tmux::spelled(
-            &["tmux", "-f", "/dev/null", "-L", &self.socket],
-            Duration::from_secs(10),
-        )
-    }
-}
-
-impl Drop for Private {
-    fn drop(&mut self) {
-        // Not `self.tmux`: that asserts, and a panicking Drop during another
-        // panic aborts the process. A server that is already gone is fine.
-        let _ = Command::new("tmux")
-            .args(["-f", "/dev/null", "-L", &self.socket, "kill-server"])
-            .output();
-    }
-}
+use common::Private;
 
 fn host() -> HostName {
     HostName::new("desktop").expect("a host name")
@@ -109,17 +58,10 @@ async fn the_panes_of_a_real_tmux_come_back_qualified() {
 // would put an error in the panel on every one of them.
 #[tokio::test]
 async fn a_socket_with_no_server_has_no_panes_and_no_complaint() {
-    let empty = Tmux::spelled(
-        &[
-            "tmux",
-            "-f",
-            "/dev/null",
-            "-L",
-            &format!("ayeaye-43-{}-nobody", std::process::id()),
-        ],
-        Duration::from_secs(10),
+    assert_eq!(
+        common::nowhere("nobody").panes(&host()).await,
+        Ok(Vec::new())
     );
-    assert_eq!(empty.panes(&host()).await, Ok(Vec::new()));
 }
 
 // AYEAYE-43 — and a tmux that could not be run at all is not silence. "I could

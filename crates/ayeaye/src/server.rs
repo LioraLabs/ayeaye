@@ -85,10 +85,11 @@ async fn handle(
         Route::Asset(asset) if method == Method::GET || method == Method::HEAD => {
             serve_asset(asset)
         }
+        Route::Panes if method == Method::GET || method == Method::HEAD => panes(&settings).await,
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
-        Route::Api | Route::NotFound | Route::Login | Route::Asset(_) => {
+        Route::Panes | Route::Api | Route::NotFound | Route::Login | Route::Asset(_) => {
             json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
         }
     }
@@ -112,6 +113,31 @@ fn log_in(settings: &Settings, query: &Query) -> Response {
                 .header(header::LOCATION, next)
                 .header(header::SET_COOKIE, login::set_cookie(&settings.token))
         },
+    )
+}
+
+/// Every live pane on this machine, with every id already qualified.
+///
+/// A tmux that could not be asked is answered as an empty list *carrying the
+/// reason*, at 200 rather than 500. The panel polls this every couple of
+/// seconds and has to keep rendering; what it must never do is show an empty
+/// list that means "nothing needs you" when the truth is "I could not look".
+async fn panes(settings: &Settings) -> Response {
+    let here = settings.peers.here().name();
+    let body = match settings.tmux.panes(here).await {
+        Ok(panes) => ayeaye_core::tmux::panes_body(here, &panes, None),
+        Err(trouble) => {
+            // Also on stderr: the panel shows the reason to whoever is holding
+            // the phone, and the journal is where whoever fixes it will look.
+            eprintln!("ayeaye: {trouble}");
+            ayeaye_core::tmux::panes_body(here, &[], Some(&trouble.to_string()))
+        }
+    };
+    build(
+        StatusCode::OK,
+        "application/json",
+        Body::from(body),
+        |response| response,
     )
 }
 

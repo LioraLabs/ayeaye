@@ -72,7 +72,7 @@ fn serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let settings = match Settings::resolve(args, config::env_var, token) {
+    let settings = match Settings::resolve(args, config::env_var, token, nodename(&Subprocess)) {
         Ok(settings) => settings,
         Err(why) => {
             eprintln!("ayeaye: {why}\n\n{USAGE}");
@@ -218,6 +218,21 @@ fn from_environment(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// What this machine calls itself, from `uname -n`.
+///
+/// Asked through the same [`Runner`] the launchd uid is asked through, rather
+/// than through the timeout helper the tmux calls use: this happens once,
+/// before the runtime exists, with nothing to interleave with. `None` when
+/// `uname` is not there or says nothing, which leaves the name to fall through
+/// to a default rather than to the empty string.
+fn nodename(runner: &impl Runner) -> Option<String> {
+    let asked = runner.run(&["uname".to_string(), "-n".to_string()]);
+    asked
+        .ok
+        .then(|| asked.output.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 /// Which service manager to talk to.
 ///
 /// Provisional, and deliberately the smallest thing that is not a guess:
@@ -260,7 +275,7 @@ fn stamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{layout, session, stamp};
+    use super::{layout, nodename, session, stamp};
     use crate::service::{Outcome, Runner};
     use ayeaye_core::service::Manager;
     use std::cell::RefCell;
@@ -320,6 +335,23 @@ mod tests {
         let session = session(&runner, false);
         assert_eq!(session.manager, Manager::Systemd);
         assert!(runner.asked.borrow().is_empty());
+    }
+
+    // AYEAYE-43 — what this machine calls itself is `uname -n`, which is what
+    // the daemon reads it from, and it is asked through the same runner the
+    // launchd uid is asked through. A machine that will not answer has no name
+    // here rather than an empty one: the empty string is not a host name and
+    // the defaulting above it is what turns "no answer" into a usable name.
+    #[test]
+    fn this_machine_is_named_by_uname_n_and_nothing_is_not_a_name() {
+        let runner = Answers::with(true, "desktop\n");
+        assert_eq!(nodename(&runner), Some("desktop".to_string()));
+        assert_eq!(
+            runner.asked.borrow().as_slice(),
+            [vec!["uname".to_string(), "-n".to_string()]]
+        );
+        assert_eq!(nodename(&Answers::with(false, "desktop")), None);
+        assert_eq!(nodename(&Answers::with(true, " \n")), None);
     }
 
     // AYEAYE-61 — the XDG defaults, which decide where a unit lands and which
