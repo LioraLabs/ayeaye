@@ -13,6 +13,28 @@
 //! deliberately no path by which a graphics card raises a tier that memory or
 //! free space did not already support — a card cannot hold a model there is no
 //! room to download.
+//!
+//! # The one place this port does not agree with the shell
+//!
+//! `lib/steps/20-hardware.sh` treats an AMD card like an NVIDIA one: its
+//! `hw_accel_usable` calls a card of 4 GB or more usable whatever made it, and
+//! its `_hw_tier_compute` lets an 8 GB Radeon on a large machine reach
+//! `maximum`. This crate does not, because ayeaye's inference is candle and
+//! candle has no ROCm backend — see `ayeaye-infer`, whose only acceleration
+//! features are `cuda` and `metal`.
+//!
+//! The concrete difference, for whoever does the cutover (**AYEAYE-66**): an AMD
+//! card at or above [`VRAM_MB_MAXIMUM`] on a machine that clears every other
+//! line drops from `maximum` to `recommended`, and its cause word changes from
+//! `graphics-small`/`graphics-unknown` to `graphics-unusable`. Nothing else
+//! moves; no other acceleration is touched, and no machine is offered *more*
+//! than the shell offered it.
+//!
+//! Two things in the shell still encode the old promise and must go with it, not
+//! before it and not after: `test_rocm_is_treated_exactly_like_cuda_at_the_same
+//! _size` in `tests/cases/hardware_tier_test.sh`, and the paragraph about AMD in
+//! `hw_accel_usable`'s comment. Deleting the shell without deleting them is
+//! fine; deleting them without this crate in place is not.
 
 use super::{Acceleration, Graphics, Limits};
 
@@ -113,6 +135,12 @@ impl Cause {
 
     /// True when the tier is the least this machine could be rather than what it
     /// measured, so a caller can say so instead of implying a measurement.
+    ///
+    /// [`Cause::Container`] counts, where the shell's `*-unknown` glob does not:
+    /// a container whose share could not be read has not been measured either,
+    /// and the numbers it reported describe the host. So a container says "that
+    /// is the least this computer could be" where the shell stayed silent. It is
+    /// a deliberate second, smaller departure, and the honest direction.
     pub fn is_ignorance(self) -> bool {
         matches!(
             self,
@@ -260,45 +288,52 @@ pub fn judge(
         ),
     }
 
-    // Acceleration caps and never lifts.
-    match graphics.acceleration {
-        // One pool of memory shared between the processor and the graphics, so
-        // the memory line above has already said everything there is to say and
-        // there is no second figure to be ignorant of. This is the one branch
-        // that caps nothing, and it is deliberate: a Mac reaches the top tier
-        // only by having the memory for it, which is the same test every other
-        // machine passes.
-        Acceleration::Metal => {}
-        Acceleration::Rocm => cap(
+    // Acceleration caps and never lifts, and it asks [`usability`] rather than
+    // comparing against VRAM_MB_ACCELERATED a second time. Two copies of that
+    // comparison could drift into a machine whose card is reported usable and
+    // whose reason says it is not.
+    match usability(graphics) {
+        // Metal has one pool of memory, shared with the processor, so the memory
+        // line above has already said everything there is to say and there is no
+        // second figure to be ignorant of. This is the one branch that caps
+        // nothing, and it is deliberate: a Mac reaches the top tier only by
+        // having the memory for it, which is the same test every other machine
+        // passes.
+        Usability::Usable if graphics.acceleration == Acceleration::Metal => {}
+        // A usable card still has to be big enough for the largest model, which
+        // is the second and higher of the two graphics lines.
+        Usability::Usable => {
+            if graphics.vram_mb.unwrap_or(0) < VRAM_MB_MAXIMUM {
+                cap(
+                    &mut verdict,
+                    Tier::Recommended,
+                    Cause::GraphicsSmall,
+                    "the graphics card cannot hold the largest model",
+                );
+            }
+        }
+        // Below the first line the card is not worth using at all, and this is a
+        // processor-only machine that happens to have a card in it. Saying so is
+        // the difference between a true sentence and a useful one.
+        Usability::TooSmall => cap(
+            &mut verdict,
+            Tier::Recommended,
+            Cause::GraphicsSmall,
+            "the graphics card is too small to be any use",
+        ),
+        Usability::Unsized => cap(
+            &mut verdict,
+            Tier::Recommended,
+            Cause::GraphicsUnknown,
+            "setup could not read the graphics card's size",
+        ),
+        Usability::Unsupported(why) => cap(
             &mut verdict,
             Tier::Recommended,
             Cause::GraphicsUnusable,
-            NO_ROCM,
+            why,
         ),
-        Acceleration::Cuda => match graphics.vram_mb {
-            None => cap(
-                &mut verdict,
-                Tier::Recommended,
-                Cause::GraphicsUnknown,
-                "setup could not read the graphics card's size",
-            ),
-            Some(mb) if mb >= VRAM_MB_MAXIMUM => {}
-            Some(mb) if mb >= VRAM_MB_ACCELERATED => cap(
-                &mut verdict,
-                Tier::Recommended,
-                Cause::GraphicsSmall,
-                "the graphics card cannot hold the largest model",
-            ),
-            // Below the first line the card is not worth using at all, and this
-            // is a processor-only machine that happens to have a card in it.
-            Some(_) => cap(
-                &mut verdict,
-                Tier::Recommended,
-                Cause::GraphicsSmall,
-                "the graphics card is too small to be any use",
-            ),
-        },
-        Acceleration::Cpu => cap(
+        Usability::None => cap(
             &mut verdict,
             Tier::Recommended,
             Cause::GraphicsNone,

@@ -68,7 +68,7 @@ pub fn classify(platform: &Platform, probes: &Probes<'_>) -> Graphics {
         // the accelerated builds this project points people at are Apple
         // Silicon builds; promising acceleration that is not there costs more
         // than declining to promise it.
-        if platform.arch != "arm64" {
+        if !platform.is_apple_silicon() {
             return Graphics::processor_only();
         }
         return Graphics {
@@ -270,6 +270,19 @@ mod tests {
         });
         assert_eq!(two.vram_mb, Some(24564));
         assert_eq!(two.name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+    }
+
+    // AYEAYE-60 — a small card is still cuda: the verdict is a statement of
+    // fact and not of size, and how small it is is the tier's business.
+    #[test]
+    fn a_small_card_is_still_a_card_and_its_size_is_still_read() {
+        let gtx = on_linux(Probes {
+            nvidia_smi: Some(fixture!("nvidia-smi/gtx-1050")),
+            ..Probes::default()
+        });
+        assert_eq!(gtx.acceleration, Acceleration::Cuda);
+        assert_eq!(gtx.vram_mb, Some(2048));
+        assert_eq!(gtx.name.as_deref(), Some("NVIDIA GeForce GTX 1050"));
     }
 
     // AYEAYE-60 — "[N/A]" is what a MIG slice, a vGPU and WSL answer. The

@@ -108,7 +108,6 @@ recipe suite
 # The ingredient is the workspace manifest - a source, which is what makes this
 # cacheable at all. The sources themselves are the sealed probe above: cargo
 # consumes them, but it does not take them as arguments.
-
 #
 # `fixtures` is sealed here as well as on the bash suite: ayeaye-core's tests
 # read tests/fixtures through include_str!, which is a compile-time input and

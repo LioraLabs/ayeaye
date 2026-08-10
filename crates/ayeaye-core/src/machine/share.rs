@@ -212,7 +212,7 @@ fn core_limit(probes: &Probes<'_>) -> Limit {
         if quota == "-1" {
             return Limit::None;
         }
-        (quota, probes.cgroup_cpu_period.unwrap_or("").trim())
+        (quota, answered(probes.cgroup_cpu_period).unwrap_or(""))
     } else {
         return Limit::Unknown;
     };

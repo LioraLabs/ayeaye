@@ -75,6 +75,17 @@ pub struct Platform {
     pub immutable: bool,
 }
 
+impl Platform {
+    /// Whether this is an Apple Silicon Mac.
+    ///
+    /// The normalised spelling of the architecture lives in `normalise_arch` and
+    /// is compared here and nowhere else, so changing it cannot quietly demote
+    /// every Mac to a processor-only machine somewhere across the crate.
+    pub fn is_apple_silicon(&self) -> bool {
+        self.os == Os::Macos && self.arch == "arm64"
+    }
+}
+
 /// Work out what this machine is from the text its probes produced.
 ///
 /// `os_release` is the contents of the first readable `/etc/os-release`-shaped

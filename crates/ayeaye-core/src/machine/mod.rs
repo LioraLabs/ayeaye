@@ -396,4 +396,35 @@ mod tests {
         );
         assert_eq!(machine.services.as_str(), "launchd");
     }
+    // AYEAYE-60 — the captured small card, end to end. It is real, it is cuda,
+    // and it is too small for the listening work, so the machine is a
+    // processor-only machine that happens to have a card in it. Saying "there
+    // is no graphics card here" to somebody who paid for one is how a tool stops
+    // being believed about anything else.
+    #[test]
+    fn a_captured_small_card_is_named_and_declined_for_being_small() {
+        let machine = Machine::read(&Probes {
+            os_release: Some(fixture!("os-release/debian-12")),
+            uname_s: Some("Linux"),
+            uname_m: Some("x86_64"),
+            meminfo: Some(fixture!("meminfo/64gb")),
+            lscpu: Some(fixture!("lscpu/x86_64-8core")),
+            df_pk: Some(fixture!("df/roomy")),
+            nvidia_smi: Some(fixture!("nvidia-smi/gtx-1050")),
+            ..Probes::default()
+        });
+        assert_eq!(
+            machine.acceleration(),
+            Acceleration::Cuda,
+            "the card is real"
+        );
+        assert_eq!(machine.gpu_name(), Some("NVIDIA GeForce GTX 1050"));
+        assert_eq!(machine.usability(), Usability::TooSmall);
+        assert_eq!(machine.tier(), Tier::Recommended);
+        assert_eq!(machine.verdict.cause, Some(Cause::GraphicsSmall));
+        assert_eq!(
+            machine.verdict.reason,
+            Some("the graphics card is too small to be any use")
+        );
+    }
 }
