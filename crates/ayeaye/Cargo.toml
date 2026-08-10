@@ -34,6 +34,13 @@ form_urlencoded = "1"
 # the machine says what it is. One sysconf call, in the one crate allowed to
 # make it; the constitution refuses libc inside ayeaye-core.
 libc = "0.2"
+# macOS keeps a process information structure the kernel fills in, and its
+# start-time field is an instant. The alternative is `ps -o lstart=`, which
+# prints a local wall-clock string that can only be read back through the
+# machine's timezone - which the pure core may not do. Six of the seven
+# questions could come from here; only this one does, because the other five
+# have captured output that a test on this machine can be held to.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

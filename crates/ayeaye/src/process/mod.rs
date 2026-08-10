@@ -18,7 +18,9 @@
 //! request handler, and a pane whose agent cannot be identified is an ordinary
 //! state of the world.
 
+pub mod darwin;
 pub mod linux;
+pub mod tool;
 
 use ayeaye_core::process::Source;
 
