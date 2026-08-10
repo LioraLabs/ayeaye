@@ -257,6 +257,11 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // about panes still cannot read the panes of whoever is running the
         // suite. The cases that do care point it at a server of their own.
         tmux: common::nowhere("serve-nobody"),
+        // Pointed at a home nobody has, for the same reason the tmux above
+        // points at a socket nobody is on: a test that does not care about
+        // sessions must not read the ones belonging to whoever is running the
+        // suite.
+        agents: ayeaye::session::Agents::under("/nonexistent/home"),
         cliban: ayeaye::cliban::Cliban::new(cliban.to_string()),
         pane_cache: Arc::new(Mutex::new(ayeaye_core::pane::Cache::default())),
         // No path: a test must never write into the state directory of whoever
@@ -2053,4 +2058,65 @@ async fn a_pane_id_in_the_query_is_decoded_before_it_is_matched() {
         .await;
     assert_eq!(asked.status, 200, "{}", asked.body_text());
     assert_eq!(asked.body_text(), r#"{"prompt":null}"#);
+}
+
+// AYEAYE-45 — a request naming no pane at all. `kind` is always there and is
+// null, so the page can tell "not an agent" from "something went wrong"
+// without reading a status code.
+#[tokio::test]
+async fn the_session_endpoint_answers_a_request_that_names_no_pane() {
+    let server = Server::started().await;
+    let answer = server
+        .request("GET", "/api/session", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body_text(), r#"{"kind":null}"#);
+}
+
+// AYEAYE-45 — an id shaped like a tmux target, or like nothing at all, is
+// *answered* rather than refused: the panel asks about whatever is selected,
+// and a pane that has just closed is a race rather than a caller doing
+// something wrong. This says nothing about membership on its own — the server
+// here has no panes at all — and the test that does is
+// `a_pane_the_list_excludes_is_never_a_target` in `tests/session.rs`, which
+// needs a real tmux to have a real pane to exclude.
+#[tokio::test]
+async fn an_odd_pane_id_is_answered_rather_than_refused() {
+    let server = Server::started().await;
+    for pane in [
+        "desktop/%99",
+        "desktop/%0",
+        // Shaped like a target and not one. The list is what refuses these,
+        // and a pattern over the id would not be a substitute.
+        "desktop/work:0.0",
+        "desktop/-X",
+        "%0",
+        "../../etc/passwd",
+    ] {
+        let answer = server
+            .request(
+                "GET",
+                &format!("/api/session?pane={}", urlencode(pane)),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{pane}");
+        assert_eq!(answer.body_text(), r#"{"kind":null}"#, "{pane}");
+    }
+}
+
+// AYEAYE-45 — it is an `/api/` path, so it is gated like every other one. This
+// is what an endpoint mounted on the router with `.route(…)` would skip, and
+// nothing else in the suite would notice.
+#[tokio::test]
+async fn the_session_endpoint_is_gated_like_the_rest_of_the_api() {
+    let server = Server::started().await;
+    let anonymous = server.get("/api/session?pane=desktop/%250").await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
+}
+
+/// Percent-encode the characters a pane id can carry that a query cannot.
+fn urlencode(text: &str) -> String {
+    form_urlencoded::byte_serialize(text.as_bytes()).collect()
 }

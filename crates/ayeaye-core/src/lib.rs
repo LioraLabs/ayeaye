@@ -23,11 +23,13 @@ pub mod machine;
 pub mod mel;
 pub mod model;
 pub mod pane;
+pub mod paths;
 pub mod peer;
 pub mod process;
 pub mod projects;
 pub mod prompt;
 pub mod service;
+pub mod session;
 pub mod sha1;
 pub mod tmux;
 

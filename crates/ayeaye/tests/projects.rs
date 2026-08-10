@@ -157,6 +157,7 @@ async fn the_picker_answers_over_a_socket() {
         cliban: ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
         pane_cache: Arc::new(Mutex::new(ayeaye_core::pane::Cache::default())),
         fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
+        agents: ayeaye::session::Agents::under(&tree.path),
     };
     let listener = ayeaye::server::listen(&settings)
         .await

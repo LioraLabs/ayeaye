@@ -299,6 +299,54 @@ pub fn string_member(text: &str, name: &str) -> Option<String> {
     Some(value)
 }
 
+/// The raw text of a top-level member's value, exactly as it was written.
+///
+/// Borrowed rather than decoded, because the two things this answers are not
+/// strings: an agent's session file records when it started as a *number*, and
+/// a codex rollout opens with a `payload` **object** whose members are the
+/// answer. Handing the object's own text back means [`string_member`] reads it
+/// with no second reader that could disagree with this one about what an object
+/// is.
+///
+/// The same narrowing as [`string_member`] otherwise: `None` when the text is
+/// not one well-formed object, or has no such member. A repeated member takes
+/// the last, which is what `json.loads` does.
+pub fn member<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = text.as_bytes();
+    let at = skip_space(bytes, 0);
+    if bytes.get(at) != Some(&b'{') {
+        return None;
+    }
+    let mut found = None;
+    let end = scan_object(bytes, at, 0, &mut |name_start, name_end, value_start| {
+        if named(bytes, name_start, name_end, name) {
+            found = Some(value_start);
+        }
+    })?;
+    if skip_space(bytes, end) != bytes.len() {
+        return None;
+    }
+    let start = found?;
+    // The object scanned, so every value in it has an end. Indexed rather than
+    // sliced by that reasoning alone would be a panic waiting for the day the
+    // reasoning is wrong.
+    let stop = scan_value(bytes, start, 0)?;
+    text.get(start..stop)
+}
+
+/// The numeric value of a top-level member, if there is one.
+///
+/// `None` when the member is absent or is not a number — a string there is not
+/// a number that happens to be quoted, and the one caller compares it against a
+/// clock.
+///
+/// Read through Rust's own float parser, which accepts every JSON number and
+/// several things that are not one; [`member`] has already established that
+/// this text *is* a JSON number, so the difference cannot arise.
+pub fn number_member(text: &str, name: &str) -> Option<f64> {
+    member(text, name)?.parse().ok()
+}
+
 /// Whether the member name at `start..end` — quotes included, escapes intact —
 /// is `name`.
 ///
@@ -693,7 +741,84 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BadJson, MAX_DEPTH, Value, is_value, parse, string, string_member};
+    use super::{
+        BadJson, MAX_DEPTH, Value, is_value, member, number_member, parse, string, string_member,
+    };
+
+    /// The first line of a codex rollout, which is the shape `member` exists
+    /// for: everything worth knowing is inside a nested object.
+    const ROLLOUT: &str = r#"{"timestamp":"2026-03-04T09:00:02.123Z","type":"session_meta","payload":{"id":"0123abcd-dead-beef-0000-111122223333","cwd":"/Users/someone/dev/thing","originator":"codex_cli_rs"}}"#;
+
+    // AYEAYE-45 — a codex rollout's answer is a whole object one level down,
+    // and the point of handing its text back is that `string_member` reads it
+    // rather than a second reader that could disagree about what an object is.
+    #[test]
+    fn a_nested_object_comes_back_whole_and_reads_again() {
+        let payload = member(ROLLOUT, "payload").expect("a payload");
+        assert!(
+            payload.starts_with('{') && payload.ends_with('}'),
+            "{payload}"
+        );
+        assert_eq!(
+            string_member(payload, "cwd").as_deref(),
+            Some("/Users/someone/dev/thing")
+        );
+        assert_eq!(string_member(payload, "parent_thread_id"), None);
+    }
+
+    // AYEAYE-45 — the raw text, not a re-rendering: a member is borrowed so
+    // nothing this crate writes can change what an agent wrote.
+    #[test]
+    fn a_member_is_the_text_that_was_written() {
+        assert_eq!(member(ROW, "key"), Some(r#""AYEAYE""#));
+        assert_eq!(member(r#"{"a":[1, 2 ,3]}"#, "a"), Some("[1, 2 ,3]"));
+        assert_eq!(member(r#"{"a":1.50e2}"#, "a"), Some("1.50e2"));
+        assert_eq!(member(r#"{"a":null}"#, "a"), Some("null"));
+    }
+
+    // AYEAYE-45 — the same narrowing `string_member` has. A truncated line is
+    // the ordinary sight here: these files are read while an agent is writing
+    // them.
+    #[test]
+    fn nothing_is_read_out_of_what_is_not_one_object() {
+        assert_eq!(member(ROW, "missing"), None);
+        assert_eq!(member(r#"{"key":"AYEAYE""#, "key"), None);
+        assert_eq!(member(r#"{"a":1} {"a":2}"#, "a"), None);
+        assert_eq!(member("[1,2]", "a"), None);
+        assert_eq!(member("", "a"), None);
+        assert_eq!(number_member(r#"{"startedAt":"#, "startedAt"), None);
+    }
+
+    // AYEAYE-45 — claude records when a session began as milliseconds since the
+    // epoch, and that number is compared against the process's own start time.
+    // A string there is not a number that happens to be quoted: reading one
+    // would compare a clock against nothing.
+    #[test]
+    fn a_number_member_reads_and_a_string_one_does_not() {
+        assert_eq!(
+            number_member(r#"{"startedAt":1772614802123}"#, "startedAt"),
+            Some(1_772_614_802_123.0)
+        );
+        assert_eq!(number_member(r#"{"a":-1.5e3}"#, "a"), Some(-1500.0));
+        assert_eq!(
+            number_member(r#"{"startedAt":"1772614802123"}"#, "startedAt"),
+            None
+        );
+        assert_eq!(number_member(r#"{"startedAt":null}"#, "startedAt"), None);
+    }
+
+    // AYEAYE-45 — `json.loads` keeps the last of a repeated member, and so does
+    // `string_member`. Two readers of the same text disagreeing about which one
+    // won is a bug nobody would look for.
+    #[test]
+    fn a_repeated_member_takes_the_last_the_way_the_others_do() {
+        assert_eq!(member(r#"{"a":1,"a":2}"#, "a"), Some("2"));
+        assert_eq!(number_member(r#"{"a":1,"a":2}"#, "a"), Some(2.0));
+        assert_eq!(
+            string_member(r#"{"a":"first","a":"second"}"#, "a").as_deref(),
+            Some("second")
+        );
+    }
 
     /// One row of `cliban project ls --json`, as it comes off the pipe.
     const ROW: &str = r#"{"key":"AYEAYE","name":"AyeAye","updated_at":"2026-08-10T05:53:47Z"}"#;

@@ -46,6 +46,7 @@ use crate::assets;
 use crate::board;
 use crate::config::Settings;
 use crate::projects;
+use crate::session;
 
 /// Build the router.
 ///
@@ -182,6 +183,11 @@ async fn handle(
         // route table: the table's job is the *gate*, and by this line the
         // request has already passed it. What is left is which effect to have,
         // and effects are this crate's.
+        //
+        // The picker is named before the chain rather than joining it: it is
+        // the one `/api/` answer that needs state the chain has no reference
+        // to, and threading `App` through `api()` to spare one arm would put
+        // the picker's cache in front of every endpoint that does not want it.
         Route::Api if method == Method::GET => match uri.path() {
             "/api/projects" => {
                 let body = app
@@ -190,7 +196,7 @@ async fn handle(
                     .await;
                 json_owned(StatusCode::OK, body)
             }
-            _ => match board::answer(&settings, uri.path(), uri.query()).await {
+            _ => match api(&settings, &uri).await {
                 Some((status, body)) => json_owned(status, body),
                 None => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
             },
@@ -214,6 +220,20 @@ async fn handle(
         | Route::Login
         | Route::Asset(_) => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
     }
+}
+
+/// Every `/api/` endpoint, asked in turn until one of them owns the path.
+///
+/// A chain rather than a router. Each module keeps its own paths, and all of
+/// them inherit the gates the handler above has already applied; an endpoint
+/// mounted with `.route(…)` would skip every one of those and no test would
+/// catch it. `None` from all of them is the handler's 404 — a path nobody has
+/// written yet is still gated rather than open by omission.
+async fn api(settings: &Settings, uri: &Uri) -> Option<(StatusCode, String)> {
+    if let Some(answered) = board::answer(settings, uri.path(), uri.query()).await {
+        return Some(answered);
+    }
+    session::answer(settings, uri.path(), uri.query()).await
 }
 
 /// The one-time handshake: a token in the query becomes a cookie.

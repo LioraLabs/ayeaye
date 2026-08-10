@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ayeaye_core::peer::HostName;
 use ayeaye_core::prompt::{Press, Typed};
-use ayeaye_core::tmux::{PANE_FORMAT, Pane, no_server_running};
+use ayeaye_core::tmux::{PANE_FORMAT, Pane, SESSION_FORMAT, no_server_running, session_names};
 
 use crate::command::{self, Failed};
 
@@ -167,6 +167,20 @@ impl Tmux {
         self.ask(&["send-keys", "-t", pane.id.pane(), "Enter"])
             .await
             .map(|_| ())
+    }
+
+    /// Every live session on this machine, by name.
+    ///
+    /// What the project picker asks to say which projects are already open,
+    /// and what spawning asks to decide between a new window and a new
+    /// session. A machine with no tmux server has no sessions, which is an
+    /// answer rather than a failure — the same reading [`Tmux::panes`] gives.
+    pub async fn sessions(&self) -> Result<Vec<String>, Trouble> {
+        match self.ask(&["list-sessions", "-F", SESSION_FORMAT]).await {
+            Ok(text) => Ok(session_names(&text)),
+            Err(Trouble::Refused(said)) if no_server_running(&said) => Ok(Vec::new()),
+            Err(trouble) => Err(trouble),
+        }
     }
 }
 

@@ -19,4 +19,5 @@ pub mod models;
 pub mod process;
 pub mod projects;
 pub mod server;
+pub mod session;
 pub mod tmux;

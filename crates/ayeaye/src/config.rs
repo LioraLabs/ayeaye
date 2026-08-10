@@ -15,6 +15,7 @@ use ayeaye_core::pane;
 use ayeaye_core::peer::{BadName, HostName, Peer, Registry};
 
 use crate::fit::{Fits, STATE_FILE};
+use crate::session::Agents;
 use crate::tmux::Tmux;
 
 use crate::cliban::Cliban;
@@ -57,6 +58,10 @@ pub struct Settings {
     /// suite can point a whole server at its own private tmux server instead of
     /// at the one holding somebody's work.
     pub tmux: Tmux,
+    /// Where the agents keep what they leave behind. A field for the same
+    /// reason `tmux` is one: without it the suite reads whatever is in the
+    /// home directory of whoever is running it.
+    pub agents: Agents,
     /// The cliban the board endpoints ask. Resolved once, at startup, because
     /// that is when the daemon resolves it and because a PATH search per
     /// request is a directory walk per request.
@@ -177,6 +182,10 @@ impl Settings {
             token,
             peers: Registry::new(vec![Peer::here(here)]).expect("one peer, and it is this machine"),
             tmux: Tmux::new(),
+            // A location rather than a decision, exactly as `Tmux::new()`
+            // above is: it is where this user's home is, and a test that cares
+            // replaces the field.
+            agents: Agents::here(),
             cliban,
             pane_cache: Arc::new(Mutex::new(pane::Cache::default())),
             fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, fits_path())),
