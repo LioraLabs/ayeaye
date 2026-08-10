@@ -10,6 +10,7 @@
 //! process and hoping.
 
 pub mod assets;
+pub mod audio;
 pub mod board;
 pub mod cliban;
 pub mod command;
