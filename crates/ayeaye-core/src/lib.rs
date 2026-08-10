@@ -14,6 +14,7 @@ pub mod http;
 pub mod identity;
 pub mod json;
 pub mod machine;
+pub mod projects;
 pub mod service;
 
 pub use identity::Identity;
