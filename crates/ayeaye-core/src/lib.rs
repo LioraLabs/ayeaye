@@ -21,6 +21,7 @@ pub mod mel;
 pub mod peer;
 pub mod process;
 pub mod service;
+pub mod session;
 pub mod tmux;
 
 pub use audio::Pcm16kMono;
