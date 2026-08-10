@@ -35,8 +35,12 @@ pub const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}";
 /// characters in it as syntax — `session:window.pane`, and a leading `$` for a
 /// session id — so a project called `$0` or `work:9` resolves to *somebody
 /// else's session*, with `=` powerless to stop it because the name has already
-/// ended by the time it is consulted. Every one of those was reproduced against
-/// a real tmux. An id is tmux's own, unambiguous, and needs no escaping.
+/// ended by the time it is consulted. Both were reproduced against a real tmux.
+///
+/// An id is tmux's own, unambiguous, and needs no escaping — and tmux reads
+/// `$1` as an id even when a different session is *named* `$1`, so a hostile
+/// name cannot shadow one. That is what makes this a closure rather than a
+/// longer list of characters to fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     /// What the session is called.

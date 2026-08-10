@@ -423,17 +423,23 @@ mod tests {
         assert_eq!(session_name("ayeaye", None), "ayeaye");
     }
 
-    // AYEAYE-51 — found at the final gate, and the reason `create`'s `=` is not
-    // enough on its own. A tmux target is `session:window.pane`, and tmux will
-    // happily hold a session called `work:9` — so a project directory of that
-    // name produces `new-window -t "=work:9"`, which opens **window 9 of the
-    // session `work`**. Verified against a real tmux on a private socket: the
-    // window lands in `work`, and the reply would name a session it is not in.
+    // AYEAYE-51 — the fold, and what it is *for*. A session name is something a
+    // person types: `tmux attach -t work:9` attaches to window 9 of `work`, so
+    // a session nobody can name at a prompt is a session that is awkward to
+    // reach outside this app. `bin/ayeaye:1403` folds the dot for the same
+    // reason; the colon is folded here as well because it is the half of the
+    // grammar that a person hits first.
     //
-    // `bin/ayeaye:1403` folds only the dot and has this hole. Folding both is a
-    // departure from it, and the safe direction: a project can be called
-    // anything, and this is the only place that can stop what it is called from
-    // naming somebody else's session.
+    // **It is not what stops one project reaching another project's session.**
+    // That is `create` targeting the session id — see
+    // `an_existing_session_is_targeted_by_its_id_and_never_by_its_name`. This
+    // fold was tried as the defence and was one character out of date twice
+    // over, which is the argument against ever making a character list load
+    // bearing.
+    //
+    // It has one effect worth knowing: `say.hi` and `say_hi` fold together, so
+    // two such directories share a session. Both are the user's own projects,
+    // and the daemon has done this since it started folding the dot.
     #[test]
     fn a_name_cannot_carry_a_character_tmux_reads_as_a_target_separator() {
         assert_eq!(session_name("/dev/work:9", None), "work_9");
@@ -542,10 +548,13 @@ mod tests {
     //   `$0` — again somebody else's session;
     // - a project whose name matches a *window* name elsewhere resolves that
     //   window instead, because `=name` is a window target and the window
-    //   lookup runs first.
+    //   lookup runs first. That one always ends in `index N in use` rather than
+    //   a stolen window — a refusal, not a hijack — but it is the same mistake.
     //
-    // An id is tmux's own and reads as nothing else. A fold of awkward
-    // characters is not a substitute: that list was wrong twice.
+    // An id is tmux's own and reads as nothing else, and tmux resolves `$1` as
+    // an id even when a different session is *named* `$1`, which is what makes
+    // this a closure rather than a longer list. A fold of awkward characters is
+    // not a substitute: that list was wrong twice.
     #[test]
     fn an_existing_session_is_targeted_by_its_id_and_never_by_its_name() {
         assert_eq!(
