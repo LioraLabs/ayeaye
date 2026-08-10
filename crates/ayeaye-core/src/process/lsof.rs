@@ -4,6 +4,31 @@
 //! is the only form that survives a path with a space in it — which on a Mac is
 //! an ordinary path, not an exotic one. `n` is a name; everything else is a
 //! process or a descriptor number this does not need.
+//!
+//! The command lines live here for the same reason the parsing does: an argv is
+//! data, and the two below differ by exactly the flag that decides whether the
+//! answer is one path or all of them.
+
+/// Ask for one process's working directory.
+///
+/// `-a` is what ANDs `-d` with `-p`. Without it `lsof` ORs them, and the first
+/// name that comes back can be some other process's working directory entirely.
+pub fn cwd_argv(pid: u32) -> Vec<String> {
+    argv(&["lsof", "-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+}
+
+/// Ask for everything one process has open.
+///
+/// Deliberately without the `-d cwd` above: with it the only file ever reported
+/// is the working directory, and the path a resumed session is found by is a
+/// descriptor.
+pub fn names_argv(pid: u32) -> Vec<String> {
+    argv(&["lsof", "-p", &pid.to_string(), "-Fn"])
+}
+
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| (*word).to_string()).collect()
+}
 
 /// Every name `lsof` reported, in the order it reported them.
 ///
@@ -28,8 +53,27 @@ pub fn cwd(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cwd, names};
+    use super::{cwd, cwd_argv, names, names_argv};
     use crate::machine::fixture;
+
+    // AYEAYE-44 — `-a` is what ANDs the two filters; without it the first name
+    // back can belong to another process entirely.
+    #[test]
+    fn the_working_directory_query_ands_its_two_filters() {
+        assert_eq!(
+            cwd_argv(702),
+            ["lsof", "-a", "-d", "cwd", "-p", "702", "-Fn"]
+        );
+    }
+
+    // AYEAYE-44 — `-d cwd` is what the query above needs and what this must not
+    // inherit: with it, the only file ever reported is the working directory.
+    #[test]
+    fn the_open_files_query_is_not_narrowed_to_one_descriptor() {
+        let asked = names_argv(702);
+        assert_eq!(asked, ["lsof", "-p", "702", "-Fn"]);
+        assert!(!asked.iter().any(|word| word == "-d"));
+    }
 
     // AYEAYE-44
     #[test]

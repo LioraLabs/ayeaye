@@ -29,6 +29,11 @@ pub fn start_time(stat: &str, uptime: &str, clk_tck: u64, now: f64) -> Option<f6
 /// One line, space separated, and empty for a process with none. Anything that
 /// is not a number is skipped rather than ending the read: this file is written
 /// while the processes it names are starting and stopping.
+///
+/// It is one file *per thread*, and a process's children are spread across all
+/// of them — whichever thread called `fork` is the one that lists the child. A
+/// caller that reads only the main thread's file loses every child of every
+/// other thread, silently, so the answers for a process's tasks are unioned.
 pub fn children(text: &str) -> Vec<u32> {
     text.split_whitespace()
         .filter_map(|word| word.parse().ok())
@@ -111,6 +116,15 @@ mod tests {
             None
         );
         assert_eq!(start_time("", "1000.0\n", CLK_TCK, NOW), None);
+    }
+
+    // AYEAYE-44 — a tick rate of zero is a machine that could not answer
+    // `SC_CLK_TCK`; dividing by it would put the process at the end of time
+    // rather than saying nothing is known.
+    #[test]
+    fn a_tick_rate_of_zero_has_no_start_time() {
+        let line = stat("bash", 400 * CLK_TCK);
+        assert_eq!(start_time(&line, "1000.0\n", 0, NOW), None);
     }
 
     // AYEAYE-44 — without a boot time the ticks mean nothing at all, and a

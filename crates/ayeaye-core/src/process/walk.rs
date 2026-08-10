@@ -127,6 +127,17 @@ mod tests {
         assert_eq!(descendant(&codex_tree(), 901, "codex", DEPTH), None);
     }
 
+    // AYEAYE-44 — the two rows that broke this once, walked rather than only
+    // parsed: an editor bundle with a space in its path between the shell and
+    // the agent, and an agent 95 columns down an nvm path. It is the
+    // combination of the odd row and the walk that failed, not either alone.
+    #[test]
+    fn an_agent_below_an_awkward_path_is_still_found() {
+        let tree = codex_tree();
+        assert_eq!(descendant(&tree, 950, "codex", DEPTH), Some(952));
+        assert_eq!(descendant(&tree, 960, "codex", DEPTH), Some(961));
+    }
+
     // AYEAYE-44 — deeper than the limit is something the agent started, not
     // the agent.
     #[test]

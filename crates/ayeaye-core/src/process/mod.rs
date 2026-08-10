@@ -22,7 +22,7 @@
 pub mod lsof;
 pub mod procfs;
 pub mod ps;
-mod walk;
+pub mod walk;
 
 pub use ps::Tree;
 pub use walk::{DEPTH, Source, descendant};
