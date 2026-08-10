@@ -68,8 +68,13 @@ probe scripts
 # red on - a stale pass on the release gate, from a probe that had quietly
 # stopped describing its own recipe. `constitution` asserts the other half of
 # this: that every workspace member really does live under crates/.
+# Not only the .rs: a fixture reaches a pure crate through `include_str!`, so
+# the expected values of a test can live in a .txt that no glob over source
+# would notice. Editing one changes what the suite asserts while leaving every
+# sealed path untouched - a cached pass over assertions that have moved, which
+# is the same stale green the benches/ omission produced.
 probe rust
-    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" }
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "crates/**/tests/fixtures/*" }
 
 # The compiler is a determinant of what the suite says: a lint that fires on
 # one toolchain and not the next is exactly the drift `-D warnings` exists to

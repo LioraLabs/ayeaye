@@ -100,11 +100,20 @@ mod tests {
     fn expected(fixture: &str, n_mels: usize, n_fft: usize) -> Vec<f32> {
         let bins = bins_for(n_fft);
         let mut dense = vec![0f32; n_mels * bins];
-        for line in fixture.lines().filter(|l| !l.starts_with('#')) {
+        for line in fixture.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             let mut field = line.split_whitespace();
-            let mel: usize = field.next().unwrap().parse().unwrap();
-            let bin: usize = field.next().unwrap().parse().unwrap();
-            let weight: f32 = field.next().unwrap().parse().unwrap();
+            let mut next = |what: &str| {
+                field
+                    .next()
+                    .unwrap_or_else(|| panic!("fixture line {line:?} has no {what}"))
+            };
+            let mel: usize = next("mel index").parse().expect("a mel index");
+            let bin: usize = next("fft bin").parse().expect("an fft bin");
+            let weight: f32 = next("weight").parse().expect("a weight");
             dense[mel * bins + bin] = weight;
         }
         dense
