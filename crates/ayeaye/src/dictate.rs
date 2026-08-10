@@ -25,7 +25,7 @@ use ayeaye_core::model::settings::ModelSettings;
 use ayeaye_infer::{LanguageSlot, SpeechSlot};
 
 use crate::audio;
-use crate::models::{self, Residents};
+use crate::models::{self, Residents, Slot};
 
 /// Something that can turn audio into words.
 pub trait Speech {
@@ -118,16 +118,30 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// once would be two models' worth of device memory and half the speed each.
 /// One at a time is also what the daemon this replaces got for free by talking
 /// to a server that serialised them.
-pub struct Voice {
+///
+/// **A dictation does hold both models at once**, and that is a real change from
+/// `Residents`' own promise, which is about one holder never holding two of *its*
+/// models. It is the shape the pipeline needs — a transcription is rewritten
+/// while the speech model is still resident — and the cost is stated here rather
+/// than discovered: a machine sized for one of these two is a machine that
+/// should configure the other away, and `AYEAYE_CLEANUP_MODEL` unset is exactly
+/// that, giving the raw transcription and no second model.
+///
+/// Generic over the two slots, with the real ones as defaults so nothing above
+/// this file mentions the parameters. That is the same boundary `models::Slot`
+/// already is, and it is what lets the suite watch a cleanup model *fail to
+/// load* and a sweep *let go* — two branches that would otherwise need a
+/// gigabyte of weights to reach.
+pub struct Voice<S: Slot = SpeechSlot, L: Slot = LanguageSlot> {
     store: PathBuf,
     settings: ModelSettings,
     policy: Policy,
     converter: String,
-    resident: tokio::sync::Mutex<Resident>,
-    probed: Mutex<Option<(Instant, bool)>>,
+    resident: tokio::sync::Mutex<Resident<S, L>>,
+    probed: Mutex<Option<(Instant, Capability)>>,
 }
 
-impl std::fmt::Debug for Voice {
+impl<S: Slot, L: Slot> std::fmt::Debug for Voice<S, L> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.debug_struct("Voice")
             .field("store", &self.store)
@@ -138,29 +152,70 @@ impl std::fmt::Debug for Voice {
 }
 
 /// What is loaded, and when it was last wanted.
-struct Resident {
-    speech: Residents<SpeechSlot>,
-    language: Residents<LanguageSlot>,
+struct Resident<S: Slot, L: Slot> {
+    speech: Residents<S>,
+    language: Residents<L>,
     /// When a model was last asked for anything. `None` until one is.
     used: Option<Instant>,
 }
 
 impl Voice {
     /// A voice on this machine.
-    pub fn new(store: PathBuf, settings: ModelSettings, converter: String) -> Voice {
+    ///
+    /// `policy` arrives resolved rather than being assembled here, for the same
+    /// reason the token and cliban do on [`crate::config::Settings`]: it is read
+    /// from the environment and a file, neither of which this should touch. It
+    /// also matters more than it looks — a policy built by hand out of
+    /// `ModelSettings::cleanup_prompt` pairs somebody's own prompt with the
+    /// default prompt's echo phrases, which `Policy::resolve` exists to prevent,
+    /// and leaves `CLEANUP_TEMPLATE` and `CLEANUP_MAX_TOKENS` reading nothing at
+    /// all.
+    pub fn new(
+        store: PathBuf,
+        settings: ModelSettings,
+        policy: Policy,
+        converter: String,
+    ) -> Voice {
+        Voice::with_slots(
+            store,
+            settings,
+            policy,
+            converter,
+            SpeechSlot::empty(),
+            LanguageSlot::empty(),
+        )
+    }
+}
+
+impl<S, L> Voice<S, L>
+where
+    S: Slot + Speech,
+    L: Slot + Cleanup,
+    // A slot that cannot say why it would not load is a slot whose failure
+    // reaches somebody as nothing at all, and "the model did not load" is the
+    // error that costs an evening.
+    S::Error: std::fmt::Display,
+    L::Error: std::fmt::Display,
+{
+    /// A voice holding somewhere other than the real slots.
+    pub fn with_slots(
+        store: PathBuf,
+        settings: ModelSettings,
+        policy: Policy,
+        converter: String,
+        speech: S,
+        language: L,
+    ) -> Voice<S, L> {
         let residency = Residency {
             idle: settings.idle,
         };
         let resident = Resident {
-            speech: Residents::new(SpeechSlot::empty(), store.clone(), residency.clone()),
-            language: Residents::new(LanguageSlot::empty(), store.clone(), residency),
+            speech: Residents::new(speech, store.clone(), residency.clone()),
+            language: Residents::new(language, store.clone(), residency),
             used: None,
         };
         Voice {
-            policy: Policy {
-                system_prompt: settings.cleanup_prompt.clone(),
-                ..Policy::default()
-            },
+            policy,
             store,
             settings,
             converter,
@@ -171,41 +226,55 @@ impl Voice {
 
     /// What this machine can do about a dictation, right now.
     ///
-    /// The converter answer is cached for [`PROBE_TTL`], because the panel polls
-    /// this and starting a process per poll is what the cache in `bin/ayeaye`
-    /// exists to avoid. A benign race between two threads costs one extra probe.
-    pub fn probe(&self) -> Capability {
+    /// Cached whole for [`PROBE_TTL`], not just the converter answer: the panel
+    /// polls this, and the store walk behind `speech_ready` is a directory
+    /// listing per poll on top of the process. The answer is *allowed* to change,
+    /// which is the point of a cache with a lifetime rather than a value resolved
+    /// once — a model pulled or a converter installed while the daemon runs must
+    /// light the talk button up without anybody restarting anything.
+    ///
+    /// A benign race between two callers costs one extra probe. The lock is never
+    /// held across the `await`, because a probe that blocked every other request
+    /// on one machine's slow filesystem would be worse than probing twice.
+    pub async fn probe(&self) -> Capability {
+        if let Some(fresh) = self.probed_recently() {
+            return fresh;
+        }
         let installed = models::installed(&self.store);
         let ready = |chosen: &Option<ayeaye_core::model::ModelId>| {
             chosen.as_ref().is_some_and(|id| installed.contains(id))
         };
-        Capability {
-            converter: self.have_converter(),
+        let capability = Capability {
+            converter: self.have_converter().await,
             speech_ready: ready(&self.settings.speech),
             cleanup_ready: ready(&self.settings.cleanup),
             speech: self.settings.speech.clone(),
             cleanup: self.settings.cleanup.clone(),
-        }
+        };
+        *self.probed.lock().unwrap_or_else(|held| held.into_inner()) =
+            Some((Instant::now(), capability.clone()));
+        capability
     }
 
-    /// Whether the audio converter is on this machine, asked at most every
-    /// [`PROBE_TTL`].
-    fn have_converter(&self) -> bool {
-        let mut probed = self.probed.lock().unwrap_or_else(|held| held.into_inner());
-        if let Some((at, answer)) = *probed
-            && at.elapsed() < PROBE_TTL
-        {
-            return answer;
-        }
-        let answer = std::process::Command::new(&self.converter)
-            .arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok();
-        *probed = Some((Instant::now(), answer));
-        answer
+    /// The last answer, if it is still worth reusing.
+    fn probed_recently(&self) -> Option<Capability> {
+        let probed = self.probed.lock().unwrap_or_else(|held| held.into_inner());
+        probed
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < PROBE_TTL)
+            .map(|(_, capability)| capability.clone())
+    }
+
+    /// Whether the audio converter is on this machine.
+    ///
+    /// Through [`crate::command::run`], which has a deadline: this is asked from
+    /// inside a request, and a converter that hangs on `-version` — a stale
+    /// network mount, a wedged interpreter — would otherwise hold the request
+    /// forever and, worse, hold it while a lock was in hand.
+    async fn have_converter(&self) -> bool {
+        crate::command::run(&[self.converter.as_str(), "-version"], PROBE_LIMIT)
+            .await
+            .is_ok()
     }
 
     /// One dictation.
@@ -213,18 +282,33 @@ impl Voice {
         // Before the clip is decoded, because decoding is a process and a
         // machine with no speech model has nothing that could transcribe the
         // result of it.
+        if self.settings.speech.is_none() {
+            return Outcome::Unavailable(
+                "no speech model is configured — `ayeaye model use <id>`".to_string(),
+            );
+        }
+        let audio = match audio::decode_with(&self.converter, clip, ext).await {
+            Ok(audio) => audio,
+            Err(why) => return Outcome::Undecodable(why.to_string()),
+        };
+        self.hear_decoded(&audio, names).await
+    }
+
+    /// The same, given audio that has already been decoded.
+    ///
+    /// Split from [`Voice::dictate`] at the one place the external converter
+    /// stops being involved, so the suite can drive residency and the pipeline
+    /// without a program on the machine — and so AYEAYE-68, which removes the
+    /// converter entirely by having both recorders send raw PCM, has the seam it
+    /// needs already cut.
+    pub async fn hear_decoded(&self, audio: &Pcm16kMono, names: &str) -> Outcome {
         let Some(speech) = self.settings.speech.clone() else {
             return Outcome::Unavailable(
                 "no speech model is configured — `ayeaye model use <id>`".to_string(),
             );
         };
-        let audio = match audio::decode_with(&self.converter, clip, ext).await {
-            Ok(audio) => audio,
-            Err(why) => return Outcome::Undecodable(why.to_string()),
-        };
 
         let mut resident = self.resident.lock().await;
-        resident.used = Some(Instant::now());
         if let Err(why) = resident.speech.ensure(Some(&speech)) {
             return Outcome::Unavailable(format!("{speech} would not load: {why}"));
         }
@@ -245,25 +329,27 @@ impl Voice {
         let Resident {
             speech: speech_models,
             language,
+            used,
             ..
         } = &mut *resident;
-        if loaded {
-            hear(
-                speech_models.slot_mut(),
-                language.slot_mut(),
-                &audio,
-                names,
-                &self.policy,
-            )
-        } else {
-            hear(
-                speech_models.slot_mut(),
-                &mut AsSpoken,
-                &audio,
-                names,
-                &self.policy,
-            )
-        }
+        let policy = &self.policy;
+        // Seconds of arithmetic, on a thread that is otherwise answering
+        // requests. `block_in_place` tells the runtime to move the rest of this
+        // worker's work elsewhere first; without it one dictation stalls every
+        // poll, every pane capture and every prompt on this machine for as long
+        // as the model takes.
+        let outcome = in_place(|| {
+            if loaded {
+                hear(speech_models.slot_mut(), language.slot_mut(), audio, names, policy)
+            } else {
+                hear(speech_models.slot_mut(), &mut AsSpoken, audio, names, policy)
+            }
+        });
+        // Stamped *after* the work, not before. A model is idle from the moment
+        // it stopped being used, and a dictation that took thirty seconds would
+        // otherwise start its idle clock thirty seconds in the past.
+        *used = Some(Instant::now());
+        outcome
     }
 
     /// Let go of a model nobody has used for a while, saying whether it did.
@@ -282,6 +368,26 @@ impl Voice {
         let speech = resident.speech.sweep(idle);
         let language = resident.language.sweep(idle);
         speech | language
+    }
+}
+
+/// How long the converter gets to say it exists.
+///
+/// Short: this is a probe behind a poll, and a converter that cannot answer in a
+/// couple of seconds is one the dictation below would not survive either.
+pub const PROBE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Run something that will not yield, without stalling the runtime.
+///
+/// `block_in_place` only exists on the multi-threaded runtime and panics on the
+/// current-thread one, which is what `#[tokio::test]` builds by default. So the
+/// flavour is asked rather than assumed: a test that reaches inference must not
+/// abort for want of a second thread, and the daemon — whose runtime is
+/// multi-threaded — must not stall for want of the call.
+fn in_place<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
     }
 }
 

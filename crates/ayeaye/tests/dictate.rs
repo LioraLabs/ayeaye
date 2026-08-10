@@ -388,8 +388,8 @@ fn settings(speech: Option<&str>, cleanup: Option<&str>) -> ModelSettings {
 // The probe answers about the store as it is, not about the configuration file.
 // A model chosen and never pulled is the state a machine is in between two
 // commands, and calling it ready lights up a talk button that cannot work.
-#[test]
-fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
+#[tokio::test]
+async fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
     let speech = ModelId::parse("openai/whisper-small.en").expect("an id");
     let store = Store::named("probe").holding(&speech);
     let converter = if have_converter() {
@@ -401,18 +401,22 @@ fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
     let here = dictate::Voice::new(
         store.0.clone(),
         settings(Some("openai/whisper-small.en"), None),
+        Policy::default(),
         converter.to_string(),
     )
-    .probe();
+    .probe()
+    .await;
     assert!(here.speech_ready, "the model really is in the store");
     assert!(here.ok(), "{:?}", here.why());
 
     let chosen_only = dictate::Voice::new(
         store.0.clone(),
         settings(Some("openai/whisper-tiny.en"), None),
+        Policy::default(),
         converter.to_string(),
     )
-    .probe();
+    .probe()
+    .await;
     assert!(!chosen_only.speech_ready);
     assert!(!chosen_only.ok());
     assert!(
@@ -428,9 +432,11 @@ fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
     let no_converter = dictate::Voice::new(
         store.0.clone(),
         settings(Some("openai/whisper-small.en"), None),
+        Policy::default(),
         "ayeaye-58-no-such-converter".to_string(),
     )
-    .probe();
+    .probe()
+    .await;
     assert!(!no_converter.converter);
     assert!(!no_converter.ok());
 }
@@ -446,6 +452,7 @@ async fn a_machine_with_no_speech_model_refuses_before_decoding_anything() {
     let voice = dictate::Voice::new(
         store.0.clone(),
         settings(None, None),
+        Policy::default(),
         "ayeaye-58-no-such-converter".to_string(),
     );
 
@@ -469,11 +476,12 @@ async fn sweeping_a_voice_that_has_never_been_used_lets_go_of_nothing() {
     let voice = dictate::Voice::new(
         store.0.clone(),
         settings(Some("openai/whisper-small.en"), None),
+        Policy::default(),
         "true".to_string(),
     );
 
     assert!(!voice.sweep(std::time::Instant::now()).await);
-    assert!(!voice.probe().speech_ready, "nothing was loaded to sweep");
+    assert!(!voice.probe().await.speech_ready, "nothing was loaded to sweep");
 }
 
 // ------------------------------------------------------------- the tmux path
@@ -809,4 +817,218 @@ fn a_write_that_cannot_be_staged_leaves_the_recording_that_was_there() {
         Some(before),
         "a write that could not be staged must leave the recording that was there"
     );
+}
+
+// --------------------------------------------------- residency, without models
+
+/// A speech slot that loads instantly and says what it was told to.
+///
+/// The real one is a directory of weights and hundreds of megabytes of device
+/// memory. Substituting it is the same boundary `models::Slot` already is, and
+/// it is what lets the two branches below be watched at all.
+#[derive(Default)]
+struct StubSpeech {
+    resident: bool,
+    releases: usize,
+}
+
+impl ayeaye::models::Slot for StubSpeech {
+    type Error = String;
+
+    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
+        self.resident = true;
+        Ok(())
+    }
+
+    fn unload(&mut self) -> bool {
+        self.releases += usize::from(self.resident);
+        std::mem::take(&mut self.resident)
+    }
+}
+
+impl Speech for StubSpeech {
+    fn transcribe(&mut self, _: &Pcm16kMono) -> Result<String, String> {
+        assert!(self.resident, "a slot that is not loaded cannot transcribe");
+        Ok("um so run the tests".to_string())
+    }
+}
+
+/// A cleanup slot whose weights are not there.
+struct NoWeights;
+
+impl ayeaye::models::Slot for NoWeights {
+    type Error = String;
+
+    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
+        Err("model.gguf: No such file or directory".to_string())
+    }
+
+    fn unload(&mut self) -> bool {
+        false
+    }
+}
+
+impl Cleanup for NoWeights {
+    fn clean(&mut self, _: &str, _: &str, _: &Policy) -> Cleaned {
+        panic!("a cleanup model that would not load must never be asked to clean");
+    }
+}
+
+/// A cleanup slot that loads and rewrites.
+#[derive(Default)]
+struct StubCleanup {
+    resident: bool,
+    releases: usize,
+}
+
+impl ayeaye::models::Slot for StubCleanup {
+    type Error = String;
+
+    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
+        self.resident = true;
+        Ok(())
+    }
+
+    fn unload(&mut self) -> bool {
+        self.releases += usize::from(self.resident);
+        std::mem::take(&mut self.resident)
+    }
+}
+
+impl Cleanup for StubCleanup {
+    fn clean(&mut self, raw: &str, _: &str, policy: &Policy) -> Cleaned {
+        settle(policy, raw, Some("Run the tests."))
+    }
+}
+
+// AYEAYE-58
+//
+// A cleanup model that is configured and will not load costs the rewrite and
+// nothing else: the dictation comes back as the words the speaker said, with the
+// reason recorded. That is the acceptance criterion in the one place it is
+// easiest to get wrong — the model *was* asked for, so a naive implementation
+// reaches for a slot that is empty and loses the dictation.
+#[tokio::test]
+async fn a_cleanup_model_that_will_not_load_costs_the_rewrite_and_not_the_words() {
+    let store = Store::named("cleanup-broken");
+    let voice = ayeaye::dictate::Voice::with_slots(
+        store.0.clone(),
+        settings(
+            Some("openai/whisper-small.en"),
+            Some("Qwen/Qwen2.5-7B-Instruct-GGUF"),
+        ),
+        Policy::default(),
+        "true".to_string(),
+        StubSpeech::default(),
+        NoWeights,
+    );
+
+    let outcome = voice.hear_decoded(&speech(1.0), "").await;
+
+    let Outcome::Heard { raw, cleaned } = &outcome else {
+        panic!("expected the words anyway, got {outcome:?}");
+    };
+    assert_eq!(raw, "um so run the tests");
+    assert_eq!(cleaned.text(), raw, "the dictation has to survive");
+    assert_eq!(cleaned.kept(), Some(Kept::Unavailable));
+}
+
+// AYEAYE-58
+//
+// The other side: both models load, and the rewrite is what gets typed. Asserted
+// beside the case above because the two differ by one branch, and a mistake in
+// that branch would make one of them pass on its own.
+#[tokio::test]
+async fn both_models_loading_gives_the_rewrite_rather_than_the_raw_words() {
+    let store = Store::named("cleanup-good");
+    let voice = ayeaye::dictate::Voice::with_slots(
+        store.0.clone(),
+        settings(
+            Some("openai/whisper-small.en"),
+            Some("Qwen/Qwen2.5-7B-Instruct-GGUF"),
+        ),
+        Policy::default(),
+        "true".to_string(),
+        StubSpeech::default(),
+        StubCleanup::default(),
+    );
+
+    let outcome = voice.hear_decoded(&speech(1.0), "").await;
+
+    let Outcome::Heard { cleaned, .. } = &outcome else {
+        panic!("expected words, got {outcome:?}");
+    };
+    assert_eq!(cleaned.text(), "Run the tests.");
+    assert!(cleaned.was_rewritten());
+}
+
+// AYEAYE-58
+//
+// The sweeper's whole point: a model is released because nobody is dictating,
+// and both of them go. The idle clock starts when the dictation *finished*, so a
+// sweep inside the window keeps them and one past it does not.
+#[tokio::test]
+async fn a_model_nobody_has_dictated_through_is_let_go_of() {
+    let store = Store::named("sweep-release");
+    let idle = std::time::Duration::from_secs(60);
+    let voice = ayeaye::dictate::Voice::with_slots(
+        store.0.clone(),
+        ModelSettings::resolve(
+            |_| None,
+            "AYEAYE_SPEECH_MODEL=openai/whisper-small.en\n\
+             AYEAYE_CLEANUP_MODEL=Qwen/Qwen2.5-7B-Instruct-GGUF\n\
+             AYEAYE_MODEL_IDLE=60s\n",
+        )
+        .expect("a readable configuration"),
+        Policy::default(),
+        "true".to_string(),
+        StubSpeech::default(),
+        StubCleanup::default(),
+    );
+
+    voice.hear_decoded(&speech(1.0), "").await;
+    let finished = std::time::Instant::now();
+
+    assert!(
+        !voice.sweep(finished + idle / 2).await,
+        "a model somebody dictated through a moment ago is still wanted"
+    );
+    assert!(
+        voice.sweep(finished + idle * 2).await,
+        "a model nobody has used for twice its idle time is not worth the memory"
+    );
+    // And sweeping again lets go of nothing, because there is nothing left.
+    assert!(!voice.sweep(finished + idle * 4).await);
+}
+
+// AYEAYE-58
+//
+// The converter's flags, held to without running anything. Each is load-bearing:
+// `-ac 1 -ar 16000` is the whole job, `pcm_s16le` and `-f wav` are what make the
+// output the one shape the reader accepts rather than whatever the converter
+// inferred from a file name, and `-nostdin` is what stops a converter that
+// decided to prompt from holding a request until its deadline.
+#[test]
+fn the_converter_is_asked_for_the_one_shape_a_speech_model_reads() {
+    let argv = audio::argv(
+        "ffmpeg",
+        std::path::Path::new("/tmp/x/clip.webm"),
+        std::path::Path::new("/tmp/x/clip16k.wav"),
+    );
+
+    assert_eq!(argv[0], "ffmpeg");
+    for flag in ["-nostdin", "-ac", "-ar", "-f", "-y"] {
+        assert!(argv.iter().any(|arg| arg == flag), "{flag} is missing: {argv:?}");
+    }
+    let after = |flag: &str| {
+        let at = argv.iter().position(|arg| arg == flag).expect("the flag");
+        argv[at + 1].clone()
+    };
+    assert_eq!(after("-ac"), "1", "one channel: {argv:?}");
+    assert_eq!(after("-ar"), "16000", "sixteen kilohertz: {argv:?}");
+    assert_eq!(after("-c:a"), "pcm_s16le", "sixteen-bit samples: {argv:?}");
+    assert_eq!(after("-f"), "wav", "a WAVE, whatever the file is called");
+    // The input is named as data after `-i`, and the output is last.
+    assert_eq!(after("-i"), "/tmp/x/clip.webm");
+    assert_eq!(argv.last().unwrap(), "/tmp/x/clip16k.wav");
 }

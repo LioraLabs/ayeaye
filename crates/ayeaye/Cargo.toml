@@ -28,8 +28,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # `process` and `time`: the standard library has no wait-with-timeout, and a
 # request that waits forever on a wedged tmux or cliban is the broken panel
 # AYEAYE-43 and AYEAYE-53 both exist to avoid. `sync` for the async mutex that
-# holds a fit lease across the tmux restore it awaits.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time", "sync"] }
+# holds a fit lease across the tmux restore it awaits. `io-util` for the
+# recording agent client, which is a socket and a few hundred bytes of HTTP
+# rather than a crate — see `src/recorder.rs` for why that is not a shortcut.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time", "sync", "io-util"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.

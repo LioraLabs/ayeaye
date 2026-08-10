@@ -46,6 +46,10 @@ pub enum DecodeError {
     BadExtension(String),
     /// There is no converter on this machine, or it could not be run.
     NoConverter(Failed),
+    /// It ran and did not finish. Its own case rather than [`Self::NoConverter`],
+    /// because "there is no ffmpeg on this machine" sends whoever reads it off to
+    /// install a program they already have.
+    TimedOut(Duration),
     /// It ran, and refused.
     Refused(String),
     /// It produced something that is not the audio it was asked for.
@@ -62,6 +66,9 @@ impl fmt::Display for DecodeError {
             DecodeError::BadExtension(ext) => write!(out, "{ext:?} is not audio this build reads"),
             DecodeError::NoConverter(why) => {
                 write!(out, "there is no {CONVERTER} on this machine: {why}")
+            }
+            DecodeError::TimedOut(limit) => {
+                write!(out, "{CONVERTER} did not finish within {limit:?}")
             }
             DecodeError::Refused(said) => {
                 write!(out, "{CONVERTER} could not read the clip: {said}")
@@ -150,9 +157,13 @@ pub async fn decode_with(
         .map_err(|why| DecodeError::Disk(format!("could not write the clip: {why}")))?;
 
     let argv = argv(converter, &source, &converted);
-    let ran = command::run(&argv, LIMIT)
-        .await
-        .map_err(DecodeError::NoConverter)?;
+    let ran = command::run(&argv, LIMIT).await.map_err(|why| match why {
+        // Told apart, because they are opposite instructions to whoever reads
+        // them: one is a program to install, the other is a clip or a machine
+        // that will not finish.
+        Failed::TimedOut(limit) => DecodeError::TimedOut(limit),
+        not_started => DecodeError::NoConverter(not_started),
+    })?;
     if !ran.ok {
         // The converter's own words. At the moment something fails they are
         // worth more to whoever has to fix it than any paraphrase.
@@ -174,25 +185,79 @@ pub async fn decode_with(
 /// Removed on the way out whatever happened, including a panic, because the
 /// contents are a recording of somebody's voice and there is no reason for one
 /// to outlive the request that carried it.
+///
+/// **Created, not opened, and readable only by this user.** The temporary
+/// directory is shared, so a predictable name is a name somebody else can make
+/// first: they would then own a directory this daemon writes a recording into,
+/// and could swap the converted audio between the converter exiting and the read
+/// below — choosing what gets transcribed and offered as a draft in somebody's
+/// terminal. `create_dir` fails on a name that already exists, which is what
+/// makes winning that race the whole of the defence; the random component is
+/// what makes it unwinnable in the first place.
+///
+/// `bin/voice-dictate` gets both from `tempfile.TemporaryDirectory()`, which is
+/// `mkdtemp`: random, exclusive, and `0700`. This is that, spelled out.
 struct Scratch {
     path: PathBuf,
 }
 
 impl Scratch {
     fn new() -> Result<Scratch, DecodeError> {
-        // The pid keeps two daemons apart and the counter keeps two concurrent
-        // dictations in one daemon apart. A clip is written under this name and
-        // read back by name, so two requests sharing a directory would decode
-        // each other's audio.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let ours = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("ayeaye-dictate-{}-{ours}", std::process::id()));
-        std::fs::create_dir_all(&path).map_err(|why| {
-            DecodeError::Disk(format!("could not make {}: {why}", path.display()))
-        })?;
-        Ok(Scratch { path })
+        let mut refused = None;
+        // A handful of attempts rather than one, because the name is random and
+        // the only way `create_dir` fails on it twice is a collision somebody
+        // arranged. Giving up after a few is what stops that being an infinite
+        // loop inside a request.
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!("ayeaye-dictate-{}", name()));
+            match create_private(&path) {
+                Ok(()) => return Ok(Scratch { path }),
+                Err(why) => refused = Some(format!("{}: {why}", path.display())),
+            }
+        }
+        Err(DecodeError::Disk(format!(
+            "could not make a private directory to decode in ({})",
+            refused.unwrap_or_else(|| "no reason given".to_string())
+        )))
     }
+}
+
+/// A name nobody can guess, from the pid, the clock, and a counter.
+///
+/// Not a cryptographic random: there is no source of one in this binary's
+/// dependencies, and the property needed is that an attacker cannot create the
+/// directory *first*, which the nanosecond clock alone makes impractical. The
+/// counter keeps two dictations in one process apart when the clock does not
+/// tick between them, and the pid keeps two processes apart.
+fn name() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ours = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{now:x}-{ours:x}", std::process::id())
+}
+
+/// Create a directory this user alone may look in, and fail if it is there.
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    // `create_dir`, not `create_dir_all`: the latter is happy with a directory
+    // that already exists, which is exactly the one that is not ours. The mode
+    // is set as the directory is made rather than afterwards, so there is no
+    // moment where it is readable.
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Everywhere else there are no permission bits to ask for, so exclusive
+/// creation is the whole of what can be promised. Present for the same reason
+/// `config.rs` keeps its pair: the daemon is a Unix daemon, and a crate that
+/// only compiles on one platform hides that behind a build failure.
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
 }
 
 impl Drop for Scratch {

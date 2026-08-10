@@ -98,16 +98,34 @@ fn serve(args: &[String]) -> ExitCode {
     // converter serves everything else, and the probe is what tells the page so.
     // A configuration file it cannot read is a different matter — that is a typo
     // somebody has to be told about rather than a feature to switch off.
-    let models = match models::settings(&PathBuf::from(layout(from_environment).env_file)) {
+    // Where models live has to be one answer, and a daemon that cannot name it
+    // is a daemon whose voice would look configured and never load anything.
+    // Refused rather than defaulted to the working directory, which is wherever
+    // a service manager happened to start this.
+    let Some(store) = config::state_dir() else {
+        return complain(
+            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+    let models = match models::settings(&config_file) {
         Ok(models) => models,
         Err(why) => {
             eprintln!("ayeaye: {why}");
             return ExitCode::FAILURE;
         }
     };
+    let policy = match models::cleanup_policy(&config_file) {
+        Ok(policy) => policy,
+        Err(why) => {
+            eprintln!("ayeaye: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     let voice = Arc::new(ayeaye::dictate::Voice::new(
-        config::state_dir().unwrap_or_else(|| PathBuf::from(".")),
+        store,
         models,
+        policy,
         ayeaye::audio::CONVERTER.to_string(),
     ));
     let settings = match Settings::resolve(
@@ -289,8 +307,13 @@ fn dictate_verb(args: &[String]) -> ExitCode {
             ));
         }
     };
-    let models = match models::settings(&PathBuf::from(layout(from_environment).env_file)) {
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+    let models = match models::settings(&config_file) {
         Ok(models) => models,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    let policy = match models::cleanup_policy(&config_file) {
+        Ok(policy) => policy,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };
 
@@ -303,6 +326,7 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         let voice = ayeaye::dictate::Voice::new(
             store.clone(),
             models,
+            policy,
             ayeaye::audio::CONVERTER.to_string(),
         );
         let state = store.join(ayeaye::dictate::STATE_FILE);

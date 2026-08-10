@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use ayeaye_core::cleanup::{Policy as CleanupPolicy, PolicyError};
 use ayeaye_core::model::hub::{self, Wanted};
 use ayeaye_core::model::residency::{self, Plan, Policy};
 use ayeaye_core::model::settings::{self, BadSetting, ModelSettings};
@@ -382,6 +383,33 @@ pub fn remove(store: &Path, id: &ModelId) -> Result<bool, PullError> {
 pub fn settings(config_file: &Path) -> Result<ModelSettings, BadSetting> {
     let text = std::fs::read_to_string(config_file).unwrap_or_default();
     ModelSettings::resolve(crate::config::env_var, &text)
+}
+
+/// How a cleanup pass is configured, from the file with the environment on top.
+///
+/// The same precedence `settings` reads under, and for the same reason: under
+/// the service unit the file has *become* the environment by the time this runs,
+/// and run by hand it has not.
+///
+/// Separate from [`settings`] because it answers a different question and fails
+/// for different reasons — a template nobody implements is refused by name,
+/// where an absent model is simply a machine nobody has configured yet. Reading
+/// it through `Policy::resolve` rather than assembling a `Policy` by hand is
+/// what keeps `CLEANUP_ECHOES` paired with the prompt it belongs to, and what
+/// makes `CLEANUP_TEMPLATE` and `CLEANUP_MAX_TOKENS` mean anything at all.
+pub fn cleanup_policy(config_file: &Path) -> Result<CleanupPolicy, PolicyError> {
+    let text = std::fs::read_to_string(config_file).unwrap_or_default();
+    let from_file = settings::parse_env_file(&text);
+    CleanupPolicy::resolve(|name| {
+        crate::config::env_var(name).or_else(|| {
+            // The last occurrence, as systemd's `EnvironmentFile=` resolves it.
+            from_file
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        })
+    })
 }
 
 /// Write one setting into the configuration file, leaving the rest alone.

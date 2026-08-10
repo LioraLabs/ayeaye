@@ -291,6 +291,7 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
             std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
+            ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
         )),
     }
@@ -2132,6 +2133,7 @@ fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictat
         store.0.clone(),
         ayeaye_core::model::settings::ModelSettings::resolve(|_| None, &file)
             .expect("a readable configuration"),
+        ayeaye_core::cleanup::Policy::default(),
         converter.to_string(),
     )
 }

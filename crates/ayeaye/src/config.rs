@@ -396,6 +396,7 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
+            ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
         ))
     }

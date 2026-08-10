@@ -172,7 +172,7 @@ async fn handle(
         Route::Answer if method == Method::POST => answer(&settings, body).await,
         Route::Dictate if method == Method::POST => dictate(&settings, &query, body).await,
         Route::Voice if method == Method::GET || method == Method::HEAD => {
-            json_body(settings.voice.probe().body())
+            json_body(settings.voice.probe().await.body())
         }
         Route::Send if method == Method::POST => send(&settings, body).await,
         // An `/api/` path that got this far is authenticated and simply does
@@ -592,7 +592,7 @@ async fn send(settings: &Settings, body: Body) -> Response {
 /// dictation, and a client asking about somebody else's pane still gets its
 /// words.
 async fn dictate(settings: &Settings, query: &Query, body: Body) -> Response {
-    let capability = settings.voice.probe();
+    let capability = settings.voice.probe().await;
     if !capability.ok() {
         return body_of(
             StatusCode::SERVICE_UNAVAILABLE,
