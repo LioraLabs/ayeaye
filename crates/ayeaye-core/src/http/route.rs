@@ -38,6 +38,15 @@ pub enum Gate {
 }
 
 const HTML: &str = "text/html; charset=utf-8";
+const PNG: &str = "image/png";
+
+/// Everything below this is the API. The trailing slash matters: `/apifake` is
+/// not the API, and must not be gated as though it were.
+const API_PREFIX: &str = "/api/";
+
+const fn asset(file: &'static str, content_type: &'static str) -> Asset {
+    Asset { file, content_type }
+}
 
 /// Every path the daemon answers on, and the file it answers with.
 ///
@@ -62,15 +71,15 @@ pub const ASSET_ROUTES: &[(&str, Asset)] = &[
     ("/icon-180.png", asset("icon-180.png", PNG)),
     ("/icon-192.png", asset("icon-192.png", PNG)),
     ("/icon-512.png", asset("icon-512.png", PNG)),
-    ("/icon-maskable-192.png", asset("icon-maskable-192.png", PNG)),
-    ("/icon-maskable-512.png", asset("icon-maskable-512.png", PNG)),
+    (
+        "/icon-maskable-192.png",
+        asset("icon-maskable-192.png", PNG),
+    ),
+    (
+        "/icon-maskable-512.png",
+        asset("icon-maskable-512.png", PNG),
+    ),
 ];
-
-const PNG: &str = "image/png";
-
-const fn asset(file: &'static str, content_type: &'static str) -> Asset {
-    Asset { file, content_type }
-}
 
 /// The paths where a `?token=` is read as a login rather than passed over.
 ///
@@ -80,9 +89,11 @@ const LOGIN_ENTRY_PATHS: &[&str] = &["/", "/index.html"];
 
 /// What a path means.
 ///
-/// `has_token_query` is whether the request carried a `token` parameter at
-/// all — not whether it was the right one, which is the caller's business and
-/// needs the secret this module does not have.
+/// `has_token_query` is whether the request carried a **non-empty** `token`
+/// parameter — not whether it was the right one, which is the caller's
+/// business and needs the secret this module does not have. Non-empty matters:
+/// the daemon reads its query with `parse_qs`, which drops blank values, so
+/// `/?token=` is the app rather than a login that is certain to fail.
 pub fn resolve(path: &str, has_token_query: bool) -> Route {
     if path == "/login" || (has_token_query && LOGIN_ENTRY_PATHS.contains(&path)) {
         return Route::Login;
@@ -99,27 +110,30 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
     Route::NotFound
 }
 
-/// Everything below this is the API. The trailing slash matters: `/apifake` is
-/// not the API, and must not be gated as though it were.
-const API_PREFIX: &str = "/api/";
-
-impl Route {
-    /// Whether this route may be reached without a token.
-    pub fn gate(self) -> Gate {
-        match self {
-            Route::Api => Gate::Token,
-            // The pages carry no data and no secrets, and the login handshake
-            // presents its own token in the query. `NotFound` is open on
-            // purpose: a 401 on an unknown path would tell an unauthenticated
-            // caller which paths are real.
-            Route::Login | Route::Asset(_) | Route::NotFound => Gate::Open,
-        }
+/// Whether a request may be served without a token.
+///
+/// The method is half of the answer, not a detail. The daemon serves pages to
+/// anyone who can reach it, but `do_POST` gates *every* POST before it looks
+/// at the path at all — a POST acts on a pane, and no path is exempt from
+/// that. So anything that is not a GET is gated whatever it names, and the
+/// route table only decides the GET case.
+pub fn gate(method: &str, route: Route) -> Gate {
+    if method != "GET" {
+        return Gate::Token;
+    }
+    match route {
+        Route::Api => Gate::Token,
+        // The pages carry no data and no secrets, and the login handshake
+        // presents its own token in the query. `NotFound` is open on purpose:
+        // a 401 on an unknown path would tell an unauthenticated caller which
+        // paths are real.
+        Route::Login | Route::Asset(_) | Route::NotFound => Gate::Open,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Gate, Route, resolve};
+    use super::{Gate, Route, gate, resolve};
 
     fn asset_file(path: &str) -> &'static str {
         match resolve(path, false) {
@@ -143,6 +157,59 @@ mod tests {
         assert_eq!(resolve("/nope", false), Route::NotFound);
     }
 
+    // AYEAYE-42 — the whole table, path by path, against the daemon's own
+    // `ICON_FILES` plus its APP_HTML/BOARD_HTML/MANIFEST routes. Spot-checking
+    // a table this mechanical leaves a deleted row and a mistyped content type
+    // both invisible; this is the list transcribed from `bin/ayeaye`, so it
+    // disagrees with the code rather than agreeing with it by construction.
+    #[test]
+    fn every_served_path_carries_the_file_and_type_the_daemon_sends() {
+        const EXPECTED: &[(&str, &str, &str)] = &[
+            ("/", "app.html", "text/html; charset=utf-8"),
+            ("/index.html", "app.html", "text/html; charset=utf-8"),
+            ("/message", "app.html", "text/html; charset=utf-8"),
+            ("/board", "board.html", "text/html; charset=utf-8"),
+            ("/board.html", "board.html", "text/html; charset=utf-8"),
+            (
+                "/manifest.webmanifest",
+                "manifest.webmanifest",
+                "application/manifest+json",
+            ),
+            ("/favicon.ico", "favicon.ico", "image/x-icon"),
+            ("/icon-64.png", "icon-64.png", "image/png"),
+            ("/icon-180.png", "icon-180.png", "image/png"),
+            ("/icon-192.png", "icon-192.png", "image/png"),
+            ("/icon-512.png", "icon-512.png", "image/png"),
+            (
+                "/icon-maskable-192.png",
+                "icon-maskable-192.png",
+                "image/png",
+            ),
+            (
+                "/icon-maskable-512.png",
+                "icon-maskable-512.png",
+                "image/png",
+            ),
+        ];
+
+        for (path, file, content_type) in EXPECTED {
+            match resolve(path, false) {
+                Route::Asset(asset) => {
+                    assert_eq!(asset.file, *file, "file for {path}");
+                    assert_eq!(asset.content_type, *content_type, "type for {path}");
+                }
+                other => panic!("{path} resolved to {other:?}, not an asset"),
+            }
+        }
+        // And nothing beyond them: a row added here without a reason is a path
+        // the daemon does not answer on.
+        assert_eq!(
+            super::ASSET_ROUTES.len(),
+            EXPECTED.len(),
+            "the asset table and the daemon's routes have drifted apart"
+        );
+    }
+
     // AYEAYE-42 — a token in the query turns the app's own URL into the login
     // handshake, which is what lets a phone be handed one bookmarkable link.
     // Without a token the same path is just the app, or the bookmark would
@@ -164,37 +231,54 @@ mod tests {
         );
     }
 
-    // AYEAYE-42 — the gate is the point of the table. Everything under /api/
-    // needs a token whether or not it exists; the pages do not, because they
-    // carry no data and every call they go on to make is gated.
+    // AYEAYE-42 — the gate is the point of the table. On a GET, everything
+    // under /api/ needs a token whether or not it exists; the pages do not,
+    // because they carry no data and every call they go on to make is gated.
     #[test]
-    fn everything_under_api_is_gated_and_nothing_else_is() {
+    fn a_get_is_gated_under_api_and_open_on_the_pages() {
         assert_eq!(resolve("/api/panes", false), Route::Api);
         assert_eq!(resolve("/api/", false), Route::Api);
         // A token in the query does not make an API path a login.
         assert_eq!(resolve("/api/panes", true), Route::Api);
-        assert_eq!(Route::Api.gate(), Gate::Token);
+        assert_eq!(gate("GET", Route::Api), Gate::Token);
         for path in [
             "/",
             "/index.html",
             "/message",
             "/board",
+            "/board.html",
             "/manifest.webmanifest",
             "/favicon.ico",
             "/icon-maskable-512.png",
             "/login",
         ] {
             assert_eq!(
-                resolve(path, false).gate(),
+                gate("GET", resolve(path, false)),
                 Gate::Open,
                 "{path} must not need a token"
             );
         }
         // An unknown path is a 404, not a 401: refusing it for the wrong
         // reason would tell an unauthenticated caller what exists.
-        assert_eq!(Route::NotFound.gate(), Gate::Open);
+        assert_eq!(gate("GET", Route::NotFound), Gate::Open);
         // A path that merely starts with the letters is not the API.
         assert_eq!(resolve("/apifake", false), Route::NotFound);
     }
 
+    // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at
+    // the path: a POST acts on a pane, and no path is exempt. Anything that is
+    // not a GET is therefore gated whatever it names, or serving the pages
+    // openly would open a hole the moment the first endpoint lands.
+    #[test]
+    fn nothing_but_a_get_is_ever_open() {
+        for method in ["POST", "PUT", "DELETE", "HEAD", "OPTIONS", "get"] {
+            for path in ["/", "/board", "/login", "/nope", "/api/send"] {
+                assert_eq!(
+                    gate(method, resolve(path, false)),
+                    Gate::Token,
+                    "{method} {path} must need a token"
+                );
+            }
+        }
+    }
 }

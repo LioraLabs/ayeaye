@@ -16,7 +16,11 @@
 ///
 /// This is hand-rolled rather than taken from `constant_time_eq` or `subtle`
 /// because the core's dependency allowlist is empty by design; see
-/// `crates/constitution/README.md`.
+/// `crates/constitution/README.md`. The honest limit of that: the property is
+/// held against the *source*, not against the codegen. There is no
+/// optimisation barrier here, and nothing stops a future compiler deciding an
+/// early exit is faster. LLVM does not do that to this shape today, and the
+/// crates that do carry a barrier are the ones the allowlist refuses.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -55,6 +59,21 @@ pub fn presented_token<'a>(
 /// Hand-rolled because the `cookie` crate carries a non-optional dependency on
 /// a clock, which the pure core may not have. The need is small: split on `;`,
 /// match the name, unquote the value.
+///
+/// It is deliberately *not* bug-compatible with Python's `SimpleCookie`, which
+/// the daemon uses today. The four differences, all verified against CPython:
+///
+/// - `SimpleCookie.load` discards the **whole jar** when any pair fails to
+///   parse, so `voice_token=abc; junk` finds nothing there and finds `abc`
+///   here. This is the one divergence in the accepting direction, and it is
+///   harmless: the value still has to survive [`constant_time_eq`].
+/// - `SimpleCookie` also splits on `,`, a legacy spelling browsers do not
+///   send. Here only `;` separates.
+/// - On a duplicated name Python keeps the last and this keeps the first.
+/// - Python decodes `\\054`-style octal escapes inside a quoted value; here a
+///   quoted value is only unquoted. The token alphabet is
+///   `[A-Za-z0-9_-]` — `secrets.token_urlsafe` — so nothing it mints can
+///   contain an escape.
 pub fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header.split(';').find_map(|pair| {
         let (found, value) = pair.split_once('=')?;
@@ -129,6 +148,17 @@ mod tests {
         assert_eq!(presented_token(None, None), None);
     }
 
+    // AYEAYE-42 — a cookie that is present but empty is the shape a logged-out
+    // browser sends after the cookie is cleared, and it is where two guards
+    // overlap: it must come back as nothing presented rather than as an empty
+    // token for `authorized` to catch further down.
+    #[test]
+    fn a_present_but_empty_cookie_is_nothing_presented() {
+        assert_eq!(presented_token(None, Some("voice_token=")), None);
+        assert_eq!(presented_token(None, Some("voice_token=\"\"")), None);
+        assert_eq!(presented_token(Some(""), Some("voice_token=")), None);
+    }
+
     // AYEAYE-42 — a `Cookie:` header is whatever the browser has accumulated,
     // so the parse has to survive other cookies, spaces, quotes and junk
     // without finding a token that is not there.
@@ -138,7 +168,10 @@ mod tests {
             cookie_value("theme=dark; voice_token=abc123; tz=UTC", "voice_token"),
             Some("abc123")
         );
-        assert_eq!(cookie_value("voice_token=\"abc123\"", "voice_token"), Some("abc123"));
+        assert_eq!(
+            cookie_value("voice_token=\"abc123\"", "voice_token"),
+            Some("abc123")
+        );
         assert_eq!(cookie_value("theme=dark", "voice_token"), None);
         assert_eq!(cookie_value("", "voice_token"), None);
         // A name that merely ends with ours is a different cookie.

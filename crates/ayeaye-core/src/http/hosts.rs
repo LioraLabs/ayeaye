@@ -21,8 +21,13 @@ impl AllowedHosts {
     /// Build the set from the bind address, the port, and an override list.
     ///
     /// `extra` is the comma-separated `AYEAYE_ALLOWED_HOSTS` value verbatim:
-    /// entries are trimmed, lowercased, and stripped of a trailing slash, so a
-    /// pasted origin works as well as a bare name.
+    /// entries are trimmed, lowercased, and stripped of a trailing slash, so
+    /// spaces after the commas and a stray slash on the end do not silently
+    /// lock somebody out. Note that these are `Host` values, not origins: a
+    /// pasted `https://phone.local/` normalises to `https://phone.local`,
+    /// which no `Host` header will ever equal. The daemon has the same gap
+    /// today; it is stated here rather than fixed, because widening it is a
+    /// change to what the allow-list admits.
     pub fn new(bind: &str, port: u16, extra: &str) -> Self {
         let mut hosts = BTreeSet::new();
         for host in [bind, "localhost", "127.0.0.1"] {
@@ -81,12 +86,7 @@ mod tests {
     #[test]
     fn the_defaults_cover_the_bind_address_localhost_and_loopback() {
         let allowed = AllowedHosts::new("127.0.0.1", 8912, "");
-        for host in [
-            "127.0.0.1",
-            "127.0.0.1:8912",
-            "localhost",
-            "localhost:8912",
-        ] {
+        for host in ["127.0.0.1", "127.0.0.1:8912", "localhost", "localhost:8912"] {
             assert!(allowed.allows(host), "{host} should be allowed");
         }
         assert!(!allowed.allows("evil.example"));
