@@ -1,5 +1,9 @@
 //! Quoting a string that is going to be typed into somebody's shell.
 //!
+//! Named for what it does rather than for where the text goes: "the shell" is
+//! already this workspace's word for the crate above the pure core, and these
+//! docs need both meanings in the same paragraph.
+//!
 //! An opening prompt is handed to an agent by *typing* a command line into the
 //! pane's shell — `send-keys -l` — rather than by handing a program an argv.
 //! That is the daemon's design and it is kept: both agents take the prompt as
@@ -43,12 +47,44 @@ pub fn quote(text: &str) -> Result<String, Unquotable> {
             '\'' => out.push_str("'\\''"),
             '\\' => return Err(Unquotable::Backslash),
             control if control.is_control() => return Err(Unquotable::Control(control)),
+            reordering if BIDI_OVERRIDES.contains(&reordering) => {
+                return Err(Unquotable::Reordering(reordering));
+            }
             other => out.push(other),
         }
     }
     out.push('\'');
     Ok(out)
 }
+
+/// The characters that make a line read differently from how it runs.
+///
+/// The bidirectional formatting controls: the embeddings and overrides, the
+/// isolates, and the two marks. None is a control character — `char::is_control`
+/// is the Cc category and these are Cf — so the refusal above does not reach
+/// them, and `shlex.quote` passes them through as ordinary text.
+///
+/// They are refused here anyway, which is a deliberate widening over the daemon.
+/// This line is *displayed in a terminal* as it is typed, and these characters
+/// reorder what is displayed without changing what runs — the Trojan Source
+/// shape. A prompt that shows one command and starts another is precisely the
+/// failure this module is here to prevent, and a prompt has no use for them.
+///
+/// The rest of Cf is left alone: a zero-width joiner is how several emoji are
+/// spelled, and refusing those would be refusing text people really type.
+const BIDI_OVERRIDES: &[char] = &[
+    '\u{200e}', // LEFT-TO-RIGHT MARK
+    '\u{200f}', // RIGHT-TO-LEFT MARK
+    '\u{202a}', // LEFT-TO-RIGHT EMBEDDING
+    '\u{202b}', // RIGHT-TO-LEFT EMBEDDING
+    '\u{202c}', // POP DIRECTIONAL FORMATTING
+    '\u{202d}', // LEFT-TO-RIGHT OVERRIDE
+    '\u{202e}', // RIGHT-TO-LEFT OVERRIDE
+    '\u{2066}', // LEFT-TO-RIGHT ISOLATE
+    '\u{2067}', // RIGHT-TO-LEFT ISOLATE
+    '\u{2068}', // FIRST STRONG ISOLATE
+    '\u{2069}', // POP DIRECTIONAL ISOLATE
+];
 
 impl fmt::Display for Unquotable {
     /// The sentence the person who typed the prompt is shown.
@@ -70,9 +106,18 @@ impl fmt::Display for Unquotable {
                 "that prompt carries a backslash — shells disagree about what \
                  one means inside quotes, so take it out"
             ),
+            Unquotable::Reordering(character) => write!(
+                out,
+                "that prompt carries a text-direction control (U+{:04X}) — \
+                 it would make the command read differently from how it runs, \
+                 so take it out",
+                *character as u32
+            ),
         }
     }
 }
+
+impl core::error::Error for Unquotable {}
 
 /// Why a string cannot be quoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +138,12 @@ pub enum Unquotable {
     /// has to reason about what follows each one, and this is the last string
     /// in the app worth being clever with.
     Backslash,
+    /// It carries a bidirectional formatting control — see [`BIDI_OVERRIDES`].
+    ///
+    /// The one refusal here that the daemon does not make. These reorder how
+    /// the typed line is *displayed* without changing what runs, so a prompt
+    /// carrying one can show a command nobody ran.
+    Reordering(char),
 }
 
 #[cfg(test)]
@@ -156,6 +207,28 @@ mod tests {
         // a non-breaking space is a character somebody's keyboard really types.
         assert!(quote("a b  c").is_ok());
         assert!(quote("a\u{a0}b").is_ok());
+    }
+
+    // AYEAYE-51 — the one refusal the daemon does not make. A bidirectional
+    // override is not a control character (`char::is_control` is category Cc;
+    // these are Cf) and `shlex.quote` passes it straight through — but this
+    // line is displayed in a terminal as it is typed, and these reorder what is
+    // displayed without changing what runs. A prompt that shows one command and
+    // starts another is the whole failure this module exists to prevent.
+    #[test]
+    fn a_character_that_reorders_the_line_is_refused_although_the_daemon_allows_it() {
+        for reordering in super::BIDI_OVERRIDES {
+            assert_eq!(
+                quote(&format!("fix{reordering}the tests")).unwrap_err(),
+                Unquotable::Reordering(*reordering),
+                "U+{:04X} reorders the line",
+                *reordering as u32
+            );
+        }
+        // And the rest of the category is left alone: a zero-width joiner is
+        // how several emoji are spelled, and refusing those would be refusing
+        // text people really type.
+        assert!(quote("ship it 👨\u{200d}👩\u{200d}👦").is_ok());
     }
 
     // AYEAYE-51 — the refusal is shown to whoever typed the prompt, so it has
