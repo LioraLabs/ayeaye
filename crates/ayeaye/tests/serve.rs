@@ -132,6 +132,12 @@ impl Server {
 }
 
 fn settings_on_port(port: u16) -> Settings {
+    // A cliban that is not there by default: no test gets to reach a real
+    // board by forgetting to say which one it meant.
+    settings_with(port, "/nonexistent/cliban")
+}
+
+fn settings_with(port: u16, cliban: &str) -> Settings {
     Settings {
         bind: "127.0.0.1".to_string(),
         port,
@@ -142,6 +148,7 @@ fn settings_on_port(port: u16) -> Settings {
         // about panes still cannot read the panes of whoever is running the
         // suite. The cases that do care point it at a server of their own.
         tmux: common::nowhere("serve-nobody"),
+        cliban: ayeaye::cliban::Cliban::new(cliban.to_string()),
     }
 }
 
@@ -149,6 +156,119 @@ fn settings_on_port(port: u16) -> Settings {
 fn registry(name: &str) -> Registry {
     Registry::new(vec![Peer::here(HostName::new(name).expect("a host name"))])
         .expect("one peer, and it is this machine")
+}
+
+/// Where the cliban stand-ins and their argv logs live.
+fn scratch() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("serve-stand-ins")
+}
+
+/// Where one stand-in records what it was asked.
+///
+/// One log per stand-in, and one stand-in per test: a single shared log would
+/// be appended to by every test running beside this one, and "these are the
+/// three questions asked" would be a claim about the whole suite.
+fn argv_log(stand_in: &str) -> std::path::PathBuf {
+    scratch().join(format!("{stand_in}.argv"))
+}
+
+/// The command lines a stand-in was run with, in order.
+///
+/// Empty when it was never started at all, which is how a test proves that
+/// something was refused before any process existed.
+fn asked(stand_in: &str) -> Vec<String> {
+    std::fs::read_to_string(argv_log(stand_in))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every cliban stand-in, written once before any of them is ever run.
+///
+/// Never the real cliban: this project is tracked on the board the real one
+/// would answer about. Written up front rather than per test because these
+/// tests run in parallel threads in one process, and a `fork` in one thread
+/// while another still holds the file open for writing is an intermittent
+/// `ETXTBSY` on the exec.
+///
+/// Every one of them records its argv first, so "cliban was never started" is
+/// a thing a test can observe rather than infer from a status code.
+fn stand_ins() -> &'static std::path::PathBuf {
+    static WRITTEN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    WRITTEN.get_or_init(|| {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = scratch();
+        std::fs::create_dir_all(&directory).expect("a writable temporary directory");
+
+        // What a board looks like: one project, one milestone, one issue, plus
+        // a blank line and a truncated one, which a real pipe can produce and
+        // which must cost their own row and nothing else.
+        const ANSWERS: &str = concat!(
+            "case \"$1 $2 $3\" in\n",
+            "  'project ls --json')   printf '%s\\n' ",
+            "'{\"key\":\"AYEAYE\",\"name\":\"AyeAye\"}' '' '{\"key\":\"CLI\"' ",
+            "'{\"key\":\"CLI\",\"name\":\"Cliban\"}' ;;\n",
+            "  'milestone ls --json') printf '%s\\n' ",
+            "'{\"name\":\"One binary\",\"project\":\"AYEAYE\",\"status\":\"open\"}' ;;\n",
+            "  'issue ls --json')     printf '%s\\n' ",
+            "'{\"key\":\"AYEAYE-53\",\"status\":\"in-progress\"}' ;;\n",
+            "  'issue show '*)        printf '%s\\n' ",
+            "'{\"key\":\"AYEAYE-53\",\"title\":\"Board integration\"}' ;;\n",
+            // Anything else is a question this stand-in was not expecting, and
+            // saying so is what makes a dropped `--json` visible rather than
+            // silently answered.
+            "  *) echo \"unexpected: $*\" >&2; exit 64 ;;\n",
+            "esac\n",
+        );
+
+        // Answers `project ls` and fails everything after it: the board's
+        // "only the first call is a failure" decision has no other witness.
+        const HALF: &str = concat!(
+            "case \"$1 $2 $3\" in\n",
+            "  'project ls --json') printf '%s\\n' ",
+            "'{\"key\":\"AYEAYE\",\"name\":\"AyeAye\"}' ;;\n",
+            "  *) echo 'cliban: no such view' >&2; exit 1 ;;\n",
+            "esac\n",
+        );
+
+        for (name, body) in [
+            ("board-answers", ANSWERS),
+            ("projects-answers", ANSWERS),
+            ("issue-answers", ANSWERS),
+            ("gated-answers", ANSWERS),
+            ("must-not-run", ANSWERS),
+            ("half-answers", HALF),
+            (
+                "fails",
+                "echo 'cliban: unable to open database file' >&2\nexit 1",
+            ),
+            ("garbles", "echo 'not json at all'"),
+        ] {
+            let path = directory.join(name);
+            let log = argv_log(name);
+            let _ = std::fs::remove_file(&log);
+            let mut file = std::fs::File::create(&path).expect("a written stand-in");
+            write!(
+                file,
+                "#!/bin/sh\necho \"$*\" >> {}\n{body}\n",
+                log.to_string_lossy()
+            )
+            .expect("a written stand-in");
+            drop(file);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("a runnable stand-in");
+        }
+        directory
+    })
+}
+
+/// A server whose cliban is the named stand-in.
+async fn served_by(stand_in: &str) -> Server {
+    let program = stand_ins().join(stand_in);
+    Server::start(settings_with(0, &program.to_string_lossy())).await
 }
 
 fn parse(raw: &[u8]) -> Answer {
@@ -696,5 +816,223 @@ async fn the_pane_list_needs_a_token() {
             .status,
         200,
         "the login cookie should authenticate"
+    );
+}
+
+// AYEAYE-53 — "board rows are fetched and rendered". The page's `load()` reads
+// `d.projects`, `d.milestones` and `d.issues`, so this asserts all three
+// arrive; and it asserts the three questions asked of cliban are the daemon's
+// own argv, because the sort orders are what put the board in the order the
+// page renders and nothing downstream would notice them missing.
+#[tokio::test]
+async fn the_board_is_fetched_with_the_questions_the_daemon_asks() {
+    let server = served_by("board-answers").await;
+
+    let answer = server
+        .request("GET", "/api/cliban/board", &[("X-Voice-Token", TOKEN)])
+        .await;
+
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("content-type"), Some("application/json"));
+    assert_eq!(answer.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        answer.body_text(),
+        concat!(
+            r#"{"projects":[{"key":"AYEAYE","name":"AyeAye"},"#,
+            r#"{"key":"CLI","name":"Cliban"}],"#,
+            r#""milestones":[{"name":"One binary","project":"AYEAYE","status":"open"}],"#,
+            r#""issues":[{"key":"AYEAYE-53","status":"in-progress"}]}"#,
+        ),
+        "a blank line and a truncated one should cost their own rows and no more"
+    );
+    assert_eq!(
+        asked("board-answers"),
+        vec![
+            "project ls --json",
+            "milestone ls --json --sort activity",
+            "issue ls --json --sort position",
+        ]
+    );
+}
+
+// AYEAYE-53 — "a missing or failing board tool degrades to an empty board with
+// a stated reason, never to a broken panel". Both halves: a cliban that fails
+// and a cliban that is not there. `load()` in board.html reads `d.error` and
+// draws it with a retry, so the body has to parse and the reason has to be in
+// `error` — a 500 with an unreadable body is the broken panel.
+#[tokio::test]
+async fn a_failing_or_missing_cliban_is_a_stated_reason_the_page_can_draw() {
+    for (stand_in, expected) in [
+        ("fails", "cliban: unable to open database file"),
+        ("/nonexistent/cliban", "/nonexistent/cliban"),
+    ] {
+        let server = if stand_in.starts_with('/') {
+            Server::start(settings_with(0, stand_in)).await
+        } else {
+            served_by(stand_in).await
+        };
+
+        let answer = server
+            .request("GET", "/api/cliban/board", &[("X-Voice-Token", TOKEN)])
+            .await;
+
+        assert_eq!(answer.status, 500, "for {stand_in}");
+        let body = answer.body_text();
+        assert!(
+            ayeaye_core::json::is_value(&body),
+            "the degraded body must still parse: {body}"
+        );
+        let reason = ayeaye_core::json::string_member(&body, "error")
+            .unwrap_or_else(|| panic!("no stated reason in {body}"));
+        assert!(reason.contains(expected), "{reason}");
+    }
+}
+
+// AYEAYE-53 — only the *first* of the board's three calls is a failure, which
+// is the daemon's `cliban_board` and a decision rather than an oversight: a
+// board with no milestones is still a board, where a board with no projects
+// has nothing to render at all. Nothing else in the suite can see this — a
+// cliban that fails everything only ever exercises the first call.
+#[tokio::test]
+async fn a_board_whose_later_queries_fail_is_still_a_board() {
+    let server = served_by("half-answers").await;
+
+    let answer = server
+        .request("GET", "/api/cliban/board", &[("X-Voice-Token", TOKEN)])
+        .await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    assert_eq!(
+        answer.body_text(),
+        concat!(
+            r#"{"projects":[{"key":"AYEAYE","name":"AyeAye"}],"#,
+            r#""milestones":[],"issues":[]}"#,
+        )
+    );
+    // And it did ask, rather than skipping them once the first had answered.
+    assert_eq!(asked("half-answers").len(), 3);
+}
+
+// AYEAYE-53 — the app page linkifies ticket references from this list, and its
+// own fetch swallows a failure into a silent catch. So the contract is that it
+// degrades to *no links*: an empty list and a 200, never an error.
+#[tokio::test]
+async fn the_project_keys_degrade_to_no_links_rather_than_to_an_error() {
+    let answered = served_by("projects-answers").await;
+    let answer = answered
+        .request("GET", "/api/cliban/projects", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body_text(), r#"{"keys":["AYEAYE","CLI"]}"#);
+    // The one question, with the flag that makes the answer parseable. Without
+    // `--json` cliban prints a table, every line of which is dropped as a row,
+    // and this endpoint degrades to no links with nothing saying why.
+    assert_eq!(asked("projects-answers"), vec!["project ls --json"]);
+
+    let absent = Server::started().await;
+    let answer = absent
+        .request("GET", "/api/cliban/projects", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "a missing cliban is fewer links, not 500"
+    );
+    assert_eq!(answer.body_text(), r#"{"keys":[]}"#);
+}
+
+// AYEAYE-53 — the key a request names lands in a subprocess argv, so a key
+// that is not shaped like one is refused before anything is started. The 400
+// and the untouched argv log are the two halves of that claim.
+#[tokio::test]
+async fn a_key_that_is_not_a_key_is_refused_before_cliban_is_started() {
+    // A stand-in that answers perfectly well and records every call: the 400
+    // alone would not say whether the process was started and its answer
+    // thrown away.
+    let server = served_by("must-not-run").await;
+
+    for key in ["", "--help", "AYEAYE", "AYE%20AYE-1", "AYEAYE-53%0Als"] {
+        let answer = server
+            .request(
+                "GET",
+                &format!("/api/cliban/issue?key={key}"),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(answer.status, 400, "for key {key:?}");
+        assert_eq!(answer.body_text(), r#"{"error":"bad key"}"#);
+    }
+
+    // A key with no `key` parameter at all is the same refusal.
+    let answer = server
+        .request("GET", "/api/cliban/issue", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 400);
+
+    assert!(
+        asked("must-not-run").is_empty(),
+        "cliban was started for a key that is not a key: {:?}",
+        asked("must-not-run")
+    );
+}
+
+// AYEAYE-53 — a real key gets cliban's own object back, and output that is not
+// one gets the daemon's "unreadable cliban output" rather than a body the
+// page's `.json()` throws on.
+#[tokio::test]
+async fn a_real_key_gets_the_issue_and_garbled_output_gets_a_reason() {
+    let server = served_by("issue-answers").await;
+    let answer = server
+        .request(
+            "GET",
+            "/api/cliban/issue?key=AYEAYE-53",
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(answer.status, 200);
+    // The key reaches cliban as its own argument, and `--json` with it.
+    assert_eq!(asked("issue-answers"), vec!["issue show AYEAYE-53 --json"]);
+    assert_eq!(
+        ayeaye_core::json::string_member(answer.body_text().trim(), "title").as_deref(),
+        Some("Board integration")
+    );
+
+    let garbled = served_by("garbles").await;
+    let answer = garbled
+        .request(
+            "GET",
+            "/api/cliban/issue?key=AYEAYE-53",
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(answer.status, 500);
+    assert_eq!(
+        answer.body_text(),
+        r#"{"error":"unreadable cliban output"}"#
+    );
+}
+
+// AYEAYE-53 — every one of these is under /api/, which AYEAYE-42 already gates
+// as one table rather than per route. This is the assertion that says so out
+// loud: the endpoints added here needed no gate of their own, and would notice
+// if they had been mounted somewhere that bypassed it.
+#[tokio::test]
+async fn none_of_the_board_endpoints_answer_without_a_token() {
+    let server = served_by("gated-answers").await;
+    for path in [
+        "/api/cliban/board",
+        "/api/cliban/projects",
+        "/api/cliban/issue?key=AYEAYE-53",
+    ] {
+        let answer = server.get(path).await;
+        assert_eq!(answer.status, 401, "for {path}");
+        assert_eq!(answer.body_text(), r#"{"error":"unauthorized"}"#);
+    }
+    // And nothing was asked of cliban on the way to refusing: a gate that let
+    // the work happen and threw the answer away would still be a gate that ran
+    // the board's three queries for an unauthenticated caller.
+    assert!(
+        asked("gated-answers").is_empty(),
+        "cliban was run for an unauthenticated request: {:?}",
+        asked("gated-answers")
     );
 }

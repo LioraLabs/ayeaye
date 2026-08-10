@@ -11,6 +11,7 @@
 //! `crates/constitution/README.md`.
 
 pub mod audio;
+pub mod board;
 pub mod http;
 pub mod identity;
 pub mod json;
