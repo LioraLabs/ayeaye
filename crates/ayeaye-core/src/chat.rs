@@ -71,11 +71,20 @@ impl Template {
     /// rendering an empty one: a model shown an empty system message has been
     /// told something, and what it has been told is nothing.
     ///
-    /// Both texts are passed through [`neutralise`] first. This is dictated
-    /// speech: it is whatever a speech model heard, from whoever was in the
-    /// room, and a transcription carrying `<|im_end|>` would otherwise end the
-    /// user's turn early and leave the rest of it addressed to the model as
-    /// instructions.
+    /// Both texts are passed through [`neutralise`] first. For the dictation
+    /// that is unarguable: it is whatever a speech model heard, from whoever was
+    /// in the room, and a transcription carrying `<|im_end|>` would otherwise
+    /// end the user's turn early and leave the rest of it addressed to the
+    /// model as instructions.
+    ///
+    /// The system prompt is neutralised too, which is the more debatable half
+    /// and is decided this way deliberately. It costs an operator the ability to
+    /// write a few-shot prompt out of real turn markers — silently, with no
+    /// error. It buys the property that `render` produces exactly one
+    /// conversation whatever it is handed, so no configuration mistake and no
+    /// prompt copied off the internet can turn a rewrite into an instruction.
+    /// If few-shot prompting is ever wanted, it should arrive as turns in the
+    /// [`Template`] rather than as markers smuggled through a text field.
     pub fn render(&self, system: &str, user: &str) -> String {
         let mut out = String::new();
         out.push_str(&self.prefix);
@@ -195,5 +204,42 @@ mod tests {
     #[test]
     fn the_default_template_is_chatml() {
         assert_eq!(Template::default(), Template::chatml());
+    }
+
+    // AYEAYE-55
+    //
+    // Pinned against literals rather than against each other. These strings are
+    // looked up in a real model's vocabulary to decide when a generation is
+    // over, so a typo in one does not fail here — it produces a model that runs
+    // to its token budget every time and gets refused for length, which reads
+    // as a bad model rather than as a bad constant.
+    #[test]
+    fn the_stop_markers_are_the_ones_the_vocabularies_actually_carry() {
+        assert_eq!(
+            Template::chatml().stop,
+            vec!["<|im_end|>".to_string(), "<|endoftext|>".to_string()]
+        );
+        assert_eq!(
+            Template::llama3().stop,
+            vec!["<|eot_id|>".to_string(), "<|end_of_text|>".to_string()]
+        );
+    }
+
+    // AYEAYE-55
+    //
+    // A stop marker has to be spelled the same way in the prompt and in the
+    // stop list, or a generation ends at a token nothing was told to look for.
+    #[test]
+    fn every_stop_marker_is_one_the_template_itself_writes() {
+        for template in [Template::chatml(), Template::llama3()] {
+            let rendered = template.render("s", "u");
+            assert!(
+                template
+                    .stop
+                    .iter()
+                    .any(|marker| rendered.contains(marker.as_str())),
+                "no stop marker of {rendered:?} appears in the prompt it renders"
+            );
+        }
     }
 }

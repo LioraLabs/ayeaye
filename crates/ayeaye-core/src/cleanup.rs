@@ -64,7 +64,9 @@ pub struct Policy {
     pub template: Template,
     /// The stop, in tokens.
     pub max_new_tokens: usize,
-    /// Lowercase phrases that disqualify a candidate as an echo of the prompt.
+    /// Phrases that disqualify a candidate as an echo of the prompt, matched
+    /// case-insensitively. Empty is legitimate: a prompt whose tells nobody has
+    /// written down is better guarded by nothing than by another prompt's.
     pub echoes: Vec<String>,
     /// The length below which a rewrite is never refused for growing.
     pub length_floor: usize,
@@ -126,25 +128,51 @@ impl Policy {
     /// An empty value is not a value. `CLEANUP_PROMPT=` in a shell that means
     /// to unset it must not blank the prompt, because a model with no
     /// instruction does not clean anything up — it continues the sentence.
+    ///
+    /// **Replacing the prompt drops the echo phrases with it**, unless
+    /// `CLEANUP_ECHOES` names new ones as a comma-separated list. That is the
+    /// coupling [`DEFAULT_ECHOES`] argues for, enforced at the one place that
+    /// can break it: the default tells belong to the default prompt, and
+    /// carrying them onto somebody else's is wrong in both directions — they
+    /// catch nothing real, and they refuse a legitimate rewrite that happens to
+    /// contain the words.
     pub fn resolve(env: impl Fn(&str) -> Option<String>) -> Result<Self, PolicyError> {
         let value = |name: &str| env(name).filter(|v| !v.trim().is_empty());
         let mut policy = Self::default();
 
         if let Some(prompt) = value("CLEANUP_PROMPT") {
             policy.system_prompt = prompt;
+            policy.echoes = Vec::new();
+        }
+        if let Some(echoes) = value("CLEANUP_ECHOES") {
+            policy.echoes = echoes
+                .split(',')
+                .map(str::trim)
+                .filter(|echo| !echo.is_empty())
+                .map(str::to_string)
+                .collect();
         }
         if let Some(name) = value("CLEANUP_TEMPLATE") {
             policy.template = match name.trim().to_ascii_lowercase().as_str() {
                 "chatml" => Template::chatml(),
                 "llama3" => Template::llama3(),
-                _ => return Err(PolicyError::UnknownTemplate(name)),
+                _ => return Err(PolicyError::UnknownTemplate(name.trim().to_string())),
             };
         }
         if let Some(tokens) = value("CLEANUP_MAX_TOKENS") {
-            policy.max_new_tokens = tokens.trim().parse().map_err(|_| PolicyError::NotANumber {
+            let not_a_number = || PolicyError::NotANumber {
                 setting: "CLEANUP_MAX_TOKENS".to_string(),
-                value: tokens.clone(),
-            })?;
+                value: tokens.trim().to_string(),
+            };
+            let budget: usize = tokens.trim().parse().map_err(|_| not_a_number())?;
+            // Zero is a number and is not a budget: it means the model is
+            // loaded, prompted, and never allowed to say anything, which
+            // degrades safely and is indistinguishable from a working
+            // configuration. Refused rather than obeyed.
+            if budget == 0 {
+                return Err(not_a_number());
+            }
+            policy.max_new_tokens = budget;
         }
 
         Ok(policy)
@@ -227,6 +255,16 @@ impl Cleaned {
     }
 }
 
+/// Whether a transcription is worth spending a model on.
+///
+/// [`settle`] asks this first and answers [`Kept::NothingSaid`] when it is
+/// false, so a caller that runs a model *before* asking has bought seconds of
+/// inference to be told something that was knowable for free — and has handed a
+/// model a blank prompt, which it will fill.
+pub fn worth_cleaning(raw: &str) -> bool {
+    !raw.trim().is_empty()
+}
+
 /// Decide between a transcription and a model's rewrite of it.
 ///
 /// Total, and that is the point. `candidate` is `None` when there was no model
@@ -239,7 +277,7 @@ pub fn settle(policy: &Policy, raw: &str, candidate: Option<&str>) -> Cleaned {
         kept: Some(kept),
     };
 
-    if raw.trim().is_empty() {
+    if !worth_cleaning(raw) {
         return keep(Kept::NothingSaid);
     }
     let Some(candidate) = candidate else {
@@ -280,15 +318,25 @@ pub fn settle(policy: &Policy, raw: &str, candidate: Option<&str>) -> Cleaned {
 /// of the quotes when it does both. Applied once each rather than until it
 /// stops changing, so that a dictation which genuinely *is* a quoted phrase
 /// keeps its inner quotes.
-pub fn tidy(candidate: &str) -> String {
+///
+/// Private: it hands back model output nobody has judged, and the only caller
+/// entitled to that is [`settle`], on its way to a verdict.
+fn tidy(candidate: &str) -> String {
     let text = candidate.trim();
 
     let text = match text.strip_prefix("```") {
-        // The opening fence may carry a language tag, which runs to the end of
-        // that line and is not part of the answer.
         Some(rest) => {
-            let body = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
-            body.trim_end().strip_suffix("```").unwrap_or(body).trim()
+            let rest = rest.trim_end().strip_suffix("```").unwrap_or(rest);
+            // The opening fence may carry a language tag, which runs to the end
+            // of that line and is not part of the answer. It may equally be a
+            // one-line fence with no newline at all — ```like this``` — where
+            // everything after the backticks *is* the answer. Splitting on the
+            // newline first threw that whole case away as empty.
+            match rest.split_once('\n') {
+                Some((_tag, body)) => body,
+                None => rest,
+            }
+            .trim()
         }
         None => text,
     };
@@ -305,7 +353,7 @@ pub fn tidy(candidate: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cleaned, Kept, Policy, PolicyError, settle, tidy};
+    use super::{Cleaned, Kept, Policy, PolicyError, settle, tidy, worth_cleaning};
     use crate::chat::Template;
 
     fn policy() -> Policy {
@@ -434,6 +482,20 @@ mod tests {
 
     // AYEAYE-55
     //
+    // A one-line fence has no language tag and no newline, so everything after
+    // the backticks is the answer. Splitting on the newline first threw the
+    // whole rewrite away as empty — safe, since the dictation survived, and
+    // still a good rewrite lost to a model doing what the prompt says it does.
+    #[test]
+    fn a_one_line_fence_is_not_the_same_as_an_empty_answer() {
+        assert_eq!(tidy("```Run the tests.```"), "Run the tests.");
+        assert!(
+            settle(&policy(), "um run the tests", Some("```Run the tests.```")).was_rewritten()
+        );
+    }
+
+    // AYEAYE-55
+    //
     // Tidying happens before judging, so a fenced answer is judged on what is
     // inside the fence rather than refused for the backticks.
     #[test]
@@ -480,8 +542,14 @@ mod tests {
     // AYEAYE-55
     //
     // Criterion 2: the prompt is configuration.
+    //
+    // And the echoes go with it. The default tells belong to the default
+    // prompt; carrying them onto somebody else's is wrong in both directions —
+    // they catch nothing real, and they refuse a legitimate rewrite that
+    // happens to contain the words. Asserting only `system_prompt` here is a
+    // test that passes while the module's central claim is false.
     #[test]
-    fn the_environment_can_replace_the_system_prompt() {
+    fn replacing_the_system_prompt_drops_the_echo_phrases_with_it() {
         let policy = Policy::resolve(|name| match name {
             "CLEANUP_PROMPT" => Some("Say it back in French.".to_string()),
             _ => None,
@@ -490,6 +558,28 @@ mod tests {
 
         assert_eq!(policy.system_prompt, "Say it back in French.");
         assert!(policy.prompt("bonjour").contains("Say it back in French."));
+        assert!(policy.echoes.is_empty());
+        // Which is observable, not bookkeeping: a rewrite carrying the old
+        // prompt's tells is now an ordinary rewrite.
+        assert!(settle(&policy, "run the tests", Some("I only rewrite.")).was_rewritten());
+    }
+
+    // AYEAYE-55
+    #[test]
+    fn the_environment_can_name_the_new_prompts_own_tells() {
+        let policy = Policy::resolve(|name| match name {
+            "CLEANUP_PROMPT" => Some("Say it back in French.".to_string()),
+            "CLEANUP_ECHOES" => Some(" say it back , en francais ".to_string()),
+            _ => None,
+        })
+        .expect("a prompt and its tells resolve");
+
+        assert_eq!(policy.echoes, vec!["say it back", "en francais"]);
+        assert_kept(
+            &settle(&policy, "run the tests", Some("I Say It Back in French.")),
+            "run the tests",
+            Kept::Instructions,
+        );
     }
 
     // AYEAYE-55
@@ -548,6 +638,72 @@ mod tests {
         .expect_err("a budget that is not a number cannot resolve");
 
         assert!(error.to_string().contains("lots"));
+    }
+
+    // AYEAYE-55
+    //
+    // Zero is a number and is not a budget. It loads a model, prompts it, and
+    // never lets it say anything — which degrades safely and is
+    // indistinguishable from a configuration that works.
+    #[test]
+    fn a_zero_token_budget_is_refused_rather_than_obeyed() {
+        assert!(
+            Policy::resolve(|name| match name {
+                "CLEANUP_MAX_TOKENS" => Some("0".to_string()),
+                _ => None,
+            })
+            .is_err()
+        );
+    }
+
+    // AYEAYE-55
+    #[test]
+    fn nothing_worth_cleaning_is_the_same_question_settle_asks_first() {
+        assert!(!worth_cleaning(""));
+        assert!(!worth_cleaning(" \n\t "));
+        assert!(worth_cleaning("run the tests"));
+    }
+
+    // AYEAYE-55
+    //
+    // The length gate is `>`, so a rewrite exactly at the limit is allowed. The
+    // boundary is asserted rather than reasoned about: an off-by-one here
+    // refuses good rewrites and nothing else would notice.
+    #[test]
+    fn the_length_gate_admits_a_rewrite_exactly_at_the_limit() {
+        let policy = Policy {
+            length_floor: 0,
+            ..Policy::default()
+        };
+        let raw = "abcde";
+
+        assert!(settle(&policy, raw, Some(&"x".repeat(10))).was_rewritten());
+        assert_kept(
+            &settle(&policy, raw, Some(&"x".repeat(11))),
+            raw,
+            Kept::TooLong,
+        );
+    }
+
+    // AYEAYE-55
+    //
+    // Every refusal has a line a person can read, and the accepted text can be
+    // taken by value without going through a borrow.
+    #[test]
+    fn a_kept_dictation_can_say_why_and_a_cleaned_one_can_be_taken() {
+        let cleaned = settle(&policy(), "run the tests", None);
+        assert_eq!(
+            cleaned.kept().map(Kept::why),
+            Some("no cleanup model answered")
+        );
+        assert_eq!(cleaned.into_text(), "run the tests");
+
+        assert_eq!(
+            settle(&policy(), "um run the tests", Some("Run the tests."))
+                .into_text()
+                .as_str(),
+            "Run the tests."
+        );
     }
 
     // AYEAYE-55
