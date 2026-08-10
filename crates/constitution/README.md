@@ -4,11 +4,12 @@ This crate is the workspace's rules in a form that can refuse a build. It is
 normative: where this file and somebody's intention disagree, this file wins,
 because it is the one the suite reads.
 
-Four rules are enforced today, the fourth in two halves. They are **tier 1** —
-the rules that keep the pure core pure, the strata apart, and the build free of
-a C toolchain. The
-duplication tiers, and the waiver ratchet that makes them landable, arrive with
-AYEAYE-64.
+Six rules are enforced today, the fourth in two halves. Rules 1–4 are
+**tier 1** — the rules that keep the pure core pure, the strata apart, and the
+build free of a C toolchain; they hold absolutely, with no per-violation
+exemption. Rules 5 and 6 are **tier 2** — the duplication rules — and they
+landed on a tree that already broke them, so they read a waiver file of the
+violations that predate them. The ratchet is that the file can only shrink.
 
 Every rule takes its input as **data**: source text, a list of dependency
 names, a graph of crates, the text of a lockfile. Only `corpus.rs` touches a
@@ -312,6 +313,88 @@ it is the diagnosis, and this is the proof.
 Both halves — all three checks — are `Rule::PureRustGraph`, because they are one
 rule.
 
+---
+
+## Tier 2 — no decision is implemented twice
+
+The enforceable rule is not "no logic outside the core". It is: **no decision
+is implemented twice.** Every duplication found so far was once labelled a
+deliberate copy by someone with a good reason that later expired. Two rules
+look for the two shapes that takes, and both read the waiver file below —
+which is what let them land green on a tree that already broke them.
+
+**Scope: shipped code.** Each crate's `src/` minus its `#[cfg(test)]` items,
+plus `build.rs` — `tests/`, `benches/` and `examples/` never enter. That is a
+decision, not an accident: a non-tautological test *restates* the value it
+asserts on, so an integration test in `ayeaye` spelling out a route that
+`ayeaye-core` owns is the independence that makes the test worth having, not a
+second implementation of the decision. Measured before the rules landed,
+including tests would have quadrupled the findings, almost all of them tests
+doing exactly that job. Only the exact spelling `#[cfg(test)]` is recognized;
+test code reached through `#[cfg(all(test, …))]` stays in scope, which errs
+loud — a waivable false positive — never silent. The `constitution` crate is
+exempt entirely: it is stratum-3 tooling that quotes the workspace by design,
+planted violations and all.
+
+### Rule 5 — a string literal written in more than one crate
+
+`duplication::literals(sources, LITERAL_FLOOR)` collects every string literal
+of 8 or more characters, spelling as written, and returns one finding per
+literal that two or more crates write. Below the floor, coincidence dominates
+decision — nobody copies `"1"`.
+
+### Rule 6 — a run of code copied across crates
+
+`duplication::runs(sources, RUN_LINES)` reduces each file to its significant
+lines — comments stripped, lines trimmed, blank and punctuation-only lines
+dropped, **string contents kept**, because two runs that differ only inside
+their literals are two different decisions — and looks for 6 or more
+consecutive such lines appearing in more than one crate. A match is extended
+to the maximal shared run and reported once, however many windows it spans.
+
+### What a finding is keyed on
+
+Never a line number: an unrelated edit above a known violation must not
+re-fire it, because the waiver file hangs on these keys. A literal keys on the
+literal itself plus the sorted set of crates that write it; a run keys on a
+content hash (FNV-1a 64) of its normalized text plus the crate set. Two
+consequences are deliberate. A waived literal spreading to a *third* crate
+changes the key, so the old waiver goes stale and the spread surfaces as new.
+And editing both copies of a waived run in step produces a new hash — a stale
+waiver plus a fresh finding, which is the ratchet asking for the justification
+to be re-made rather than inherited.
+
+## The waiver ratchet
+
+`crates/constitution/waivers.toml` is the tracked list of violations that
+existed before the rules did, each entry a `[[waiver]]` with the finding's
+`key` and a written `justification`. `waiver::apply` suppresses exactly the
+findings the file names and adds a finding for every way the file itself can
+be wrong:
+
+- **A blank justification is a violation.** "Someone once had a reason" is
+  the label every duplication in this tree already wore.
+- **A waiver whose violation is gone is a violation.** Delete the entry; the
+  list only shrinks, so nobody banks an old entry against a future copy.
+- **A key listed twice is a violation.** One violation, one entry, one
+  justification.
+
+The non-empty list is also the gate's canary: a scanner that quietly went
+blind would turn every entry stale at once, and the gate fails loudly instead
+of passing silently.
+
+When the gate fires:
+
+```
+cargo run -p constitution --example ratchet
+```
+
+prints every unwaived finding as a paste-ready `[[waiver]]` skeleton — with an
+empty justification, deliberately — and every problem with the waiver file as
+a comment. Fix the duplication, or paste the entry and write down why the copy
+is the design. The Cookfile's `rust` probe names `waivers.toml` explicitly:
+the suite reads it through `include_str!`, so no glob over source would
+otherwise notice an entry being deleted.
 
 ---
 
@@ -322,14 +405,15 @@ cargo test -p constitution          # the rules, and the rules against this tree
 cook rust-suite                     # the same, as the build system's cached unit
 ```
 
-`crates/constitution/tests/constitution.rs` runs all four rules over the real
-workspace, rule 4 in all three of its checks — the lockfile against
-`FORBIDDEN`, every manifest (the root's included) against `GATED`, and cargo's
-own resolution of the default build against `ACCELERATED`. It also asserts the corpus walk found a
-non-trivial number of files, and that every crate the strata place contributed
-at least one — a walk that
-finds nothing passes every rule it feeds, silently, which is the failure those
-floors exist to make loud.
+`crates/constitution/tests/constitution.rs` runs all six rules over the real
+workspace — rule 4 in all three of its checks (the lockfile against
+`FORBIDDEN`, every manifest, the root's included, against `GATED`, and cargo's
+own resolution of the default build against `ACCELERATED`), and the
+duplication rules through the waiver file. It also asserts the corpus walk
+found a non-trivial number of files, that every crate the strata place
+contributed at least one, and that the duplication scope still covers the
+three shipped crates — a walk that finds nothing passes every rule it feeds,
+silently, which is the failure those floors exist to make loud.
 
 It asserts one more thing, which is about the build system rather than about
 the code: **every workspace member lives under `crates/`.** The Cookfile's
@@ -357,6 +441,10 @@ The rules are meant to be changed; they are not meant to be edged around.
    empty — the table is passed in as an argument so a test can supply one that
    does.
 4. **Loosening is a decision, and it is written down.** Removing an entry means
-   saying, here, why the thing it refused is now acceptable. Until AYEAYE-64
-   lands the waiver ratchet there is no per-violation exemption: a rule either
-   holds for the whole crate or it does not hold.
+   saying, here, why the thing it refused is now acceptable. Tier 1 has no
+   per-violation exemption: a rule either holds for the whole crate or it does
+   not hold. Tier 2's exemptions are the waiver file, and they run the other
+   way — every entry was written down before the rule landed, each with its
+   justification, and the file only shrinks. A *new* violation does not get a
+   waiver as a convenience; it gets one by making the same argument the
+   existing entries make, in writing, or it gets fixed.
