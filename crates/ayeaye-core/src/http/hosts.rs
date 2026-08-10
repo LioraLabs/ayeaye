@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 /// The defaults cover direct access to the bind address. Anything fronting the
 /// daemon — `tailscale serve`, a reverse proxy — presents its own `Host` and
 /// has to be named in the override list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AllowedHosts {
     hosts: BTreeSet<String>,
 }

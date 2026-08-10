@@ -31,9 +31,10 @@ fn files_on_disk() -> Vec<String> {
 fn every_file_in_share_is_embedded_byte_for_byte() {
     let on_disk = files_on_disk();
     assert!(
-        on_disk.len() >= 9,
-        "share/ holds {} files, fewer than the pages, manifest and icon set — \
-         this test is looking in the wrong place",
+        on_disk.len() >= 10,
+        "share/ holds {} files, fewer than the two pages, the manifest and the \
+         seven icons that are there today — either this test is looking in the \
+         wrong place, or a file was removed and this floor is the deliberate act",
         on_disk.len()
     );
 

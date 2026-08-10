@@ -78,11 +78,19 @@ async fn handle(
     }
 
     match route {
-        Route::Login => log_in(&settings, &query),
-        Route::Asset(asset) => serve_asset(asset),
+        // The handshake is a GET. The daemon has no `do_POST` route for
+        // /login, so a POST there falls through to 404 — answering one with a
+        // Set-Cookie would be a divergence nobody asked for.
+        Route::Login if method == Method::GET => log_in(&settings, &query),
+        Route::Asset(asset) if method == Method::GET || method == Method::HEAD => {
+            serve_asset(asset)
+        }
         // An `/api/` path that got this far is authenticated and simply does
-        // not exist yet; an unknown path never needed a token to be told so.
-        Route::Api | Route::NotFound => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
+        // not exist yet; an unknown path never needed a token to be told so;
+        // and a method with no route here is the same answer the daemon gives.
+        Route::Api | Route::NotFound | Route::Login | Route::Asset(_) => {
+            json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
+        }
     }
 }
 

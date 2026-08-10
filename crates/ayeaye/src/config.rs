@@ -7,6 +7,7 @@
 //! only part that does.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use ayeaye_core::http::hosts::AllowedHosts;
 
@@ -129,8 +130,17 @@ fn parse_port(value: &str) -> Result<u16, ConfigError> {
 /// Empty is treated as unset, so `AYEAYE_BIND=` in a service unit does not
 /// bind the empty string.
 pub fn env_var(name: &str) -> Option<String> {
+    prefixed(name, |key| std::env::var(key).ok())
+}
+
+/// The prefix search itself, with the environment as an argument.
+///
+/// Separate from [`env_var`] because the *order* is the part that matters and
+/// the part that can be got wrong, and a test that had to set a real variable
+/// would be a test racing every other test in the process.
+fn prefixed(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     for prefix in ["AYEAYE_", "VOICE_REMOTE_"] {
-        if let Ok(value) = std::env::var(format!("{prefix}{name}"))
+        if let Some(value) = lookup(&format!("{prefix}{name}"))
             && !value.trim().is_empty()
         {
             return Some(value.trim().to_string());
@@ -150,40 +160,64 @@ pub fn load_token() -> Result<String, ConfigError> {
     if let Some(token) = env_var("TOKEN") {
         return Ok(token);
     }
-    for dir in state_dirs() {
-        let path = dir.join("token");
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            let token = contents.trim();
-            if !token.is_empty() {
-                return Ok(token.to_string());
-            }
+    let path = state_dir().map(|dir| dir.join("token"));
+    if let Some(path) = &path
+        && let Ok(contents) = std::fs::read_to_string(path)
+    {
+        let token = contents.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
         }
     }
     Err(ConfigError::NoToken(format!(
         "no token: set AYEAYE_TOKEN, or start the Python daemon once so it writes {}",
-        state_dirs()
-            .first()
-            .map(|dir| dir.join("token").display().to_string())
-            .unwrap_or_default()
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the state file".to_string())
     )))
 }
 
-/// Where the daemon keeps its state, newest naming first.
-fn state_dirs() -> Vec<std::path::PathBuf> {
+/// Where the daemon keeps its state, or `None` if there is no home to look in.
+fn state_dir() -> Option<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".local/state")));
-    match base {
-        Some(base) => vec![base.join("ayeaye"), base.join("voice-remote")],
-        None => Vec::new(),
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        // Not `std::env::home_dir`: the workspace declares an MSRV of 1.85 and
+        // nothing here builds at it, so the un-deprecation is not worth
+        // depending on for a daemon that only runs on Unix anyway.
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(choose_state_dir(&base, |path| path.is_dir()))
+}
+
+/// Which of the two names the state lives under.
+///
+/// One directory, not two tried in turn — that is what `bin/ayeaye`'s
+/// `_state_dir` does, and the difference is load-bearing while both daemons
+/// run. If the legacy directory holds a token and the new one exists but is
+/// empty, "try both" would authenticate against the stale secret while the
+/// daemon mints a fresh one in the new directory, and the two would disagree
+/// about the shared secret with nothing saying so.
+///
+/// `exists` is an argument so this decision is testable without laying out
+/// directories on disk.
+fn choose_state_dir(base: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let current = base.join("ayeaye");
+    let legacy = base.join("voice-remote");
+    if exists(&legacy) && !exists(&current) {
+        legacy
+    } else {
+        current
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, DEFAULT_DEV_PORT, Settings};
+    use super::{ConfigError, DEFAULT_DEV_PORT, Path, Settings};
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -200,17 +234,78 @@ mod tests {
         Settings::resolve(&args(list), env, "s3cret".to_string())
     }
 
+    // AYEAYE-42 — the newer name wins, and the legacy one is only used when it
+    // is the only one there. Trying both in turn would let this daemon
+    // authenticate against a stale secret while the Python one mints a fresh
+    // secret next door, and nothing would say the two had diverged.
+    #[test]
+    fn the_state_directory_is_chosen_the_way_the_daemon_chooses_it() {
+        let base = Path::new("/state");
+        let current = base.join("ayeaye");
+        let legacy = base.join("voice-remote");
+
+        // Neither exists yet: the new name, so a first run writes there.
+        assert_eq!(super::choose_state_dir(base, |_| false), current);
+        // Only the legacy one: keep using it.
+        assert_eq!(super::choose_state_dir(base, |p| p == legacy), legacy);
+        // Only the new one, or both: the new one.
+        assert_eq!(super::choose_state_dir(base, |p| p == current), current);
+        assert_eq!(super::choose_state_dir(base, |_| true), current);
+    }
+
+    // AYEAYE-42 — the AYEAYE_ prefix wins over the legacy VOICE_REMOTE_ one,
+    // and an empty value is unset rather than the empty string: a service unit
+    // that writes `AYEAYE_BIND=` must not bind nothing.
+    #[test]
+    fn the_current_prefix_wins_and_empty_is_unset() {
+        let both = |key: &str| match key {
+            "AYEAYE_BIND" => Some("new".to_string()),
+            "VOICE_REMOTE_BIND" => Some("old".to_string()),
+            _ => None,
+        };
+        assert_eq!(super::prefixed("BIND", both), Some("new".to_string()));
+
+        let legacy_only = |key: &str| match key {
+            "VOICE_REMOTE_BIND" => Some("old".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::prefixed("BIND", legacy_only),
+            Some("old".to_string())
+        );
+
+        let blank_current = |key: &str| match key {
+            "AYEAYE_BIND" => Some("   ".to_string()),
+            "VOICE_REMOTE_BIND" => Some("old".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::prefixed("BIND", blank_current),
+            Some("old".to_string()),
+            "a blank current value must fall through, not win"
+        );
+        assert_eq!(super::prefixed("BIND", |_| None), None);
+        // Values are trimmed, so a trailing newline in an env file is not a host.
+        assert_eq!(
+            super::prefixed("BIND", |_| Some(" 0.0.0.0\n".to_string())),
+            Some("0.0.0.0".to_string())
+        );
+    }
+
     // AYEAYE-42 — "the port is configurable so both daemons can run side by
     // side". The default has to be a port the Python daemon is not already
     // holding, or the two cannot run at once at all.
     #[test]
     fn the_default_port_is_not_the_one_the_python_daemon_holds() {
-        let settings = resolve(&[], no_env).expect("the defaults should resolve");
-        assert_eq!(settings.port, DEFAULT_DEV_PORT);
+        // The claim is about the constant, not about this call: asserting it
+        // on `settings.port` after asserting that equals the constant is a
+        // second assertion that can never fail on its own.
         assert_ne!(
-            settings.port, 8911,
+            DEFAULT_DEV_PORT, 8911,
             "the daemon's port cannot be the default"
         );
+        let settings = resolve(&[], no_env).expect("the defaults should resolve");
+        assert_eq!(settings.port, DEFAULT_DEV_PORT);
         assert_eq!(settings.bind, "127.0.0.1");
         assert_eq!(settings.address(), format!("127.0.0.1:{DEFAULT_DEV_PORT}"));
     }

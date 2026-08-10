@@ -358,3 +358,70 @@ async fn a_hostile_next_cannot_bounce_the_browser_off_this_origin() {
         );
     }
 }
+
+// AYEAYE-42 — regression, found at the final gate. `next` is percent-decoded
+// before it is used, so a CRLF survived into the `Location:` header: the
+// response could not be built, the worker panicked, and the client got a
+// dropped connection instead of an answer. An authenticated caller could do it
+// to itself, which is not a breach, but a network-reachable panic is not an
+// answer either.
+#[tokio::test]
+async fn control_characters_in_next_do_not_kill_the_response() {
+    let server = Server::started().await;
+    for hostile in [
+        "%2Fa%0d%0aX-Injected:%20yes",
+        "%2Fa%0aX-Injected:%20yes",
+        "%2Fa%00b",
+    ] {
+        let answer = server
+            .get(&format!("/login?token={TOKEN}&next={hostile}"))
+            .await;
+        assert_eq!(answer.status, 303, "status for {hostile}");
+        assert_eq!(
+            answer.header("location"),
+            Some("/"),
+            "{hostile} must not reach the Location header"
+        );
+        assert_eq!(
+            answer.header("x-injected"),
+            None,
+            "{hostile} spliced a header into the response"
+        );
+    }
+    // The server is still answering afterwards, which a panicked worker that
+    // took the runtime down with it would not be.
+    assert_eq!(server.get("/").await.status, 200);
+}
+
+// AYEAYE-42 — HEAD is the ticket's one deliberate widening over the daemon
+// (which 501s it). The pure test says the gate is open; this says the server
+// actually answers, with headers and no body.
+#[tokio::test]
+async fn head_is_answered_where_get_is_and_gated_where_get_is() {
+    let server = Server::started().await;
+
+    let open = server.request("HEAD", "/favicon.ico", &[]).await;
+    assert_eq!(open.status, 200);
+    assert_eq!(open.header("content-type"), Some("image/x-icon"));
+    assert!(open.body.is_empty(), "HEAD must not return a body");
+
+    let gated = server.request("HEAD", "/api/panes", &[]).await;
+    assert_eq!(gated.status, 401, "HEAD is gated exactly where GET is");
+}
+
+// AYEAYE-42 — the login handshake is a GET. The daemon's do_POST has no route
+// for /login and falls through to 404; answering a POST with a Set-Cookie
+// would be a divergence nobody asked for.
+#[tokio::test]
+async fn the_login_handshake_is_not_reachable_by_post() {
+    let server = Server::started().await;
+    let answer = server
+        .request(
+            "POST",
+            &format!("/login?token={TOKEN}"),
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(answer.status, 404);
+    assert_eq!(answer.header("set-cookie"), None);
+}
