@@ -83,3 +83,41 @@ async fn a_tmux_that_is_not_there_is_reported_rather_than_swallowed() {
         "the thing that could not be run is named: {trouble}"
     );
 }
+
+// AYEAYE-45 — the live-session list really comes from tmux: one name to a
+// line, and a session name with a space in it stays one session. A unit test
+// over text somebody typed cannot say that tmux prints it that way.
+#[tokio::test]
+async fn the_live_sessions_of_a_real_tmux_come_back_one_to_a_line() {
+    let Some(server) = Private::named("sessions") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    server.tmux(&["new-session", "-d", "-s", "my work", "/bin/sh"]);
+
+    let mut sessions = server
+        .layer()
+        .sessions()
+        .await
+        .expect("a running tmux answers");
+    sessions.sort();
+    assert_eq!(
+        sessions,
+        ["my work", "work"],
+        "a name with a space in it is one session, not two"
+    );
+}
+
+// AYEAYE-45 — a machine with no tmux server has no sessions, and that is an
+// answer rather than a failure, for the same reason it is for panes.
+#[tokio::test]
+async fn a_socket_with_no_server_has_no_sessions_and_no_complaint() {
+    if !common::have_tmux() {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    }
+    assert_eq!(
+        common::nowhere("no-sessions").sessions().await,
+        Ok(Vec::new())
+    );
+}

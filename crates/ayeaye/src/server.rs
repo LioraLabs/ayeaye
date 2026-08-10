@@ -26,6 +26,7 @@ const SEC_FETCH_SITE: &str = "sec-fetch-site";
 use crate::assets;
 use crate::board;
 use crate::config::Settings;
+use crate::session;
 
 /// Build the router.
 ///
@@ -111,12 +112,10 @@ async fn handle(
         // endpoints live in one module rather than on the router, so they
         // inherit every gate in this handler instead of each having to
         // remember them.
-        Route::Api if method == Method::GET => {
-            match board::answer(&settings, uri.path(), uri.query()).await {
-                Some((status, body)) => json_owned(status, body),
-                None => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
-            }
-        }
+        Route::Api if method == Method::GET => match api(&settings, &uri).await {
+            Some((status, body)) => json_owned(status, body),
+            None => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
+        },
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
@@ -124,6 +123,20 @@ async fn handle(
             json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
         }
     }
+}
+
+/// Every `/api/` endpoint, asked in turn until one of them owns the path.
+///
+/// A chain rather than a router. Each module keeps its own paths, and all of
+/// them inherit the gates the handler above has already applied; an endpoint
+/// mounted with `.route(…)` would skip every one of those and no test would
+/// catch it. `None` from all of them is the handler's 404 — a path nobody has
+/// written yet is still gated rather than open by omission.
+async fn api(settings: &Settings, uri: &Uri) -> Option<(StatusCode, String)> {
+    if let Some(answered) = board::answer(settings, uri.path(), uri.query()).await {
+        return Some(answered);
+    }
+    session::answer(settings, uri.path(), uri.query()).await
 }
 
 /// The one-time handshake: a token in the query becomes a cookie.

@@ -16,4 +16,5 @@ pub mod command;
 pub mod config;
 pub mod process;
 pub mod server;
+pub mod session;
 pub mod tmux;

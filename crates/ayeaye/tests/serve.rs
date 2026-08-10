@@ -148,6 +148,11 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // about panes still cannot read the panes of whoever is running the
         // suite. The cases that do care point it at a server of their own.
         tmux: common::nowhere("serve-nobody"),
+        // Pointed at a home nobody has, for the same reason the tmux above
+        // points at a socket nobody is on: a test that does not care about
+        // sessions must not read the ones belonging to whoever is running the
+        // suite.
+        agents: ayeaye::session::Agents::under("/nonexistent/home"),
         cliban: ayeaye::cliban::Cliban::new(cliban.to_string()),
     }
 }
