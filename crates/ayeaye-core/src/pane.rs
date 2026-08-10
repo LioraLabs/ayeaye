@@ -21,6 +21,14 @@ use crate::sha1;
 /// short and to change when the text does.
 const TOKEN_LEN: usize = 12;
 
+/// How much scrollback the terminal view carries above the screen.
+///
+/// Five hundred lines, as `bin/ayeaye`'s `PANE_LINES`. It is about five
+/// milliseconds of `capture-pane`, and the diff protocol resends only what
+/// changed since the client last asked — so depth costs the server memory, not
+/// the phone's radio.
+pub const LINES: usize = 500;
+
 /// The token naming this text.
 pub fn token(text: &str) -> String {
     let mut digest = sha1::hex(text.as_bytes());
@@ -94,7 +102,8 @@ impl View {
     /// capture is screen: pretending the top of it is settled history would let
     /// a repaint be sent as an append, and the client would grow a transcript of
     /// every frame a TUI ever drew.
-    pub fn split(mut lines: Vec<String>, rows: usize) -> View {
+    pub fn split(mut lines: Vec<String>, rows: u16) -> View {
+        let rows = rows as usize;
         let hist = if rows > 0 && lines.len() > rows {
             lines.drain(..lines.len() - rows).collect()
         } else {
@@ -371,6 +380,17 @@ pub fn whole_body(text: &str, cols: u16, rows: u16) -> String {
 mod tests {
     use super::{Answer, Cache, Diff, View, blank, lines, token, whole, whole_body};
 
+    /// A real capture, from a private `tmux -L` server: `capture-pane -p -e` over
+    /// a pane carrying colour, a blank line, a line with a quote and a backslash
+    /// in it, and a shell prompt at the bottom.
+    ///
+    /// Held to output really captured rather than to output somebody imagined —
+    /// which is the module's whole claim, and which a hand-written `["h1","h2"]`
+    /// cannot make. Its shape is load-bearing below: line 7 is blank and line 9
+    /// carries the quote, so a split at four rows ends the history on a blank
+    /// line and a split at two rows puts the quote inside the history array.
+    const CAPTURE: &str = include_str!("../../../tests/fixtures/tmux/capture-pane-coloured");
+
     fn owned(list: &[&str]) -> Vec<String> {
         list.iter().map(|line| line.to_string()).collect()
     }
@@ -495,6 +515,30 @@ mod tests {
         assert_eq!(empty.hist, owned(&["h1"]));
         assert!(empty.screen.is_empty());
         assert_eq!(empty.screen_text(), "");
+    }
+
+    // AYEAYE-47 — a real capture, and the half of the trim rule a handwritten
+    // fixture kept leaving unproven: the scrollback's trailing blank line stays.
+    // A blank line in the scrollback is one something really printed, and
+    // trimming it would shift the split, change `hh`, and cost a full send every
+    // time a program printed a blank line at just the wrong moment.
+    #[test]
+    fn the_scrollback_keeps_a_blank_line_the_screen_would_lose() {
+        let captured = lines(CAPTURE);
+        assert_eq!(captured.len(), 11, "the fixture has drifted: {captured:?}");
+        assert!(captured[6].is_empty(), "line 7 is the blank one");
+
+        // Four rows: the history ends on that blank line, and keeps it.
+        let view = View::split(captured.clone(), 4);
+        assert_eq!(view.hist.len(), 7);
+        assert_eq!(view.hist.last().map(String::as_str), Some(""));
+        assert_eq!(view.screen.len(), 4, "and the screen ends non-blank");
+
+        // The same capture with the blank line at the bottom of the screen
+        // instead: now it goes, because down there it is tmux padding the grid.
+        let padded = View::split(captured[..7].to_vec(), 3);
+        assert_eq!(padded.hist, captured[..4].to_vec());
+        assert_eq!(padded.screen, captured[4..6].to_vec());
     }
 
     // AYEAYE-47 — the whole-text shape is the whole capture, not the last
@@ -745,6 +789,48 @@ mod tests {
                 ),
                 patch.hh, patch.sh
             )
+        );
+    }
+
+    // AYEAYE-47 — and the *lines* are JSON strings too, not only the screen.
+    // Scrollback is exactly where a quote or a backslash turns up — somebody's
+    // shell history — and a `hist` array that emitted one raw would be invalid
+    // JSON. `share/app.html:1536` catches the parse failure and does nothing
+    // with it, so the terminal would simply stay blank with no error anywhere.
+    #[test]
+    fn a_quote_in_the_scrollback_cannot_break_the_arrays() {
+        let captured = lines(CAPTURE);
+        // Two rows, so the line carrying `"` and `\` lands in the history.
+        let held = View::split(captured.clone(), 2);
+        assert!(
+            held.hist.iter().any(|line| line.contains('"')),
+            "the fixture no longer puts a quote in the scrollback: {:?}",
+            held.hist
+        );
+
+        let mut cache = Cache::default();
+        let full = cache.diff("desktop/%1", &held, 40, 2, "", "");
+        let Answer::Full { .. } = full.answer else {
+            panic!("the first answer is a full send");
+        };
+        assert!(
+            full.body().contains(r#"say \"hi\" and \\ back"#),
+            "the quote and the backslash are escaped in `hist`: {}",
+            full.body()
+        );
+
+        // And in `add`, which is the array a scroll travels in.
+        let grown = View::split(captured, 1);
+        let patch = cache.diff("desktop/%1", &grown, 40, 1, &full.hh, &full.sh);
+        assert!(
+            matches!(patch.answer, Answer::Patch { .. }),
+            "{:?}",
+            patch.answer
+        );
+        assert!(
+            patch.body().contains(r#""add":["#) && !patch.body().contains("\u{1b}"),
+            "a coloured line reaches `add` escaped: {}",
+            patch.body()
         );
     }
 

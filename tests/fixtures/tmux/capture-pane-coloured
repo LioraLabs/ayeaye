@@ -1,0 +1,11 @@
+sh-5.3$ printf "plain scrollback\n\033[3
+1mred line\033[0m   \n\n\033[44mpainted
+  \033[0m\nsay \"hi\" and \\ back\n\033[
+1mbold tail\033[0m\n"
+plain scrollback
+[31mred line[39m
+
+[44mpainted   [49m
+say "hi" and \ back
+[1mbold tail[0m
+sh-5.3$

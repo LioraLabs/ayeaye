@@ -10,9 +10,10 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ayeaye::config::Settings;
+use ayeaye::fit::Fits;
 use ayeaye_core::http::hosts::AllowedHosts;
 use ayeaye_core::peer::{HostName, Peer, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -129,6 +130,34 @@ impl Server {
     async fn get(&self, path: &str) -> Answer {
         self.request("GET", path, &[]).await
     }
+
+    /// A GET carrying the token, which is what every `/api/` call needs.
+    async fn api(&self, path: &str) -> Answer {
+        self.request("GET", path, &[("X-Voice-Token", TOKEN)]).await
+    }
+
+    /// A POST carrying the token and a JSON body, as the page sends.
+    async fn post(&self, path: &str, body: &str) -> Answer {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .expect("the server should be listening");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Voice-Token: {TOKEN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.port,
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request should be writable");
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .await
+            .expect("the response should be readable");
+        parse(&raw)
+    }
 }
 
 fn settings_on_port(port: u16) -> Settings {
@@ -142,6 +171,11 @@ fn settings_on_port(port: u16) -> Settings {
         // about panes still cannot read the panes of whoever is running the
         // suite. The cases that do care point it at a server of their own.
         tmux: common::nowhere("serve-nobody"),
+        pane_cache: Arc::new(Mutex::new(ayeaye_core::pane::Cache::default())),
+        // No path: a test must never write into the state directory of whoever
+        // is running the suite. Recovery across a restart is proved in
+        // `tests/fit.rs`, where the file is the test's own.
+        fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
     }
 }
 

@@ -208,6 +208,22 @@ impl Fits {
     }
 }
 
+/// Run the sweeper for as long as the server does.
+///
+/// **This is the only cleanup path.** There is no second one, and the reason is
+/// worth keeping: two paths that expire leases would each have to know what the
+/// other had already restored, and the first disagreement would put a window
+/// back to a size it was never at.
+pub fn sweeper(settings: std::sync::Arc<crate::config::Settings>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let every = settings.fits.sweep_every();
+        loop {
+            tokio::time::sleep(every).await;
+            settings.fits.sweep(&settings.tmux).await;
+        }
+    })
+}
+
 /// What tmux says this window's sizing was before anyone fitted it.
 ///
 /// A window it will not describe is reported as automatic, which is what
