@@ -68,8 +68,14 @@ probe scripts
 # red on - a stale pass on the release gate, from a probe that had quietly
 # stopped describing its own recipe. `constitution` asserts the other half of
 # this: that every workspace member really does live under crates/.
+#
+# `share/*` is in here because the web UI is compiled into the binary with
+# `include_bytes!`: those files are inputs to `cargo test --workspace` that
+# appear on no command line and live outside `crates/`. Verified by mutation -
+# with this glob removed, editing app.html left rust-suite cached and green
+# over a binary that no longer held it.
 probe rust
-    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" }
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "share/*" }
 
 # The compiler is a determinant of what the suite says: a lint that fires on
 # one toolchain and not the next is exactly the drift `-D warnings` exists to
