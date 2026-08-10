@@ -37,6 +37,15 @@ pub trait Runner {
     fn run(&self, argv: &[String]) -> Outcome;
 }
 
+/// A borrowed runner is a runner. AYEAYE-62 needs one runner to serve several
+/// `Services` in a single `ayeaye setup`, and recording every command a whole
+/// run made is only possible if they all reach the same recorder.
+impl<R: Runner + ?Sized> Runner for &R {
+    fn run(&self, argv: &[String]) -> Outcome {
+        (**self).run(argv)
+    }
+}
+
 /// The real one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Subprocess;

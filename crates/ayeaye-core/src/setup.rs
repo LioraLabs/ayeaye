@@ -187,6 +187,35 @@ pub struct Existing {
     pub models: Vec<ModelId>,
 }
 
+/// A key, from random bytes, in the alphabet a URL can carry.
+///
+/// The same shape as the key `install.sh` mints with
+/// `secrets.token_urlsafe(32)`, because the phone opens the page with the key in
+/// a query string and a `+` or a `/` there is a different key by the time it
+/// arrives. There is no padding for the same reason.
+///
+/// Pure, and the randomness is the caller's: where the bytes come from is a
+/// decision about entropy sources and belongs in the crate that is allowed to
+/// open `/dev/urandom`.
+pub fn urlsafe(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let mut packed = 0u32;
+        for (at, byte) in group.iter().enumerate() {
+            packed |= u32::from(*byte) << (16 - 8 * at);
+        }
+        // One output character per 6 bits that any input byte contributed to,
+        // and no padding: a key is a string, not a decodable payload.
+        for at in 0..=group.len() {
+            let index = (packed >> (18 - 6 * at)) & 0x3f;
+            out.push(char::from(ALPHABET[index as usize]));
+        }
+    }
+    out
+}
+
 /// Which model setup should get.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Wanted {
@@ -201,11 +230,44 @@ pub enum Wanted {
     None,
 }
 
+/// What was agreed to.
+///
+/// Two answers and not one, because the shell asks two questions and they are
+/// genuinely different decisions: somebody on a metered connection may well want
+/// the service and not the download, and somebody on a shared machine the
+/// reverse. Collapsing them into a single `--yes` would make the cautious answer
+/// to either the cautious answer to both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Consent {
+    /// Fetching a model may go to the internet.
+    pub network: bool,
+    /// The service may be enabled and started.
+    pub run_at_login: bool,
+}
+
+impl Consent {
+    /// Yes to everything — what `--yes` means.
+    pub fn all() -> Self {
+        Consent {
+            network: true,
+            run_at_login: true,
+        }
+    }
+
+    /// Whether this covers that consequence.
+    pub fn allows(&self, consequence: Consequence) -> bool {
+        match consequence {
+            Consequence::Network => self.network,
+            Consequence::RunsAtLogin => self.run_at_login,
+        }
+    }
+}
+
 /// What was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choices {
-    /// Whether the consequential steps were agreed to.
-    pub consented: bool,
+    /// Which consequential acts were agreed to.
+    pub consent: Consent,
     /// Whether to install a service at all.
     pub service: bool,
     /// Which model.
@@ -215,7 +277,7 @@ pub struct Choices {
 impl Default for Choices {
     fn default() -> Self {
         Choices {
-            consented: false,
+            consent: Consent::default(),
             service: true,
             model: Wanted::Suited,
         }
@@ -264,24 +326,23 @@ pub fn plan(machine: &Machine, has_manager: bool, existing: &Existing, choices: 
     if let Some(id) = wanted_model(machine, choices)
         && !existing.models.contains(&id)
     {
-        gate(&mut plan, Step::FetchModel(id), choices.consented);
+        gate(&mut plan, Step::FetchModel(id), &choices.consent);
     }
 
     if has_manager && choices.service {
         plan.steps.push(Step::InstallService);
-        gate(&mut plan, Step::EnableService, choices.consented);
+        gate(&mut plan, Step::EnableService, &choices.consent);
     }
 
     plan
 }
 
 /// Put a consequential step on the plan, or on the list of what was declined.
-fn gate(plan: &mut Plan, step: Step, consented: bool) {
-    debug_assert!(
-        step.consequence().is_some(),
-        "only a consequential step is gated"
-    );
-    if consented {
+fn gate(plan: &mut Plan, step: Step, consent: &Consent) {
+    let consequence = step
+        .consequence()
+        .expect("only a consequential step is gated");
+    if consent.allows(consequence) {
         plan.steps.push(step);
     } else {
         plan.declined.push(step);
@@ -306,7 +367,9 @@ fn wanted_model(machine: &Machine, choices: &Choices) -> Option<ModelId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOGUE, Choices, Consequence, Existing, Step, Wanted, plan, suggested};
+    use super::{
+        CATALOGUE, Choices, Consent, Consequence, Existing, Step, Wanted, plan, suggested,
+    };
     use crate::machine::{Machine, Probes, Tier};
     use crate::model::{ModelId, architecture};
 
@@ -424,7 +487,7 @@ mod tests {
             true,
             &Existing::default(),
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 ..Choices::default()
             },
         );
@@ -482,7 +545,7 @@ mod tests {
             true,
             &already,
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 ..Choices::default()
             },
         );
@@ -522,7 +585,7 @@ mod tests {
             false,
             &Existing::default(),
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 ..Choices::default()
             },
         );
@@ -556,7 +619,7 @@ mod tests {
             true,
             &Existing::default(),
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 ..Choices::default()
             },
         );
@@ -593,7 +656,7 @@ mod tests {
             true,
             &Existing::default(),
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 model: Wanted::Named(id("openai/whisper-large-v3-turbo")),
                 ..Choices::default()
             },
@@ -612,13 +675,87 @@ mod tests {
             true,
             &Existing::default(),
             &Choices {
-                consented: true,
+                consent: Consent::all(),
                 service: false,
                 model: Wanted::None,
             },
         );
         assert_eq!(made.steps, vec![Step::MintKey, Step::WriteSettings]);
         assert!(made.declined.is_empty(), "not declined — never asked for");
+    }
+
+    // AYEAYE-62 — the two questions are two, and answering one does not answer
+    // the other. Somebody on a metered connection may well want the service and
+    // not the download; collapsing them would make the cautious answer to either
+    // the cautious answer to both.
+    #[test]
+    fn the_two_consents_are_independent_of_each_other() {
+        let network_only = plan(
+            &roomy(),
+            true,
+            &Existing::default(),
+            &Choices {
+                consent: Consent {
+                    network: true,
+                    run_at_login: false,
+                },
+                ..Choices::default()
+            },
+        );
+        assert!(
+            network_only
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::FetchModel(_)))
+        );
+        assert_eq!(network_only.declined, vec![Step::EnableService]);
+
+        let service_only = plan(
+            &roomy(),
+            true,
+            &Existing::default(),
+            &Choices {
+                consent: Consent {
+                    network: false,
+                    run_at_login: true,
+                },
+                ..Choices::default()
+            },
+        );
+        assert!(service_only.steps.contains(&Step::EnableService));
+        assert_eq!(
+            service_only.declined,
+            vec![Step::FetchModel(id("openai/whisper-large-v3-turbo"))]
+        );
+    }
+
+    // AYEAYE-62 — the key goes on the end of a URL, so it has to survive being
+    // one. The alphabet is url-safe and there is no padding: `+`, `/` and `=` in
+    // a query string are all a different key by the time the phone sends it back.
+    #[test]
+    fn a_minted_key_survives_being_put_in_a_url() {
+        use super::urlsafe;
+        assert_eq!(urlsafe(&[]), "");
+        // The two bytes that produce `+` and `/` in the standard alphabet.
+        assert_eq!(urlsafe(&[0xff, 0xef, 0xbf]), "_--_");
+        assert_eq!(urlsafe(&[0, 0, 0]), "AAAA");
+        // 32 bytes in, 43 characters out — the same as secrets.token_urlsafe(32).
+        let key = urlsafe(&(0u8..32).collect::<Vec<u8>>());
+        assert_eq!(key.len(), 43);
+        for byte in 0u8..=255 {
+            let said = urlsafe(&[byte, byte, byte]);
+            assert!(
+                said.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{byte} produced {said}, which a URL would change"
+            );
+        }
+        // Different bytes are different keys: an encoder that dropped the tail
+        // would collide, and every colliding key is a shared secret that is not
+        // secret.
+        assert_ne!(urlsafe(&[1, 2, 3]), urlsafe(&[1, 2, 4]));
+        assert_ne!(urlsafe(&[1, 2]), urlsafe(&[1, 3]));
+        assert_ne!(urlsafe(&[1]), urlsafe(&[2]));
     }
 
     // AYEAYE-62 — every step says what it would do, before it is done. A plan

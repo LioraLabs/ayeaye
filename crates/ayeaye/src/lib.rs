@@ -21,4 +21,5 @@ pub mod probe;
 pub mod process;
 pub mod server;
 pub mod service;
+pub mod setup;
 pub mod tmux;
