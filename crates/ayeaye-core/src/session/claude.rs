@@ -46,6 +46,14 @@ const TAG: &str = "cc:";
 /// How many characters of the id the marker carries.
 const MARKED: usize = 8;
 
+/// How much of a session id must be plain hex before the dashes start.
+///
+/// The same eight as [`MARKED`] today, and a different fact: this is what a
+/// *file* is found by and that is what a statusline chose to print. Spelling
+/// them once would tie the security control below to the width of somebody
+/// else's status bar.
+const HEX_HEAD: usize = 8;
+
 /// Whether `id` is a session id claude could have written.
 ///
 /// **This is a security control, not a formatting nicety.** The id comes out of
@@ -55,7 +63,7 @@ const MARKED: usize = 8;
 /// way the daemon matches it: eight hex characters, then hex and dashes.
 pub fn valid_id(id: &str) -> bool {
     let bytes = id.as_bytes();
-    let Some((head, tail)) = bytes.split_at_checked(MARKED) else {
+    let Some((head, tail)) = bytes.split_at_checked(HEX_HEAD) else {
         return false;
     };
     head.iter()
@@ -94,8 +102,15 @@ pub fn transcript_name(name: &str, id: &str) -> bool {
 
 /// The session id the statusline printed into a pane, if it is there.
 ///
-/// The first one, as the daemon's `search` takes it. A pane holds one session's
-/// output, so a second marker is an older paint of the same id.
+/// The **first** one, as the daemon's `search` takes it. A pane holds one
+/// session's output, so every marker in it names the same id and which one is
+/// taken does not arise — except in the case where it does: a pane where claude
+/// exited and was started again without the screen being cleared has both ids
+/// in its scrollback, oldest first, and this takes the stale one.
+///
+/// That is a known cost of the marker route and it is why the marker is the
+/// *fallback*. The route above it asks the process, which cannot name a session
+/// that is not running.
 pub fn marker(pane_text: &str) -> Option<String> {
     for (at, _) in pane_text.match_indices(OPEN) {
         let after = &pane_text[at + OPEN.len_utf8()..];
@@ -168,6 +183,24 @@ mod tests {
         assert_eq!(
             session_id(&session_file(ID, (just_outside * 1000.0) as u64), STARTED),
             None
+        );
+
+        // Closed at both ends, and on both sides of the start: the daemon
+        // compares an absolute difference against `>`, so exactly the skew is
+        // still this process.
+        for edge in [STARTED + START_SKEW, STARTED - START_SKEW] {
+            assert!(
+                session_id(&session_file(ID, (edge * 1000.0) as u64), STARTED).is_some(),
+                "exactly the skew is inside the window"
+            );
+        }
+        assert_eq!(
+            session_id(
+                &session_file(ID, ((STARTED - START_SKEW - 1.0) * 1000.0) as u64),
+                STARTED
+            ),
+            None,
+            "a file stamped before the process it claims to be about"
         );
     }
 
@@ -249,8 +282,8 @@ mod tests {
         assert_eq!(marker(&text).as_deref(), Some("0123abcd"));
     }
 
-    // AYEAYE-45 — a pane holds one session's output, so a second marker is an
-    // older paint of the same id and the first is the one to take.
+    // AYEAYE-45 — the daemon's `search` takes the first, and a pane normally
+    // holds one session's output so every marker in it names the same id.
     #[test]
     fn the_first_marker_wins() {
         let text = format!(

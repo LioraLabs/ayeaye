@@ -94,6 +94,18 @@ impl Session {
     }
 }
 
+/// The last component of a path, which is all any of this asks of one.
+///
+/// Here rather than beside either agent: both of them find a session by looking
+/// at the name at the end of a path, and a second copy of this is how the two
+/// sides come to disagree about what a trailing separator means.
+pub fn file_name(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    }
+}
+
 /// The body `/api/session` answers with.
 ///
 /// The daemon's shape: `kind` is always present and is `null` when the pane is
@@ -112,7 +124,7 @@ pub fn session_body(session: Option<&Session>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Session, session_body};
+    use super::{Kind, Session, file_name, session_body};
 
     // AYEAYE-45 — a closed set: a pane running something else resolves to
     // nothing rather than to a guess, and `sh` is what a pane whose agent has
@@ -146,6 +158,15 @@ mod tests {
         assert_eq!(Session::new(Kind::Codex, "", "/p").id, "");
         // Not an id any agent writes, and not a panic either.
         assert_eq!(Session::new(Kind::Codex, "ααααααααα", "/p").id, "αααααααα");
+    }
+
+    // AYEAYE-45 — both agents find a session by the name at the end of a path.
+    #[test]
+    fn a_path_ends_in_its_name() {
+        assert_eq!(file_name("/a/b/c.jsonl"), "c.jsonl");
+        assert_eq!(file_name("c.jsonl"), "c.jsonl");
+        assert_eq!(file_name("/a/b/"), "");
+        assert_eq!(file_name(""), "");
     }
 
     // AYEAYE-45 — `kind` is always present so the panel can tell "this pane is

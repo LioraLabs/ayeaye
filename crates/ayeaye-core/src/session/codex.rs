@@ -24,6 +24,7 @@
 //! nobody.
 
 use crate::json;
+use crate::session::file_name;
 
 /// What a rollout file is called, at both ends.
 const ROLLOUT: &str = "rollout-";
@@ -54,9 +55,34 @@ pub struct Meta {
     pub id: String,
     /// Where the session is running, or `None` if it did not say.
     pub cwd: Option<String>,
-    /// Whether this rollout belongs to a thread its parent spawned.
-    pub subagent: bool,
+    /// The thread that spawned this one, as codex recorded it.
+    pub parent_thread_id: Option<String>,
+    /// What codex says this thread came from: `cli` for one somebody started,
+    /// `subagent` for one another thread did.
+    pub thread_source: Option<String>,
 }
+
+impl Meta {
+    /// Whether this rollout belongs to a thread its parent spawned.
+    ///
+    /// Codex holds its subagents' rollouts open too, so the process in the pane
+    /// has several and only one of them is its own. Two facts say so and either
+    /// is enough — they arrived in different versions of codex — and neither is
+    /// stored pre-judged: the raw values are what a transcript view will want to
+    /// label a delegation with.
+    ///
+    /// A parent recorded as `null` or as nothing at all is no parent, which is
+    /// what the daemon's truthiness test comes to.
+    pub fn is_subagent(&self) -> bool {
+        self.parent_thread_id
+            .as_deref()
+            .is_some_and(|parent| !parent.is_empty())
+            || self.thread_source.as_deref() == Some(SUBAGENT)
+    }
+}
+
+/// What `thread_source` says when a thread was spawned rather than started.
+const SUBAGENT: &str = "subagent";
 
 /// The `session_meta` a rollout opens with, or `None`.
 ///
@@ -75,15 +101,11 @@ pub fn meta(first_line: &str) -> Option<Meta> {
     if id.is_empty() {
         return None;
     }
-    // A parent recorded as `null` is no parent, which is what the daemon's
-    // truthiness test comes to; an empty string is the same nothing.
-    let parented =
-        json::string_member(payload, "parent_thread_id").is_some_and(|parent| !parent.is_empty());
     Some(Meta {
         id,
         cwd: json::string_member(payload, "cwd"),
-        subagent: parented
-            || json::string_member(payload, "thread_source").as_deref() == Some("subagent"),
+        parent_thread_id: json::string_member(payload, "parent_thread_id"),
+        thread_source: json::string_member(payload, "thread_source"),
     })
 }
 
@@ -111,14 +133,6 @@ pub fn held(path: &str, sessions_root: &str) -> bool {
         && rollout_name(file_name(path))
 }
 
-/// The last component of a path, which is all any of this asks of one.
-pub fn file_name(path: &str) -> &str {
-    match path.rsplit_once('/') {
-        Some((_, name)) => name,
-        None => path,
-    }
-}
-
 /// A wall-clock moment, as a rollout's name spells it.
 ///
 /// Fields rather than an instant, and that is the whole point: codex writes
@@ -131,14 +145,17 @@ pub struct Stamp {
     pub year: i32,
     /// 1–12.
     pub month: u32,
-    /// 1–31, unchecked against the month: `mktime` normalises, and so does the
-    /// `strptime` the daemon reads this with.
+    /// 1–31, and a day that month really has: February the 31st is refused
+    /// here rather than normalised into March, because the daemon's `strptime`
+    /// refuses it too and the `mktime` the shell converts with would not.
     pub day: u32,
     /// 0–23.
     pub hour: u32,
     /// 0–59.
     pub minute: u32,
-    /// 0–60, because a leap second is a second somebody's clock printed.
+    /// 0–61, which is the range `strptime`'s `%S` accepts. Two leap seconds in
+    /// one minute has never happened; the point is not to differ from the
+    /// daemon over a second nobody will ever see.
     pub second: u32,
 }
 
@@ -174,11 +191,32 @@ pub fn stamp(name: &str) -> Option<Stamp> {
         second: field(17..19)?,
     };
     ((1..=12).contains(&stamp.month)
-        && (1..=31).contains(&stamp.day)
+        && (1..=days_in(stamp.year, stamp.month)).contains(&stamp.day)
         && stamp.hour < 24
         && stamp.minute < 60
-        && stamp.second <= 60)
+        && stamp.second <= 61)
         .then_some(stamp)
+}
+
+/// How many days that month has.
+///
+/// The check the daemon gets from `strptime` and the shell's `mktime` would
+/// not: `mktime` normalises February the 31st into March the 3rd and answers
+/// with an instant, where `strptime` raises and the daemon skips the file. A
+/// normalised instant is a *different moment* being compared against a process
+/// start, which is the one thing this whole comparison exists to get right.
+fn days_in(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.rem_euclid(4) == 0
+            && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0) =>
+        {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// How long after a process started its rollout appeared, if that is close
@@ -194,7 +232,7 @@ pub fn delay(rollout_at: f64, process_start: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stamp, delay, file_name, held, meta, rollout_name, stamp};
+    use super::{Stamp, delay, held, meta, rollout_name, stamp};
     use crate::machine::fixture;
 
     const ROOT: &str = "/Users/someone/.codex/sessions";
@@ -205,7 +243,9 @@ mod tests {
         let read = meta(fixture!("codex/rollout-meta")).expect("a session_meta");
         assert_eq!(read.id, "0123abcd-dead-beef-0000-111122223333");
         assert_eq!(read.cwd.as_deref(), Some("/Users/someone/dev/thing"));
-        assert!(!read.subagent, "nobody spawned this one");
+        assert_eq!(read.thread_source.as_deref(), Some("cli"));
+        assert_eq!(read.parent_thread_id, None);
+        assert!(!read.is_subagent(), "nobody spawned this one");
     }
 
     // AYEAYE-45 — codex holds its subagents' rollouts open too, so the process
@@ -215,23 +255,29 @@ mod tests {
     #[test]
     fn a_rollout_codex_is_holding_for_a_subagent_says_so() {
         let read = meta(fixture!("codex/rollout-meta-subagent")).expect("a session_meta");
+        assert_eq!(
+            read.parent_thread_id.as_deref(),
+            Some("0123abcd-dead-beef-0000-111122223333"),
+            "the parent is kept rather than pre-judged: a transcript view is \
+             what labels a delegation with it"
+        );
         assert!(
-            read.subagent,
+            read.is_subagent(),
             "this one has a parent and says it is a subagent"
         );
 
         // Either fact alone is enough: the two arrived in different versions.
         let parented = r#"{"payload":{"id":"aaaa","parent_thread_id":"bbbb"}}"#;
-        assert!(meta(parented).expect("a payload").subagent);
+        assert!(meta(parented).expect("a payload").is_subagent());
         let sourced = r#"{"payload":{"id":"aaaa","thread_source":"subagent"}}"#;
-        assert!(meta(sourced).expect("a payload").subagent);
+        assert!(meta(sourced).expect("a payload").is_subagent());
 
         // And a parent recorded as nothing is no parent, which is what the
         // daemon's truthiness test comes to.
         let orphan = r#"{"payload":{"id":"aaaa","parent_thread_id":null,"thread_source":"cli"}}"#;
-        assert!(!meta(orphan).expect("a payload").subagent);
+        assert!(!meta(orphan).expect("a payload").is_subagent());
         let blank = r#"{"payload":{"id":"aaaa","parent_thread_id":""}}"#;
-        assert!(!meta(blank).expect("a payload").subagent);
+        assert!(!meta(blank).expect("a payload").is_subagent());
     }
 
     // AYEAYE-45 — these are files this server did not write, read while the
@@ -309,15 +355,6 @@ mod tests {
         }
     }
 
-    // AYEAYE-45
-    #[test]
-    fn a_path_ends_in_its_name() {
-        assert_eq!(file_name("/a/b/c.jsonl"), "c.jsonl");
-        assert_eq!(file_name("c.jsonl"), "c.jsonl");
-        assert_eq!(file_name("/a/b/"), "");
-        assert_eq!(file_name(""), "");
-    }
-
     // AYEAYE-45 — the second route reads the moment out of the filename, which
     // is the only place a rollout records when it was created.
     #[test]
@@ -344,7 +381,6 @@ mod tests {
             "rollout-2026-03-32T09-00-02-x.jsonl",
             "rollout-2026-03-04T24-00-02-x.jsonl",
             "rollout-2026-03-04T09-60-02-x.jsonl",
-            "rollout-2026-03-04T09-00-61-x.jsonl",
             "rollout-2026-03-04 09-00-02-x.jsonl",
             "rollout-2026-03-04T09:00:02-x.jsonl",
             "rollout-202x-03-04T09-00-02-x.jsonl",
@@ -355,9 +391,25 @@ mod tests {
         ] {
             assert_eq!(stamp(name), None, "read a moment out of {name}");
         }
-        // The day is not checked against the month, because `mktime` normalises
-        // and so does the daemon's `strptime`.
-        assert!(stamp("rollout-2026-02-31T09-00-02-x.jsonl").is_some());
+        // A day that month does not have is refused here rather than left for
+        // the shell's `mktime`, which would normalise it into March and hand
+        // back a *different moment* to compare against a process start. The
+        // daemon's `strptime` raises on it and skips the file.
+        assert_eq!(stamp("rollout-2026-02-31T09-00-02-x.jsonl"), None);
+        assert_eq!(stamp("rollout-2026-02-29T09-00-02-x.jsonl"), None);
+        assert_eq!(stamp("rollout-2026-04-31T09-00-02-x.jsonl"), None);
+        assert_eq!(stamp("rollout-2026-01-00T09-00-02-x.jsonl"), None);
+        assert!(
+            stamp("rollout-2028-02-29T09-00-02-x.jsonl").is_some(),
+            "2028 is a leap year and the 29th is a day it has"
+        );
+        assert!(stamp("rollout-2000-02-29T09-00-02-x.jsonl").is_some());
+        assert_eq!(stamp("rollout-1900-02-29T09-00-02-x.jsonl"), None);
+        assert!(
+            stamp("rollout-2026-03-04T09-00-61-x.jsonl").is_some(),
+            "61 is what strptime's %S accepts, and differing over it is a \
+             divergence for a second nobody will ever see"
+        );
     }
 
     // AYEAYE-45 — a rollout belongs to a process only if it appeared just after
@@ -374,6 +426,11 @@ mod tests {
             "the two clocks are the same clock; a second early is granularity"
         );
         assert_eq!(delay(started + 120.0, started), Some(120.0));
+        assert_eq!(
+            delay(started - 5.0, started),
+            Some(-5.0),
+            "the window is closed at both ends"
+        );
 
         assert_eq!(delay(started + 121.0, started), None);
         assert_eq!(delay(started - 6.0, started), None);
