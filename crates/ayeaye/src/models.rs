@@ -468,6 +468,14 @@ pub trait Slot {
     fn load(&mut self, dir: &Path) -> Result<(), Self::Error>;
     /// Release the resident model, saying whether there was one.
     fn unload(&mut self) -> bool;
+    /// Why what is resident is not on the backend the build was compiled for.
+    ///
+    /// `None` when nothing was given up. This is how the daemon's load-time
+    /// report reaches the real slots through the residency seam — AYEAYE-73's
+    /// "a model loaded an hour later says so" — and it is on the trait rather
+    /// than read around it because the trait's contract is the real slots'
+    /// exact shape, and both real slots carry the answer.
+    fn fallback(&self) -> Option<&str>;
 }
 
 impl Slot for SpeechSlot {
@@ -480,6 +488,10 @@ impl Slot for SpeechSlot {
     fn unload(&mut self) -> bool {
         SpeechSlot::unload(self)
     }
+
+    fn fallback(&self) -> Option<&str> {
+        SpeechSlot::fallback(self)
+    }
 }
 
 impl Slot for LanguageSlot {
@@ -491,6 +503,10 @@ impl Slot for LanguageSlot {
 
     fn unload(&mut self) -> bool {
         LanguageSlot::unload(self)
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        LanguageSlot::fallback(self)
     }
 }
 
@@ -527,18 +543,25 @@ impl<S: Slot> Residents<S> {
         &mut self.slot
     }
 
-    /// Make the resident model be the one that is wanted.
+    /// Make the resident model be the one that is wanted, saying whether a
+    /// load actually happened.
     ///
     /// This is the only thing that loads. `wanted` comes from the configuration
     /// as it stands *now*, so a reconfiguration is not an event anything has to
     /// be told about: the next request notices that what is resident is not
     /// what is chosen, and the plan says to let go of it first.
-    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
+    ///
+    /// `true` exactly when a model went in just now. That answer is what a
+    /// degradation report hangs off — AYEAYE-73's operator sees the fallback at
+    /// each load, an hour into the daemon's life as much as at startup, and
+    /// without this bool a caller could only say it once at startup or on every
+    /// dictation, which are respectively the bug and the spam.
+    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<bool, S::Error> {
         match residency::on_demand(self.loaded.as_ref(), wanted) {
-            Plan::Keep => Ok(()),
+            Plan::Keep => Ok(false),
             Plan::Release => {
                 self.release();
-                Ok(())
+                Ok(false)
             }
             Plan::Load => self.take(wanted),
             Plan::Reload => {
@@ -569,16 +592,16 @@ impl<S: Slot> Residents<S> {
         self.slot.unload()
     }
 
-    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
+    fn take(&mut self, wanted: Option<&ModelId>) -> Result<bool, S::Error> {
         let Some(wanted) = wanted else {
-            return Ok(());
+            return Ok(false);
         };
         self.slot.load(&self.store.join(wanted.relative_dir()))?;
         // Recorded only once the load has worked. Recording first would leave
         // the holder claiming a model it does not have, and the next request
         // would decide to keep something that is not there.
         self.loaded = Some(wanted.clone());
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -692,6 +715,10 @@ mod tests {
             self.at_once = self.at_once.saturating_sub(1);
             self.resident.take().is_some()
         }
+
+        fn fallback(&self) -> Option<&str> {
+            None
+        }
     }
 
     // AYEAYE-56 — lifetime and residency owned by ayeaye: loaded on demand,
@@ -759,6 +786,72 @@ mod tests {
         assert_eq!(residents.slot.loads, 1);
     }
 
+    // AYEAYE-73 — `ensure` says when a load actually happened, because that is
+    // the moment a degradation report belongs to. The last third is the case
+    // the ticket names: a model swept for idleness and loaded again an hour
+    // later is a fresh load, and an operator scrolled an hour past the startup
+    // banner gets the fallback said again where they are looking.
+    #[test]
+    fn ensure_says_when_it_actually_loaded_so_a_late_load_can_be_reported() {
+        let small = ModelId::parse("openai/whisper-small.en").expect("an id");
+        let tiny = ModelId::parse("openai/whisper-tiny.en").expect("an id");
+        let mut residents = Residents::new(
+            Recording::default(),
+            PathBuf::from("/state"),
+            Policy {
+                idle: Some(Duration::from_secs(300)),
+            },
+        );
+
+        assert!(
+            residents.ensure(Some(&small)).expect("it should load"),
+            "the first load is a load"
+        );
+        assert!(
+            !residents.ensure(Some(&small)).expect("it should keep"),
+            "a keep must not claim a load, or the report becomes per-dictation spam"
+        );
+        assert!(
+            residents.ensure(Some(&tiny)).expect("it should reload"),
+            "a reconfiguration puts a model in, so it is a load"
+        );
+        assert!(
+            !residents.ensure(None).expect("it should release"),
+            "a release loads nothing"
+        );
+
+        // The hour-later case: resident, swept idle, wanted again.
+        assert!(residents.ensure(Some(&tiny)).expect("it should load again"));
+        assert!(residents.sweep(Duration::from_secs(600)), "swept for idleness");
+        assert!(
+            residents.ensure(Some(&tiny)).expect("the late load"),
+            "a load after a sweep is a load, which is what lets the daemon \
+             repeat the fallback an hour after the startup banner scrolled away"
+        );
+    }
+
+    // AYEAYE-73 — the real slots answer the trait's question with the device
+    // decision they hold, which is what the daemon's load-time report reads
+    // through the residency seam. The selection is built by asking for cuda
+    // and opening the processor — a fallback by definition, deterministic on
+    // every build row, no card involved.
+    #[test]
+    fn the_real_slots_report_their_device_fallback_through_the_trait() {
+        use ayeaye_infer::backend::{self, Backend};
+
+        let selection = backend::choose(Backend::Cuda, |_| backend::open(Backend::Cpu));
+        let why = selection
+            .fallback()
+            .expect("a cpu opened for a cuda ask is a fallback")
+            .to_string();
+
+        let speech = ayeaye_infer::SpeechSlot::on(selection.clone());
+        let language = ayeaye_infer::LanguageSlot::on(selection);
+
+        assert_eq!(super::Slot::fallback(&speech), Some(why.as_str()));
+        assert_eq!(super::Slot::fallback(&language), Some(why.as_str()));
+    }
+
     // AYEAYE-56 — a load that fails leaves the holder claiming nothing.
     // Recording the model first would leave it insisting on a model it does
     // not have, and the next request would decide to keep it.
@@ -773,6 +866,9 @@ mod tests {
             }
             fn unload(&mut self) -> bool {
                 false
+            }
+            fn fallback(&self) -> Option<&str> {
+                None
             }
         }
 

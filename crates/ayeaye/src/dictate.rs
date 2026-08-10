@@ -307,15 +307,36 @@ where
         };
 
         let mut resident = self.resident.lock().await;
-        if let Err(why) = resident.speech.ensure(Some(&speech)) {
-            return Outcome::Unavailable(format!("{speech} would not load: {why}"));
+        match resident.speech.ensure(Some(&speech)) {
+            Err(why) => return Outcome::Unavailable(format!("{speech} would not load: {why}")),
+            // A degradation is said at each load, not only at startup — the
+            // model an idle sweep let go of reloads an hour later, and whoever
+            // is reading the log then was not reading it at startup. Only at a
+            // load, though: a resident model kept is not news, and per-dictation
+            // repetition is the spam a real fallback line drowns in. Read off
+            // the slot rather than the process's own `Selection`, so the line
+            // names the device the resident model is actually on.
+            Ok(loaded_now) => {
+                if loaded_now {
+                    if let Some(why) = resident.speech.slot().fallback() {
+                        eprintln!("ayeaye: {why}");
+                    }
+                }
+            }
         }
         // Loaded on the same demand, and released the same way. A cleanup model
         // nobody configured is not an error: it is a machine that dictates the
         // words the speaker said.
         let cleanup = self.settings.cleanup.clone();
         let loaded = match resident.language.ensure(cleanup.as_ref()) {
-            Ok(()) => cleanup.is_some(),
+            Ok(loaded_now) => {
+                if loaded_now {
+                    if let Some(why) = resident.language.slot().fallback() {
+                        eprintln!("ayeaye: {why}");
+                    }
+                }
+                cleanup.is_some()
+            }
             Err(why) => {
                 // Said out loud and stepped over. Losing the rewrite is a worse
                 // dictation; losing the dictation is no dictation.

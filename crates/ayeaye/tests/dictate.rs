@@ -875,6 +875,10 @@ impl ayeaye::models::Slot for StubSpeech {
         self.releases += usize::from(self.resident);
         std::mem::take(&mut self.resident)
     }
+
+    fn fallback(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl Speech for StubSpeech {
@@ -896,6 +900,10 @@ impl ayeaye::models::Slot for NoWeights {
 
     fn unload(&mut self) -> bool {
         false
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -923,6 +931,10 @@ impl ayeaye::models::Slot for StubCleanup {
     fn unload(&mut self) -> bool {
         self.releases += usize::from(self.resident);
         std::mem::take(&mut self.resident)
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        None
     }
 }
 
