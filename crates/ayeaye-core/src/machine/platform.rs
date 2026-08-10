@@ -1,0 +1,551 @@
+//! What this machine is, and who to ask to change it.
+//!
+//! A port of `lib/platform.sh`'s judgement, with its effects left behind. The
+//! shell reads files and runs commands; this takes the text they produced and
+//! says what it means.
+//!
+//! Every answer is a word, never a sentence, and `unknown` is a first-class
+//! answer everywhere: this module would rather say it cannot identify a machine
+//! than guess wrong about one.
+
+/// The kernel this machine runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    Macos,
+    Unknown,
+}
+
+/// The family whose package manager and conventions this machine follows.
+///
+/// Deliberately generous: a derivative nobody here has heard of still reaches
+/// the right package manager through `ID_LIKE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Debian,
+    Fedora,
+    Arch,
+    Suse,
+    Macos,
+    Unknown,
+}
+
+impl Os {
+    /// The lower-case word a caller matches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Os::Linux => "linux",
+            Os::Macos => "macos",
+            Os::Unknown => "unknown",
+        }
+    }
+}
+
+impl Family {
+    /// The lower-case word a caller matches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Family::Debian => "debian",
+            Family::Fedora => "fedora",
+            Family::Arch => "arch",
+            Family::Suse => "suse",
+            Family::Macos => "macos",
+            Family::Unknown => "unknown",
+        }
+    }
+}
+
+/// Everything this layer can say about the machine's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Platform {
+    /// The kernel.
+    pub os: Os,
+    /// The family, which is what decides who to ask to install something.
+    pub family: Family,
+    /// The distribution's own id: `ubuntu`, `raspbian`, `macos`, `unknown`.
+    pub id: String,
+    /// `VERSION_ID`, or the macOS product version. Empty on a rolling release.
+    pub version: String,
+    /// The human name: `Ubuntu 24.04.1 LTS`, `macOS 15.1`.
+    pub pretty: String,
+    /// `x86_64`, `arm64`, or the raw `uname -m` when this layer has no opinion.
+    pub arch: String,
+    /// True on an image-based system, where the package manager is right there
+    /// and installing with it does not survive a reboot.
+    pub immutable: bool,
+}
+
+/// Work out what this machine is from the text its probes produced.
+///
+/// `os_release` is the contents of the first readable `/etc/os-release`-shaped
+/// file, `uname_s` and `uname_m` are what `uname -s` and `uname -m` printed, and
+/// `sw_vers` is the whole of `sw_vers` with no arguments. `None` means the probe
+/// found nothing to read — which is not the same as an empty answer, and is why
+/// these are options rather than empty strings.
+pub fn identify(
+    os_release: Option<&str>,
+    uname_s: Option<&str>,
+    uname_m: Option<&str>,
+    sw_vers: Option<&str>,
+) -> Platform {
+    let arch = normalise_arch(uname_m.unwrap_or("").trim());
+    let kernel = uname_s.unwrap_or("").trim();
+
+    // The kernel wins over any os-release lying around: a nix or a linuxbrew
+    // install can leave one on a Mac.
+    if kernel == "Darwin" {
+        return macos(arch, sw_vers);
+    }
+    match os_release {
+        Some(text) => linux(arch, text),
+        None if kernel == "Linux" => Platform {
+            os: Os::Linux,
+            family: Family::Unknown,
+            id: "unknown".to_string(),
+            version: String::new(),
+            pretty: "Linux".to_string(),
+            arch,
+            immutable: false,
+        },
+        None => Platform {
+            os: Os::Unknown,
+            family: Family::Unknown,
+            id: "unknown".to_string(),
+            version: String::new(),
+            pretty: "unknown".to_string(),
+            arch,
+            immutable: false,
+        },
+    }
+}
+
+fn macos(arch: String, sw_vers: Option<&str>) -> Platform {
+    let version = sw_vers
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("ProductVersion:"))
+        })
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let pretty = if version.is_empty() {
+        "macOS".to_string()
+    } else {
+        format!("macOS {version}")
+    };
+    Platform {
+        os: Os::Macos,
+        family: Family::Macos,
+        id: "macos".to_string(),
+        version,
+        pretty,
+        arch,
+        immutable: false,
+    }
+}
+
+fn linux(arch: String, os_release: &str) -> Platform {
+    let id = value(os_release, "ID")
+        .map(|v| lower(&v))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let version = value(os_release, "VERSION_ID").unwrap_or_default();
+    let pretty = value(os_release, "PRETTY_NAME")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| id.clone());
+    let family = if id == "unknown" {
+        Family::Unknown
+    } else {
+        family_from_os_release(os_release, &id)
+    };
+    let variant = value(os_release, "VARIANT_ID")
+        .map(|v| lower(&v))
+        .unwrap_or_default();
+    Platform {
+        os: Os::Linux,
+        family,
+        immutable: is_immutable(&id, &variant),
+        id,
+        version,
+        pretty,
+        arch,
+    }
+}
+
+/// `ID` first, then each `ID_LIKE` token, through the one id table.
+///
+/// The tokens go through the same lookup rather than a table of their own, which
+/// is what makes a derivative of a derivative work: Trisquel says
+/// `ID_LIKE=ubuntu`, and ubuntu is only debian by the same rule.
+fn family_from_os_release(os_release: &str, id: &str) -> Family {
+    if let Some(family) = family_of_id(id) {
+        return family;
+    }
+    let like = value(os_release, "ID_LIKE")
+        .map(|v| lower(&v))
+        .unwrap_or_default();
+    like.split_whitespace()
+        .find_map(family_of_id)
+        .unwrap_or(Family::Unknown)
+}
+
+/// The id table. Adding a name here is the cheapest change in this file, and
+/// getting one wrong is the most expensive: it sends the shell off to run a
+/// package manager the machine does not have.
+fn family_of_id(id: &str) -> Option<Family> {
+    match id {
+        "debian" | "ubuntu" | "raspbian" | "raspberry-pi-os" | "linuxmint" | "mint" | "pop"
+        | "elementary" | "neon" | "zorin" | "devuan" | "kali" | "parrot" | "deepin" | "mx"
+        | "pureos" | "tuxedo" | "linuxlite" | "peppermint" => Some(Family::Debian),
+        "fedora" | "rhel" | "centos" | "rocky" | "almalinux" | "ol" | "oracle" | "amzn"
+        | "scientific" | "nobara" | "bazzite" | "silverblue" | "qubes" | "eurolinux" | "circle"
+        | "navylinux" => Some(Family::Fedora),
+        "arch" | "archarm" | "arch32" | "manjaro" | "manjaro-arm" | "endeavouros" | "garuda"
+        | "cachyos" | "artix" | "arcolinux" | "steamos" | "blendos" | "parabola" => {
+            Some(Family::Arch)
+        }
+        "opensuse"
+        | "opensuse-leap"
+        | "opensuse-tumbleweed"
+        | "opensuse-slowroll"
+        | "opensuse-microos"
+        | "opensuse-aeon"
+        | "opensuse-kalpa"
+        | "suse"
+        | "sles"
+        | "sled"
+        | "sle-micro"
+        | "sle_hpc"
+        | "tumbleweed"
+        | "leap"
+        | "geckolinux" => Some(Family::Suse),
+        "macos" | "darwin" => Some(Family::Macos),
+        _ => None,
+    }
+}
+
+/// An image-based system: the package manager is present and installing with it
+/// does not survive a reboot. Recognising the distribution and refusing to act
+/// on it is the only honest combination — `unknown` would lose the name the
+/// manual instructions need to print.
+fn is_immutable(id: &str, variant: &str) -> bool {
+    matches!(
+        id,
+        "opensuse-microos"
+            | "opensuse-aeon"
+            | "opensuse-kalpa"
+            | "sle-micro"
+            | "steamos"
+            | "qubes"
+            | "bazzite"
+            | "silverblue"
+            | "fedora-coreos"
+            | "fedora-iot"
+    ) || matches!(
+        // Silverblue and its siblings arrive as plain ID=fedora; only the
+        // variant gives them away.
+        variant,
+        "silverblue"
+            | "kinoite"
+            | "sericea"
+            | "onyx"
+            | "iot"
+            | "coreos"
+            | "atomic-host"
+            | "sway-atomic"
+            | "budgie-atomic"
+    )
+}
+
+/// Normalise what `uname -m` printed.
+///
+/// Deliberately not `armv8*`: `armv8l` is a 32-bit userland on a 64-bit kernel,
+/// and calling it arm64 hands whoever picks a binary by architecture the wrong
+/// one. An architecture this layer has no opinion about is passed through rather
+/// than flattened to `unknown`, which would lose the only name there is.
+fn normalise_arch(machine: &str) -> String {
+    match machine {
+        "x86_64" | "amd64" | "x64" => "x86_64".to_string(),
+        "arm64" | "aarch64" => "arm64".to_string(),
+        "" => "unknown".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// One key's value out of an os-release file. The last assignment wins, as it
+/// would in the shell.
+///
+/// Parsed, not sourced. `. /etc/os-release` is the documented way to read the
+/// file and it is also arbitrary code execution from a path a caller is
+/// explicitly allowed to have pointed somewhere else.
+fn value(text: &str, key: &str) -> Option<String> {
+    let mut found = None;
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r').trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        found = Some(unquote(rest.trim()));
+    }
+    found
+}
+
+/// A value ends where the shell would say it ends: a quoted one at its closing
+/// quote, whatever follows it, and an unquoted one at a comment.
+///
+/// The order is load-bearing. Stripping the comment first would leave the quotes
+/// on for `ID="debian" # like this`, which demotes a fully supported machine to
+/// unknown.
+fn unquote(value: &str) -> String {
+    for quote in ['"', '\''] {
+        if let Some(rest) = value.strip_prefix(quote) {
+            return match rest.find(quote) {
+                Some(end) => rest[..end].to_string(),
+                None => rest.to_string(),
+            };
+        }
+    }
+    match value.find(" #") {
+        Some(hash) => value[..hash].trim().to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// ASCII lower case. Deepin has shipped `ID=Deepin`, and os-release ids are
+/// compared, not displayed.
+fn lower(text: &str) -> String {
+    text.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Family, Os, identify};
+
+    /// The captured probe output the shell suite reads, reaching a pure crate
+    /// the only way it may: at compile time.
+    macro_rules! fixture {
+        ($path:literal) => {
+            include_str!(concat!("../../../../tests/fixtures/", $path))
+        };
+    }
+
+    /// A Linux machine described by one os-release fixture and nothing else.
+    fn distro(os_release: &str) -> super::Platform {
+        identify(Some(os_release), Some("Linux"), Some("x86_64"), None)
+    }
+
+    // AYEAYE-60 — the sixteen captured os-release files, each landing in the
+    // family `tests/cases/platform_detect_test.sh` pins for it. The port is only
+    // a port if it agrees with the shell over the same corpus.
+    #[test]
+    fn every_captured_distribution_lands_in_the_family_the_shell_puts_it_in() {
+        let corpus: &[(&str, Family)] = &[
+            (fixture!("os-release/debian-12"), Family::Debian),
+            (fixture!("os-release/ubuntu-24.04"), Family::Debian),
+            (fixture!("os-release/raspbian-12"), Family::Debian),
+            (fixture!("os-release/linuxmint-21"), Family::Debian),
+            // Deliberately absent from the id table: only ID_LIKE=ubuntu can
+            // place it, and ubuntu is itself only debian by the same rule.
+            (fixture!("os-release/trisquel-11"), Family::Debian),
+            (fixture!("os-release/fedora-40"), Family::Fedora),
+            (fixture!("os-release/fedora-silverblue-40"), Family::Fedora),
+            (fixture!("os-release/rocky-9"), Family::Fedora),
+            (fixture!("os-release/arch"), Family::Arch),
+            (fixture!("os-release/manjaro"), Family::Arch),
+            (fixture!("os-release/steamos-3.5"), Family::Arch),
+            (fixture!("os-release/opensuse-leap-15.6"), Family::Suse),
+            (fixture!("os-release/opensuse-tumbleweed"), Family::Suse),
+            (fixture!("os-release/alpine-3.20"), Family::Unknown),
+            (fixture!("os-release/void"), Family::Unknown),
+            (fixture!("os-release/nixos-24.05"), Family::Unknown),
+        ];
+        let got: Vec<Family> = corpus.iter().map(|(text, _)| distro(text).family).collect();
+        let want: Vec<Family> = corpus.iter().map(|(_, family)| *family).collect();
+        assert_eq!(got, want);
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn a_distribution_nobody_knows_still_reports_its_own_identity() {
+        let alpine = distro(fixture!("os-release/alpine-3.20"));
+        assert_eq!(alpine.family, Family::Unknown);
+        assert_eq!(alpine.id, "alpine");
+        assert_eq!(alpine.version, "3.20.3");
+        assert_eq!(alpine.pretty, "Alpine Linux v3.20");
+        assert_eq!(alpine.os, Os::Linux);
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn an_id_like_list_is_searched_past_its_first_token() {
+        let made_up = distro("ID=speculative\nID_LIKE=\"madeup alsomadeup debian\"\n");
+        assert_eq!(made_up.family, Family::Debian);
+    }
+
+    // AYEAYE-60 — a quoted value ends at its closing quote and an unquoted one
+    // at a comment, in that order. Doing the comment first leaves the quotes on
+    // for `ID="debian" # like this`, which demotes a supported machine.
+    #[test]
+    fn a_value_ends_where_the_shell_would_say_it_ends() {
+        let commented = distro(concat!(
+            "ID=\"debian\" # the only one that matters\n",
+            "VERSION_ID=\"12\" # stable\n",
+            "PRETTY_NAME=\"Debian GNU/Linux 12\" # codename bookworm\n",
+        ));
+        assert_eq!(commented.id, "debian");
+        assert_eq!(commented.family, Family::Debian);
+        assert_eq!(commented.version, "12");
+        assert_eq!(commented.pretty, "Debian GNU/Linux 12");
+
+        assert_eq!(distro("ID=arch # rolling\n").id, "arch");
+        assert_eq!(
+            distro("ID=debian\nPRETTY_NAME=\"Debian #1\"\n").pretty,
+            "Debian #1",
+            "inside the quotes a hash is just a hash"
+        );
+        assert_eq!(
+            distro("ID=\"fedora\"   \nVERSION_ID=40  \n").version,
+            "40",
+            "trailing blanks must not defeat the quote stripping"
+        );
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn the_shapes_that_are_not_values_are_not_read_as_values() {
+        // The real tumbleweed file carries a commented VERSION and two commented
+        // CPE_NAMEs above the live one.
+        let tumbleweed = distro(fixture!("os-release/opensuse-tumbleweed"));
+        assert_eq!(tumbleweed.id, "opensuse-tumbleweed");
+        assert_eq!(tumbleweed.version, "20260724");
+        assert_eq!(tumbleweed.pretty, "openSUSE Tumbleweed");
+
+        // Deepin has shipped ID=Deepin. An id is compared, not displayed.
+        let deepin = distro("ID=Deepin\nPRETTY_NAME=\"deepin 23\"\n");
+        assert_eq!(deepin.id, "deepin");
+        assert_eq!(deepin.family, Family::Debian);
+
+        let crlf = distro("ID=debian\r\nVERSION_ID=\"12\"\r\n");
+        assert_eq!((crlf.id.as_str(), crlf.version.as_str()), ("debian", "12"));
+
+        let anonymous = distro("PRETTY_NAME=\"Something Else\"\nHOME_URL=\"https://x.invalid/\"\n");
+        assert_eq!(anonymous.id, "unknown");
+        assert_eq!(anonymous.family, Family::Unknown);
+
+        assert_eq!(
+            distro("ID=debian\n").pretty,
+            "debian",
+            "there has to be something to print"
+        );
+    }
+
+    // AYEAYE-60 — the kernel is the stronger signal: nix on macOS leaves a
+    // linux-looking os-release lying around, and a Mac is still a Mac.
+    #[test]
+    fn a_darwin_kernel_beats_any_os_release_lying_around() {
+        let mac = identify(
+            Some(fixture!("os-release/nixos-24.05")),
+            Some(
+                fixture!("uname/darwin-arm64")
+                    .split_whitespace()
+                    .next()
+                    .unwrap(),
+            ),
+            Some("arm64"),
+            Some(fixture!("sw_vers/macos-15.1")),
+        );
+        assert_eq!(mac.os, Os::Macos);
+        assert_eq!(mac.family, Family::Macos);
+        assert_eq!(mac.id, "macos");
+        assert_eq!(mac.version, "15.1");
+        assert_eq!(mac.pretty, "macOS 15.1");
+
+        let older = identify(
+            None,
+            Some("Darwin"),
+            Some("x86_64"),
+            Some(fixture!("sw_vers/macos-13.6")),
+        );
+        assert_eq!(older.version, "13.6");
+        assert_eq!(older.arch, "x86_64");
+
+        let bare = identify(None, Some("Darwin"), Some("arm64"), None);
+        assert_eq!(
+            bare.family,
+            Family::Macos,
+            "the kernel name alone is enough"
+        );
+        assert_eq!(bare.version, "");
+        assert_eq!(bare.pretty, "macOS");
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn a_machine_with_neither_kernel_nor_os_release_is_unknown_everything() {
+        let nothing = identify(None, None, None, None);
+        assert_eq!(nothing.os, Os::Unknown);
+        assert_eq!(nothing.family, Family::Unknown);
+        assert_eq!(nothing.arch, "unknown");
+
+        let kernel_only = identify(None, Some("Linux"), Some("x86_64"), None);
+        assert_eq!(kernel_only.os, Os::Linux);
+        assert_eq!(kernel_only.family, Family::Unknown);
+
+        let os_release_only = identify(Some(fixture!("os-release/fedora-40")), None, None, None);
+        assert_eq!(
+            os_release_only.os,
+            Os::Linux,
+            "a readable os-release is proof enough of linux"
+        );
+        assert_eq!(os_release_only.family, Family::Fedora);
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn architecture_is_normalised_without_being_flattened() {
+        let arch_of = |machine| identify(None, Some("Linux"), Some(machine), None).arch;
+        assert_eq!(arch_of("x86_64"), "x86_64");
+        assert_eq!(
+            arch_of("amd64"),
+            "x86_64",
+            "the same machine by another name"
+        );
+        assert_eq!(arch_of("x64"), "x86_64");
+        assert_eq!(arch_of("aarch64"), "arm64", "linux says aarch64");
+        assert_eq!(arch_of("arm64"), "arm64", "apple silicon says arm64");
+        assert_eq!(
+            arch_of("riscv64"),
+            "riscv64",
+            "an architecture we have no opinion about beats calling it unknown"
+        );
+        assert_eq!(
+            arch_of("armv8l"),
+            "armv8l",
+            "a 32-bit userland on a 64-bit kernel is not arm64"
+        );
+    }
+
+    // AYEAYE-60 — an image-based system is recognised and refused, not made
+    // unknown: the manual instructions still need its name.
+    #[test]
+    fn an_image_based_system_is_named_and_marked() {
+        let silverblue = distro(fixture!("os-release/fedora-silverblue-40"));
+        assert!(
+            silverblue.immutable,
+            "only VARIANT_ID gives Silverblue away"
+        );
+        assert_eq!(silverblue.id, "fedora");
+
+        let steamos = distro(fixture!("os-release/steamos-3.5"));
+        assert!(steamos.immutable);
+        assert_eq!(steamos.family, Family::Arch);
+
+        assert!(!distro(fixture!("os-release/fedora-40")).immutable);
+        assert!(!distro(fixture!("os-release/debian-12")).immutable);
+    }
+}

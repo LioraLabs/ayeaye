@@ -11,6 +11,7 @@
 //! `crates/constitution/README.md`.
 
 pub mod identity;
+pub mod machine;
 
 pub use identity::Identity;
 
