@@ -732,3 +732,249 @@ async fn the_pane_list_needs_a_token() {
         "the login cookie should authenticate"
     );
 }
+
+/// The first pane id out of an `/api/panes` body, qualified as the server sent
+/// it.
+///
+/// Read back off the wire rather than built by the test, because the id the
+/// client hands to `/api/pane` is exactly the id `/api/panes` gave it — and an
+/// endpoint that answered about *bare* ids would make `share/app.html`'s
+/// `reconcileOv` wipe the overview every two seconds. A test that assembled the
+/// id itself could not notice that.
+fn first_pane_id(panes_body: &str) -> String {
+    let after = panes_body
+        .split_once(r#""id":""#)
+        .unwrap_or_else(|| panic!("no pane in {panes_body}"))
+        .1;
+    after
+        .split_once('"')
+        .expect("an id ends its string")
+        .0
+        .to_string()
+}
+
+/// A field out of a small flat JSON body, without a parser.
+fn field(body: &str, name: &str) -> String {
+    let after = body
+        .split_once(&format!("\"{name}\":"))
+        .unwrap_or_else(|| panic!("no {name} in {body}"))
+        .1;
+    let value = after
+        .split_once(|c| c == ',' || c == '}')
+        .map_or(after, |(value, _)| value);
+    value.trim_matches('"').to_string()
+}
+
+// AYEAYE-47 — the terminal view, from the seam a phone reads: a real socket, a
+// real tmux, and the id the pane list just handed out. Both shapes, because a
+// client that does not send `df=1` is a page cached from before the protocol
+// existed and still has to render.
+#[tokio::test]
+async fn the_terminal_view_answers_about_the_id_the_pane_list_gave() {
+    let Some(tmux) = common::Private::named("serve-pane") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+    assert!(id.starts_with("desktop/%"), "{id} is not qualified");
+    let asked = format!("/api/pane?id={}", id.replace('/', "%2F"));
+
+    // No `df`: the whole-text shape, with the grid beside it.
+    let whole = server.api(&asked).await;
+    assert_eq!(whole.status, 200);
+    assert_eq!(whole.header("content-type"), Some("application/json"));
+    assert_eq!(whole.header("cache-control"), Some("no-store"));
+    let body = whole.body_text();
+    assert!(body.starts_with(r#"{"text":"#), "{body}");
+    assert!(
+        field(&body, "cols").parse::<u16>().expect("a width") > 0,
+        "the client renders at the width tmux wrapped for: {body}"
+    );
+
+    // `df=1`: the diff shape, with the two tokens.
+    let first = server.api(&format!("{asked}&df=1")).await;
+    assert_eq!(first.status, 200);
+    let first_body = first.body_text();
+    assert!(first_body.contains(r#""hh":"#), "{first_body}");
+    let (hh, sh) = (field(&first_body, "hh"), field(&first_body, "sh"));
+    assert_eq!(hh.len(), 12, "{first_body}");
+
+    // Echo the tokens back, as the poll does. An idle pane costs a header.
+    let again = server
+        .api(&format!("{asked}&df=1&hh={hh}&sh={sh}"))
+        .await
+        .body_text();
+    assert!(
+        again.contains(r#""same":1"#),
+        "an unchanged pane should cost nothing: {again}"
+    );
+}
+
+// AYEAYE-47 — the defence against a forged target is **membership, not
+// syntax**. `%0` is a perfectly well-formed tmux pane id and `desktop/%99` is a
+// perfectly well-formed qualified one; neither is in the list this machine just
+// reported, and neither may reach `capture-pane`.
+#[tokio::test]
+async fn only_a_pane_this_machine_actually_lists_can_be_read() {
+    let Some(tmux) = common::Private::named("serve-forged") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    for asked in [
+        // Bare: names no machine at all, and "bare means here" is the
+        // conditional qualified ids exist to delete.
+        "/api/pane?id=%250",
+        // A machine this deployment has never heard of.
+        "/api/pane?id=gpu-box%2F%250",
+        // This machine, and a pane it does not have.
+        "/api/pane?id=desktop%2F%2599",
+        // A tmux target that is not a pane id: `work:0.0` resolves to a real
+        // pane for tmux and to nothing for the pane list.
+        "/api/pane?id=desktop%2Fwork:0.0",
+    ] {
+        let answer = server.api(asked).await;
+        assert_eq!(answer.status, 404, "{asked} was not refused: {}", answer.body_text());
+        assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
+    }
+    // And no id at all is a different mistake, told apart from a wrong one.
+    let empty = server.api("/api/pane").await;
+    assert_eq!(empty.status, 400);
+    assert_eq!(empty.body_text(), r#"{"error":"no pane"}"#);
+}
+
+// AYEAYE-47 — both endpoints are gated, and the resize is gated as a POST: it
+// resizes somebody's actual terminal, so it is refused without a token whatever
+// it names.
+#[tokio::test]
+async fn the_terminal_view_and_the_resize_need_a_token() {
+    let server = Server::started().await;
+    assert_eq!(server.get("/api/pane?id=desktop%2F%250").await.status, 401);
+    assert_eq!(
+        server
+            .request("POST", "/api/resize", &[("Content-Length", "0")])
+            .await
+            .status,
+        401
+    );
+    // A GET of the resize is not the resize, and a POST of the view is not the
+    // view: the method is half of what a route means.
+    assert_eq!(server.api("/api/resize").await.status, 404);
+    assert_eq!(server.post("/api/pane", "{}").await.status, 404);
+}
+
+// AYEAYE-47 — the whole lease, over the wire: the phone asks for its width, the
+// window takes it, and releasing gives the desktop its window back. The size is
+// read from tmux rather than from the answer, because an endpoint that reported
+// a resize it never performed would pass a test that only read its own reply.
+#[tokio::test]
+async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
+    let Some(tmux) = common::Private::named("serve-resize") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let layer = tmux.layer();
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+    let pane = id.split_once('/').expect("a qualified id").1.to_string();
+
+    // Somebody had already sized this window by hand.
+    ayeaye::fit::resize(&layer, &pane, 100, 40).await;
+
+    let fitted = server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
+        )
+        .await;
+    assert_eq!(fitted.status, 200);
+    assert_eq!(fitted.body_text(), r#"{"ok":true,"cols":40,"rows":10}"#);
+    assert_eq!(window_size(&layer, &pane).await, (40, 10));
+
+    let released = server
+        .post("/api/resize", &format!(r#"{{"pane":"{id}","release":true}}"#))
+        .await;
+    assert_eq!(released.body_text(), r#"{"ok":true,"restored":true}"#);
+    assert_eq!(
+        window_size(&layer, &pane).await,
+        (100, 40),
+        "the desktop should have its own window back"
+    );
+    // Releasing again restores nothing: there is no lease left to end.
+    let twice = server
+        .post("/api/resize", &format!(r#"{{"pane":"{id}","release":true}}"#))
+        .await;
+    assert_eq!(twice.body_text(), r#"{"ok":true,"restored":false}"#);
+}
+
+// AYEAYE-47 — a size nobody typed cannot make a window nobody can use, and a
+// body that is not a resize is refused before it acts on anything.
+#[tokio::test]
+async fn a_preposterous_size_is_clamped_and_a_bad_body_is_refused() {
+    let Some(tmux) = common::Private::named("serve-clamp") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+
+    let tiny = server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","cols":1,"rows":1}}"#),
+        )
+        .await;
+    assert_eq!(tiny.body_text(), r#"{"ok":true,"cols":20,"rows":5}"#);
+
+    let huge = server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","cols":99999,"rows":99999}}"#),
+        )
+        .await;
+    assert_eq!(huge.body_text(), r#"{"ok":true,"cols":400,"rows":200}"#);
+
+    for (body, refused) in [
+        ("not json at all", r#"{"error":"bad json"}"#),
+        ("{}", r#"{"error":"no pane"}"#),
+    ] {
+        let answer = server.post("/api/resize", body).await;
+        assert_eq!(answer.status, 400, "{body}");
+        assert_eq!(answer.body_text(), refused);
+    }
+    let bad_size = server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","cols":"wide","rows":10}}"#),
+        )
+        .await;
+    assert_eq!(bad_size.status, 400);
+    assert_eq!(bad_size.body_text(), r#"{"error":"bad size"}"#);
+}
+
+/// The window this pane is in, as tmux reports it.
+async fn window_size(tmux: &ayeaye::tmux::Tmux, pane: &str) -> (u16, u16) {
+    let said = tmux
+        .ask(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{window_width}\t#{window_height}",
+        ])
+        .await
+        .expect("tmux should describe a window it has");
+    ayeaye_core::fit::size(&said).unwrap_or_else(|| panic!("not a size: {said:?}"))
+}
