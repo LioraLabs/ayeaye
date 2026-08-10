@@ -26,27 +26,52 @@ pub fn order(
     query: &str,
     limit: usize,
 ) -> Vec<Candidate> {
-    let query = query.trim().to_lowercase();
-    let mut ranked = found.to_vec();
+    // Scored and matched once each rather than inside the comparator, which
+    // would ask for the same frecency and the same lowercasing a few thousand
+    // times over for three hundred candidates.
+    let mut ranked: Vec<(bool, f64, bool, usize, &Candidate)> = found
+        .iter()
+        .map(|candidate| {
+            (
+                !candidate.is_git,
+                -recents.score(&candidate.path, now),
+                !names_it(&candidate.path, query),
+                candidate.level,
+                candidate,
+            )
+        })
+        .collect();
     ranked.sort_by(|left, right| {
-        left.is_git
-            .cmp(&right.is_git)
-            .reverse()
-            .then_with(|| {
-                recents
-                    .score(&right.path, now)
-                    .total_cmp(&recents.score(&left.path, now))
-            })
-            .then_with(|| {
-                names_it(&left.path, &query)
-                    .cmp(&names_it(&right.path, &query))
-                    .reverse()
-            })
-            .then_with(|| left.level.cmp(&right.level))
-            .then_with(|| left.path.cmp(&right.path))
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.path.cmp(&right.4.path))
     });
-    ranked.truncate(limit);
     ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, _, _, candidate)| candidate.clone())
+        .collect()
+}
+
+/// Whether a path answers the query at all.
+///
+/// The whole path, folded to lower case, exactly as the daemon's
+/// `q in child.lower()` has it — so typing `ayeaye` finds
+/// `/home/a/src/ayeaye` and typing part of a parent finds everything under it.
+/// The query is trimmed and folded too: on a phone the first letter is
+/// auto-capitalised, so `Ayeaye` is the *common* input, not the exotic one.
+///
+/// This is the walk's filter as well as the fold-back's. The daemon filters
+/// inside the walk and counts only matches against its cap; a walk that
+/// counted every directory it *visited* would stop three hundred directories
+/// in and answer a query with a handful of rows where the daemon answers with
+/// a full list.
+pub fn matches(path: &str, query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || path.to_lowercase().contains(&query.to_lowercase())
 }
 
 /// How many of the strongest picks are worth offering back as candidates.
@@ -66,12 +91,11 @@ pub fn recent_candidates<'a>(
     query: &str,
     already: &[String],
 ) -> Vec<&'a str> {
-    let query = query.trim().to_lowercase();
     recents
         .strongest(now, RECENT_CANDIDATES)
         .into_iter()
         .filter(|path| !already.iter().any(|known| known == path))
-        .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+        .filter(|path| matches(path, query))
         .collect()
 }
 
@@ -142,22 +166,24 @@ pub fn body(rows: &[Row]) -> String {
 /// which is what leaves the level and the path to decide when nobody is
 /// typing.
 fn names_it(path: &str, query: &str) -> bool {
-    basename(path).to_lowercase().contains(query)
+    matches(basename(path), query)
 }
 
 /// The last component of a path, with any trailing slashes ignored.
 pub fn basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some((_, name)) if !name.is_empty() => name,
-        _ if trimmed.is_empty() => "/",
-        _ => trimmed,
+    if trimmed.is_empty() {
+        // Every slash: the root, which has no component to be named after.
+        return "/";
     }
+    // The trailing slashes are gone, so whatever follows the last one is a
+    // component.
+    trimmed.rsplit_once('/').map_or(trimmed, |(_, name)| name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Row, SUPERSEDED, body, order, recent_candidates, shorten};
+    use super::{Candidate, Row, SUPERSEDED, body, matches, order, recent_candidates, shorten};
     use crate::projects::recents::Recents;
 
     fn candidate(path: &str, is_git: bool, level: usize) -> Candidate {
@@ -264,6 +290,43 @@ mod tests {
         assert_eq!(paths(&best), vec!["/dir0", "/dir2", "/dir4"]);
     }
 
+    // AYEAYE-50 — the one matching rule, used by the walk to decide what to
+    // return and by the fold-back to decide what to offer. The query is
+    // trimmed and folded to lower case because on a phone the first letter is
+    // auto-capitalised: "Ayeaye" is the common input, not the exotic one, and
+    // a rule that only matched the exact keys typed would find nothing for
+    // most of the people using this.
+    #[test]
+    fn matching_is_the_whole_path_folded_and_the_query_trimmed() {
+        assert!(matches("/home/a/src/ayeaye", "ayeaye"));
+        assert!(matches("/home/a/src/ayeaye", "Ayeaye"), "auto-capitalised");
+        assert!(matches("/home/a/src/ayeaye", "  ayeaye  "), "trimmed");
+        assert!(
+            matches("/home/a/AyeAye", "ayeaye"),
+            "and the path folds too"
+        );
+        assert!(matches("/home/a/src/ayeaye", "src"), "part of a parent");
+        assert!(!matches("/home/a/src/ayeaye", "codex"));
+        // Nothing typed matches everything, which is the picker's first paint.
+        assert!(matches("/anything", ""));
+        assert!(matches("/anything", "   "));
+    }
+
+    // AYEAYE-50 — and the rung reads the same query the same way, so a
+    // capitalised search still prefers the directory that is named for it.
+    #[test]
+    fn the_name_rung_reads_a_capitalised_query_too() {
+        let store = Recents::default();
+        let found = vec![
+            candidate("/home/ayeaye/notes", true, 2),
+            candidate("/home/src/ayeaye", true, 2),
+        ];
+        assert_eq!(
+            paths(&order(&found, &store, 100.0, "  AyeAye ", 10)),
+            vec!["/home/src/ayeaye", "/home/ayeaye/notes"]
+        );
+    }
+
     // AYEAYE-50 — somewhere you have started an agent is a candidate even when
     // the walk cannot reach it: outside the roots, or below the depth bound.
     // Only the strongest handful are worth offering, because each one the
@@ -334,9 +397,11 @@ mod tests {
         assert_eq!(shorten("/etc", ""), "/etc");
     }
 
-    // AYEAYE-50 — the five fields `share/app.html` reads off each row, under
-    // the names it reads them by. A renamed field is a picker that renders
-    // nothing, and nothing else in the tree would notice.
+    // AYEAYE-50 — the fields the page reads off each row, under the names it
+    // reads them by: `dir`, `short`, `session` and `exists` are what
+    // `share/app.html` touches, and `git` is there because the daemon's JSON
+    // has it. A renamed field is a picker that renders nothing, and nothing
+    // else in the tree would notice.
     #[test]
     fn the_body_carries_the_five_fields_the_page_reads() {
         let rows = vec![

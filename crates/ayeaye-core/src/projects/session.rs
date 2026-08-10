@@ -13,14 +13,11 @@ use super::rank::basename;
 /// shell's, and whether it exists at all is the shell's answer to give.
 pub fn name_for(path: &str, tmux_yaml: Option<&str>) -> String {
     let named = tmux_yaml.and_then(declared_name).unwrap_or_else(|| {
+        // `basename` answers "/" for a path that is nothing but slashes, and
+        // that is the only case with no name to be had.
         let name = basename(path);
         if name == "/" { "root" } else { name }.to_string()
     });
-    let named = if named.is_empty() {
-        "root".to_string()
-    } else {
-        named
-    };
     named.replace('.', "_")
 }
 

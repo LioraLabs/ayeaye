@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ayeaye_core::projects::rank::Candidate;
-use ayeaye_core::projects::skip;
+use ayeaye_core::projects::{rank, skip};
 
 /// What ended the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +41,28 @@ pub trait Lister: Send + Sync {
 /// a request answer from a walk that is still running.
 ///
 /// The bound that ended it comes back, and callers care which: a walk that
-/// finished is worth caching and one that was cut short is not.
+/// finished is worth caching and one that was cut short is not. `Depth` is
+/// answered before `stop` is consulted at a level boundary, which is
+/// deliberate: reaching it means every level above the bound was listed in
+/// full, so the answer really is a complete depth-bounded walk and really is
+/// worth caching.
+///
+/// Only directories matching `query` are handed to `found` and counted
+/// against `limit`, but *every* directory is descended into — a project whose
+/// own name does not match may sit under a parent whose name does not either.
+/// Counting visited directories rather than matched ones would have a query
+/// answered with a handful of rows where the daemon answers with a full list.
+///
+/// `roots` are taken as given: absolute, and existing. Resolving `~` and a
+/// relative path needs a home and a working directory, and a candidate path
+/// that is not absolute matches no pick in the history and shortens to
+/// nothing.
 pub fn walk(
     lister: &dyn Lister,
     roots: &[PathBuf],
     depth: usize,
     limit: usize,
+    query: &str,
     stop: &dyn Fn() -> Option<Stopped>,
     found: &mut dyn FnMut(Candidate),
 ) -> Stopped {
@@ -74,8 +90,15 @@ pub fn walk(
                 if !seen.insert(child.clone()) {
                     continue;
                 }
+                let path = child.to_string_lossy().into_owned();
+                // Descended into whatever the query says: a project can sit
+                // under a parent that does not match either.
+                next.push(child);
+                if !rank::matches(&path, query) {
+                    continue;
+                }
                 found(Candidate {
-                    path: child.to_string_lossy().into_owned(),
+                    path,
                     is_git,
                     level: level + 1,
                 });
@@ -83,7 +106,6 @@ pub fn walk(
                 if limit > 0 && count >= limit {
                     return Stopped::Limit;
                 }
-                next.push(child);
             }
         }
         frontier = next;
@@ -125,6 +147,19 @@ pub fn stopper(deadline: Instant, cancel: Arc<AtomicBool>) -> impl Fn() -> Optio
 pub struct FsLister {
     /// Names this machine adds to the skip list.
     pub skip_extra: Vec<String>,
+    /// How many entries to examine in any one directory. [`PER_DIR_MAX`] in
+    /// the daemon; an argument so the bound itself can be tested without
+    /// laying down five thousand directories.
+    pub per_dir_max: usize,
+}
+
+impl Default for FsLister {
+    fn default() -> FsLister {
+        FsLister {
+            skip_extra: Vec::new(),
+            per_dir_max: PER_DIR_MAX,
+        }
+    }
 }
 
 impl Lister for FsLister {
@@ -142,7 +177,7 @@ impl Lister for FsLister {
             return Vec::new();
         };
         let mut rows = Vec::new();
-        for entry in entries.take(PER_DIR_MAX) {
+        for entry in entries.take(self.per_dir_max) {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
             if skip::is_skipped(&name.to_string_lossy(), &self.skip_extra) {
@@ -167,17 +202,32 @@ impl Lister for FsLister {
 pub struct Cached<L> {
     inner: L,
     ttl: Duration,
+    max: usize,
     entries: Mutex<HashMap<PathBuf, (Instant, Listing)>>,
 }
 
 impl<L: Lister> Cached<L> {
     /// Wrap a lister.
     pub fn new(inner: L, ttl: Duration) -> Cached<L> {
+        Cached::bounded(inner, ttl, LIST_MAX)
+    }
+
+    /// The same, with the bound as an argument so it can be tested.
+    pub fn bounded(inner: L, ttl: Duration, max: usize) -> Cached<L> {
         Cached {
             inner,
             ttl,
+            max,
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many listings are remembered right now.
+    pub fn remembered(&self) -> usize {
+        self.entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0)
     }
 
     /// List, from memory if it was listed recently enough.
@@ -195,7 +245,7 @@ impl<L: Lister> Cached<L> {
         }
         let rows = self.inner.list(path);
         if let Ok(mut entries) = self.entries.lock() {
-            if entries.len() >= LIST_MAX {
+            if entries.len() >= self.max {
                 entries.clear();
             }
             entries.insert(path.to_path_buf(), (now, rows.clone()));
@@ -259,6 +309,24 @@ mod tests {
         None
     }
 
+    /// Every candidate the walk found, whole, so a test can see the fields the
+    /// ranker leans on and not only the path.
+    fn walked(
+        tree: &Tree,
+        roots: &[&str],
+        depth: usize,
+        limit: usize,
+        query: &str,
+        stop: &dyn Fn() -> Option<Stopped>,
+    ) -> (Vec<Candidate>, Stopped) {
+        let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        let mut found = Vec::new();
+        let stopped = walk(tree, &roots, depth, limit, query, stop, &mut |candidate| {
+            found.push(candidate)
+        });
+        (found, stopped)
+    }
+
     fn collect(
         tree: &Tree,
         roots: &[&str],
@@ -266,17 +334,8 @@ mod tests {
         limit: usize,
         stop: &dyn Fn() -> Option<Stopped>,
     ) -> (Vec<String>, Stopped) {
-        let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-        let mut found = Vec::new();
-        let stopped = walk(
-            tree,
-            &roots,
-            depth,
-            limit,
-            stop,
-            &mut |candidate: Candidate| found.push(candidate.path),
-        );
-        (found, stopped)
+        let (found, stopped) = walked(tree, roots, depth, limit, "", stop);
+        (found.into_iter().map(|row| row.path).collect(), stopped)
     }
 
     // AYEAYE-50 — breadth first, because a project sits a couple of levels
@@ -316,6 +375,74 @@ mod tests {
             collect(&tree, &["/nowhere"], 6, 0, &never).1,
             Stopped::Exhausted
         );
+    }
+
+    // AYEAYE-50 — the fields the ranker leans on hardest: whether it is a
+    // repository, which is the first rung, and how deep it sits, which is the
+    // fourth. A walk that reported every candidate as non-git would rank a
+    // home directory's worth of folders above every checkout, and only this
+    // reads them back.
+    #[test]
+    fn a_candidate_carries_its_repository_flag_and_its_depth() {
+        let tree = Tree::of(&[
+            ("/root", &[("/root/repo", true), ("/root/plain", false)]),
+            ("/root/plain", &[("/root/plain/inner", true)]),
+        ]);
+        let (found, _) = walked(&tree, &["/root"], 6, 0, "", &never);
+        let seen: Vec<(&str, bool, usize)> = found
+            .iter()
+            .map(|row| (row.path.as_str(), row.is_git, row.level))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("/root/repo", true, 1),
+                ("/root/plain", false, 1),
+                ("/root/plain/inner", true, 2),
+            ]
+        );
+    }
+
+    // AYEAYE-50 — the walk filters, and the limit counts what it *returned*.
+    // The daemon does both; a walk that counted every directory it visited
+    // would spend its whole cap on the directories nobody asked about and
+    // answer a query with a handful of rows.
+    #[test]
+    fn the_query_filters_what_comes_back_but_not_where_the_walk_goes() {
+        let tree = Tree::of(&[
+            ("/root", &[("/root/plain", false), ("/root/other", false)]),
+            ("/root/plain", &[("/root/plain/ayeaye", true)]),
+            ("/root/other", &[("/root/other/nope", false)]),
+        ]);
+        let (found, stopped) = walked(&tree, &["/root"], 6, 0, "ayeaye", &never);
+        assert_eq!(
+            found
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/root/plain/ayeaye"],
+            "found under a parent that does not match, which is the point"
+        );
+        assert_eq!(stopped, Stopped::Exhausted);
+
+        // The cap counts matches. Four directories are visited and one
+        // matches, so a cap of one is reached by the match rather than by the
+        // second directory nobody asked about.
+        let (found, stopped) = walked(&tree, &["/root"], 6, 1, "ayeaye", &never);
+        assert_eq!(found.len(), 1);
+        assert_eq!(stopped, Stopped::Limit);
+    }
+
+    // AYEAYE-50 — a root reached again as somebody's child is not offered
+    // twice, which is what seeding the roots into the seen set buys.
+    #[test]
+    fn a_root_that_is_also_a_child_is_not_offered_twice() {
+        let tree = Tree::of(&[
+            ("/root", &[("/root/inner", false)]),
+            ("/root/inner", &[("/root", false)]),
+        ]);
+        let (found, _) = collect(&tree, &["/root"], 6, 0, &never);
+        assert_eq!(found, vec!["/root/inner"]);
     }
 
     // AYEAYE-50 — the deadline and the cancel flag are one seam, so a test can
@@ -375,6 +502,51 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(1);
         let expired = stopper(past, Arc::new(AtomicBool::new(false)));
         assert_eq!(expired(), Some(Stopped::Deadline));
+
+        // Both at once is Cancel, not Deadline: a superseded walk that
+        // reported "deadline" would have the caller cache a result for a
+        // question nobody is asking any more.
+        let both = stopper(past, Arc::new(AtomicBool::new(true)));
+        assert_eq!(both(), Some(Stopped::Cancel));
+    }
+
+    // AYEAYE-50 — every other bound is checked between directories, which is
+    // no help at all inside a single one holding a hundred thousand children.
+    // This is the bound that keeps the clock and the cancel flag reachable.
+    #[test]
+    fn one_enormous_directory_is_examined_only_so_far() {
+        let root = TempTree::named("enormous");
+        for index in 0..20 {
+            root.dir(&format!("child{index:02}"));
+        }
+        let lister = FsLister {
+            per_dir_max: 5,
+            ..FsLister::default()
+        };
+        assert_eq!(lister.list(&root.path).len(), 5);
+        assert_eq!(FsLister::default().per_dir_max, super::PER_DIR_MAX);
+    }
+
+    // AYEAYE-50 — the memo is bounded by clearing it wholesale: an eviction
+    // policy would be more code than the walk it serves, and refilling costs
+    // one bounded walk. Without the bound it grows for as long as the daemon
+    // runs.
+    #[test]
+    fn the_memo_is_cleared_wholesale_rather_than_growing_for_ever() {
+        struct Nothing;
+        impl Lister for Nothing {
+            fn list(&self, _path: &Path) -> Listing {
+                Vec::new()
+            }
+        }
+        let cache = Cached::bounded(Nothing, Duration::from_secs(60), 3);
+        let now = Instant::now();
+        for index in 0..3 {
+            cache.list_at(Path::new(&format!("/dir{index}")), now);
+        }
+        assert_eq!(cache.remembered(), 3);
+        cache.list_at(Path::new("/one-too-many"), now);
+        assert_eq!(cache.remembered(), 1, "cleared, then refilled from empty");
     }
 
     // AYEAYE-50 — listing the same directory once per keystroke is what would
@@ -427,6 +599,7 @@ mod tests {
 
         let lister = FsLister {
             skip_extra: vec!["machine-hidden".to_string()],
+            ..FsLister::default()
         };
         let mut rows: Vec<(String, bool)> = lister
             .list(&root.path)
