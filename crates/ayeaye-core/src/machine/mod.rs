@@ -9,11 +9,13 @@
 //! held to the same corpus those two are tested against.
 
 pub mod graphics;
+pub mod network;
 pub mod platform;
 pub mod share;
 pub mod size;
 
 pub use graphics::{Acceleration, Graphics};
+pub use network::Network;
 pub use platform::{
     Family, Os, PackageManager, Packaging, Platform, ServiceManager, brew_prefix_of, identify,
     packaging, service_manager,
@@ -76,4 +78,11 @@ pub struct Probes<'a> {
     pub cgroup_cpu_quota: Option<&'a str>,
     /// The version-one processor period.
     pub cgroup_cpu_period: Option<&'a str>,
+    /// `/proc/net/route`.
+    pub route: Option<&'a str>,
+    /// `/proc/net/ipv6_route`.
+    pub route6: Option<&'a str>,
+    /// Whether `route -n get default` resolved a route, on a machine with no
+    /// `/proc` to read. `None` when there was no `route` command to ask.
+    pub route_default_exists: Option<bool>,
 }
