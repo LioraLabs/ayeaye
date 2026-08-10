@@ -300,11 +300,7 @@ impl Agents {
             best = Some((delta, path, meta.id));
         }
         let (_, path, id) = best?;
-        Some(Session::new(
-            Kind::Codex,
-            &id,
-            &path.to_string_lossy().into_owned(),
-        ))
+        Some(Session::new(Kind::Codex, &id, &path.to_string_lossy()))
     }
 
     /// The transcript file for one claude session id.
@@ -486,7 +482,7 @@ fn instant(stamp: codex::Stamp) -> Option<f64> {
     // The one call in this module that is not a file read. `mktime` reads the
     // timezone and writes back into `when`, and does not touch anything else.
     let seconds = unsafe { libc::mktime(&mut when) };
-    (seconds != -1).then(|| seconds as f64)
+    (seconds != -1).then_some(seconds as f64)
 }
 
 #[cfg(test)]
@@ -727,7 +723,7 @@ mod tests {
         let fake = Fake::pane("codex")
             .started(200, STARTED)
             .cwd(200, "/dev/somewhere-else")
-            .holding(200, &[rollout.clone()]);
+            .holding(200, std::slice::from_ref(&rollout));
 
         let found = home.agents().behind_process(&fake, "codex\t100");
         let Behind::Found(session) = found else {
