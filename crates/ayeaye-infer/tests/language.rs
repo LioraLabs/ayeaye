@@ -2,8 +2,11 @@
 
 mod gguf;
 
-use ayeaye_infer::language::{LanguageError, LanguageModel, SUPPORTED};
-use gguf::{tiny_model, tiny_model_missing_a_tensor, tiny_model_of_architecture};
+use ayeaye_core::cleanup::{Kept, Policy};
+use ayeaye_infer::language::{LanguageError, LanguageModel, LanguageSlot, SUPPORTED};
+use gguf::{
+    WINDOW, tiny_model, tiny_model_missing_a_tensor, tiny_model_named, tiny_model_of_architecture,
+};
 
 // AYEAYE-55
 //
@@ -109,12 +112,62 @@ fn an_architecture_this_build_cannot_run_is_refused_by_name() {
 // AYEAYE-55
 //
 // The list is public so AYEAYE-56 can refuse a download rather than restating
-// it. `qwen2` is off it deliberately: candle 0.9's `quantized_qwen2` weights
-// neither derive `Clone` nor expose a cache reset, so one dictation would bleed
-// into the next.
+// it. Every name on it is loaded by a test below — a list is only honest if
+// something proves each entry, and "supported on paper" is exactly the failure
+// an allowlist is supposed to prevent.
 #[test]
-fn the_supported_architectures_are_published_for_pull_time() {
-    assert_eq!(SUPPORTED, &["llama"]);
+fn every_published_architecture_really_loads() {
+    assert_eq!(SUPPORTED, &["llama", "qwen2"]);
+    for architecture in SUPPORTED {
+        let dir = tiny_model_named(architecture, architecture);
+        let model = LanguageModel::load(dir.path())
+            .unwrap_or_else(|e| panic!("{architecture} is on the list and did not load: {e}"));
+        assert_eq!(&model.architecture(), architecture);
+    }
+}
+
+// AYEAYE-55
+//
+// The window is the loader's rotary table, not the file's claim about itself,
+// and the two architectures answer differently: `quantized_llama` builds a
+// fixed 4 096 whatever the file says, `quantized_qwen2` builds exactly the
+// context length it reads. A position past the table indexes out of bounds
+// rather than degrading, so getting this from the wrong place is a panic in the
+// middle of somebody's dictation.
+#[test]
+fn each_architecture_reports_the_window_its_own_loader_built() {
+    let llama =
+        LanguageModel::load(tiny_model_named("window-llama", "llama").path()).expect("llama loads");
+    let qwen =
+        LanguageModel::load(tiny_model_named("window-qwen2", "qwen2").path()).expect("qwen2 loads");
+
+    assert_eq!(qwen.window(), WINDOW);
+    assert!(
+        llama.window() > WINDOW,
+        "llama ignores the file's context length: {}",
+        llama.window()
+    );
+}
+
+// AYEAYE-55
+//
+// Refused with the two numbers in it, rather than met as an out-of-bounds index
+// part way through a dictation. And refusal is not loss: `clean` turns it back
+// into the words the speaker said.
+#[test]
+fn a_prompt_past_the_window_is_refused_by_the_numbers_and_still_returns_the_dictation() {
+    let dir = tiny_model_named("too-long", "qwen2");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+    let raw = "run the tests ".repeat(WINDOW);
+
+    let error = slot
+        .rewrite(&raw, &Policy::default())
+        .expect_err("a prompt past the window cannot be run");
+    let message = error.to_string();
+    assert!(message.contains(&WINDOW.to_string()), "{message}");
+
+    assert_eq!(slot.clean(&raw, &Policy::default()).text(), raw);
 }
 
 // AYEAYE-55
@@ -151,4 +204,169 @@ fn a_complete_quantized_model_loads_from_the_directory_it_was_pointed_at() {
     let described = format!("{model:?}");
     assert!(described.contains("llama"), "{described}");
     assert!(described.contains("cpu"), "{described}");
+}
+
+// -------------------------------------------------------------- generation
+
+// AYEAYE-55
+//
+// Criterion 3, at its bluntest. No model at all, and the dictation still
+// arrives — with no `Result` in the caller's way to unwrap the wrong direction.
+#[test]
+fn cleaning_with_an_empty_slot_returns_the_dictation_itself() {
+    let mut slot = LanguageSlot::empty();
+
+    let cleaned = slot.clean("um so run the tests", &Policy::default());
+
+    assert_eq!(cleaned.text(), "um so run the tests");
+    assert!(!cleaned.was_rewritten());
+    assert_eq!(cleaned.kept(), Some(Kept::Unavailable));
+}
+
+// AYEAYE-55
+//
+// The diagnostic half of the pair says what happened, so a log can. It does not
+// load a model: a slot that loads on first use has taken out a lifetime nobody
+// wrote down.
+#[test]
+fn rewriting_with_an_empty_slot_is_an_error_rather_than_a_load() {
+    let mut slot = LanguageSlot::empty();
+
+    let error = slot
+        .rewrite("run the tests", &Policy::default())
+        .expect_err("an empty slot cannot rewrite");
+
+    assert!(
+        matches!(error, LanguageError::NotLoaded),
+        "expected NotLoaded, got {error:?}"
+    );
+    assert!(!slot.is_loaded());
+}
+
+// AYEAYE-55
+#[test]
+fn a_slot_loads_unloads_and_reloads() {
+    let dir = tiny_model("residency");
+    let mut slot = LanguageSlot::empty();
+
+    assert!(!slot.is_loaded());
+    assert!(!slot.unload(), "there was nothing to unload");
+
+    slot.load(dir.path()).expect("a complete model loads");
+    assert!(slot.is_loaded());
+    assert!(slot.unload());
+    assert!(!slot.is_loaded());
+
+    slot.load(dir.path())
+        .expect("and loads again after unloading");
+    assert!(slot.is_loaded());
+}
+
+// AYEAYE-55
+//
+// Criterion 1's second half, and criterion 4: a loaded quantized model is
+// prompted with the policy's system prompt and generates, on the CPU. The toy
+// model's weights are noise, so what it says is noise — what is under test is
+// that it says a bounded amount of it and stops.
+#[test]
+fn a_loaded_model_generates_within_the_token_budget_and_stops() {
+    let dir = tiny_model("generates");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+
+    let policy = Policy {
+        max_new_tokens: 8,
+        ..Policy::default()
+    };
+    let written = slot
+        .rewrite("run the tests", &policy)
+        .expect("a loaded model rewrites");
+
+    // A word-level vocabulary, so tokens are words: at most the budget, and the
+    // point is that it terminated at all rather than running to the context.
+    assert!(
+        written.split_whitespace().count() <= policy.max_new_tokens,
+        "generated past its budget: {written:?}"
+    );
+}
+
+// AYEAYE-55
+//
+// The assertion the pristine clone exists for, and the one a single-shot test
+// cannot make. candle 0.9's quantized_llama keeps a key-value cache inside every
+// layer with no way to clear it, so without a fresh copy per generation the
+// second dictation would attend to the first one's tokens — a wrong answer with
+// no symptom but a worse one.
+#[test]
+fn two_dictations_through_one_loaded_model_do_not_bleed_into_each_other() {
+    let policy = Policy {
+        max_new_tokens: 6,
+        ..Policy::default()
+    };
+
+    for architecture in SUPPORTED {
+        let dir = tiny_model_named(&format!("no-bleed-{architecture}"), architecture);
+        let mut slot = LanguageSlot::empty();
+        slot.load(dir.path()).expect("a complete model loads");
+
+        let first = slot.rewrite("run the tests", &policy).expect("the first");
+        let _elsewhere = slot
+            .rewrite("tell me what broke in the parser please", &policy)
+            .expect("a different dictation in between");
+        let again = slot
+            .rewrite("run the tests", &policy)
+            .expect("the first again");
+
+        assert_eq!(
+            first, again,
+            "{architecture} gave two answers to one dictation, so state survived between them"
+        );
+    }
+}
+
+// AYEAYE-55
+//
+// Criterion 3 against a model that really ran. The toy weights are noise, so
+// whatever it produces is exactly the kind of thing the guard exists to refuse —
+// which makes this the honest version of the degradation test rather than a
+// staged one. Either outcome is correct; returning nothing is not.
+#[test]
+fn cleaning_against_a_real_model_never_loses_the_dictation() {
+    let dir = tiny_model("degrades");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+
+    for raw in [
+        "um so run the tests",
+        "tell me what broke in the parser please",
+        "run",
+    ] {
+        let cleaned = slot.clean(raw, &Policy::default());
+        assert!(
+            !cleaned.text().is_empty(),
+            "a dictation was lost: {raw:?} came back empty"
+        );
+        assert!(
+            cleaned.was_rewritten() || cleaned.text() == raw,
+            "{raw:?} came back as neither a rewrite nor itself: {:?}",
+            cleaned.text()
+        );
+    }
+}
+
+// AYEAYE-55
+//
+// A blank dictation is never handed to a model. It would cost seconds of
+// inference to be told what the guard already knows, and a model given a blank
+// prompt fills it — which would be a dictation the speaker never gave.
+#[test]
+fn a_blank_dictation_is_not_worth_a_model_and_is_never_rewritten() {
+    let dir = tiny_model("blank");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+
+    let cleaned = slot.clean("   ", &Policy::default());
+
+    assert_eq!(cleaned.text(), "   ");
+    assert_eq!(cleaned.kept(), Some(Kept::NothingSaid));
 }

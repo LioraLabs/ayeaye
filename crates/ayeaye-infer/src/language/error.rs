@@ -12,7 +12,7 @@ use super::model::SUPPORTED;
 /// not load" at two in the morning is the error message that costs an evening.
 ///
 /// Note what having one of these does *not* mean. A cleanup pass that fails
-/// still returns the dictation — see `LanguageSlot::clean` — so these
+/// still returns the dictation — see [`super::LanguageSlot::clean`] — so these
 /// are for the log and for the person configuring a model, never for a caller
 /// deciding whether the user gets their words back.
 #[derive(Debug)]
@@ -55,7 +55,7 @@ pub enum LanguageError {
     /// A rewrite was asked of a slot holding no model.
     ///
     /// Deliberately an error rather than an implicit load: see
-    /// `LanguageSlot`.
+    /// [`super::LanguageSlot`].
     NotLoaded,
 }
 

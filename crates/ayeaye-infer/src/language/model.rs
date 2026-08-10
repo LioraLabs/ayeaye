@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use candle_core::Device;
 use candle_core::quantized::gguf_file;
-use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_core::{Device, Tensor};
+use candle_transformers::models::{quantized_llama, quantized_qwen2};
 use tokenizers::Tokenizer;
 
 use super::error::LanguageError;
@@ -35,16 +35,17 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// spells them.
 ///
 /// Public so AYEAYE-56 can check it at pull time rather than restating the
-/// list. In GGUF terms `llama` is a family and not a model: the Llama and
-/// Mistral lineages, and most community fine-tunes of either, convert to it.
+/// list. Two entries covering most of what a person would point this at: in
+/// GGUF terms `llama` is a family rather than a model — the Llama and Mistral
+/// lineages, and most community fine-tunes of either, convert to it — and
+/// `qwen2` is what the cleanup model this replaces an external server for is
+/// published as.
 ///
-/// `qwen2` is deliberately absent even though `candle-transformers` implements
-/// it. Its `ModelWeights` does not derive `Clone` and exposes no way to clear
-/// the attention cache, so a second dictation would decode with the first one's
-/// cache still in it — a wrong answer that looks like a working model. See
-/// [`LanguageModel::fresh`] for what `llama` gets instead. An architecture that
-/// cannot be reset between dictations does not belong on this list.
-pub const SUPPORTED: &[&str] = &["llama"];
+/// The list is short because `candle-transformers` implements architectures one
+/// at a time, and that is the property which makes an allowlist honest rather
+/// than bureaucratic: an unsupported architecture is knowable from a file's
+/// header instead of discovered at the first dictation.
+pub const SUPPORTED: &[&str] = &["llama", "qwen2"];
 
 /// The GGUF metadata key naming the architecture.
 const ARCHITECTURE_KEY: &str = "general.architecture";
@@ -52,16 +53,51 @@ const ARCHITECTURE_KEY: &str = "general.architecture";
 /// The GGUF metadata key naming the token that ends a generation.
 const EOS_KEY: &str = "tokenizer.ggml.eos_token_id";
 
+/// The weights, behind whichever loader understands them.
+///
+/// An enum rather than a trait object: there are two, the workspace owns
+/// neither, and `forward` is the only thing either is ever asked for.
+pub(crate) enum Weights {
+    /// Llama, Mistral, and the fine-tunes that convert to their layout.
+    Llama(quantized_llama::ModelWeights),
+    /// Qwen 2 and 2.5, which differ by carrying attention biases.
+    Qwen2(quantized_qwen2::ModelWeights),
+}
+
+impl Weights {
+    /// Logits for the last position, given tokens and where they start.
+    ///
+    /// **`index_pos == 0` is what clears the attention cache**, in both of
+    /// these. That is read out of candle 0.9's source rather than assumed:
+    /// every layer keeps a key-value cache and concatenates onto it *except*
+    /// when the index is zero, where it drops what was there. There is no
+    /// `reset` to call, so starting each generation from zero is the whole of
+    /// what stops one dictation attending to the last — and the test that two
+    /// dictations through one loaded model agree is what would notice if that
+    /// behaviour ever changed under us.
+    pub(crate) fn forward(
+        &mut self,
+        input: &Tensor,
+        index_pos: usize,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Llama(weights) => weights.forward(input, index_pos),
+            Self::Qwen2(weights) => weights.forward(input, index_pos),
+        }
+    }
+}
+
 /// A loaded language model, resident in memory until it is dropped.
 ///
 /// Loading is the expensive, explicit act. Nothing here loads on demand; see
-/// `LanguageSlot` for why that is the point rather than an omission.
+/// [`super::LanguageSlot`] for why that is the point rather than an omission.
 pub struct LanguageModel {
-    /// The weights as they were loaded, never generated through.
-    pristine: ModelWeights,
+    pub(crate) weights: Weights,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) device: Device,
     pub(crate) architecture: String,
+    /// How many positions this model's rotary table was built for.
+    pub(crate) window: usize,
     /// The end-of-generation token the file itself names, where it names one.
     pub(crate) eos: Option<u32>,
 }
@@ -105,9 +141,23 @@ impl LanguageModel {
         }
 
         let eos = content.metadata.get(EOS_KEY).and_then(|v| v.to_u32().ok());
+        let window = window_of(&architecture, &content);
+        if window == 0 {
+            return Err(LanguageError::malformed(
+                &weights_path,
+                "the file's context length is 0, so there is no position to decode at",
+            ));
+        }
 
-        let pristine = ModelWeights::from_gguf(content, &mut file, &device)
-            .map_err(|e| LanguageError::malformed(&weights_path, e))?;
+        let weights = match architecture.as_str() {
+            "qwen2" => quantized_qwen2::ModelWeights::from_gguf(content, &mut file, &device)
+                .map(Weights::Qwen2),
+            // `llama`. The allowlist above is what makes that the only other
+            // value able to reach here.
+            _ => quantized_llama::ModelWeights::from_gguf(content, &mut file, &device)
+                .map(Weights::Llama),
+        }
+        .map_err(|e| LanguageError::malformed(&weights_path, e))?;
 
         let tokenizer_path = dir.join(TOKENIZER_FILE);
         let tokenizer_bytes =
@@ -116,10 +166,11 @@ impl LanguageModel {
             .map_err(|e| LanguageError::malformed(&tokenizer_path, e))?;
 
         Ok(Self {
-            pristine,
+            weights,
             tokenizer,
             device,
             architecture,
+            window,
             eos,
         })
     }
@@ -134,19 +185,29 @@ impl LanguageModel {
         &self.architecture
     }
 
-    /// A copy of the weights with no attention cache in it.
-    ///
-    /// candle 0.9's `quantized_llama` keeps a key-value cache inside every
-    /// layer and offers no way to clear it, so a second generation through the
-    /// same weights would attend to the first one's tokens — one dictation
-    /// bleeding into the next, with no symptom but a worse answer.
-    ///
-    /// Cloning is the way out and is nearly free: every tensor in there is
-    /// behind an `Arc`, so this copies pointers rather than weights. It is why
-    /// [`SUPPORTED`] holds `llama` and not the architectures whose weights do
-    /// not derive `Clone`.
-    pub(crate) fn fresh(&self) -> ModelWeights {
-        self.pristine.clone()
+    /// How many positions this model can be prompted and answered within.
+    pub fn window(&self) -> usize {
+        self.window
+    }
+}
+
+/// How far the loader will build a rotary table for this file.
+///
+/// Not the same question as "what context length does the file claim", and the
+/// difference is why this is a function rather than a metadata read.
+/// `quantized_llama` ignores the file's context length and precomputes a fixed
+/// 4 096 positions; `quantized_qwen2` reads `qwen2.context_length` and builds
+/// exactly that many. Either way a position past the table is an out-of-bounds
+/// index rather than a degradation, so the table is what a generation has to be
+/// bounded by.
+fn window_of(architecture: &str, content: &gguf_file::Content) -> usize {
+    match architecture {
+        "qwen2" => content
+            .metadata
+            .get("qwen2.context_length")
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(0) as usize,
+        _ => quantized_llama::MAX_SEQ_LEN,
     }
 }
 
@@ -155,6 +216,7 @@ impl std::fmt::Debug for LanguageModel {
         // The weights are gigabytes and nobody wants them in a log line.
         f.debug_struct("LanguageModel")
             .field("architecture", &self.architecture)
+            .field("window", &self.window)
             .field("vocab_size", &self.tokenizer.get_vocab_size(true))
             .field("backend", &self.backend().label())
             .finish()

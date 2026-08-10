@@ -33,6 +33,10 @@ const FEED_FORWARD: usize = 64;
 const HEADS: usize = 2;
 /// One transformer block. The wiring is what is under test, not the depth.
 const BLOCKS: usize = 1;
+/// How many positions the model can hold, where the architecture reads that
+/// from its own metadata. Small on purpose: it is also the number a
+/// too-long-prompt refusal has to be provoked past.
+pub const WINDOW: usize = 128;
 
 /// The first id used by a special token; everything below is a word.
 const FIRST_SPECIAL: u32 = 60;
@@ -117,9 +121,19 @@ fn scratch(label: &str) -> PathBuf {
     path
 }
 
-/// Build a complete, loadable model directory.
+/// Build a complete, loadable `llama` model directory.
 pub fn tiny_model(label: &str) -> ModelDir {
     build(label, "llama", true)
+}
+
+/// Build a complete, loadable model directory of a named supported
+/// architecture.
+///
+/// The two are not interchangeable files: `qwen2` carries attention biases that
+/// `llama` does not, and reads its window out of its own metadata. Building
+/// both here is what stops the second architecture being supported on paper.
+pub fn tiny_model_named(label: &str, architecture: &str) -> ModelDir {
+    build(label, architecture, true)
 }
 
 /// Build a model directory whose GGUF claims an architecture nothing runs.
@@ -149,42 +163,57 @@ fn write_gguf(path: &Path, architecture: &str, complete: bool) {
     let device = Device::Cpu;
     let head_dim = EMBEDDING / HEADS;
 
-    // The keys are namespaced by architecture in a real file, and candle looks
-    // them up under whatever `general.architecture` says only for the tensor
-    // names — the metadata prefix is `llama.` regardless, because that is the
-    // loader being pointed at. A file claiming another architecture is refused
-    // before any of this is read, which is what the unsupported test asserts.
-    let metadata: Vec<(&str, gguf_file::Value)> = vec![
+    // GGUF namespaces these by architecture, and each loader looks them up
+    // under its own prefix. A file claiming something nothing implements is
+    // refused before any of this is read, so an unsupported fixture gets the
+    // `llama` keys and never has them looked at.
+    let prefix = match architecture {
+        "qwen2" => "qwen2",
+        _ => "llama",
+    };
+    let mut metadata: Vec<(String, gguf_file::Value)> = vec![
         (
-            "general.architecture",
+            "general.architecture".to_string(),
             gguf_file::Value::String(architecture.to_string()),
         ),
         (
-            "llama.attention.head_count",
+            format!("{prefix}.attention.head_count"),
             gguf_file::Value::U32(HEADS as u32),
         ),
         (
-            "llama.attention.head_count_kv",
+            format!("{prefix}.attention.head_count_kv"),
             gguf_file::Value::U32(HEADS as u32),
         ),
-        ("llama.block_count", gguf_file::Value::U32(BLOCKS as u32)),
         (
-            "llama.embedding_length",
+            format!("{prefix}.block_count"),
+            gguf_file::Value::U32(BLOCKS as u32),
+        ),
+        (
+            format!("{prefix}.embedding_length"),
             gguf_file::Value::U32(EMBEDDING as u32),
         ),
         (
-            "llama.rope.dimension_count",
-            gguf_file::Value::U32(head_dim as u32),
-        ),
-        (
-            "llama.attention.layer_norm_rms_epsilon",
+            format!("{prefix}.attention.layer_norm_rms_epsilon"),
             gguf_file::Value::F32(1e-5),
         ),
         (
-            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(special_id("<|im_end|>")),
         ),
     ];
+    if prefix == "qwen2" {
+        // qwen2 builds its rotary table to exactly this many positions, so it
+        // is the model's real window rather than a claim about it.
+        metadata.push((
+            "qwen2.context_length".to_string(),
+            gguf_file::Value::U32(WINDOW as u32),
+        ));
+    } else {
+        metadata.push((
+            "llama.rope.dimension_count".to_string(),
+            gguf_file::Value::U32(head_dim as u32),
+        ));
+    }
 
     let mut tensors: Vec<(String, QTensor)> = vec![
         (
@@ -239,6 +268,16 @@ fn write_gguf(path: &Path, architecture: &str, complete: bool) {
                 ),
             ));
         }
+        // qwen2's one structural difference from llama: the attention
+        // projections carry biases, and `from_gguf` demands all three.
+        if architecture == "qwen2" {
+            for name in ["attn_q", "attn_k", "attn_v"] {
+                tensors.push((
+                    format!("{prefix}.{name}.bias"),
+                    norm(&device, &format!("{prefix}.{name}.bias"), EMBEDDING),
+                ));
+            }
+        }
         tensors.push((
             format!("{prefix}.attn_norm.weight"),
             norm(&device, &format!("{prefix}.attn_norm"), EMBEDDING),
@@ -249,7 +288,8 @@ fn write_gguf(path: &Path, architecture: &str, complete: bool) {
         ));
     }
 
-    let metadata: Vec<(&str, &gguf_file::Value)> = metadata.iter().map(|(k, v)| (*k, v)).collect();
+    let metadata: Vec<(&str, &gguf_file::Value)> =
+        metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let tensors: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     let mut file = std::fs::File::create(path).expect("creating the toy GGUF");

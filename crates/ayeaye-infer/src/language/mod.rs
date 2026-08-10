@@ -10,7 +10,10 @@
 //! process buys: reach, not tidiness.
 
 pub mod error;
+pub mod generate;
 pub mod model;
+pub mod residency;
 
 pub use error::LanguageError;
 pub use model::{LanguageModel, SUPPORTED};
+pub use residency::LanguageSlot;
