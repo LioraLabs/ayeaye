@@ -13,5 +13,21 @@
 
 pub mod architecture;
 pub mod config;
+pub mod hub;
+pub mod id;
 
 pub use architecture::{Architecture, Unsupported};
+pub use id::{BadModelId, ModelId};
+
+/// The model's own description of its shape and vocabulary.
+///
+/// These three names are what acquisition writes and what
+/// `ayeaye_infer::speech::model` reads back. They are spelled in both places
+/// because the core may not depend on the crate above it — so
+/// `crates/ayeaye/tests/models.rs` asserts the two agree, since a disagreement
+/// would be a pull that lands files no load can find, with nothing saying so.
+pub const CONFIG_FILE: &str = "config.json";
+/// The vocabulary, in HuggingFace `tokenizers` form.
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+/// The weights.
+pub const WEIGHTS_FILE: &str = "model.safetensors";
