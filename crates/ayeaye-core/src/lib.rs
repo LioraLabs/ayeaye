@@ -15,6 +15,7 @@ pub mod identity;
 pub mod machine;
 pub mod peer;
 pub mod service;
+pub mod tmux;
 
 pub use identity::Identity;
 pub use machine::Machine;

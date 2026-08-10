@@ -1,0 +1,5 @@
+%3	_scratch	0	float	sh	1	0
+%0	work	0	editor	sh	1	0
+%1	work	0	editor	sh	0	0
+%2	work	1	cook	sh	1	0
+%4	work	2	gone	true	1	1
