@@ -1,16 +1,22 @@
-//! Which device this build can run inference on.
+//! Which device this build can run inference on, and which it actually got.
+//!
+//! Two questions, deliberately kept apart. What acceleration is *compiled in*
+//! is fixed when the binary is built ([`selected`]); whether the machine
+//! actually has it is not knowable until the process starts ([`select`]). They
+//! have different answers on a card that will not open, and reporting the
+//! first as though it were the second is the silent degradation AYEAYE-57
+//! exists to refuse.
 
-/// The compute device inference runs on.
-///
-/// Which one is available is fixed when the binary is compiled, so this is a
-/// report of the build rather than a choice made at startup.
+/// A compute device inference can run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// Pure Rust, everywhere, no toolchain beyond cargo.
     Cpu,
-    /// NVIDIA, compiled in behind the `cuda` feature.
+    /// NVIDIA, compiled in behind the `cuda` feature, which costs a CUDA
+    /// toolkit and a host C++ compiler at build time.
     Cuda,
-    /// Apple, compiled in behind the `metal` feature.
+    /// Apple. On by default in an Apple build rather than behind the `metal`
+    /// feature, because it needs no toolchain — see this crate's manifest.
     Metal,
 }
 
@@ -73,6 +79,15 @@ pub const fn selected() -> Backend {
 
 /// Which device inference is actually running on, and why it is that one.
 ///
+/// **Only [`choose`] builds one.** The fields are crate-private and the public
+/// surface is four readers, because the invariant this type carries — that
+/// `fallback` is `None` exactly when `got()` is `asked` — is established by
+/// `choose` and cannot be re-established by a struct literal. With the fields
+/// public and [`crate::SpeechModel::load_with`] public with them, an outside
+/// caller could hand a model a `Selection` claiming the processor with nothing
+/// to explain, which is the silent degradation this whole module exists to
+/// refuse, reached through the front door.
+///
 /// A build is compiled for one backend and runs on whatever the machine turned
 /// out to have, and those are two different facts. Keeping both is the point:
 /// "this build has cuda in it" and "this process is using a card" have
@@ -81,23 +96,35 @@ pub const fn selected() -> Backend {
 /// exists to refuse.
 #[derive(Debug, Clone)]
 pub struct Selection {
+    pub(crate) asked: Backend,
+    pub(crate) device: candle_core::Device,
+    pub(crate) fallback: Option<String>,
+}
+
+impl Selection {
     /// The backend this build was compiled for.
-    pub asked: Backend,
+    pub fn asked(&self) -> Backend {
+        self.asked
+    }
+
+    /// The backend actually in use. Read off the device rather than stored,
+    /// so there is no second copy of the answer to fall out of step with it.
+    pub fn got(&self) -> Backend {
+        Backend::of(&self.device)
+    }
+
     /// The device to build tensors on.
-    pub device: candle_core::Device,
+    pub fn device(&self) -> &candle_core::Device {
+        &self.device
+    }
+
     /// Why the device is not the one asked for, in words a user can act on.
     ///
     /// `None` exactly when [`Selection::got`] is [`Selection::asked`], and that
     /// is arranged in [`choose`] rather than trusted: it is computed from the
     /// device, so the two cannot say different things.
-    pub fallback: Option<String>,
-}
-
-impl Selection {
-    /// The backend actually in use. Read off the device rather than stored,
-    /// so there is no second copy of the answer to fall out of step with it.
-    pub fn got(&self) -> Backend {
-        Backend::of(&self.device)
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
     }
 }
 
@@ -166,8 +193,12 @@ pub fn open(backend: Backend) -> candle_core::Result<candle_core::Device> {
 
 /// What this process should run inference on.
 ///
-/// The whole of the runtime device decision, in one call, so that two models
-/// cannot make it two different ways.
+/// The one *place* the runtime decision is made, so two models cannot make it
+/// two different ways. Not the one *time* it is made: this asks the machine
+/// every call, and it is [`crate::SpeechSlot`] and [`crate::LanguageSlot`] that
+/// hold the answer across a model's lifetime so an idle unload and reload does
+/// not re-probe. A daemon that wants one answer for the whole process calls
+/// this once and hands it to `SpeechSlot::on` and `LanguageSlot::on`.
 ///
 /// **What this cannot cover, and it matters for the NVIDIA artifact.** A build
 /// with `cuda` in it is dynamically linked against `libcudart` — that link is
@@ -196,10 +227,12 @@ mod tests {
     fn a_device_that_will_not_open_falls_back_to_the_processor_with_a_reason() {
         let selection = choose(Backend::Cuda, refuses("no CUDA-capable device is detected"));
 
-        assert_eq!(selection.asked, Backend::Cuda);
+        assert_eq!(selection.asked(), Backend::Cuda);
         assert_eq!(selection.got(), Backend::Cpu);
-        assert!(matches!(selection.device, Device::Cpu));
-        let why = selection.fallback.expect("a stated reason, not a silence");
+        assert!(matches!(selection.device(), Device::Cpu));
+        let why = selection
+            .fallback()
+            .expect("a stated reason, not a silence");
         assert!(why.contains("cuda"), "{why}");
         assert!(
             why.contains("no CUDA-capable device is detected"),
@@ -214,8 +247,8 @@ mod tests {
     // AYEAYE-57 amends it: Metal arrives two ways, and being an Apple build is
     // the one that matters, because nobody passes a feature. This arm is red on
     // macOS until `selected()` learns it, and unreachable anywhere else — which
-    // is why `an_apple_build_gets_metal_without_anyone_passing_a_feature` above
-    // is the half that runs here.
+    // is why `an_apple_build_gets_metal_without_anyone_passing_a_feature`
+    // below is the half that runs here.
     #[test]
     fn selected_reports_the_acceleration_this_build_was_compiled_with() {
         #[cfg(feature = "cuda")]
@@ -236,9 +269,13 @@ mod tests {
     fn a_device_that_opens_as_asked_leaves_nothing_to_explain() {
         let selection = choose(Backend::Cpu, |_| Ok(Device::Cpu));
 
-        assert_eq!(selection.asked, Backend::Cpu);
+        assert_eq!(selection.asked(), Backend::Cpu);
         assert_eq!(selection.got(), Backend::Cpu);
-        assert_eq!(selection.fallback, None, "nothing happened worth reporting");
+        assert_eq!(
+            selection.fallback(),
+            None,
+            "nothing happened worth reporting"
+        );
     }
 
     // AYEAYE-57 — the reason is derived from the device, not from whether the
@@ -254,7 +291,9 @@ mod tests {
         let selection = choose(Backend::Metal, |_| Ok(Device::Cpu));
 
         assert_eq!(selection.got(), Backend::Cpu);
-        let why = selection.fallback.expect("a device that is not the one asked for");
+        let why = selection
+            .fallback()
+            .expect("a device that is not the one asked for");
         assert!(why.contains("metal"), "{why}");
         assert!(
             why.contains("the device that opened is a cpu"),
@@ -270,8 +309,8 @@ mod tests {
         let selection = choose(Backend::Cpu, refuses("something impossible"));
 
         assert_eq!(selection.got(), Backend::Cpu);
-        assert!(matches!(selection.device, Device::Cpu));
-        assert_eq!(selection.fallback, None);
+        assert!(matches!(selection.device(), Device::Cpu));
+        assert_eq!(selection.fallback(), None);
     }
 
     // AYEAYE-57 — "the Apple feature is on by default in Apple builds", as

@@ -84,12 +84,11 @@ impl SpeechModel {
 
     /// Load the model in `dir` onto a device already chosen.
     ///
-    /// [`Self::load`] is this with [`backend::select`] called for you, which is
-    /// what a caller loading one model wants. This exists because the device
-    /// decision is a property of the process and not of the model: a caller
-    /// holding both a speech and a language model should make it once rather
-    /// than probe the machine again per load, and a test needs to be able to
-    /// name a selection that this machine cannot produce.
+    /// [`Self::load`] is this with [`backend::select`] called for you. This
+    /// exists because the device decision is a property of the process and not
+    /// of the model: it is what [`crate::SpeechSlot`] hands in so that a model unloaded
+    /// by the idle policy and loaded again lands on the same device, and it is
+    /// how a test names a selection this machine cannot produce.
     pub fn load_with(dir: &Path, selection: Selection) -> Result<Self, SpeechError> {
         let device = selection.device.clone();
 

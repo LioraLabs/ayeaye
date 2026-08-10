@@ -53,7 +53,7 @@ fn the_bare_binary_prints_the_banner_and_succeeds() {
 fn the_banner_reports_the_acceleration_this_run_actually_got() {
     let selection = ayeaye_infer::backend::select();
 
-    let (code, out, _) = ayeaye(&["--version"]);
+    let (code, out, err) = ayeaye(&["--version"]);
 
     assert_eq!(code, 0);
     assert!(
@@ -61,16 +61,18 @@ fn the_banner_reports_the_acceleration_this_run_actually_got() {
         "the banner should name the backend in use ({}): {out:?}",
         selection.got().label()
     );
-    match &selection.fallback {
-        None => assert_eq!(
-            out.lines().count(),
-            1,
-            "nothing was given up, so there is nothing to explain: {out:?}"
-        ),
-        Some(why) => assert!(
-            out.contains(why.as_str()),
-            "the reason has to reach the person reading it: {out:?}"
-        ),
+    // Whatever happened, stdout stays one line: it is what a `--version`-style
+    // probe parses, and a fallback must not change its shape.
+    assert_eq!(
+        out.lines().count(),
+        1,
+        "stdout is one line whether or not anything was given up: {out:?}"
+    );
+    if let Some(why) = selection.fallback() {
+        assert!(
+            err.contains(why),
+            "the reason has to reach the person reading it, on stderr: {err:?}"
+        );
     }
 }
 

@@ -79,13 +79,16 @@ fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
 /// Say what this build is, and — when it is not what it was compiled to be —
 /// why.
 ///
-/// Kept out of [`banner`] because the banner is one line and is also used as
-/// the first half of the startup line; the reason is a sentence of its own.
+/// The banner goes to stdout and stays **one line**, because that is what a
+/// `--version`-style probe reads and a second line would be a parsing change
+/// that only appears on the artifacts hardest to test. The reason goes to
+/// stderr, which is where the serve path puts it too: stdout answers the
+/// question that was asked, stderr explains a degradation nobody asked about.
 fn report() -> ExitCode {
     let selection = ayeaye_infer::backend::select();
     println!("{}", banner(&selection));
-    if let Some(why) = &selection.fallback {
-        println!("ayeaye: {why}");
+    if let Some(why) = selection.fallback() {
+        eprintln!("ayeaye: {why}");
     }
     ExitCode::SUCCESS
 }
@@ -135,7 +138,7 @@ fn serve(args: &[String]) -> ExitCode {
         // startup line would bury the one sentence somebody needs when their
         // card is not being used.
         let selection = ayeaye_infer::backend::select();
-        if let Some(why) = &selection.fallback {
+        if let Some(why) = selection.fallback() {
             eprintln!("ayeaye: {why}");
         }
         eprintln!(

@@ -2,7 +2,7 @@
 
 mod support;
 
-use ayeaye_infer::speech::{SpeechError, SpeechModel};
+use ayeaye_infer::speech::{SpeechError, SpeechModel, SpeechSlot};
 use support::{tiny_config, tiny_model};
 
 // AYEAYE-54
@@ -179,10 +179,43 @@ fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
         ayeaye_infer::Backend::Cpu,
         "it is on the processor, whatever the build asked for"
     );
-    let why = model.fallback().expect("the reason should survive the load");
-    assert_eq!(Some(why), selection.fallback.as_deref());
+    let why = model
+        .fallback()
+        .expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback());
     assert!(why.contains("cuda"), "{why}");
     assert!(why.contains("no CUDA-capable device is detected"), "{why}");
+}
+
+// AYEAYE-57
+//
+// A slot outlives the models in it: AYEAYE-56's idle policy unloads and reloads,
+// and a `load` that re-probed the machine each time would let the device change
+// under a report already printed at startup. `on` binds the decision to the
+// slot, and the assertion is that it survives an unload-and-reload — the model
+// resident after the second load still reports the fallback the first one had.
+#[test]
+fn a_slot_keeps_its_device_decision_across_an_unload_and_reload() {
+    let dir = tiny_model("slot-keeps-its-device", &tiny_config(vec![]));
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cuda, |_| {
+        Err(candle_core::Error::Msg(
+            "no CUDA-capable device is detected".to_string(),
+        ))
+    });
+    let mut slot = SpeechSlot::on(selection);
+
+    slot.load(dir.path()).expect("the first load");
+    let first = slot.fallback().map(str::to_string);
+    assert!(slot.unload(), "there was a model to release");
+    slot.load(dir.path()).expect("the reload");
+
+    assert_eq!(
+        slot.fallback().map(str::to_string),
+        first,
+        "the reload must land on the decision the slot already made"
+    );
+    let why = slot.fallback().expect("the reason outlives the model");
+    assert!(why.contains("cuda"), "{why}");
 }
 
 // AYEAYE-54

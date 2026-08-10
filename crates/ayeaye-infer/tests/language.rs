@@ -257,7 +257,9 @@ fn a_complete_quantized_model_loads_from_the_directory_it_was_pointed_at() {
 fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
     let dir = tiny_model("carries-the-reason");
     let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Metal, |_| {
-        Err(candle_core::Error::Msg("no Metal device is present".to_string()))
+        Err(candle_core::Error::Msg(
+            "no Metal device is present".to_string(),
+        ))
     });
 
     let model = LanguageModel::load_with(dir.path(), selection.clone())
@@ -265,8 +267,10 @@ fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
 
     assert_eq!(model.backend(), selection.got());
     assert_eq!(model.backend(), ayeaye_infer::Backend::Cpu);
-    let why = model.fallback().expect("the reason should survive the load");
-    assert_eq!(Some(why), selection.fallback.as_deref());
+    let why = model
+        .fallback()
+        .expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback());
     assert!(why.contains("metal"), "{why}");
     assert!(why.contains("no Metal device is present"), "{why}");
 }

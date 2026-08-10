@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use candle_core::quantized::gguf_file;
 use candle_core::Tensor;
+use candle_core::quantized::gguf_file;
 use candle_transformers::models::{quantized_llama, quantized_qwen2};
 use tokenizers::Tokenizer;
 
@@ -119,8 +119,12 @@ impl LanguageModel {
 
     /// Load the model in `dir` onto a device already chosen.
     ///
-    /// See [`super::super::speech::SpeechModel::load_with`] for why the device
-    /// decision is the process's rather than the model's.
+    /// [`Self::load`] is this with [`backend::select`] called for you. This
+    /// exists because the device decision is a property of the process and not
+    /// of the model: it is what [`crate::LanguageSlot`] hands in so that a
+    /// model unloaded by the idle policy and loaded again lands on the same
+    /// device, and it is how a test names a selection this machine cannot
+    /// produce.
     pub fn load_with(dir: &Path, selection: Selection) -> Result<Self, LanguageError> {
         let device = selection.device.clone();
 
