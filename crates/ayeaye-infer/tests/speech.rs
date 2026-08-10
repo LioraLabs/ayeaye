@@ -2,7 +2,7 @@
 
 mod support;
 
-use ayeaye_infer::speech::{SpeechError, SpeechModel};
+use ayeaye_infer::speech::{SpeechError, SpeechModel, SpeechSlot};
 use support::{tiny_config, tiny_model};
 
 // AYEAYE-54
@@ -118,6 +118,104 @@ fn a_clip_shorter_than_the_window_transcribes_in_one_segment() {
         !transcript.segments[0].text.is_empty(),
         "the model should have decoded something"
     );
+}
+
+// AYEAYE-57
+//
+// A model's `backend()` is a claim about the device it is holding, not about
+// the build it came out of, and those disagree exactly when a fallback
+// happened. The invariant is written as an equality between the two halves so
+// that it means something on every row of the release matrix: on this machine
+// it says "nothing was compiled in and nothing was reported"; on the NVIDIA
+// artifact, a `backend()` that returned the build's constant would keep
+// claiming `cuda` while `fallback()` explained why it was not — and this is
+// what fails.
+#[test]
+fn a_loaded_model_reports_the_device_it_got_and_says_when_that_is_not_the_build() {
+    let dir = tiny_model("reports-its-device", &tiny_config(vec![]));
+    let model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    assert_eq!(
+        model.backend() == ayeaye_infer::backend::selected(),
+        model.fallback().is_none(),
+        "a model that fell back must say so, and one that did not must not: \
+         backend {:?}, compiled in {:?}, fallback {:?}",
+        model.backend(),
+        ayeaye_infer::backend::selected(),
+        model.fallback(),
+    );
+}
+
+// AYEAYE-57
+//
+// The test above is `true == true` on a machine with no card, which is every
+// machine anyone develops on — so this is the one that actually holds the
+// wiring down. `load_with` lets the selection be named rather than probed, so
+// the state a GPU artifact reaches after a dead card can be reached here: a
+// build that asked for cuda, a processor to run on, and a sentence saying so.
+//
+// What it pins is that the reason survives the load and comes back out. A
+// `fallback()` returning `None`, or a `backend()` that answered `asked` rather
+// than the device, each fail this on any machine.
+#[test]
+fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
+    let dir = tiny_model("carries-the-reason", &tiny_config(vec![]));
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cuda, |_| {
+        Err(candle_core::Error::Msg(
+            "no CUDA-capable device is detected".to_string(),
+        ))
+    });
+
+    let model = SpeechModel::load_with(dir.path(), selection.clone())
+        .expect("a model should load on the device it fell back to");
+
+    assert_eq!(
+        model.backend(),
+        selection.got(),
+        "the model reports the selection it was loaded with, not the build"
+    );
+    assert_eq!(
+        model.backend(),
+        ayeaye_infer::Backend::Cpu,
+        "it is on the processor, whatever the build asked for"
+    );
+    let why = model
+        .fallback()
+        .expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback());
+    assert!(why.contains("cuda"), "{why}");
+    assert!(why.contains("no CUDA-capable device is detected"), "{why}");
+}
+
+// AYEAYE-57
+//
+// A slot outlives the models in it: AYEAYE-56's idle policy unloads and reloads,
+// and a `load` that re-probed the machine each time would let the device change
+// under a report already printed at startup. `on` binds the decision to the
+// slot, and the assertion is that it survives an unload-and-reload — the model
+// resident after the second load still reports the fallback the first one had.
+#[test]
+fn a_slot_keeps_its_device_decision_across_an_unload_and_reload() {
+    let dir = tiny_model("slot-keeps-its-device", &tiny_config(vec![]));
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cuda, |_| {
+        Err(candle_core::Error::Msg(
+            "no CUDA-capable device is detected".to_string(),
+        ))
+    });
+    let mut slot = SpeechSlot::on(selection);
+
+    slot.load(dir.path()).expect("the first load");
+    let first = slot.fallback().map(str::to_string);
+    assert!(slot.unload(), "there was a model to release");
+    slot.load(dir.path()).expect("the reload");
+
+    assert_eq!(
+        slot.fallback().map(str::to_string),
+        first,
+        "the reload must land on the decision the slot already made"
+    );
+    let why = slot.fallback().expect("the reason outlives the model");
+    assert!(why.contains("cuda"), "{why}");
 }
 
 // AYEAYE-54

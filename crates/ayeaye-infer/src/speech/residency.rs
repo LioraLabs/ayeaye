@@ -4,6 +4,8 @@ use std::path::Path;
 
 use ayeaye_core::Pcm16kMono;
 
+use crate::backend::{self, Selection};
+
 use super::error::SpeechError;
 use super::model::SpeechModel;
 use super::transcript::Transcript;
@@ -23,12 +25,54 @@ use super::transcript::Transcript;
 #[derive(Debug, Default)]
 pub struct SpeechSlot {
     model: Option<SpeechModel>,
+    /// The device decision every model this slot loads is put on.
+    ///
+    /// Held on the slot rather than made inside `load`, because a slot outlives
+    /// the models in it: AYEAYE-56's idle policy unloads and reloads, and
+    /// re-asking the machine each time means a card that goes away between two
+    /// loads changes the answer under a report that has already been printed.
+    /// One probe per slot, whatever the residency policy does.
+    selection: Option<Selection>,
 }
 
 impl SpeechSlot {
-    /// A slot with nothing in it.
+    /// A slot with nothing in it, which will choose a device when first asked
+    /// to load one.
     pub fn empty() -> Self {
-        Self { model: None }
+        Self {
+            model: None,
+            selection: None,
+        }
+    }
+
+    /// A slot bound to a device decision already made.
+    ///
+    /// The decision belongs to the process, not to the model: a daemon holding
+    /// a speech slot and a language slot should probe the machine once and hand
+    /// the answer to both, so that the acceleration it reported at startup is
+    /// the acceleration its models are actually on. [`Self::empty`] makes the
+    /// decision on first load instead, which is right for a caller that has
+    /// only one slot and no report to keep honest.
+    pub fn on(selection: Selection) -> Self {
+        Self {
+            model: None,
+            selection: Some(selection),
+        }
+    }
+
+    /// Why the resident model is not on the backend the build was compiled for.
+    ///
+    /// Read off the **model** when one is resident, and off the slot's own
+    /// decision only when none is. That is deliberate: answering from the
+    /// slot's decision either way would report what this slot intended rather
+    /// than what the model in it actually got, and those are the same thing
+    /// only for as long as `load` really uses the decision — which is the
+    /// property worth being able to test.
+    pub fn fallback(&self) -> Option<&str> {
+        match &self.model {
+            Some(model) => model.fallback(),
+            None => self.selection.as_ref()?.fallback(),
+        }
     }
 
     /// Load a model from `dir`, replacing whatever was resident.
@@ -37,7 +81,8 @@ impl SpeechSlot {
         // models at once is how a reconfiguration doubles the memory of the
         // thing it was reconfiguring.
         self.unload();
-        self.model = Some(SpeechModel::load(dir)?);
+        let selection = self.selection.get_or_insert_with(backend::select).clone();
+        self.model = Some(SpeechModel::load_with(dir, selection)?);
         Ok(())
     }
 

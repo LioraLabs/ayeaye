@@ -5,7 +5,7 @@
 //! Both halves are needed: a rule with no mutation test may be blind, and a
 //! rule that is never run against the tree is decoration.
 
-use constitution::corpus::{Corpus, workspace_root};
+use constitution::corpus::{self, Corpus, workspace_root};
 use constitution::{deps, effect_budget, finding::report, strata, toolchain};
 
 /// The floor the whole corpus walk has to clear.
@@ -171,5 +171,137 @@ fn nothing_in_the_dependency_graph_needs_a_c_compiler() {
         findings.is_empty(),
         "the build is no longer pure Rust:\n{}",
         report(&findings)
+    );
+}
+
+// AYEAYE-57
+//
+// Rule 4's second half, against the real manifests. The first half proves the
+// graph compiles no C; this proves the cost that `cc` cannot see — nvcc, driven
+// by candle-kernels' build script — stays out of the build nobody asks for.
+#[test]
+fn no_default_build_turns_on_a_feature_that_needs_a_toolchain() {
+    let corpus = corpus();
+
+    // A rule that finds nothing in manifests it is not really reading would
+    // pass this vacuously, and unlike the lockfile there is nothing to plant:
+    // the real tree has no violation. So the proof runs the other way round —
+    // hand it a table naming `metal`, which `ayeaye-infer` really does turn on
+    // for Apple builds through a target table, and it has to say so.
+    let probe = &[toolchain::Gated {
+        feature: "metal",
+        also: &[],
+        cost: "nothing at all, which is why it is not really gated",
+        artifact: "no artifact",
+    }];
+    let infer = corpus
+        .member("ayeaye-infer")
+        .expect("ayeaye-infer should be a workspace member");
+    assert!(
+        !toolchain::gated(&infer.dir, &infer.manifest, probe).is_empty(),
+        "the rule found nothing in a manifest that turns metal on for macOS; \
+         it is not reading the manifests"
+    );
+    // The root manifest is its own guard: an empty string parses as an empty
+    // table and reports clean, so a `root_manifest` that regressed to `""`
+    // would look exactly like a workspace with nothing to say.
+    assert!(
+        corpus.root_manifest.contains("[workspace]"),
+        "the root manifest was not read, so judging it proves nothing"
+    );
+
+    // The root manifest as well as every member's. It is not a member, it has
+    // no sources, and it is where this workspace keeps candle — so "every
+    // member" would skip exactly the file a future acceleration edit lands in.
+    let findings: Vec<_> = corpus
+        .members
+        .iter()
+        .map(|member| (member.dir.as_str(), member.manifest.as_str()))
+        .chain([("Cargo.toml", corpus.root_manifest.as_str())])
+        .flat_map(|(subject, manifest)| toolchain::gated(subject, manifest, toolchain::GATED))
+        .collect();
+
+    assert!(
+        findings.is_empty(),
+        "a default build would need a toolchain:\n{}",
+        report(&findings)
+    );
+}
+
+// AYEAYE-57
+//
+// The exact half of rule 4's feature question, and the one that holds. Three
+// separate bypasses of the manifest half were found by planting them — a
+// feature spelled `flash-attn`, a feature of ours forwarding one across a crate
+// boundary, and a crate cargo treats as a member that our own walk never listed
+// — and all three are the same shape: a rule that restates cargo's feature
+// resolution will keep being incomplete. This one reads cargo's answer.
+#[test]
+fn the_default_build_resolves_to_no_acceleration_package() {
+    let root = workspace_root();
+    let packages =
+        corpus::default_build_packages(&root).expect("cargo tree should describe the workspace");
+
+    // A resolution that returned nothing would pass every table it is handed.
+    assert!(
+        packages.len() > 50,
+        "cargo tree named {} packages, which is not a real workspace",
+        packages.len()
+    );
+    // ...and a rule that cannot find a package the default build certainly has
+    // is not reading the list it was given.
+    assert!(
+        !toolchain::in_default_build(&packages, &[("candle-core", "the graph really has this")])
+            .is_empty(),
+        "the rule found nothing in a resolution containing candle-core"
+    );
+
+    let findings = toolchain::in_default_build(&packages, toolchain::ACCELERATED);
+
+    assert!(
+        findings.is_empty(),
+        "the portable build needs a CUDA toolchain:\n{}",
+        report(&findings)
+    );
+}
+
+// AYEAYE-57 — the twin of `every_workspace_member_lives_under_crates`, and the
+// half that was missing.
+//
+// **Cargo treats a path dependency inside the workspace directory as a member
+// whether or not `[workspace] members` lists it.** The corpus walks the list,
+// so a crate under `crates/` that nobody added to it was built, resolved
+// features, and had rules 1, 2 and 3 applied to it not at all — the effect
+// budget never scanned it, the strata never placed it, the allowlist never read
+// it. Rule 4's package check catches what such a crate *pulls in*; nothing
+// caught the crate itself.
+#[test]
+fn every_crate_under_crates_is_a_listed_workspace_member() {
+    let root = workspace_root();
+    let listed: Vec<String> = corpus().members.iter().map(|m| m.dir.clone()).collect();
+
+    let entries = std::fs::read_dir(root.join("crates")).expect("crates/ should be readable");
+    let mut unlisted = Vec::new();
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if !path.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a directory name")
+            .to_string_lossy()
+            .into_owned();
+        let dir = format!("crates/{name}");
+        if !listed.contains(&dir) {
+            unlisted.push(dir);
+        }
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "these crates are under crates/ but not in [workspace] members, so cargo builds \
+         them and the constitution never reads them: {unlisted:?}. Add them to the member \
+         list, or move them out of the workspace directory"
     );
 }

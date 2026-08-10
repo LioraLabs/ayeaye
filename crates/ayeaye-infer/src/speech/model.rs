@@ -2,13 +2,13 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device};
+use candle_core::DType;
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self, Config, model::Whisper};
 use tokenizers::Tokenizer;
 
 use super::error::SpeechError;
-use crate::backend::{self, Backend};
+use crate::backend::{self, Backend, Selection};
 
 /// The model's own description of its shape and vocabulary.
 pub const CONFIG_FILE: &str = "config.json";
@@ -44,7 +44,12 @@ pub struct SpeechModel {
     pub(crate) whisper: Whisper,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) config: Config,
-    pub(crate) device: Device,
+    /// The device, and how it came to be that one.
+    ///
+    /// The whole answer is kept rather than the device alone, so that
+    /// [`Self::backend`] and [`Self::fallback`] are two readings of one fact
+    /// instead of two fields that can drift.
+    pub(crate) selection: Selection,
     pub(crate) filters: Vec<f32>,
     pub(crate) tokens: SpecialTokens,
 }
@@ -74,7 +79,18 @@ impl SpeechModel {
     /// The directory is the caller's to choose and ayeaye's to read: acquiring
     /// what goes in it is AYEAYE-56's, and shipping weights is nobody's.
     pub fn load(dir: &Path) -> Result<Self, SpeechError> {
-        let device = device_for(backend::selected())?;
+        Self::load_with(dir, backend::select())
+    }
+
+    /// Load the model in `dir` onto a device already chosen.
+    ///
+    /// [`Self::load`] is this with [`backend::select`] called for you. This
+    /// exists because the device decision is a property of the process and not
+    /// of the model: it is what [`crate::SpeechSlot`] hands in so that a model unloaded
+    /// by the idle policy and loaded again lands on the same device, and it is
+    /// how a test names a selection this machine cannot produce.
+    pub fn load_with(dir: &Path, selection: Selection) -> Result<Self, SpeechError> {
+        let device = selection.device.clone();
 
         let config_path = dir.join(CONFIG_FILE);
         let config_text = std::fs::read_to_string(&config_path)
@@ -117,15 +133,27 @@ impl SpeechModel {
             whisper,
             tokenizer,
             config,
-            device,
+            selection,
             filters,
             tokens,
         })
     }
 
-    /// Where this model is running.
+    /// Where this model is really running.
+    ///
+    /// Read off the device it is holding, not off the build: on an artifact
+    /// with acceleration compiled in these differ exactly when [`Self::fallback`]
+    /// has something to say.
     pub fn backend(&self) -> Backend {
-        backend::selected()
+        self.selection.got()
+    }
+
+    /// Why this model is not on the backend the build was compiled for.
+    ///
+    /// `None` when it is — which is every CPU build, where there was nothing
+    /// to give up.
+    pub fn fallback(&self) -> Option<&str> {
+        self.selection.fallback.as_deref()
     }
 
     /// How many mel bins this model's config asks for.
@@ -247,15 +275,6 @@ fn check_shape(
     }
 
     Ok(())
-}
-
-/// The device this build's backend runs on.
-///
-/// The mapping itself moved to [`backend::device`] when a second model started
-/// needing it; this is the error type it wears here. AYEAYE-57 owns turning the
-/// mapping into a real selection.
-fn device_for(backend: Backend) -> Result<Device, SpeechError> {
-    backend::device(backend).map_err(SpeechError::inference)
 }
 
 #[cfg(test)]

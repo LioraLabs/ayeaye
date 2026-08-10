@@ -4,8 +4,9 @@ This crate is the workspace's rules in a form that can refuse a build. It is
 normative: where this file and somebody's intention disagree, this file wins,
 because it is the one the suite reads.
 
-Four rules are enforced today. They are **tier 1** — the rules that keep the
-pure core pure, the strata apart, and the build free of a C toolchain. The
+Four rules are enforced today, the fourth in two halves. They are **tier 1** —
+the rules that keep the pure core pure, the strata apart, and the build free of
+a C toolchain. The
 duplication tiers, and the waiver ratchet that makes them landable, arrive with
 AYEAYE-64.
 
@@ -135,7 +136,14 @@ without this the way past the rule is to not be in it.
 
 ## Rule 4 — the pure Rust graph
 
-> Nothing in the dependency graph may need a C or C++ compiler.
+> Nothing the portable build needs may require a C, C++ or CUDA compiler.
+
+Three checks, because no single input answers it. `toolchain::check` reads
+`Cargo.lock` and proves the graph carries no crate that vendors C for a C
+compiler to build. `toolchain::gated` reads the *manifests* and names the
+feature and the file when one turns a toolchain on. `toolchain::in_default_build`
+reads what **cargo** resolved and is the one that actually holds, because it
+refuses packages rather than feature spellings.
 
 `toolchain::check(lockfile, forbidden)` reads the text of `Cargo.lock` and
 refuses the package names in `FORBIDDEN`:
@@ -147,11 +155,13 @@ refuses the package names in `FORBIDDEN`:
 | `bindgen` | needs libclang at build time |
 | `onig`, `onig_sys` | oniguruma, a C library — how this nearly arrived |
 
-**`cc` is the one that makes this cheap to trust.** Whatever vendors the native
-source, `cc` is what compiles it, so `cc` absent from the lockfile is a
-mechanical proof that nothing in the graph compiles C — including crates nobody
-has read. The rest are named for the other two shapes the cost takes, and for
-the specific near-miss below.
+**`cc` is the one that makes this cheap to trust.** Whatever vendors native
+source *for a C compiler to build*, `cc` is what builds it, so `cc` absent from
+the lockfile is a mechanical proof that no such crate is in the graph —
+including crates nobody has read. The rest are named for the other two shapes
+that cost takes, and for the specific near-miss below. It is not proof that
+nothing anywhere compiles C: a build script that drives its own compiler needs
+no `cc`, which is exactly what the CUDA path does. See below.
 
 **It reads the lockfile, not the manifests, and that is the point.** The
 manifests say what *we* asked for. This cost arrives through somebody else's
@@ -160,21 +170,148 @@ itself, and no amount of `default-features = false` on our own line has any
 effect on that. `ayeaye-infer` is held at candle 0.9 for exactly this reason —
 the note in its manifest is the long version.
 
-**What it cannot catch.** A lockfile lists every optional dependency in the
-graph, enabled or not, so a name here is not proof that anything was compiled.
-The rule is conservative in the safe direction: it can refuse a build that
-would have been fine, and it cannot pass one that would not. `bindgen_cuda` is
-the standing example — in the lockfile today, built only under the `cuda`
-feature, which the milestone has already accepted is the one artifact that is
-not portable. If AYEAYE-57 makes that build reach `cc`, this rule is supposed
-to fire, and amending `FORBIDDEN` is how you say out loud which artifact stops
-being static.
+**What it cannot catch, and it is worse than it looked.** A lockfile is
+feature-blind in **both** directions, and AYEAYE-57 measured both:
 
-The mutation tests plant `onig_sys` and `cc` in a synthetic lockfile. Against
-the real tree the proof runs the other way round: a planted package cannot be
-used, because cargo rewrites `Cargo.lock` before the test runs and drops any
-entry nothing depends on — so the test instead hands the rule a table naming
-`libc`, which the graph really does carry, and fails if the rule finds nothing.
+- A name being present is not proof anything is compiled. The lockfile lists
+  every optional dependency whether or not a feature enables it — `bindgen_cuda`
+  sits in it today with `cuda` off. AYEAYE-56 measured that half.
+- A name being absent is not proof that nothing is. **`cc` is absent under
+  `--features cuda` too.** `candle-kernels`' build script drives **nvcc**
+  directly over its `.cu` sources, compiles `src/moe/*.cu` into a static
+  `libmoe.a`, and emits `cargo:rustc-link-lib=stdc++` and
+  `cargo:rustc-link-lib=dylib=cudart`; `bindgen_cuda` depends on `glob`,
+  `num_cpus` and `rayon`, and on nothing that compiles C.
+
+That is why the paragraph above is worded as narrowly as it is. `cc` absent
+proves no crate in the graph vendors C *for a C compiler to build*; it proves
+nothing about a build script that drives its own compiler. The first half
+remains the right rule for the cost it was written for. It simply cannot answer
+"does the default build need a toolchain" at all, in either direction, because
+the lockfile does not record what is on.
+
+**The first half's mutation tests** plant `onig_sys` and `cc` in a synthetic
+lockfile. Against the real tree the proof runs the other way round: a planted
+package cannot be used, because cargo rewrites `Cargo.lock` before the test runs
+and drops any entry nothing depends on — so the test instead hands the rule a
+table naming `libc`, which the graph really does carry, and fails if the rule
+finds nothing.
+
+### The second half: a feature that legitimately needs a toolchain
+
+The manifests are where what is *on* is written down, so that is what the
+second half reads. It is the **diagnosis** — it names the feature and the file,
+which is what somebody needs in order to fix it — and the section after this is
+the proof. `toolchain::gated(subject, manifest, gated)` judges one manifest's
+text against `GATED`:
+
+| Feature | What building it costs | Which artifact stops being static |
+|---|---|---|
+| `cuda` | nvcc and a host C++ compiler; candle-kernels compiles `.cu` and links `stdc++` and `cudart` | the x86_64 Linux NVIDIA build, glibc-dynamic rather than static musl |
+
+**A name on `GATED` is not permission to be on. It is permission to exist, on
+the condition that nothing turns it on by default.** That is the decision this
+table records: an optional acceleration feature is allowed to need a toolchain,
+because the milestone accepted one non-portable artifact out of five — and the
+price is written next to it rather than left in a commit message.
+
+It refuses two shapes, because closing one leaves the other open:
+
+1. **The transitive closure of `[features] default`.** Transitive, because
+   `default = ["everything"]` with `everything = ["cuda"]` is the same build,
+   and a check that read one level would pass it.
+2. **A `features = [...]` array on any dependency edge**, target-conditional
+   tables included. This is not hypothetical: it is exactly how `ayeaye-infer`
+   turns `metal` on for Apple builds, since a cargo feature nobody passes is
+   off. The way past a `default = []` check is to not use `default`.
+
+**`metal` is deliberately not on the table.** `candle-metal-kernels` declares
+`build = false`, and every build script in the Apple graph is pure Rust with no
+build-dependencies, so Metal costs no toolchain. Gating it would be a rule
+nobody could obey, since being on by default in an Apple build is the point.
+
+**A gated feature is rarely reachable only under its own name**, so `Gated`
+carries the other spellings that turn the same cost on. candle defines
+`cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, and candle-transformers adds
+`flash-attn = ["cuda", …]`; `default = ["candle-core/cudnn"]` pays for nvcc
+while naming nothing called `cuda`. All three are on the table — and that list
+is a courtesy rather than a guarantee, because it describes an upstream's
+vocabulary and the upstream may add to it in any release.
+
+**The root manifest is judged too.** It is not a workspace member, it has no
+sources, and it declares dependencies under `[workspace.dependencies]` — which
+is where this workspace keeps candle, and therefore the most likely place a
+future acceleration edit lands. A rule over "every member's manifest" would skip
+exactly that file.
+
+The second half's mutation tests plant a `default` naming a gated feature, a
+`default` that reaches one through another of our own features, a `default`
+naming an implying spelling, a target table forcing one on, and a
+`[workspace.dependencies]` edge forcing one on — and assert that the same target
+table forcing `metal` on is clean. Against the real tree the proof runs the
+other way round again: there is no violation to leave planted, so the test hands
+the rule a table naming `metal`, which `ayeaye-infer` really does turn on for
+Apple builds, and fails if it finds nothing.
+
+### The third half, which is the one that actually holds
+
+**`gated` cannot be complete, and pretending otherwise cost three bypasses.**
+Each was found by planting it, and each was the same shape — a rule that
+restates cargo's feature resolution will keep being one release behind it:
+
+1. `candle-transformers/flash-attn` also implies `cuda`, and was not on the
+   alias list. Nor were `cudnn` and `nccl` until a gate found them.
+2. `gpu = ["cuda"]` in `ayeaye-infer` with `default = ["ayeaye-infer/gpu"]` in
+   `ayeaye`. Neither manifest reads badly on its own, and `gated`'s closure
+   stops at the crate boundary.
+3. A crate under `crates/` that is not in `[workspace] members`. Cargo treats a
+   path dependency inside the workspace as a member anyway; the corpus walk
+   reads the list, so **no** rule applied to it at all. The package check below
+   catches what such a crate pulls *in*; catching the crate itself is a
+   separate test, `every_crate_under_crates_is_a_listed_workspace_member`,
+   which is the twin of the one asserting members live under `crates/`.
+
+So the question is asked of cargo instead. `corpus::default_build_packages`
+runs `cargo tree --workspace --edges normal --locked` and
+`toolchain::in_default_build(packages, ACCELERATED)` refuses the **packages**
+that exist only to build acceleration — `candle-kernels`, `bindgen_cuda`,
+`candle-flash-attn`, `candle-flash-attn-build`, `cudarc`, `ug-cuda`.
+
+A feature can be spelled four ways and forwarded through three crates; a
+package cannot. All the bypasses above fail this check, and it needs to know
+nothing about what any of them was called.
+
+**Three flags, each put there by a bypass someone planted.** Two more were
+found after the first version of this section claimed to hold, which is why
+they are written down rather than assumed:
+
+- `--target all`, because "the portable build" is a five-row release matrix and
+  the host is one row. `[target.'cfg(target_os = "macos")'.dependencies]`
+  forwarding a feature put nvcc into both Apple rows while a host resolution on
+  Linux saw nothing.
+- `--edges normal,build`, because a build dependency is the one edge kind that
+  *definitionally* runs a compiler on the build machine. It is also how
+  `bindgen_cuda` and `candle-flash-attn-build` are declared upstream, so a
+  normal-only listing could never contain them and two rows of `ACCELERATED`
+  were unreachable. Dev edges stay out: a dev dependency is not in the artifact.
+- `--locked`, so asking the question can never rewrite the lockfile.
+
+**And `ACCELERATED` is a hand-written list too.** It names the CUDA toolchain,
+which is the cost this milestone accepted and wrote a release row for. It does
+not name candle's `mkl` or `accelerate` paths — a different toolchain nobody has
+asked for, where `intel-mkl-src` is *believed* to reach `cc` and so to be
+`FORBIDDEN`'s to catch, unmeasured. The guarantee is "no CUDA in the portable
+build", not "no native toolchain of any kind".
+
+This is the one rule that runs a subprocess, and it is worth it for exactly the
+reason the three bypasses give: feature resolution belongs to cargo, and every
+attempt to restate it here has been wrong. `gated` stays because a finding that
+names the feature and the manifest is what somebody needs in order to *fix* it —
+it is the diagnosis, and this is the proof.
+
+Both halves — all three checks — are `Rule::PureRustGraph`, because they are one
+rule.
+
 
 ---
 
@@ -186,8 +323,11 @@ cook rust-suite                     # the same, as the build system's cached uni
 ```
 
 `crates/constitution/tests/constitution.rs` runs all four rules over the real
-workspace. It also asserts the corpus walk found a non-trivial number of files,
-and that every crate the strata place contributed at least one — a walk that
+workspace, rule 4 in all three of its checks — the lockfile against
+`FORBIDDEN`, every manifest (the root's included) against `GATED`, and cargo's
+own resolution of the default build against `ACCELERATED`. It also asserts the corpus walk found a
+non-trivial number of files, and that every crate the strata place contributed
+at least one — a walk that
 finds nothing passes every rule it feeds, silently, which is the failure those
 floors exist to make loud.
 

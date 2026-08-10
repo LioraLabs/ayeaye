@@ -24,14 +24,8 @@ fn main() -> ExitCode {
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
         Some("dictate") => dictate_verb(&args[1..]),
-        None => {
-            println!("{}", banner());
-            ExitCode::SUCCESS
-        }
-        Some("--version" | "-V") => {
-            println!("{}", banner());
-            ExitCode::SUCCESS
-        }
+        None => report(),
+        Some("--version" | "-V") => report(),
         Some("--help" | "-h") => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -78,14 +72,38 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated
   VOICE_PORT            the port the recording agent listens on (default 8787)";
 
-/// One line naming the version and the capabilities compiled in.
-fn banner() -> String {
-    let backend = ayeaye_infer::backend::selected();
+/// One line naming the version and what this build can do *here*.
+///
+/// `got()` and not `selected()`, which is the whole of AYEAYE-57 in one line: a
+/// capability report that goes on claiming `cuda` after finding no card is the
+/// silent degradation the ticket exists to refuse.
+///
+/// This reports the selection *this call* made. Making it the same one the
+/// resident models are on — one decision per process, handed to the slots — is
+/// AYEAYE-73, because the daemon's slot construction is not in this tree.
+fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
     ayeaye_core::Identity {
         version: ayeaye_core::VERSION,
-        capabilities: &[backend.label()],
+        capabilities: &[selection.got().label()],
     }
     .banner()
+}
+
+/// Say what this build is, and — when it is not what it was compiled to be —
+/// why.
+///
+/// The banner goes to stdout and stays **one line**, because that is what a
+/// `--version`-style probe reads and a second line would be a parsing change
+/// that only appears on the artifacts hardest to test. The reason goes to
+/// stderr, which is where the serve path puts it too: stdout answers the
+/// question that was asked, stderr explains a degradation nobody asked about.
+fn report() -> ExitCode {
+    let selection = ayeaye_infer::backend::select();
+    println!("{}", banner(&selection));
+    if let Some(why) = selection.fallback() {
+        eprintln!("ayeaye: {why}");
+    }
+    ExitCode::SUCCESS
 }
 
 fn serve(args: &[String]) -> ExitCode {
@@ -168,9 +186,17 @@ fn serve(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // The acceleration line first and on its own: it is a fact about the
+        // machine rather than about the address, and folding it into the
+        // startup line would bury the one sentence somebody needs when their
+        // card is not being used.
+        let selection = ayeaye_infer::backend::select();
+        if let Some(why) = selection.fallback() {
+            eprintln!("ayeaye: {why}");
+        }
         eprintln!(
             "{} on {} · token auth on, browsers log in once via /?token=<token>",
-            banner(),
+            banner(&selection),
             settings.address()
         );
         // Before the first request, and only here: a window a previous process

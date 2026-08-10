@@ -9,10 +9,62 @@ repository.workspace = true
 
 [features]
 default = []
-# Acceleration is a compile-time choice, not a runtime one: both of these pull
-# a toolchain the portable build deliberately does not have.
+# Acceleration is a compile-time choice, not a runtime one. The two are not
+# symmetric, and AYEAYE-57 measured the asymmetry rather than assuming it:
+#
+# **cuda costs a toolchain, and not the one rule 4 watches for.**
+# `candle-kernels`' build script runs `bindgen_cuda`, which shells out to
+# **nvcc** over every `.cu` file, then compiles `src/moe/*.cu` into a static
+# `libmoe.a` and emits `cargo:rustc-link-lib=stdc++` and
+# `cargo:rustc-link-lib=dylib=cudart`. So a cuda build needs the CUDA toolkit
+# and a host C++ compiler, and links the C++ runtime and the CUDA runtime
+# dynamically — which is why it is the one release row that is glibc-dynamic
+# rather than static musl. Note `bindgen_cuda` depends on `glob`, `num_cpus`
+# and `rayon` and **not** on `cc`: none of this is visible to the constitution's
+# lockfile rule, which is why rule 4 grew a second half. See `GATED` in
+# `crates/constitution/src/toolchain.rs`.
+#
+# **metal costs no toolchain**, measured against the resolved Apple graph rather
+# than the lockfile — the lockfile also lists `metal` 0.29 and `ug-metal`, and
+# neither is in it, because `candle-ug` is optional and off.
+# `cargo tree -e normal --target aarch64-apple-darwin` adds
+# `candle-metal-kernels` and the `objc2` family (others arrive on that target
+# too, from `gemm`, and are nothing to do with metal), and
+# `cargo tree -e build --target aarch64-apple-darwin` prints the workspace
+# members with no children: **no build-dependency edges at all.** `candle-metal-kernels` declares
+# `build = false`; the kernels are Metal source held in the binary and compiled
+# by the Metal runtime. `objc2` does carry a `build.rs`, but a pure-Rust one
+# with no build-dependencies. So nothing in an Apple build compiles C, and there
+# is nothing here rule 4 would refuse — a narrower claim than "no build
+# scripts", and the true one.
+#
+# That asymmetry is why `metal` is not only a feature: the target table below
+# turns it on for every Apple build, because a feature nobody passes is off and
+# an Apple user should not have to ask for acceleration that costs nothing.
+# The feature stays because `crates/ayeaye/Cargo.toml` forwards it and the
+# release matrix may name it; on macOS it is now a no-op.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+# Apple acceleration, on by default in an Apple build and nowhere else.
+#
+# `target_os = "macos"` rather than Apple Silicon alone, because AYEAYE-59's
+# matrix is "both Apple architectures with Apple acceleration on". Note this
+# does not contradict `ayeaye-core`'s `machine::graphics`, which declines to
+# call an Intel Mac `metal`: that is a recommendation about which machine is
+# worth pointing at a model, and this is what the build can do if asked.
+# The version is `workspace = true` on both this table and `[dependencies]`
+# below, and that is not tidiness. Cargo does **not** intersect two
+# requirements for one crate across two dependency tables: `0.8` here against
+# `0.9.1` there resolves *both*, one per target edge, and the 0.8 tree pulls
+# `cc`. The failure that shape produces is the Apple release row silently
+# shipping a different candle from every other row with a C compiler in it —
+# so there is one requirement, in the root manifest, and neither edge can
+# drift from the other.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }
 
 [dependencies]
 ayeaye-core.workspace = true
@@ -39,9 +91,13 @@ ayeaye-core.workspace = true
 # Upgrading is not a routine bump. Before moving off 0.9, check whether
 # candle-core still names tokenizers/onig, and if it does, say out loud that
 # the build is gaining a C toolchain rather than discovering it later.
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
-candle-transformers = "0.9.1"
+#
+# The requirement itself lives in the root manifest's `[workspace.dependencies]`
+# because this crate names candle from two tables; see the note on the macOS
+# table above for what goes wrong when the two are written separately.
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
 
 # The same trap one level down, and here it *is* a feature we control.
 # `tokenizers` defaults to `onig` too, so default features are off and the

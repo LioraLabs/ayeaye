@@ -247,6 +247,59 @@ fn a_complete_quantized_model_loads_from_the_directory_it_was_pointed_at() {
     assert!(described.contains("cpu"), "{described}");
 }
 
+// AYEAYE-57
+//
+// The language model got the same wiring as the speech model and needs the same
+// hold-down: `load_with` names a selection this machine cannot produce, so the
+// state a GPU artifact reaches after a dead card is reachable here. See the
+// twin in `tests/speech.rs` for the argument.
+#[test]
+fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
+    let dir = tiny_model("carries-the-reason");
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Metal, |_| {
+        Err(candle_core::Error::Msg(
+            "no Metal device is present".to_string(),
+        ))
+    });
+
+    let model = LanguageModel::load_with(dir.path(), selection.clone())
+        .expect("a model should load on the device it fell back to");
+
+    assert_eq!(model.backend(), selection.got());
+    assert_eq!(model.backend(), ayeaye_infer::Backend::Cpu);
+    let why = model
+        .fallback()
+        .expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback());
+    assert!(why.contains("metal"), "{why}");
+    assert!(why.contains("no Metal device is present"), "{why}");
+}
+
+// AYEAYE-57
+//
+// The twin of `a_slot_keeps_its_device_decision_across_an_unload_and_reload` in
+// tests/speech.rs. Both slots got the same wiring, so both need the same
+// hold-down: a `load` that re-probed the machine instead of using the decision
+// the slot already made would fail this.
+#[test]
+fn a_slot_keeps_its_device_decision_across_an_unload_and_reload() {
+    let dir = tiny_model("slot-keeps-its-device");
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Metal, |_| {
+        Err(candle_core::Error::Msg(
+            "no Metal device is present".to_string(),
+        ))
+    });
+    let mut slot = LanguageSlot::on(selection);
+
+    slot.load(dir.path()).expect("the first load");
+    assert!(slot.unload(), "there was a model to release");
+    slot.load(dir.path()).expect("the reload");
+
+    let why = slot.fallback().expect("the reason outlives the model");
+    assert!(why.contains("metal"), "{why}");
+    assert!(why.contains("no Metal device is present"), "{why}");
+}
+
 // -------------------------------------------------------------- generation
 
 // AYEAYE-55

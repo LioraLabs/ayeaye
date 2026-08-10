@@ -2,13 +2,13 @@
 
 use std::path::Path;
 
+use candle_core::Tensor;
 use candle_core::quantized::gguf_file;
-use candle_core::{Device, Tensor};
 use candle_transformers::models::{quantized_llama, quantized_qwen2};
 use tokenizers::Tokenizer;
 
 use super::error::LanguageError;
-use crate::backend::{self, Backend};
+use crate::backend::{self, Backend, Selection};
 
 /// The weights, quantized, in the format llama.cpp publishes.
 ///
@@ -94,7 +94,12 @@ impl Weights {
 pub struct LanguageModel {
     pub(crate) weights: Weights,
     pub(crate) tokenizer: Tokenizer,
-    pub(crate) device: Device,
+    /// The device, and how it came to be that one.
+    ///
+    /// The whole answer is kept rather than the device alone, so that
+    /// [`Self::backend`] and [`Self::fallback`] are two readings of one fact
+    /// instead of two fields that can drift.
+    pub(crate) selection: Selection,
     pub(crate) architecture: String,
     /// How many positions this model's rotary table was built for.
     pub(crate) window: usize,
@@ -109,7 +114,19 @@ impl LanguageModel {
     /// The directory is the caller's to choose and ayeaye's to read: acquiring
     /// what goes in it is AYEAYE-56's, and shipping weights is nobody's.
     pub fn load(dir: &Path) -> Result<Self, LanguageError> {
-        let device = backend::device(backend::selected()).map_err(LanguageError::inference)?;
+        Self::load_with(dir, backend::select())
+    }
+
+    /// Load the model in `dir` onto a device already chosen.
+    ///
+    /// [`Self::load`] is this with [`backend::select`] called for you. This
+    /// exists because the device decision is a property of the process and not
+    /// of the model: it is what [`crate::LanguageSlot`] hands in so that a
+    /// model unloaded by the idle policy and loaded again lands on the same
+    /// device, and it is how a test names a selection this machine cannot
+    /// produce.
+    pub fn load_with(dir: &Path, selection: Selection) -> Result<Self, LanguageError> {
+        let device = selection.device.clone();
 
         let weights_path = dir.join(WEIGHTS_FILE);
         // The file stays open and is read from as the tensors are pulled out,
@@ -167,16 +184,28 @@ impl LanguageModel {
         Ok(Self {
             weights,
             tokenizer,
-            device,
+            selection,
             architecture,
             window,
             eos,
         })
     }
 
-    /// Where this model is running.
+    /// Where this model is really running.
+    ///
+    /// Read off the device it is holding, not off the build: on an artifact
+    /// with acceleration compiled in these differ exactly when [`Self::fallback`]
+    /// has something to say.
     pub fn backend(&self) -> Backend {
-        backend::selected()
+        self.selection.got()
+    }
+
+    /// Why this model is not on the backend the build was compiled for.
+    ///
+    /// `None` when it is — which is every CPU build, where there was nothing
+    /// to give up.
+    pub fn fallback(&self) -> Option<&str> {
+        self.selection.fallback.as_deref()
     }
 
     /// What the file called itself.

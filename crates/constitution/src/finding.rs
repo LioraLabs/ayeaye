@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// The rules this crate enforces. Tier 1 — the four that hold the pure core
-/// pure, the strata apart, and a C toolchain out of the build.
+/// pure, the strata apart, and a toolchain out of the portable build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// `ayeaye-core` may not reach outside itself.
@@ -12,7 +12,10 @@ pub enum Rule {
     DependencyAllowlist,
     /// A crate may depend only on a strictly lower stratum.
     Stratum,
-    /// Nothing in the dependency graph may need a C or C++ compiler.
+    /// Nothing the portable build needs may require a C, C++ or CUDA compiler.
+    ///
+    /// Both halves of rule 4 report under this: `toolchain::check` over the
+    /// lockfile, and `toolchain::gated` over the manifests.
     PureRustGraph,
 }
 

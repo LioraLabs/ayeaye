@@ -4,6 +4,8 @@ use std::path::Path;
 
 use ayeaye_core::cleanup::{Cleaned, Policy, settle, worth_cleaning};
 
+use crate::backend::{self, Selection};
+
 use super::error::LanguageError;
 use super::model::LanguageModel;
 
@@ -23,12 +25,45 @@ use super::model::LanguageModel;
 #[derive(Debug, Default)]
 pub struct LanguageSlot {
     model: Option<LanguageModel>,
+    /// The device decision every model this slot loads is put on. See
+    /// [`crate::speech::SpeechSlot`] for why it is held here.
+    selection: Option<Selection>,
 }
 
 impl LanguageSlot {
-    /// A slot with nothing in it.
+    /// A slot with nothing in it, which will choose a device when first asked
+    /// to load one.
     pub fn empty() -> Self {
-        Self { model: None }
+        Self {
+            model: None,
+            selection: None,
+        }
+    }
+
+    /// A slot bound to a device decision already made.
+    ///
+    /// The decision belongs to the process, not to the model: a daemon holding
+    /// a speech slot and a language slot should probe the machine once and hand
+    /// the answer to both, so that the acceleration it reported at startup is
+    /// the acceleration its models are actually on. [`Self::empty`] makes the
+    /// decision on first load instead, which is right for a caller that has
+    /// only one slot and no report to keep honest.
+    pub fn on(selection: Selection) -> Self {
+        Self {
+            model: None,
+            selection: Some(selection),
+        }
+    }
+
+    /// Why the resident model is not on the backend the build was compiled for.
+    ///
+    /// Read off the **model** when one is resident, and off the slot's own
+    /// decision only when none is. See [`crate::speech::SpeechSlot::fallback`].
+    pub fn fallback(&self) -> Option<&str> {
+        match &self.model {
+            Some(model) => model.fallback(),
+            None => self.selection.as_ref()?.fallback(),
+        }
     }
 
     /// Load a model from `dir`, replacing whatever was resident.
@@ -37,7 +72,8 @@ impl LanguageSlot {
         // models at once is how a reconfiguration doubles the memory of the
         // thing it was reconfiguring.
         self.unload();
-        self.model = Some(LanguageModel::load(dir)?);
+        let selection = self.selection.get_or_insert_with(backend::select).clone();
+        self.model = Some(LanguageModel::load_with(dir, selection)?);
         Ok(())
     }
 
