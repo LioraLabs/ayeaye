@@ -102,6 +102,16 @@ test_a_bump_leaves_third_party_lock_entries_alone() {
 }
 
 # AYEAYE-59
+test_a_bump_refuses_a_tree_missing_the_lockfile() {
+  rm "$FAKE_ROOT/Cargo.lock"
+  run_script "$BUMP" v0.2.0 "$FAKE_ROOT"
+  assert_status 1 "$RUN_STATUS"
+  assert_contains "$RUN_STDERR" "Cargo.lock"
+  assert_contains "$(cat "$FAKE_ROOT/install.sh")" 'AYEAYE_VERSION="v0.1.0"' \
+    "a refused bump must leave the tree exactly as it was"
+}
+
+# AYEAYE-59
 test_a_bump_refuses_a_tree_missing_the_crate_manifest() {
   rm "$FAKE_ROOT/Cargo.toml"
   run_script "$BUMP" v0.2.0 "$FAKE_ROOT"

@@ -1,0 +1,172 @@
+# The release pipeline: pushing a version tag produces every release artifact
+# and its checksums, with nothing built by hand. Builds run here rather than
+# on any one machine because the Apple artifacts cannot be produced anywhere
+# else we control - that was the milestone's hard blocker the moment there is
+# one Apple user.
+#
+# Five rows, and why each is shaped the way it is:
+#
+#   x86_64/aarch64-unknown-linux-musl   static, via cargo-zigbuild. The whole
+#                                       point of choosing candle: no C
+#                                       toolchain, so musl static linking works.
+#   x86_64/aarch64-apple-darwin         Apple acceleration on. metal costs no
+#                                       toolchain and is already forced on for
+#                                       every macOS target by ayeaye-infer's
+#                                       target table; naming the feature here
+#                                       keeps the claim visible in the matrix.
+#   x86_64-unknown-linux-gnu + cuda     the one row that is not static: nvcc
+#                                       compiles real kernels and links
+#                                       libstdc++ and cudart dynamically, so it
+#                                       builds against the system C library
+#                                       inside a CUDA devel container, which
+#                                       pins both nvcc and the glibc baseline.
+#                                       No aarch64 NVIDIA row: niche hardware,
+#                                       no convenient runner.
+#
+# Every artifact is published under a versioned name and a versionless alias,
+# so releases/latest/download/<alias> fetches the newest release without first
+# asking an API what "latest" is. SHA256SUMS covers every published name.
+#
+# The publish job converges rather than insists: if the local `cook publish`
+# already created the release (it uploads the stamped tarball), the workflow
+# adds the binaries to it and re-uploads byte-identical files - the tarball is
+# reproducible from the tag commit, which is what makes the overlap safe.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Nothing builds until every version claim in the tree agrees with the tag,
+  # both suites pass, and the linter passes as an error gate.
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: every version claim agrees with the tag
+        run: bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+      - name: rust suite
+        run: cargo test --workspace --locked
+      - name: linter, as an error gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: shell suite
+        run: bash tests/run.sh
+
+  build:
+    needs: verify
+    strategy:
+      # A red tag should show every broken row, not just the first one.
+      fail-fast: false
+      matrix:
+        include:
+          # The zigbuild container ships rust, zig and cargo-zigbuild
+          # together; installing cargo-zigbuild from PyPI on the host looks
+          # simpler and is not, because pipx isolates the ziglang dependency
+          # from the interpreter cargo-zigbuild would find it with.
+          - row: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            kind: zigbuild
+            container: ghcr.io/rust-cross/cargo-zigbuild:latest
+          - row: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            kind: zigbuild
+            container: ghcr.io/rust-cross/cargo-zigbuild:latest
+          - row: x86_64-apple-darwin
+            target: x86_64-apple-darwin
+            os: macos-14
+            kind: host
+            features: metal
+          - row: aarch64-apple-darwin
+            target: aarch64-apple-darwin
+            os: macos-14
+            kind: host
+            features: metal
+          - row: x86_64-unknown-linux-gnu-cuda
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            kind: cuda
+            features: cuda
+            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    runs-on: ${{ matrix.os }}
+    # Empty for the Apple rows, which run on the runner itself.
+    container: ${{ matrix.container || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust, inside the cuda container
+        if: matrix.kind == 'cuda'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: target
+        run: rustup target add "${{ matrix.target }}"
+      - name: build
+        run: |
+          set -euo pipefail
+          cmd=build
+          [ "${{ matrix.kind }}" = zigbuild ] && cmd=zigbuild
+          features="${{ matrix.features }}"
+          cargo "$cmd" --release --locked -p ayeaye \
+            --target "${{ matrix.target }}" \
+            ${features:+--features "$features"}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.row }}
+          path: target/${{ matrix.target }}/release/ayeaye
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: rows
+      - name: both names for every artifact, and the tarball
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          mkdir -p dist
+          rows="x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu-cuda"
+          for row in $rows; do
+            # The versioned name, and the versionless alias that lets
+            # releases/latest/download fetch the newest without an API call.
+            # Release assets are bare bytes, so the execute bit is the
+            # downloader's job - the installer chmods what it fetches.
+            cp "rows/$row/ayeaye" "dist/ayeaye-$tag-$row"
+            cp "rows/$row/ayeaye" "dist/ayeaye-$row"
+          done
+          # The source tarball is a release artifact too, byte-reproducible
+          # from the tag commit - which is why rebuilding it here cannot
+          # disagree with a tarball the local flow already stamped.
+          bash scripts/release-archive.sh "dist/ayeaye-$tag.tar.gz"
+          cp "dist/ayeaye-$tag.tar.gz" "dist/ayeaye.tar.gz"
+      - name: the tarball is installable
+        run: bash scripts/check-release-artifact.sh "dist/ayeaye-$GITHUB_REF_NAME.tar.gz"
+      - name: checksums over every published name
+        run: |
+          set -euo pipefail
+          bash scripts/release-checksums.sh dist/ayeaye-* dist/ayeaye.tar.gz dist/SHA256SUMS
+      - name: publish
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --title "ayeaye $tag" \
+              --notes "Five binaries and the source tarball, each under a versioned name and a versionless alias, all covered by SHA256SUMS. The newest release is always at releases/latest/download/<alias>, no API call required."
+          fi
+          gh release upload "$tag" dist/* --clobber
