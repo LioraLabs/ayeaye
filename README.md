@@ -135,6 +135,16 @@ from where it stopped, and a release already unpacked is used as it is,
 without touching the network at all. Running it from a clone downloads
 nothing whatsoever — see [Setup](#setup).
 
+### An assistant for the judgement calls
+
+Setup's judgement-heavy parts — where this machine should sit on the network,
+which speech model suits its hardware, what a failed health check means — ship
+as a Claude skill: an accelerant, never a requirement. Everything it does is a
+command you could type yourself, and setup is complete without it. To use it,
+copy [`.claude/skills/setting-up-ayeaye`](.claude/skills/setting-up-ayeaye)
+into `~/.claude/skills/` on the machine being set up and ask Claude Code to
+set up ayeaye.
+
 ## Setup
 
 One command gets you the whole of the base install: the phone page, the pane
