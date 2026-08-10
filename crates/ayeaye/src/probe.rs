@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use ayeaye_core::machine::{Probes, ServiceManager, platform, share, size};
+use ayeaye_core::machine::{Privilege, Probes, ServiceManager, packages, platform, share, size};
 use ayeaye_core::service::Session;
 
 use crate::service::{Outcome, Runner, Subprocess};
@@ -181,6 +181,7 @@ pub struct Captured {
     route: Option<String>,
     route6: Option<String>,
     route_default_exists: Option<bool>,
+    privilege: Privilege,
 }
 
 impl Captured {
@@ -242,6 +243,27 @@ impl Captured {
             available_commands: &names,
             ..self.probes()
         })
+    }
+
+    /// What this session could become, if it had to.
+    pub fn privilege(&self) -> Privilege {
+        self.privilege
+    }
+
+    /// What to tell somebody who has to install those packages themselves.
+    ///
+    /// Two lines, and never an install: the criterion is that setup prints the
+    /// exact command for this platform, and the whole of `machine::packages` is
+    /// built so that nothing here can run it.
+    pub fn install_hint(&self, logical: &[&str]) -> [String; 2] {
+        let machine = self.machine();
+        packages::manual_hint(
+            &machine.platform,
+            &machine.packaging,
+            machine.homebrew.as_ref(),
+            self.privilege,
+            logical,
+        )
     }
 
     /// Which service manager this machine's user session has, out of the one
@@ -394,6 +416,15 @@ pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
         captured.route_default_exists =
             Some(sources.run(&argv(&["route", "-n", "get", "default"])).ok);
     }
+
+    // `id -u` is where lib/pkg.sh reads privilege from, and `sudo` on PATH is
+    // the rest of it. Homebrew refuses to run as root, so this is not simply
+    // "can I install": it is what a generated command line has to say.
+    captured.privilege = match said(sources, &["id", "-u"]).as_deref().map(str::trim) {
+        Some("0") => Privilege::Root,
+        _ if captured.available.iter().any(|name| name == "sudo") => Privilege::Sudo,
+        _ => Privilege::None,
+    };
 
     // macOS only, and asked last so the two cheap `uname` calls have already
     // said whether this is a Mac. The one gated probe, because it is the one

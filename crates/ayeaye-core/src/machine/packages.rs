@@ -21,13 +21,16 @@ use super::platform::{Family, Homebrew, PackageManager, Packaging, Platform};
 /// Read from `id -u` and the presence of `sudo`, which is where `lib/pkg.sh`
 /// reads it from. It arrives as a value rather than being detected here for the
 /// same reason nothing else in `machine` detects anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Privilege {
     /// This process is already root.
     Root,
     /// It is not, and `sudo` is here.
     Sudo,
-    /// It is not, and there is no way to become root.
+    /// It is not, and there is no way to become root. The default, because a
+    /// machine nothing has been asked about is a machine nothing may be
+    /// installed on.
+    #[default]
     None,
 }
 

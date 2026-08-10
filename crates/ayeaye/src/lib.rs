@@ -15,6 +15,7 @@ pub mod cliban;
 pub mod command;
 pub mod config;
 pub mod fit;
+pub mod health;
 pub mod models;
 pub mod probe;
 pub mod process;
