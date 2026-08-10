@@ -100,12 +100,7 @@ pub fn classify(probes: &Probes<'_>) -> Network {
 mod tests {
     use super::{Network, classify};
     use crate::machine::Probes;
-
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../../tests/fixtures/", $path))
-        };
-    }
+    use crate::machine::fixture;
 
     // AYEAYE-60
     #[test]

@@ -14,13 +14,14 @@
 //! recommendation rather than raising it.
 
 use super::Probes;
+use super::text::{field, first_word, positive, whole};
 
 /// How many processors this machine has.
 pub fn cores(probes: &Probes<'_>) -> Option<u64> {
-    None.or_else(|| probes.nproc.and_then(one_positive_number))
+    None.or_else(|| probes.nproc.and_then(positive))
         .or_else(|| probes.lscpu.and_then(cores_from_lscpu))
         .or_else(|| probes.cpuinfo.and_then(cores_from_cpuinfo))
-        .or_else(|| probes.sysctl_ncpu.and_then(one_positive_number))
+        .or_else(|| probes.sysctl_ncpu.and_then(positive))
         .or_else(|| {
             probes
                 .system_profiler
@@ -36,7 +37,7 @@ pub fn ram_mb(probes: &Probes<'_>) -> Option<u64> {
         .or_else(|| {
             probes
                 .sysctl_memsize
-                .and_then(one_positive_number)
+                .and_then(positive)
                 .map(|bytes| bytes / 1_048_576)
         })
         .or_else(|| {
@@ -57,6 +58,28 @@ pub fn disk_mb(probes: &Probes<'_>) -> Option<u64> {
         .lines()
         .rfind(|line| !line.trim().is_empty())?;
     field(last, 4).and_then(whole).map(|blocks| blocks / 1024)
+}
+
+/// Every directory `df` could usefully be asked about, nearest first.
+///
+/// On a first run nothing has created the model directory yet, and `df` has
+/// nothing to say about a path that is not there. The shell walks up to the
+/// first ancestor that exists; this is that walk with the existence test left
+/// out, so the impure half is one `is_dir` per element of a list it did not have
+/// to compute. The last element is always `/`, which is the floor: there is
+/// always a filesystem to ask about.
+pub fn model_dir_ancestors(model_dir: &str) -> Vec<String> {
+    let mut walk = Vec::new();
+    let mut here = model_dir;
+    while !here.is_empty() && here != "/" {
+        walk.push(here.to_string());
+        here = match here.rsplit_once('/') {
+            Some((head, _)) => head,
+            None => "",
+        };
+    }
+    walk.push("/".to_string());
+    walk
 }
 
 // ------------------------------------------------------------------ readers
@@ -100,9 +123,9 @@ fn ram_from_words(value: &str) -> Option<u64> {
     let mut words = value.split_whitespace();
     let n = positive(words.next()?)?;
     match words.next()? {
-        "GB" | "gb" | "GiB" => Some(n * 1024),
+        "GB" | "gb" | "GiB" => n.checked_mul(1024),
         "MB" | "mb" | "MiB" => Some(n),
-        "TB" | "tb" | "TiB" => Some(n * 1024 * 1024),
+        "TB" | "tb" | "TiB" => n.checked_mul(1024 * 1024),
         _ => None,
     }
 }
@@ -118,49 +141,11 @@ fn hardware_overview(text: &str, label: &str) -> Option<String> {
     })
 }
 
-// ------------------------------------------------------------------ numbers
-
-/// The first whitespace-separated word, or the whole of a text that has none.
-fn first_word(text: &str) -> &str {
-    text.split_whitespace().next().unwrap_or("")
-}
-
-/// The nth whitespace-separated field, counting from one.
-fn field(line: &str, n: usize) -> Option<&str> {
-    line.split_whitespace().nth(n - 1)
-}
-
-/// A run of digits and nothing else. `unknown`, `-1`, `quite a few` and `8
-/// cores` all arrive here at some point from a command that answered something
-/// unexpected, and none of them is a number.
-fn whole(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
-}
-
-/// A whole number greater than zero.
-fn positive(text: &str) -> Option<u64> {
-    whole(text).filter(|n| *n > 0)
-}
-
-/// A source whose entire output is one number.
-fn one_positive_number(text: &str) -> Option<u64> {
-    positive(text.trim())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cores, disk_mb, ram_mb};
+    use super::{cores, disk_mb, model_dir_ancestors, ram_mb};
     use crate::machine::Probes;
-
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../../tests/fixtures/", $path))
-        };
-    }
+    use crate::machine::fixture;
 
     // AYEAYE-60 — the captured lscpu output, at the figures
     // tests/cases/hardware_probe_test.sh pins. The aarch64 board is the one
@@ -324,6 +309,30 @@ mod tests {
                 ..Probes::default()
             }),
             None
+        );
+    }
+    // AYEAYE-60 — asking df about a directory nobody has created answers
+    // nothing, so the walk up is part of the question rather than part of the
+    // reading.
+    #[test]
+    fn the_disk_question_walks_up_to_something_that_could_exist() {
+        assert_eq!(
+            model_dir_ancestors("/home/ada/whisper-models"),
+            ["/home/ada/whisper-models", "/home/ada", "/home", "/"]
+        );
+        assert_eq!(
+            model_dir_ancestors("/whisper-models"),
+            ["/whisper-models", "/"]
+        );
+        assert_eq!(
+            model_dir_ancestors("/"),
+            ["/"],
+            "there is always a filesystem to ask about"
+        );
+        assert_eq!(
+            model_dir_ancestors(""),
+            ["/"],
+            "a caller with no HOME still gets a question df can answer"
         );
     }
 }

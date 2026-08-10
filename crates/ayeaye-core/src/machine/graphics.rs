@@ -3,9 +3,10 @@
 //! The two are different questions and this module answers the first. A
 //! two-gigabyte NVIDIA card is honestly `cuda` — CUDA is what is there — and a
 //! card whose size will not read is still a card. Whether it is big enough to be
-//! worth using, and whether ayeaye can run inference on it at all, is
-//! [`super::tier`]'s business, and that is where the sizes live.
+//! worth using, and whether ayeaye can run inference on it at all, is the
+//! tier's business, and that is where the sizes live.
 
+use super::text::positive;
 use super::{Os, Platform, Probes};
 
 /// What would do the arithmetic here.
@@ -235,25 +236,11 @@ fn rocm(text: &str) -> Option<Card> {
     })
 }
 
-/// A whole number greater than zero, and nothing else.
-fn positive(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok().filter(|n| *n > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Acceleration, Graphics, classify};
+    use crate::machine::fixture;
     use crate::machine::{Probes, identify};
-
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../../tests/fixtures/", $path))
-        };
-    }
 
     /// An ordinary Linux machine, so only the graphics probes vary.
     fn on_linux(probes: Probes<'_>) -> Graphics {

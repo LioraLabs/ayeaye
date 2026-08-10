@@ -13,14 +13,31 @@ pub mod network;
 pub mod platform;
 pub mod share;
 pub mod size;
+mod text;
 
 pub use graphics::{Acceleration, Graphics};
 pub use network::Network;
 pub use platform::{
-    Family, Os, PackageManager, Packaging, Platform, ServiceManager, brew_prefix_of, identify,
-    packaging, service_manager,
+    Family, Homebrew, Os, PackageManager, Packaging, Platform, ServiceManager, homebrew, identify,
+    is_known, packaging, service_manager, summary,
 };
 pub use share::{Limit, Limits, Share};
+pub use size::model_dir_ancestors;
+
+/// The captured probe output the shell suite reads, reaching a pure crate the
+/// only way it may: at compile time.
+///
+/// Defined once, here, so every module's corpus is the same corpus. The relative
+/// path resolves against this file, and every module that uses it sits in this
+/// same directory.
+#[cfg(test)]
+macro_rules! fixture {
+    ($path:literal) => {
+        include_str!(concat!("../../../../tests/fixtures/", $path))
+    };
+}
+#[cfg(test)]
+pub(crate) use fixture;
 
 /// Everything the shell captured about this machine, exactly as it was printed.
 ///

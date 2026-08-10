@@ -120,10 +120,12 @@ pub fn identify(
 }
 
 fn macos(arch: String, sw_vers: Option<&str>) -> Platform {
+    // The last assignment wins, as it would in the shell's own read loop.
     let version = sw_vers
         .and_then(|text| {
             text.lines()
-                .find_map(|line| line.strip_prefix("ProductVersion:"))
+                .filter_map(|line| line.strip_prefix("ProductVersion:"))
+                .next_back()
         })
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
@@ -331,7 +333,11 @@ pub enum PackageManager {
 }
 
 impl PackageManager {
-    /// The command's own name, which is also the word a caller matches on.
+    /// The tool's own name, which is also the word a caller matches on.
+    ///
+    /// A name, not an invocation. `brew` is the right name and the wrong command
+    /// on a machine where Homebrew is in its prefix and not yet on `PATH`; the
+    /// command to run is [`Homebrew::invocation`].
     pub fn as_str(self) -> &'static str {
         match self {
             PackageManager::AptGet => "apt-get",
@@ -387,9 +393,14 @@ impl ServiceManager {
 /// A family names the candidates and `available` — the commands the shell found
 /// on `PATH` — decides which is really there. Claiming apt-get on a debian
 /// container that has had it removed would send the shell off to run a command
-/// that does not exist. `has_brew` is separate from `available` because Homebrew
-/// installed in this same session is in its prefix and not yet on `PATH`.
-pub fn packaging(family: Family, immutable: bool, available: &[&str], has_brew: bool) -> Packaging {
+/// that does not exist. Homebrew is passed separately from `available` because
+/// one installed in this same session is in its prefix and not yet on `PATH`.
+pub fn packaging(
+    family: Family,
+    immutable: bool,
+    available: &[&str],
+    brew: Option<&Homebrew>,
+) -> Packaging {
     let candidates: &[PackageManager] = match family {
         Family::Debian => &[PackageManager::AptGet],
         Family::Fedora => &[PackageManager::Dnf, PackageManager::Yum],
@@ -402,7 +413,7 @@ pub fn packaging(family: Family, immutable: bool, available: &[&str], has_brew: 
         .iter()
         .copied()
         .find(|candidate| match candidate {
-            PackageManager::Brew => has_brew,
+            PackageManager::Brew => brew.is_some(),
             other => available.contains(&other.as_str()),
         })
         .unwrap_or(PackageManager::None);
@@ -436,12 +447,47 @@ pub fn service_manager(os: Os, available: &[&str], user_bus_responds: bool) -> S
     }
 }
 
-/// Where Homebrew is installed, worked out from where its binary was found.
+/// A Homebrew that is really installed, and how to invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Homebrew {
+    /// The prefix it is installed under: `/opt/homebrew`, `/usr/local`, …
+    pub prefix: String,
+    /// What a generated command line must actually say to run it.
+    pub invocation: String,
+}
+
+/// Find Homebrew, and work out what a generated command line has to say.
 ///
-/// Path arithmetic and never `brew --prefix`, because asking would mean running
-/// it. A `command -v brew` that answered with something which is not a path at
-/// all — a shell function or an alias by that name — is not a Homebrew.
-pub fn brew_prefix_of(brew_path: &str) -> Option<String> {
+/// Homebrew is detected on its own and not as a property of macOS: a Mac without
+/// it is an ordinary machine, and Homebrew on Linux exists too.
+///
+/// `on_path` is what `command -v brew` printed, and `in_prefix` is the first
+/// standard prefix whose `bin/brew` is executable. The distinction is the whole
+/// point of this function. On `PATH`, a generated command may plainly say
+/// `brew`. Found only in its prefix — which is where a Homebrew installed in
+/// this same session lives — a command saying `brew` would die with
+/// command-not-found, so it has to say where the binary is.
+///
+/// The prefix is path arithmetic and never `brew --prefix`, because asking would
+/// mean running it. A `command -v brew` that answered with something which is
+/// not a path at all — a shell function or an alias by that name — is not a
+/// Homebrew.
+pub fn homebrew(on_path: Option<&str>, in_prefix: Option<&str>) -> Option<Homebrew> {
+    if let Some(prefix) = on_path.and_then(brew_prefix_of) {
+        return Some(Homebrew {
+            prefix,
+            invocation: "brew".to_string(),
+        });
+    }
+    let prefix = in_prefix?;
+    Some(Homebrew {
+        prefix: prefix.to_string(),
+        invocation: format!("{prefix}/bin/brew"),
+    })
+}
+
+/// The prefix a `brew` binary at this path is installed under.
+fn brew_prefix_of(brew_path: &str) -> Option<String> {
     if !brew_path.starts_with('/') {
         return None;
     }
@@ -454,6 +500,36 @@ pub fn brew_prefix_of(brew_path: &str) -> Option<String> {
     })
 }
 
+/// Whether this layer recognised the machine well enough to act on its own.
+///
+/// The one question asked before anything is installed without being told how.
+/// A family it cannot name, or a package manager it has nothing to say to, both
+/// mean the manual path — which is the only one that works.
+pub fn is_known(platform: &Platform, packaging: &Packaging) -> bool {
+    platform.family != Family::Unknown && packaging.manager != PackageManager::None
+}
+
+/// The whole verdict as one line, because it is one line of output.
+pub fn summary(platform: &Platform, packaging: &Packaging, services: ServiceManager) -> String {
+    let name = if platform.pretty.is_empty() {
+        "unknown"
+    } else {
+        &platform.pretty
+    };
+    let note = if platform.immutable {
+        ", image-based"
+    } else {
+        ""
+    };
+    format!(
+        "{name} ({}) {}, packages: {}, services: {}{note}",
+        platform.family.as_str(),
+        platform.arch,
+        packaging.manager.as_str(),
+        services.as_str(),
+    )
+}
+
 /// ASCII lower case. Deepin has shipped `ID=Deepin`, and os-release ids are
 /// compared, not displayed.
 fn lower(text: &str) -> String {
@@ -463,17 +539,10 @@ fn lower(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Family, Os, PackageManager, ServiceManager, brew_prefix_of, identify, packaging,
-        service_manager,
+        Family, Homebrew, Os, PackageManager, ServiceManager, homebrew, identify, is_known,
+        packaging, service_manager, summary,
     };
-
-    /// The captured probe output the shell suite reads, reaching a pure crate
-    /// the only way it may: at compile time.
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../../tests/fixtures/", $path))
-        };
-    }
+    use crate::machine::fixture;
 
     /// A Linux machine described by one os-release fixture and nothing else.
     fn distro(os_release: &str) -> super::Platform {
@@ -589,14 +658,12 @@ mod tests {
     // linux-looking os-release lying around, and a Mac is still a Mac.
     #[test]
     fn a_darwin_kernel_beats_any_os_release_lying_around() {
+        // The uname/* fixtures are whole `uname -a` lines; this seam takes
+        // `uname -s` and `uname -m`, which the shell's own tests stub with
+        // literals for the same reason.
         let mac = identify(
             Some(fixture!("os-release/nixos-24.05")),
-            Some(
-                fixture!("uname/darwin-arm64")
-                    .split_whitespace()
-                    .next()
-                    .unwrap(),
-            ),
+            Some("Darwin"),
             Some("arm64"),
             Some(fixture!("sw_vers/macos-15.1")),
         );
@@ -704,7 +771,7 @@ mod tests {
             (Family::Unknown, &["apt-get", "dnf", "pacman"], "none"),
         ];
         for (family, available, want) in corpus {
-            let got = packaging(*family, false, available, false);
+            let got = packaging(*family, false, available, None);
             assert_eq!(got.manager.as_str(), *want, "{family:?} with {available:?}");
         }
     }
@@ -714,7 +781,7 @@ mod tests {
     fn a_family_whose_tool_is_not_installed_says_none_rather_than_naming_it() {
         // A debian container that has had apt-get removed is a real machine,
         // and running a command that is not there is not a plan.
-        let stripped = packaging(Family::Debian, false, &["dpkg"], false);
+        let stripped = packaging(Family::Debian, false, &["dpkg"], None);
         assert_eq!(stripped.manager, PackageManager::None);
         assert_eq!(stripped.tool, PackageManager::None);
     }
@@ -723,32 +790,44 @@ mod tests {
     // before it is on PATH, and it exists on Linux too.
     #[test]
     fn homebrew_counts_when_it_is_installed_rather_than_when_it_is_on_the_path() {
+        let on_path = homebrew(Some("/opt/homebrew/bin/brew"), None).unwrap();
+        assert_eq!(on_path.prefix, "/opt/homebrew");
         assert_eq!(
-            packaging(Family::Macos, false, &[], true).manager,
+            on_path.invocation, "brew",
+            "on PATH, a generated command may plainly say brew"
+        );
+
+        // The case the distinction exists for: a Homebrew installed in this
+        // same session is in its prefix and not yet on PATH, and a command
+        // saying "brew" would die with command-not-found.
+        let fresh = homebrew(None, Some("/home/linuxbrew/.linuxbrew")).unwrap();
+        assert_eq!(fresh.prefix, "/home/linuxbrew/.linuxbrew");
+        assert_eq!(fresh.invocation, "/home/linuxbrew/.linuxbrew/bin/brew");
+
+        assert_eq!(homebrew(Some("/bin/brew"), None).unwrap().prefix, "/");
+        assert_eq!(
+            homebrew(Some("brew is a function"), None),
+            None,
+            "a shell function named brew is not a Homebrew"
+        );
+        assert_eq!(homebrew(None, None), None);
+
+        assert_eq!(
+            packaging(Family::Macos, false, &[], Some(&on_path)).manager,
             PackageManager::Brew
         );
         assert_eq!(
-            packaging(Family::Macos, false, &["brew"], false).manager,
+            packaging(Family::Macos, false, &["brew"], None).manager,
             PackageManager::None,
-            "a shell function named brew is not a Homebrew"
+            "brew on PATH without a Homebrew behind it is not a package manager"
         );
-        assert_eq!(
-            brew_prefix_of("/opt/homebrew/bin/brew").as_deref(),
-            Some("/opt/homebrew")
-        );
-        assert_eq!(
-            brew_prefix_of("/home/linuxbrew/.linuxbrew/bin/brew").as_deref(),
-            Some("/home/linuxbrew/.linuxbrew")
-        );
-        assert_eq!(brew_prefix_of("/bin/brew").as_deref(), Some("/"));
-        assert_eq!(brew_prefix_of("brew is a function"), None);
     }
 
     // AYEAYE-60 — the tool is remembered even where installing with it does
     // not last, because asking it what is already present is a read.
     #[test]
     fn an_image_based_system_may_not_install_and_is_still_asked() {
-        let silverblue = packaging(Family::Fedora, true, &["dnf"], false);
+        let silverblue = packaging(Family::Fedora, true, &["dnf"], None);
         assert_eq!(
             silverblue.manager,
             PackageManager::None,
@@ -786,5 +865,127 @@ mod tests {
             ServiceManager::Systemd,
             "a machine we cannot name can still have a user bus that answers"
         );
+    }
+    // AYEAYE-60 — the one question asked before anything is installed without
+    // being told how.
+    #[test]
+    fn a_machine_is_only_known_when_it_has_both_a_family_and_a_tool() {
+        let ubuntu = distro(fixture!("os-release/ubuntu-24.04"));
+        assert!(is_known(
+            &ubuntu,
+            &packaging(ubuntu.family, false, &["apt-get"], None)
+        ));
+        assert!(
+            !is_known(&ubuntu, &packaging(ubuntu.family, false, &[], None)),
+            "a family with nothing to install with is the manual path"
+        );
+
+        let silverblue = distro(fixture!("os-release/fedora-silverblue-40"));
+        assert!(
+            !is_known(
+                &silverblue,
+                &packaging(silverblue.family, true, &["dnf"], None)
+            ),
+            "installing does not last here, so setup may not act on its own"
+        );
+
+        let void = distro(fixture!("os-release/void"));
+        assert!(!is_known(
+            &void,
+            &packaging(void.family, false, &["xbps-install"], None)
+        ));
+    }
+
+    // AYEAYE-60 — one line, because it is one line of output.
+    #[test]
+    fn the_summary_names_everything_and_stays_on_one_line() {
+        let ubuntu = distro(fixture!("os-release/ubuntu-24.04"));
+        let line = summary(
+            &ubuntu,
+            &packaging(ubuntu.family, false, &["apt-get"], None),
+            ServiceManager::Systemd,
+        );
+        assert_eq!(
+            line,
+            "Ubuntu 24.04.1 LTS (debian) x86_64, packages: apt-get, services: systemd"
+        );
+        assert!(!line.contains('\n'));
+
+        let void = distro(fixture!("os-release/void"));
+        let unknown = summary(
+            &void,
+            &packaging(void.family, false, &[], None),
+            ServiceManager::None,
+        );
+        assert!(unknown.contains("void"), "it still names what it found");
+        assert!(unknown.contains("(unknown)"));
+        assert!(unknown.contains("packages: none"));
+        assert!(unknown.contains("services: none"));
+
+        let steamos = distro(fixture!("os-release/steamos-3.5"));
+        assert!(
+            summary(
+                &steamos,
+                &packaging(steamos.family, true, &["pacman"], None),
+                ServiceManager::Systemd,
+            )
+            .ends_with(", image-based"),
+            "an image-based system says so, or its packages line reads as a fault"
+        );
+    }
+
+    // AYEAYE-60 — these words are the state-file contract: the shell writes
+    // them into step.detect.* and later stages branch on them. A typo here is
+    // a stage that silently stops matching.
+    #[test]
+    fn the_words_a_caller_matches_on_are_the_words_the_shell_writes() {
+        assert_eq!(
+            [Os::Linux, Os::Macos, Os::Unknown].map(Os::as_str),
+            ["linux", "macos", "unknown"]
+        );
+        assert_eq!(
+            [
+                Family::Debian,
+                Family::Fedora,
+                Family::Arch,
+                Family::Suse,
+                Family::Macos,
+                Family::Unknown,
+            ]
+            .map(Family::as_str),
+            ["debian", "fedora", "arch", "suse", "macos", "unknown"]
+        );
+        assert_eq!(
+            [
+                PackageManager::AptGet,
+                PackageManager::Dnf,
+                PackageManager::Yum,
+                PackageManager::Pacman,
+                PackageManager::Zypper,
+                PackageManager::Brew,
+                PackageManager::None,
+            ]
+            .map(PackageManager::as_str),
+            ["apt-get", "dnf", "yum", "pacman", "zypper", "brew", "none"]
+        );
+        assert_eq!(
+            [
+                ServiceManager::Systemd,
+                ServiceManager::Launchd,
+                ServiceManager::None,
+            ]
+            .map(ServiceManager::as_str),
+            ["systemd", "launchd", "none"]
+        );
+    }
+
+    // AYEAYE-60 — keeps the type in the test's own use list honest.
+    #[test]
+    fn a_homebrew_can_be_written_down() {
+        let brew = Homebrew {
+            prefix: "/usr/local".to_string(),
+            invocation: "brew".to_string(),
+        };
+        assert_eq!(homebrew(Some("/usr/local/bin/brew"), None), Some(brew));
     }
 }

@@ -7,6 +7,7 @@
 //! read, and the tier capped where it cannot.
 
 use super::Probes;
+use super::text::{answered, positive};
 
 /// A cgroup limit, which has three states and not two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +139,9 @@ pub fn cgroup_path(self_cgroup: &str, controller: &str, leaf: &str, root: &str) 
 fn cgroup_relative<'a>(self_cgroup: &'a str, controller: &str) -> Option<&'a str> {
     for line in self_cgroup.lines() {
         let mut parts = line.splitn(3, ':');
-        let hierarchy = parts.next()?;
+        let Some(hierarchy) = parts.next() else {
+            continue;
+        };
         let Some(controllers) = parts.next() else {
             continue;
         };
@@ -167,14 +170,14 @@ fn memory_limit(probes: &Probes<'_>) -> Limit {
     // Version two first, version one second; both are read, neither is required.
     // Only a failed read falls through — a version-two file that says `max` has
     // answered, and its answer is "no limit".
-    if let Some(text) = probes.cgroup_memory_max {
+    if let Some(text) = answered(probes.cgroup_memory_max) {
         let value = text.trim();
         if value == "max" {
             return Limit::None;
         }
         return bytes_to_limit(value);
     }
-    match probes.cgroup_memory_limit {
+    match answered(probes.cgroup_memory_limit) {
         Some(text) => bytes_to_limit(text.trim()),
         None => Limit::Unknown,
     }
@@ -197,14 +200,14 @@ fn bytes_to_limit(value: &str) -> Limit {
 /// still counts as one, because there is no such thing as most of a processor to
 /// schedule on.
 fn core_limit(probes: &Probes<'_>) -> Limit {
-    let (quota, period) = if let Some(text) = probes.cgroup_cpu_max {
+    let (quota, period) = if let Some(text) = answered(probes.cgroup_cpu_max) {
         let mut fields = text.split_whitespace();
         let quota = fields.next().unwrap_or("");
         if quota == "max" {
             return Limit::None;
         }
         (quota, fields.next().unwrap_or(""))
-    } else if let Some(text) = probes.cgroup_cpu_quota {
+    } else if let Some(text) = answered(probes.cgroup_cpu_quota) {
         let quota = text.trim();
         if quota == "-1" {
             return Limit::None;
@@ -252,25 +255,11 @@ fn marked(probes: &Probes<'_>) -> bool {
     })
 }
 
-/// A whole number greater than zero, and nothing else.
-fn positive(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok().filter(|n| *n > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Limit, Limits, cgroup_path, clamp, read};
     use crate::machine::Probes;
-
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../../tests/fixtures/", $path))
-        };
-    }
+    use crate::machine::fixture;
 
     /// A container that says it is one, so only the limits vary.
     fn in_a_container(probes: Probes<'_>) -> super::Share {
