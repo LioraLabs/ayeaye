@@ -6,7 +6,7 @@
 //! rule that is never run against the tree is decoration.
 
 use constitution::corpus::{Corpus, workspace_root};
-use constitution::{deps, effect_budget, finding::report, strata};
+use constitution::{deps, effect_budget, finding::report, strata, toolchain};
 
 /// The floor the whole corpus walk has to clear.
 ///
@@ -128,6 +128,48 @@ fn no_crate_depends_upwards_or_sideways() {
     assert!(
         findings.is_empty(),
         "the strata are broken:\n{}",
+        report(&findings)
+    );
+}
+
+// AYEAYE-54
+//
+// The milestone's defining property, as a test rather than a comment. It very
+// nearly left without anyone noticing: candle-core 0.10 names `tokenizers`
+// with the `onig` feature itself, so upgrading candle — a routine-looking
+// bump — would have put a C compiler back into every native build.
+#[test]
+fn nothing_in_the_dependency_graph_needs_a_c_compiler() {
+    let lockfile_path = workspace_root().join("Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", lockfile_path.display()));
+    // A walk that read nothing would pass this vacuously.
+    assert!(
+        lockfile
+            .lines()
+            .filter(|l| l.starts_with("name = "))
+            .count()
+            > 50,
+        "the lockfile looks empty; the rule would pass over nothing"
+    );
+
+    // ...and a rule pointed at the real lockfile that cannot find anything in
+    // it would also pass vacuously. Planting a package to prove otherwise does
+    // not work: cargo rewrites Cargo.lock before the test runs and removes any
+    // entry nothing depends on. So the proof is the other way round - hand the
+    // rule a table naming something the lockfile really does carry, and it has
+    // to say so.
+    let planted = toolchain::check(&lockfile, &[("libc", "a package this graph really has")]);
+    assert!(
+        !planted.is_empty(),
+        "the rule found nothing in a lockfile that contains libc; it is not reading it"
+    );
+
+    let findings = toolchain::check(&lockfile, toolchain::FORBIDDEN);
+
+    assert!(
+        findings.is_empty(),
+        "the build is no longer pure Rust:\n{}",
         report(&findings)
     );
 }

@@ -44,6 +44,6 @@ impl Transcript {
 
     /// Whether anything was heard at all.
     pub fn is_empty(&self) -> bool {
-        self.text().is_empty()
+        self.segments.iter().all(|s| s.text.trim().is_empty())
     }
 }

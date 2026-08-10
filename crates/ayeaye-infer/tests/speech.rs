@@ -68,7 +68,8 @@ fn a_config_that_is_not_json_is_malformed_rather_than_missing() {
     let dir = tiny_model("bad-config", &tiny_config(vec![]));
     dir.corrupt("config.json");
 
-    let error = SpeechModel::load(dir.path()).expect_err("a model with a broken config cannot load");
+    let error =
+        SpeechModel::load(dir.path()).expect_err("a model with a broken config cannot load");
 
     assert!(
         matches!(error, SpeechError::Malformed { .. }),
@@ -269,6 +270,76 @@ fn a_failed_load_leaves_the_slot_empty_rather_than_holding_the_old_model() {
         .expect_err("there is no model there");
 
     assert!(matches!(error, SpeechError::Missing { .. }));
-    assert!(!slot.is_loaded(), "the old model was released, not retained");
+    assert!(
+        !slot.is_loaded(),
+        "the old model was released, not retained"
+    );
     assert!(slot.transcribe(&support::tone(1.0)).is_err());
+}
+
+// AYEAYE-54
+//
+// A tokenizer that cannot say where a transcript starts is not decodable, and
+// that is a fact worth learning when the model loads rather than at the first
+// dictation.
+#[test]
+fn a_tokenizer_missing_the_start_token_is_refused_at_load() {
+    let dir = tiny_model("no-sot", &tiny_config(vec![]));
+    dir.strip_special_token("<|startoftranscript|>");
+
+    let error = SpeechModel::load(dir.path()).expect_err("it has nothing to decode from");
+
+    assert!(
+        matches!(&error, SpeechError::MissingToken { token } if token == "<|startoftranscript|>"),
+        "expected a MissingToken error, got {error:?}"
+    );
+}
+
+// AYEAYE-54
+//
+// The join across windows: a transcript is several segments and one line of
+// text, and empty windows do not become double spaces.
+#[test]
+fn a_transcript_reads_as_one_line_across_its_windows() {
+    let transcript = ayeaye_infer::Transcript {
+        segments: vec![
+            ayeaye_infer::Segment {
+                start_secs: 0.0,
+                end_secs: 1.0,
+                text: " hello ".into(),
+            },
+            ayeaye_infer::Segment {
+                start_secs: 1.0,
+                end_secs: 2.0,
+                text: "   ".into(),
+            },
+            ayeaye_infer::Segment {
+                start_secs: 2.0,
+                end_secs: 3.0,
+                text: "there".into(),
+            },
+        ],
+    };
+
+    assert_eq!(transcript.text(), "hello there");
+    assert!(!transcript.is_empty());
+}
+
+// AYEAYE-54
+//
+// Valid JSON is not a valid model. A zero-length audio window divides the
+// audio into chunks of nothing, which panics rather than errors — so it is
+// refused at load, naming the file that said it.
+#[test]
+fn a_config_describing_no_audio_window_is_refused_at_load() {
+    let mut config = tiny_config(vec![]);
+    let dir = tiny_model("no-window", &config);
+    config.max_source_positions = 0;
+    dir.rewrite_config(&config);
+
+    let error = SpeechModel::load(dir.path()).expect_err("there is no window to transcribe in");
+
+    assert!(matches!(error, SpeechError::Malformed { .. }), "{error:?}");
+    assert!(error.to_string().contains("config.json"));
+    assert!(error.to_string().contains("max_source_positions"));
 }

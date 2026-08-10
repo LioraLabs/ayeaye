@@ -4,12 +4,14 @@ This crate is the workspace's rules in a form that can refuse a build. It is
 normative: where this file and somebody's intention disagree, this file wins,
 because it is the one the suite reads.
 
-Three rules are enforced today. They are **tier 1** — the rules that keep the
-pure core pure and the strata apart. The duplication tiers, and the waiver
-ratchet that makes them landable, arrive with AYEAYE-64.
+Four rules are enforced today. They are **tier 1** — the rules that keep the
+pure core pure, the strata apart, and the build free of a C toolchain. The
+duplication tiers, and the waiver ratchet that makes them landable, arrive with
+AYEAYE-64.
 
 Every rule takes its input as **data**: source text, a list of dependency
-names, a graph of crates. Only `corpus.rs` touches a disk. That separation is
+names, a graph of crates, the text of a lockfile. Only `corpus.rs` touches a
+disk. That separation is
 not tidiness — it is what lets each rule be handed a planted violation and
 asked whether it notices. **A rule with no mutation test is not done.**
 
@@ -131,6 +133,51 @@ without this the way past the rule is to not be in it.
 
 ---
 
+## Rule 4 — the pure Rust graph
+
+> Nothing in the dependency graph may need a C or C++ compiler.
+
+`toolchain::check(lockfile, forbidden)` reads the text of `Cargo.lock` and
+refuses the package names in `FORBIDDEN`:
+
+| Package | Why it is refused |
+|---|---|
+| `cc` | how a build script compiles C or C++; the general case |
+| `cmake` | runs CMake at build time |
+| `bindgen` | needs libclang at build time |
+| `onig`, `onig_sys` | oniguruma, a C library — how this nearly arrived |
+
+**`cc` is the one that makes this cheap to trust.** Whatever vendors the native
+source, `cc` is what compiles it, so `cc` absent from the lockfile is a
+mechanical proof that nothing in the graph compiles C — including crates nobody
+has read. The rest are named for the other two shapes the cost takes, and for
+the specific near-miss below.
+
+**It reads the lockfile, not the manifests, and that is the point.** The
+manifests say what *we* asked for. This cost arrives through somebody else's
+dependency: `candle-core` 0.10 names `tokenizers` with the `onig` feature
+itself, and no amount of `default-features = false` on our own line has any
+effect on that. `ayeaye-infer` is held at candle 0.9 for exactly this reason —
+the note in its manifest is the long version.
+
+**What it cannot catch.** A lockfile lists every optional dependency in the
+graph, enabled or not, so a name here is not proof that anything was compiled.
+The rule is conservative in the safe direction: it can refuse a build that
+would have been fine, and it cannot pass one that would not. `bindgen_cuda` is
+the standing example — in the lockfile today, built only under the `cuda`
+feature, which the milestone has already accepted is the one artifact that is
+not portable. If AYEAYE-57 makes that build reach `cc`, this rule is supposed
+to fire, and amending `FORBIDDEN` is how you say out loud which artifact stops
+being static.
+
+The mutation tests plant `onig_sys` and `cc` in a synthetic lockfile. Against
+the real tree the proof runs the other way round: a planted package cannot be
+used, because cargo rewrites `Cargo.lock` before the test runs and drops any
+entry nothing depends on — so the test instead hands the rule a table naming
+`libc`, which the graph really does carry, and fails if the rule finds nothing.
+
+---
+
 ## Running it
 
 ```
@@ -138,7 +185,7 @@ cargo test -p constitution          # the rules, and the rules against this tree
 cook rust-suite                     # the same, as the build system's cached unit
 ```
 
-`crates/constitution/tests/constitution.rs` runs all three rules over the real
+`crates/constitution/tests/constitution.rs` runs all four rules over the real
 workspace. It also asserts the corpus walk found a non-trivial number of files,
 and that every crate the strata place contributed at least one — a walk that
 finds nothing passes every rule it feeds, silently, which is the failure those

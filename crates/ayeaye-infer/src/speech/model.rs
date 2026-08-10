@@ -17,6 +17,24 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// The weights.
 pub const WEIGHTS_FILE: &str = "model.safetensors";
 
+/// The sample rate the filterbank is built for.
+///
+/// `ayeaye-core` and candle each name this number, and the mel filters are
+/// computed from one while the audio is validated against the other. If they
+/// ever disagree the filterbank silently describes the wrong frequencies, so
+/// they are made to agree at compile time rather than at transcription time.
+const SAMPLE_RATE_HZ: u32 = ayeaye_core::audio::SAMPLE_RATE_HZ;
+const _: () = assert!(SAMPLE_RATE_HZ as usize == whisper::SAMPLE_RATE);
+
+/// The vocabulary size of OpenAI's English-only Whisper models.
+///
+/// The only thing that distinguishes an `.en` model from a multilingual one.
+/// Their tokenizers are not a clue: `tiny.en` and `tiny` both carry
+/// `<|en|>`, `<|fr|>` and 98 language tokens, and both have 1 608 added
+/// tokens — verified against the published tokenizers, because the obvious
+/// "does it have a language token" check quietly gets this wrong.
+const ENGLISH_ONLY_VOCAB_SIZE: usize = 51_864;
+
 /// A loaded speech model, resident in memory until it is dropped.
 ///
 /// Loading is the expensive, explicit act — reading hundreds of megabytes and
@@ -45,7 +63,7 @@ pub(crate) struct SpecialTokens {
     pub(crate) transcribe: Option<u32>,
     /// `<|notimestamps|>`, since this ticket returns text and not timings.
     pub(crate) no_timestamps: Option<u32>,
-    /// The language token, where the model has one.
+    /// The language token, where the model is one that takes one.
     pub(crate) language: Option<u32>,
 }
 
@@ -71,23 +89,29 @@ impl SpeechModel {
             .map_err(|e| SpeechError::malformed(&tokenizer_path, e))?;
 
         let weights_path = dir.join(WEIGHTS_FILE);
-        // `metadata` first so an absent file is `Missing` naming the file,
-        // rather than whatever the tensor library says about a path it cannot
-        // open — which is the difference between a fixable error and a puzzle.
-        std::fs::metadata(&weights_path).map_err(|e| SpeechError::read(&weights_path, e))?;
-        let weights = std::fs::read(&weights_path).map_err(|e| SpeechError::read(&weights_path, e))?;
+        // Read into memory rather than mmapped, deliberately. candle offers
+        // `from_mmaped_safetensors`, which is `unsafe` and undefined if anyone
+        // writes to the file while it is mapped — and this is a daemon that
+        // may be transcribing while a model directory is being replaced.
+        //
+        // The price is peak memory: the file is buffered whole, and candle
+        // converts each tensor to F32 on the way in, so an F16 checkpoint
+        // peaks near three times its own size before settling at two. That is
+        // fine for the models this runs on a CPU and is not fine for the
+        // largest ones. AYEAYE-56 owns residency policy and is where the
+        // trade-off should be revisited with a number attached.
+        let weights =
+            std::fs::read(&weights_path).map_err(|e| SpeechError::read(&weights_path, e))?;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)
             .map_err(|e| SpeechError::malformed(&weights_path, e))?;
 
         let whisper = Whisper::load(&vb, config.clone())
             .map_err(|e| SpeechError::malformed(&weights_path, e))?;
 
-        let tokens = SpecialTokens::resolve(&tokenizer)?;
-        let filters = ayeaye_core::mel::mel_filterbank(
-            u32::try_from(whisper::SAMPLE_RATE).unwrap_or(16_000),
-            whisper::N_FFT,
-            config.num_mel_bins,
-        );
+        let tokens = SpecialTokens::resolve(&tokenizer, &config, &tokenizer_path)?;
+        check_shape(&config, &tokens, &config_path)?;
+        let filters =
+            ayeaye_core::mel::mel_filterbank(SAMPLE_RATE_HZ, whisper::N_FFT, config.num_mel_bins);
 
         Ok(Self {
             whisper,
@@ -129,25 +153,57 @@ impl SpecialTokens {
     ///
     /// `<|startoftranscript|>` and `<|endoftext|>` are required: without the
     /// first there is nothing to decode from, and without the second nothing
-    /// says when to stop. The rest are optional because the English-only
-    /// models do not all carry them.
-    fn resolve(tokenizer: &Tokenizer) -> Result<Self, SpeechError> {
+    /// says when to stop.
+    ///
+    /// The language and task tokens are taken only for a multilingual model.
+    /// An `.en` model is prompted with `<|startoftranscript|>` and
+    /// `<|notimestamps|>` alone — it was never trained with the other two — and
+    /// since its tokenizer carries them anyway, looking them up and using what
+    /// is found puts the most likely CPU model off its own distribution.
+    ///
+    /// Ids are checked against the vocabulary here rather than met at the
+    /// first transcription, which is the whole reason this resolves at load.
+    fn resolve(
+        tokenizer: &Tokenizer,
+        config: &Config,
+        tokenizer_path: &Path,
+    ) -> Result<Self, SpeechError> {
         let id = |token: &str| tokenizer.token_to_id(token);
         let required = |token: &str| {
             id(token).ok_or_else(|| SpeechError::MissingToken {
                 token: token.to_string(),
             })
         };
-        Ok(Self {
+        let multilingual = config.vocab_size > ENGLISH_ONLY_VOCAB_SIZE;
+
+        let tokens = Self {
             start: required(whisper::SOT_TOKEN)?,
             end: required(whisper::EOT_TOKEN)?,
-            transcribe: id(whisper::TRANSCRIBE_TOKEN),
+            transcribe: multilingual
+                .then(|| id(whisper::TRANSCRIBE_TOKEN))
+                .flatten(),
             no_timestamps: id(whisper::NO_TIMESTAMPS_TOKEN),
-            // English, because that is what the rest of ayeaye assumes today.
-            // Language as configuration belongs with model choice, which is
-            // AYEAYE-56's.
-            language: id("<|en|>"),
-        })
+            // English. Which language, and whether to translate instead, are
+            // configuration — AYEAYE-56's, along with model choice.
+            language: multilingual.then(|| id("<|en|>")).flatten(),
+        };
+
+        if let Some(out_of_range) = tokens
+            .prompt()
+            .into_iter()
+            .chain([tokens.end])
+            .find(|id| *id as usize >= config.vocab_size)
+        {
+            return Err(SpeechError::malformed(
+                tokenizer_path,
+                format!(
+                    "token {out_of_range} is outside the {} the config declares",
+                    config.vocab_size
+                ),
+            ));
+        }
+
+        Ok(tokens)
     }
 
     /// The prompt every decode starts from.
@@ -158,6 +214,39 @@ impl SpecialTokens {
         prompt.extend(self.no_timestamps);
         prompt
     }
+}
+
+/// Refuse a config that parses but describes nothing transcribable.
+///
+/// Valid JSON is not a valid model. A zero-length audio window would divide
+/// the audio into chunks of nothing — which panics rather than errors — and a
+/// target length no longer than the prompt could never emit a token. Both are
+/// caught here, where the file that said so can still be named, instead of at
+/// the first dictation.
+fn check_shape(
+    config: &Config,
+    tokens: &SpecialTokens,
+    config_path: &Path,
+) -> Result<(), SpeechError> {
+    let prompt = tokens.prompt().len();
+    let refuse = |what: &str| Err(SpeechError::malformed(config_path, what.to_string()));
+
+    if config.max_source_positions == 0 {
+        return refuse("max_source_positions is 0, so the model has no audio window");
+    }
+    if config.num_mel_bins == 0 {
+        return refuse("num_mel_bins is 0, so there is no spectrogram to encode");
+    }
+    if config.vocab_size == 0 {
+        return refuse("vocab_size is 0, so there is nothing the model could say");
+    }
+    if config.max_target_positions <= prompt {
+        return refuse(
+            "max_target_positions leaves no room past the prompt, so no token could be decoded",
+        );
+    }
+
+    Ok(())
 }
 
 /// The device this build's backend runs on.
@@ -171,5 +260,37 @@ fn device_for(backend: Backend) -> Result<Device, SpeechError> {
         Backend::Cpu => Ok(Device::Cpu),
         Backend::Cuda => Device::new_cuda(0).map_err(SpeechError::inference),
         Backend::Metal => Device::new_metal(0).map_err(SpeechError::inference),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpecialTokens;
+
+    fn tokens(language: Option<u32>, transcribe: Option<u32>) -> SpecialTokens {
+        SpecialTokens {
+            start: 1,
+            end: 2,
+            transcribe,
+            no_timestamps: Some(4),
+            language,
+        }
+    }
+
+    // AYEAYE-54
+    //
+    // A multilingual model is told the language and the task.
+    #[test]
+    fn a_multilingual_prompt_names_the_language_and_the_task() {
+        assert_eq!(tokens(Some(3), Some(5)).prompt(), vec![1, 3, 5, 4]);
+    }
+
+    // AYEAYE-54
+    //
+    // An `.en` model gets neither, even though its tokenizer carries both.
+    // This is the shape no toy-model test can see and no real model forgives.
+    #[test]
+    fn an_english_only_prompt_is_the_start_token_and_no_timestamps() {
+        assert_eq!(tokens(None, None).prompt(), vec![1, 4]);
     }
 }

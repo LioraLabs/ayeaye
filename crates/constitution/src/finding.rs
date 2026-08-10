@@ -12,6 +12,8 @@ pub enum Rule {
     DependencyAllowlist,
     /// A crate may depend only on a strictly lower stratum.
     Stratum,
+    /// Nothing in the dependency graph may need a C or C++ compiler.
+    PureRustGraph,
 }
 
 impl Rule {
@@ -21,6 +23,7 @@ impl Rule {
             Rule::EffectBudget => "effect-budget",
             Rule::DependencyAllowlist => "dependency-allowlist",
             Rule::Stratum => "stratum",
+            Rule::PureRustGraph => "pure-rust-graph",
         }
     }
 }

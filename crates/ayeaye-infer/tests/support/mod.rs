@@ -37,11 +37,55 @@ const FIRST_SPECIAL: u32 = 50;
 
 /// The words this toy vocabulary can emit.
 const WORDS: [&str; 49] = [
-    "ayeaye", "hears", "you", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
-    "and", "then", "says", "something", "about", "a", "model", "that", "was", "never", "trained",
-    "on", "anything", "at", "all", "which", "is", "fine", "because", "this", "test", "cares",
-    "only", "about", "wiring", "not", "about", "words", "so", "here", "are", "some", "more", "of",
-    "them", "to", "fill", "space",
+    "ayeaye",
+    "hears",
+    "you",
+    "the",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "lazy",
+    "dog",
+    "and",
+    "then",
+    "says",
+    "something",
+    "about",
+    "a",
+    "model",
+    "that",
+    "was",
+    "never",
+    "trained",
+    "on",
+    "anything",
+    "at",
+    "all",
+    "which",
+    "is",
+    "fine",
+    "because",
+    "this",
+    "test",
+    "cares",
+    "only",
+    "about",
+    "wiring",
+    "not",
+    "about",
+    "words",
+    "so",
+    "here",
+    "are",
+    "some",
+    "more",
+    "of",
+    "them",
+    "to",
+    "fill",
+    "space",
 ];
 
 /// The special tokens, at ids [`FIRST_SPECIAL`] and up.
@@ -93,6 +137,28 @@ impl ModelDir {
     /// Delete one of the model's files, to see what the loader says about it.
     pub fn remove(&self, name: &str) {
         std::fs::remove_file(self.path.join(name)).expect("removing a file that should be there");
+    }
+
+    /// Replace config.json, leaving the weights as they were.
+    pub fn rewrite_config(&self, config: &Config) {
+        std::fs::write(
+            self.path.join("config.json"),
+            serde_json::to_string_pretty(&config_json(config)).expect("rendering the config"),
+        )
+        .expect("writing the config");
+    }
+
+    /// Remove one special token from the tokenizer, leaving it valid JSON.
+    pub fn strip_special_token(&self, token: &str) {
+        let path = self.path.join("tokenizer.json");
+        let text = std::fs::read_to_string(&path).expect("reading the tokenizer");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&text).expect("the tokenizer should be JSON");
+        let added = json["added_tokens"]
+            .as_array_mut()
+            .expect("added_tokens should be a list");
+        added.retain(|t| t["content"] != token);
+        std::fs::write(&path, json.to_string()).expect("writing the tokenizer");
     }
 
     /// Overwrite one of the model's files with something that is not it.

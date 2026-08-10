@@ -131,7 +131,14 @@ impl SpeechModel {
                 .to_vec1::<f32>()
                 .map_err(SpeechError::inference)?;
 
-            let next = self.best_token(logits);
+            // Nothing legal left to say ends the decode, exactly as an end
+            // token does. The alternative - a fallback token - is a token the
+            // model was forbidden to emit.
+            let Some(next) =
+                ayeaye_core::logits::best_allowed(&logits, &self.config.suppress_tokens)
+            else {
+                break;
+            };
             if next == self.tokens.end {
                 break;
             }
@@ -139,29 +146,5 @@ impl SpeechModel {
         }
 
         Ok(tokens.split_off(prompt.len()))
-    }
-
-    /// The highest-scoring token the model is allowed to emit.
-    ///
-    /// The config's `suppress_tokens` are the model's own list of things it
-    /// must never say — Whisper ships one — and they are refused here rather
-    /// than filtered out of the text afterwards, because a suppressed token
-    /// that was still *decoded* steers everything after it.
-    fn best_token(&self, mut logits: Vec<f32>) -> u32 {
-        for &suppressed in &self.config.suppress_tokens {
-            if let Some(logit) = logits.get_mut(suppressed as usize) {
-                *logit = f32::NEG_INFINITY;
-            }
-        }
-
-        let mut best = 0u32;
-        let mut best_logit = f32::NEG_INFINITY;
-        for (id, logit) in logits.into_iter().enumerate() {
-            if logit > best_logit {
-                best_logit = logit;
-                best = id as u32;
-            }
-        }
-        best
     }
 }
