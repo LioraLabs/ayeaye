@@ -1,8 +1,8 @@
 # Pinned to the declared MSRV on purpose (AYEAYE-72). cargo never checks a
-# crate's own source against its own `rust-version` — the field only constrains
-# dependents — so the workspace once claimed 1.85 while using let-chains, which
-# need 1.88, and every gate stayed green on developer machines running current
-# stable. Building *at* the floor is the only proof of the claim; with this pin
+# crate's own source against its own `rust-version` — it only refuses when the
+# *active toolchain* is older than the field — so the workspace once claimed
+# 1.85 while using let-chains, which need 1.88, and every gate stayed green on
+# developer machines running current stable. Building *at* the floor is the only proof of the claim; with this pin
 # every contributor and CI build is that proof, and a post-1.88 feature or a
 # dependency past the floor fails everywhere immediately instead of only on a
 # packager's machine.
