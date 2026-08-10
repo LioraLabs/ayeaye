@@ -6,5 +6,7 @@
 //! here, where a test reaches them without a machine; the walking itself, the
 //! clock and the store on disk are the shell's.
 
+pub mod rank;
 pub mod recents;
+pub mod session;
 pub mod skip;
