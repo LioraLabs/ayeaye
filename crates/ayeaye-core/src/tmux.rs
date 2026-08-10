@@ -222,6 +222,16 @@ mod tests {
         assert!(!no_server_running(
             "error connecting to /tmp/tmux-0/default (Permission denied)"
         ));
+        // A stale socket nobody is listening on is no server, though.
+        assert!(no_server_running(
+            "error connecting to /tmp/tmux-1000/default (Connection refused)"
+        ));
+        // And the reason only means that *about a socket*. Read on its own it
+        // appears in failures that have nothing to do with one, which would be
+        // the same lie from the other side.
+        assert!(!no_server_running(
+            "tmux: open terminal failed: No such file or directory"
+        ));
     }
 
     // AYEAYE-43 — a line with *more* than seven fields is dropped too. A window

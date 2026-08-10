@@ -57,8 +57,11 @@ pub enum BadName {
 ///
 /// The pane half is carried verbatim and is only checked for being a thing that
 /// can live inside a qualified id. Whether it is a *usable tmux target* is a
-/// different question, and it belongs to whichever ticket first sends one to
-/// tmux rather than to the type that federates it.
+/// different question, and it belongs to whoever first sends one to tmux rather
+/// than to the type that federates it — with one warning worth inheriting: the
+/// daemon's defence there is **membership, not syntax**. It checks the id
+/// against the pane list it just read before using it as a target, and a
+/// pattern over the pane half is not a substitute for that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneId {
     host: HostName,
@@ -194,7 +197,12 @@ impl Registry {
     ///
     /// Names are compared with case folded, because `gpu-box` and `GPU-Box` are
     /// one machine to DNS and would be two rows in a panel. They are *stored*
-    /// as written: the name is what the panel shows.
+    /// as written: the name is what the panel shows. The fold is ASCII-only,
+    /// which is what DNS means by case — so two names differing only in the
+    /// case of a non-ASCII letter are two peers here. That is a gap between the
+    /// justification and the rule, and it is left open rather than papered
+    /// over, because these are display names and case-folding somebody's
+    /// alphabet for them is a bigger decision than this.
     pub fn new(peers: Vec<Peer>) -> Result<Registry, BadRegistry> {
         let mut here: Option<usize> = None;
         for (index, peer) in peers.iter().enumerate() {
