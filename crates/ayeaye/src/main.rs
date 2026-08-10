@@ -303,37 +303,28 @@ fn setup_verb(args: &[String]) -> ExitCode {
     }
     let session = probe::session(&probe::System);
 
+    let run = setup::Run {
+        captured: &captured,
+        places: &places,
+        session: session.as_ref(),
+        layout: &layout,
+        program: &program,
+        flags: &flags,
+    };
+
     // Asked only where there is somebody to ask. A pipe is not a person, and
     // taking silence for consent is the one thing this must never do.
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let plan = if interactive {
-        setup::decide(&captured, &places, session.as_ref(), &flags, &setup::Tty)
+    let plan = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        setup::decide(&run, &setup::Tty)
     } else {
-        setup::decide(
-            &captured,
-            &places,
-            session.as_ref(),
-            &flags,
-            &setup::Assumed(false),
-        )
+        setup::decide(&run, &setup::Assumed(false))
     };
 
     if let Err(why) = setup::record_consent(&places.state_dir, &plan, &stamp()) {
         return complain(&format!("ayeaye: {why}"));
     }
 
-    let did = match setup::carry_out(
-        &plan,
-        &captured,
-        &places,
-        session.as_ref(),
-        &layout,
-        &program,
-        &flags,
-        Subprocess,
-        &models::Curl,
-        &stamp(),
-    ) {
+    let did = match setup::carry_out(&plan, &run, Subprocess, &models::Curl, &stamp()) {
         Ok(did) => did,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };

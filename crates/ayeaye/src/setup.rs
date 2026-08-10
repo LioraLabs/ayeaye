@@ -198,18 +198,40 @@ pub struct Did {
     pub declined: Vec<String>,
 }
 
+/// Everything about this run that does not change while it happens.
+///
+/// One value rather than seven parameters threaded through two functions, and
+/// the grouping is the real one: every field here is settled before the first
+/// decision is taken and none of them is touched afterwards. What varies — the
+/// plan, the runner, the fetcher, the clock — stays an argument.
+pub struct Run<'a> {
+    /// What this machine said about itself.
+    pub captured: &'a Captured,
+    /// Everything setup writes to.
+    pub places: &'a Places,
+    /// The session the service would live in, if this machine has one.
+    pub session: Option<&'a Session>,
+    /// Where this machine keeps things.
+    pub layout: &'a Layout,
+    /// The absolute path of this binary, which the definition names.
+    pub program: &'a str,
+    /// What was typed on the command line.
+    pub flags: &'a Flags,
+}
+
 /// Decide the plan for this machine.
 ///
 /// Split from [`carry_out`] so that what setup *would* do can be asked for
 /// without doing any of it — which is what the printed plan above the questions
 /// is, and what makes the questions informed consent rather than a prompt.
-pub fn decide(
-    captured: &Captured,
-    places: &Places,
-    session: Option<&Session>,
-    flags: &Flags,
-    ask: &impl Ask,
-) -> Plan {
+pub fn decide(run: &Run<'_>, ask: &impl Ask) -> Plan {
+    let Run {
+        captured,
+        places,
+        session,
+        flags,
+        ..
+    } = run;
     let machine = captured.machine();
     let existing = Existing {
         // A file with nothing in it is not a key. `config::load_token` reads it
@@ -261,16 +283,19 @@ pub fn decide(
 /// Do it.
 pub fn carry_out<R: Runner, F: Fetcher>(
     plan: &Plan,
-    captured: &Captured,
-    places: &Places,
-    session: Option<&Session>,
-    layout: &Layout,
-    program: &str,
-    flags: &Flags,
+    run: &Run<'_>,
     runner: R,
     fetcher: &F,
     stamp: &str,
 ) -> Result<Did, Failed> {
+    let Run {
+        captured,
+        places,
+        session,
+        layout,
+        program,
+        flags,
+    } = run;
     let mut did = Did::default();
     for step in &plan.steps {
         match step {
@@ -306,7 +331,7 @@ pub fn carry_out<R: Runner, F: Fetcher>(
                 let session = session.expect("a service step needs a session");
                 let services = Services {
                     session: session.clone(),
-                    layout: layout.clone(),
+                    layout: (*layout).clone(),
                     runner: &runner,
                 };
                 let installed = services
@@ -325,7 +350,7 @@ pub fn carry_out<R: Runner, F: Fetcher>(
                 let session = session.expect("a service step needs a session");
                 let services = Services {
                     session: session.clone(),
-                    layout: layout.clone(),
+                    layout: (*layout).clone(),
                     runner: &runner,
                 };
                 services
@@ -495,8 +520,8 @@ pub fn build_acceleration() -> Acceleration {
 #[cfg(test)]
 mod tests {
     use super::{
-        Assumed, Flags, Places, build_acceleration, carry_out, decide, mint, parse, record_consent,
-        write_settings,
+        Assumed, Flags, Places, Run, build_acceleration, carry_out, decide, mint, parse,
+        record_consent, write_settings,
     };
     use crate::probe::{Captured, Sources, capture};
     use crate::service::{Outcome, Runner};
@@ -658,13 +683,18 @@ mod tests {
         let root = scratch("unattended");
         let captured = machine_with(&["tmux"]);
         let session = Session::systemd();
-        let decided = decide(
-            &captured,
-            &places(&root),
-            Some(&session),
-            &Flags::default(),
-            &Assumed(false),
-        );
+        let flags = Flags::default();
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: Some(&session),
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let decided = decide(&run, &Assumed(false));
         assert!(!decided.consequential());
         assert!(
             decided.declined.contains(&Step::EnableService),
@@ -673,19 +703,7 @@ mod tests {
 
         let fetcher = NoDownloads::default();
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &captured,
-            &places(&root),
-            Some(&session),
-            &layout(&root),
-            "/opt/ayeaye",
-            &Flags::default(),
-            &runner,
-            &fetcher,
-            "1",
-        )
-        .expect("it should finish");
+        let did = carry_out(&decided, &run, &runner, &fetcher, "1").expect("it should finish");
 
         assert!(fetcher.asked.borrow().is_empty(), "nothing was downloaded");
         assert!(
@@ -717,27 +735,20 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
-        let decided = decide(
-            &captured,
-            &places(&root),
-            Some(&session),
-            &flags,
-            &Assumed(false),
-        );
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: Some(&session),
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &captured,
-            &places(&root),
-            Some(&session),
-            &layout(&root),
-            "/opt/ayeaye",
-            &flags,
-            &runner,
-            &NoDownloads::default(),
-            "1",
-        )
-        .expect("it should finish");
+        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
+            .expect("it should finish");
 
         let unit = root.join("config/systemd/user/ayeaye.service");
         assert!(unit.exists(), "{:?}", did.lines);
@@ -782,13 +793,20 @@ mod tests {
 
         // A second run does not plan to mint one, because the bookmark already on
         // somebody's phone is logged in with the first.
+        let captured = machine_with(&[]);
+        let flags = Flags {
+            no_model: true,
+            ..Flags::default()
+        };
+        let layout = layout(&root);
         let decided = decide(
-            &machine_with(&[]),
-            &places,
-            None,
-            &Flags {
-                no_model: true,
-                ..Flags::default()
+            &Run {
+                captured: &captured,
+                places: &places,
+                session: None,
+                layout: &layout,
+                program: "/opt/ayeaye",
+                flags: &flags,
             },
             &Assumed(true),
         );
@@ -809,13 +827,20 @@ mod tests {
         let places = places(&root);
         std::fs::create_dir_all(&places.state_dir).unwrap();
         std::fs::write(&places.token_file, "  \n").unwrap();
+        let captured = machine_with(&[]);
+        let flags = Flags {
+            no_model: true,
+            ..Flags::default()
+        };
+        let layout = layout(&root);
         let decided = decide(
-            &machine_with(&[]),
-            &places,
-            None,
-            &Flags {
-                no_model: true,
-                ..Flags::default()
+            &Run {
+                captured: &captured,
+                places: &places,
+                session: None,
+                layout: &layout,
+                program: "/opt/ayeaye",
+                flags: &flags,
             },
             &Assumed(true),
         );
@@ -891,29 +916,41 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
+        let places = places(&root);
+        let layout = layout(&root);
+        fn run<'a>(
+            captured: &'a Captured,
+            places: &'a Places,
+            session: &'a Session,
+            layout: &'a Layout,
+            flags: &'a Flags,
+        ) -> Run<'a> {
+            Run {
+                captured,
+                places,
+                session: Some(session),
+                layout,
+                program: "/opt/ayeaye",
+                flags,
+            }
+        }
         let agreed = decide(
-            &captured,
-            &places(&root),
-            Some(&session),
-            &flags,
+            &run(&captured, &places, &session, &layout, &flags),
             &Assumed(false),
         );
-        record_consent(&places(&root).state_dir, &agreed, "1000").expect("recorded");
+        record_consent(&places.state_dir, &agreed, "1000").expect("recorded");
 
+        let cautious = Flags {
+            no_model: true,
+            ..Flags::default()
+        };
         let declined = decide(
-            &captured,
-            &places(&root),
-            Some(&session),
-            &Flags {
-                no_model: true,
-                ..Flags::default()
-            },
+            &run(&captured, &places, &session, &layout, &cautious),
             &Assumed(false),
         );
-        record_consent(&places(&root).state_dir, &declined, "2000").expect("recorded");
+        record_consent(&places.state_dir, &declined, "2000").expect("recorded");
 
-        let held =
-            std::fs::read_to_string(places(&root).state_dir.join("consent")).expect("a record");
+        let held = std::fs::read_to_string(places.state_dir.join("consent")).expect("a record");
         assert!(held.contains("1000 agreed start ayeaye now"), "{held}");
         assert!(
             held.contains("2000 declined start ayeaye now"),
@@ -934,22 +971,21 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
-        let decided = decide(&captured, &places(&root), None, &flags, &Assumed(true));
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: None,
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let decided = decide(&run, &Assumed(true));
         assert!(!decided.steps.contains(&Step::InstallService));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &captured,
-            &places(&root),
-            None,
-            &layout(&root),
-            "/opt/ayeaye",
-            &flags,
-            &runner,
-            &NoDownloads::default(),
-            "1",
-        )
-        .expect("a finished run");
+        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
+            .expect("a finished run");
         assert!(
             did.lines
                 .iter()
@@ -971,21 +1007,20 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
-        let decided = decide(&captured, &places(&root), None, &flags, &Assumed(false));
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: None,
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &captured,
-            &places(&root),
-            None,
-            &layout(&root),
-            "/opt/ayeaye",
-            &flags,
-            &runner,
-            &NoDownloads::default(),
-            "1",
-        )
-        .expect("a finished run");
+        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
+            .expect("a finished run");
         assert!(
             did.lines
                 .iter()
