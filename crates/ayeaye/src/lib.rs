@@ -17,6 +17,7 @@ pub mod cliban;
 pub mod command;
 pub mod config;
 pub mod dictate;
+pub mod files;
 pub mod fit;
 pub mod models;
 pub mod process;
