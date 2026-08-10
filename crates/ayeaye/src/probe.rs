@@ -54,11 +54,18 @@ pub const LOOKED_FOR: &[&str] = &[
     "route",
 ];
 
+// Every name above is asked about somewhere: the five package managers and the
+// two service managers by `machine::platform`, and `brew`, `sudo`, `tmux`,
+// `curl`, `ffmpeg`, `claude`, `codex`, `cliban`, `tailscale` and `route` by the
+// capture itself or by `crate::health`. A name nobody asks about is a probe run
+// on every machine for nothing.
+
 /// The prefixes a Homebrew is installed under, in the order the shell tries
 /// them: Apple silicon, Intel, and Linuxbrew.
 const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
 
-/// The four marks a container leaves. None is reliable alone.
+/// The three files a container leaves. None is reliable alone, and the fourth
+/// mark is the `container` environment variable, which is not a path.
 const CONTAINER_MARKERS: &[&str] = &[
     "/.dockerenv",
     "/run/.containerenv",
@@ -182,6 +189,7 @@ pub struct Captured {
     route6: Option<String>,
     route_default_exists: Option<bool>,
     privilege: Privilege,
+    launchd_uid: Option<String>,
 }
 
 impl Captured {
@@ -245,11 +253,6 @@ impl Captured {
         })
     }
 
-    /// What this session could become, if it had to.
-    pub fn privilege(&self) -> Privilege {
-        self.privilege
-    }
-
     /// What to tell somebody who has to install those packages themselves.
     ///
     /// Two lines, and never an install: the criterion is that setup prints the
@@ -266,10 +269,15 @@ impl Captured {
         )
     }
 
-    /// Which service manager this machine's user session has, out of the one
-    /// capture rather than asked again.
-    pub fn service_manager(&self) -> ServiceManager {
-        self.machine().services
+    /// The session this machine's service verbs address, out of the one capture
+    /// rather than asked again.
+    ///
+    /// `None` is the third answer — a machine with neither manager — and it is
+    /// the same answer [`session`] gives; this is the door for a caller that has
+    /// already asked the machine everything, so `ayeaye setup` does not run the
+    /// platform probes twice and cannot end up with two ideas of what it is on.
+    pub fn session(&self) -> Option<Session> {
+        Session::for_manager(self.machine().services, self.launchd_uid.as_deref())
     }
 
     /// Whether that command is on this machine's `PATH`.
@@ -420,11 +428,16 @@ pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
     // `id -u` is where lib/pkg.sh reads privilege from, and `sudo` on PATH is
     // the rest of it. Homebrew refuses to run as root, so this is not simply
     // "can I install": it is what a generated command line has to say.
-    captured.privilege = match said(sources, &["id", "-u"]).as_deref().map(str::trim) {
+    let uid = said(sources, &["id", "-u"]).map(|said| said.trim().to_string());
+    captured.privilege = match uid.as_deref() {
         Some("0") => Privilege::Root,
         _ if captured.available.iter().any(|name| name == "sudo") => Privilege::Sudo,
         _ => Privilege::None,
     };
+    // Kept only where a domain is addressed by one. systemd's user manager is
+    // addressed as whoever is calling, and a uid there would describe a thing
+    // that does not exist.
+    captured.launchd_uid = uid.filter(|uid| !uid.is_empty());
 
     // macOS only, and asked last so the two cheap `uname` calls have already
     // said whether this is a Mac. The one gated probe, because it is the one

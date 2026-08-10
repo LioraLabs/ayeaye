@@ -93,11 +93,23 @@ impl Ask for Tty {
         if std::io::stdin().lock().read_line(&mut line).is_err() {
             return default;
         }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "" => default,
-            "y" | "yes" => true,
-            _ => false,
-        }
+        answer(&line, default)
+    }
+}
+
+/// What a typed line means.
+///
+/// Split out of [`Tty`] because it is the whole of the consent question and it
+/// is unreachable from a test while it lives inside a `read_line`. **A bare
+/// newline takes the default, and the default at every call site here is `no`.**
+/// If pressing return ever came to mean yes, `ayeaye setup` would download a
+/// gigabyte and start a service for somebody who was skimming, and nothing else
+/// in the program would notice.
+fn answer(line: &str, default: bool) -> bool {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => default,
+        "y" | "yes" => true,
+        _ => false,
     }
 }
 
@@ -296,6 +308,14 @@ pub fn carry_out<R: Runner, F: Fetcher>(
         program,
         flags,
     } = run;
+
+    // Written down *before* the first step, and inside this function rather than
+    // beside it, so the order cannot be got wrong by a caller. A record written
+    // afterwards is a record that a failure halfway through erases — and what
+    // somebody agreed to is exactly the thing worth still knowing when the run
+    // that followed it went wrong.
+    record_consent(&places.state_dir, plan, stamp)?;
+
     let mut did = Did::default();
     for step in &plan.steps {
         match step {
@@ -450,7 +470,22 @@ fn write_settings(places: &Places, flags: &Flags) -> Result<String, Failed> {
         .to_path_buf();
     std::fs::create_dir_all(&dir)
         .map_err(|why| Failed::Disk(format!("create {}: {why}", dir.display())))?;
-    let before = std::fs::read_to_string(&places.config_file).unwrap_or_default();
+    // A file that is not there is a machine nobody has configured yet, which is
+    // every machine the first time. Anything *else* — not valid UTF-8, no
+    // permission, a directory where a file should be — is refused, and refused
+    // loudly. Folding every failure into an empty string would make the next
+    // line truncate somebody's settings to nothing, which is the one thing
+    // "does not damage an existing install" is about.
+    let before = match std::fs::read_to_string(&places.config_file) {
+        Ok(text) => text,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(why) => {
+            return Err(Failed::Disk(format!(
+                "{} is there and could not be read ({why}), so it has been left alone",
+                places.config_file.display()
+            )));
+        }
+    };
     let after = wanted.iter().fold(before.clone(), |text, (key, value)| {
         settings::upsert(&text, key, value)
     });
@@ -504,6 +539,30 @@ pub fn record_consent(state_dir: &Path, plan: &Plan, stamp: &str) -> Result<(), 
     Ok(())
 }
 
+/// One setting, as the running daemon would see it.
+///
+/// **The environment wins, then the file, then the default** — the milestone's
+/// own decision, and the reason this exists rather than reading `config::env_var`
+/// alone. `Settings::resolve` reads the environment because a *unit* puts the
+/// file into it with `EnvironmentFile=`; anything asking the same question
+/// *outside* the service — `ayeaye check`, run from a shell, right after setup
+/// wrote the file — sees none of that. Without this the health checks would ask
+/// about the default port on a machine setup had just configured for another
+/// one, and report a perfectly healthy install as dead.
+pub fn effective(config_file: &Path, key: &str, default: &str) -> String {
+    if let Some(from_environment) = crate::config::env_var(key) {
+        return from_environment;
+    }
+    let text = std::fs::read_to_string(config_file).unwrap_or_default();
+    settings::parse_env_file(&text)
+        .into_iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// What this build runs inference on, as the core names it.
 ///
 /// The one place `ayeaye_infer::Backend` is turned into `machine::Acceleration`,
@@ -520,8 +579,8 @@ pub fn build_acceleration() -> Acceleration {
 #[cfg(test)]
 mod tests {
     use super::{
-        Assumed, Flags, Places, Run, build_acceleration, carry_out, decide, mint, parse,
-        record_consent, write_settings,
+        Assumed, Flags, Places, Run, answer, build_acceleration, carry_out, decide, effective,
+        mint, parse, record_consent, write_settings,
     };
     use crate::probe::{Captured, Sources, capture};
     use crate::service::{Outcome, Runner};
@@ -1041,6 +1100,114 @@ mod tests {
                 "setup verifies it and never installs it: {argv:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // AYEAYE-62 — a bare newline takes the default, and every default here is
+    // no. If return ever came to mean yes, setup would download a gigabyte and
+    // start a service for somebody who was skimming, and nothing else in the
+    // program would notice.
+    #[test]
+    fn pressing_return_never_agrees_to_anything() {
+        assert!(!answer("\n", false));
+        assert!(!answer("", false));
+        assert!(!answer("   \n", false));
+        assert!(answer("\n", true), "and it does take a yes default");
+
+        for yes in ["y", "Y", "yes", "YES", " Yes \n"] {
+            assert!(answer(yes, false), "{yes:?}");
+        }
+        for no in ["n", "no", "N", "nope", "later", "1", "true"] {
+            assert!(
+                !answer(no, false),
+                "{no:?} is not one of the two words that mean yes"
+            );
+        }
+    }
+
+    // AYEAYE-62 — the health checks have to ask about the machine setup just
+    // configured. The environment wins, then the file, then the default: a check
+    // that read only the environment would ask about the default port on a
+    // machine setup had put on another one, and call a healthy install dead.
+    #[test]
+    fn a_setting_is_read_the_way_the_daemon_would_read_it() {
+        let root = scratch("effective");
+        let file = root.join("env");
+        assert_eq!(effective(&file, "BIND", "127.0.0.1"), "127.0.0.1");
+        std::fs::write(&file, "AYEAYE_BIND=10.0.0.5\n").unwrap();
+        assert_eq!(effective(&file, "BIND", "127.0.0.1"), "10.0.0.5");
+        // A key the file mentions with nothing after it is not an answer.
+        std::fs::write(&file, "AYEAYE_BIND=\n").unwrap();
+        assert_eq!(effective(&file, "BIND", "127.0.0.1"), "127.0.0.1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // AYEAYE-62 — a settings file that is there and cannot be read is left
+    // exactly as it is. Folding every read failure into an empty string would
+    // make the next write truncate somebody's settings to nothing, which is the
+    // one thing "does not damage an existing install" is about.
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_left_alone() {
+        let root = scratch("unreadable");
+        let places = places(&root);
+        std::fs::create_dir_all(places.config_file.parent().unwrap()).unwrap();
+        // Not valid UTF-8, which read_to_string refuses.
+        std::fs::write(&places.config_file, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        let before = std::fs::read(&places.config_file).unwrap();
+
+        let why = write_settings(&places, &Flags::default())
+            .expect_err("it must refuse rather than truncate");
+        assert!(why.to_string().contains("left alone"), "{why}");
+        assert_eq!(
+            std::fs::read(&places.config_file).unwrap(),
+            before,
+            "not one byte of it may change"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // AYEAYE-62 — what somebody agreed to is written down before the first step,
+    // not after the last. A record written afterwards is a record a failure
+    // halfway through erases, and what was agreed is exactly the thing worth
+    // still knowing when the run that followed went wrong.
+    #[test]
+    fn consent_is_recorded_before_anything_is_done() {
+        let root = scratch("consent-first");
+        let captured = machine_with(&[]);
+        let session = Session::systemd();
+        let flags = Flags {
+            yes: true,
+            no_model: true,
+            ..Flags::default()
+        };
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: Some(&session),
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let decided = decide(&run, &Assumed(false));
+
+        // A runner that refuses everything, so the enable fails and the run
+        // stops partway.
+        struct Refuses;
+        impl Runner for Refuses {
+            fn run(&self, _argv: &[String]) -> Outcome {
+                Outcome {
+                    ok: false,
+                    output: "no".to_string(),
+                }
+            }
+        }
+        let failed = carry_out(&decided, &run, Refuses, &NoDownloads::default(), "7");
+        assert!(failed.is_err(), "the enable should have failed");
+        let held = std::fs::read_to_string(places.state_dir.join("consent"))
+            .expect("the record survives the failure it preceded");
+        assert!(held.contains("7 agreed"), "{held}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

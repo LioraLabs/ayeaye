@@ -81,12 +81,20 @@ impl Definition {
     /// is a *system* target a user manager has never heard of, so the line was
     /// an ordering guarantee that did not exist. ayeaye binds when it starts and
     /// the restart policy covers the rest.
+    /// **The `serve` is load-bearing.** The shell's `bin/ayeaye` is the server
+    /// and running it bare starts one, which is why the captured unit says only
+    /// `@REPO@/bin/ayeaye`. This binary is not: run bare it prints its banner and
+    /// exits 0. A unit without the verb installs perfectly, starts, prints one
+    /// line, exits successfully, and — because the policy is `on-failure` — is
+    /// never restarted. Nothing is running and nothing anywhere says so, which
+    /// is the failure mode this whole ticket's health checks exist to catch, so
+    /// it would be a poor thing to ship.
     pub fn ayeaye(program: &str) -> Self {
         Definition {
             name: "ayeaye".to_string(),
             title: "voice remote for tmux (phone web UI)".to_string(),
             after: None,
-            argv: vec![program.to_string()],
+            argv: vec![program.to_string(), "serve".to_string()],
         }
     }
 
@@ -514,9 +522,14 @@ fn xml_text(text: &str) -> String {
 /// is explicit that a machine with no user service manager is a machine where
 /// setup has nothing left to do, and that telling somebody to come back to it
 /// later would be telling them to fix something that is not broken.
+/// The `serve` is the same load-bearing word as in [`Definition::ayeaye`], and
+/// for the same reason. `install.sh` says `run the server with: $REPO/bin/ayeaye`
+/// because that script *is* the server; telling somebody to run this binary bare
+/// would have them watch it print one line and exit, on the one path where there
+/// is no service manager to notice.
 pub fn manual_instructions(program: &str, env_file: &str) -> [String; 3] {
     [
-        format!("run the server with: {program}"),
+        format!("run the server with: {program} serve"),
         format!("(it reads {env_file} by itself)"),
         "its log is whatever the terminal you start it in shows.".to_string(),
     ]
@@ -722,7 +735,7 @@ mod tests {
         assert_eq!(
             said,
             [
-                "run the server with: /opt/ayeaye/bin/ayeaye",
+                "run the server with: /opt/ayeaye/bin/ayeaye serve",
                 "(it reads /home/tester/.config/ayeaye/env by itself)",
                 "its log is whatever the terminal you start it in shows.",
             ]
@@ -830,8 +843,47 @@ mod tests {
         }
     }
 
+    /// The definition the *shell* installs, which is what the golden files
+    /// captured: its `bin/ayeaye` is the server, so its `ExecStart` is the
+    /// program and nothing else.
+    ///
+    /// Written out here rather than taken from [`Definition::ayeaye`] because
+    /// AYEAYE-62 gave the real one a `serve`, without which the unit starts a
+    /// process that prints a banner and exits. The goldens pin the *renderer*,
+    /// and the test below pins the difference between the two on purpose.
     fn ayeaye() -> Definition {
-        Definition::ayeaye(&format!("{REPO}/bin/ayeaye"))
+        Definition {
+            name: "ayeaye".to_string(),
+            title: "voice remote for tmux (phone web UI)".to_string(),
+            after: None,
+            argv: vec![format!("{REPO}/bin/ayeaye")],
+        }
+    }
+
+    // AYEAYE-62 — the one place the port deliberately differs from the file it
+    // was captured from, so that the difference is a decision rather than a
+    // drift. The shell's `bin/ayeaye` serves when run bare; this binary prints
+    // its banner and exits 0, and `Restart=on-failure` never restarts a process
+    // that exited successfully. A unit without the verb is a service that
+    // installs cleanly, runs once, stops, and says nothing.
+    #[test]
+    fn the_installed_unit_tells_this_binary_to_serve() {
+        let real = Definition::ayeaye("/opt/ayeaye");
+        assert_eq!(real.argv, ["/opt/ayeaye", "serve"]);
+        let unit = render_systemd(&real, &layout());
+        assert!(
+            unit.contains("ExecStart=/opt/ayeaye serve"),
+            "a unit that starts nothing: {unit}"
+        );
+        // And it differs from the shell's unit in that line and nothing else.
+        let shell = render_systemd(&ayeaye(), &layout());
+        let differing: Vec<(&str, &str)> = shell
+            .lines()
+            .zip(unit.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(differing.len(), 1, "{differing:?}");
+        assert!(differing[0].0.starts_with("ExecStart="));
     }
 
     // AYEAYE-61 — the port is only a port if it agrees with the file the shell
@@ -936,7 +988,7 @@ mod tests {
         let spaced = Definition::ayeaye("/Users/John Smith/ayeaye/bin/ayeaye");
         assert!(
             render_systemd(&spaced, &layout())
-                .contains("ExecStart=\"/Users/John Smith/ayeaye/bin/ayeaye\"\n"),
+                .contains("ExecStart=\"/Users/John Smith/ayeaye/bin/ayeaye\" serve\n"),
             "systemd splits an unquoted argument on the space"
         );
         assert!(
@@ -954,7 +1006,7 @@ mod tests {
         let awkward = Definition::ayeaye("/srv/100% $path/bin/ayeaye");
         assert!(
             render_systemd(&awkward, &layout())
-                .contains("ExecStart=\"/srv/100%% $$path/bin/ayeaye\"\n"),
+                .contains("ExecStart=\"/srv/100%% $$path/bin/ayeaye\" serve\n"),
         );
         assert!(
             render_launchd(&awkward, &layout())
@@ -975,7 +1027,7 @@ mod tests {
         );
         assert_eq!(
             program_arguments(&agent),
-            vec![path.to_string()],
+            vec![path.to_string(), "serve".to_string()],
             "the path has to come back out of the XML exactly as it went in"
         );
     }

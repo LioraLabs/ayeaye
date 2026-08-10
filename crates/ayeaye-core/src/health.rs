@@ -84,12 +84,22 @@ pub struct Check {
     pub verdict: Verdict,
     /// The evidence, for whoever has to fix it. Never shown as the verdict.
     pub detail: Option<String>,
+    /// Whether the claim already says why this verdict is what it is.
+    ///
+    /// The default qualification for `skipped` is "you did not ask for this",
+    /// and it is right for every check that reports on something a person
+    /// chooses. It is *wrong* for the ones that report a fact about the machine:
+    /// "ayeaye cannot use an AMD graphics card — you did not ask for this" tells
+    /// somebody they declined a thing they never had the option of. So a check
+    /// whose own claim carries the reason says so, and keeps the mark without
+    /// the sentence.
+    pub explains_itself: bool,
 }
 
 impl Check {
     /// One line: the mark, the claim, and the qualification a mark needs.
     pub fn line(&self) -> String {
-        match self.verdict.because() {
+        match self.verdict.because().filter(|_| !self.explains_itself) {
             Some(because) => format!("{:>7}  {} — {because}", self.verdict.mark(), self.claim),
             None => format!("{:>7}  {}", self.verdict.mark(), self.claim),
         }
@@ -140,6 +150,7 @@ impl Report {
             claim: claim.to_string(),
             verdict,
             detail: code.map(|code| format!("an unauthenticated request answered {code}")),
+            explains_itself: false,
         });
         verdict
     }
@@ -318,18 +329,67 @@ pub fn https(asked_for: bool, host: Option<&str>, code: Option<u16>) -> Verdict 
     }
 }
 
-/// The coding agents. Only the ones that are here; the others are not missing.
+/// The coding agents: detected and verified, never installed.
 ///
-/// Detected and verified, never installed. `wanted` is empty when nothing was
-/// asked for, which is skipped and not a failure.
-pub fn agents(wanted: &[(&str, bool)]) -> Verdict {
-    if wanted.is_empty() {
+/// **A deliberate departure from the shell, and the reason is that the question
+/// changed.** `_health_check_agents` checks the agents somebody *chose* in the
+/// wizard and reports the chosen ones that are missing. Nobody chooses any more
+/// — the conversation is not ported — so "you asked for codex and it is not
+/// here" is a sentence with no one to say it to.
+///
+/// What is left is the question ayeaye actually depends on: is there *an* agent
+/// for it to show you. None at all is a real failure, because the panel has
+/// nothing to put in it; one is enough, and the second missing is not a fault.
+///
+/// `candidates` is every agent this build knows, each with whether it is on
+/// `PATH`. An empty list would mean this build knows of no agents at all, which
+/// is nothing to report on.
+pub fn agents(candidates: &[(&str, bool)]) -> Verdict {
+    if candidates.is_empty() {
         return Verdict::Skipped;
     }
-    if wanted.iter().all(|(_, present)| *present) {
+    if candidates.iter().any(|(_, present)| *present) {
         Verdict::Passed
     } else {
         Verdict::Failed
+    }
+}
+
+/// A mesh network, if this machine is on one.
+///
+/// *Detected and verified, never configured* — the criterion's exact words, and
+/// the reason this only ever reads. `installed` is whether the client is on
+/// `PATH` at all; `up` is what its own status command answered, and `None` there
+/// is a command that could not be run or would not say.
+///
+/// Not installed is [`Verdict::Skipped`] and not a failure: a mesh network is one
+/// of several ways to reach this machine and ayeaye has no opinion about which
+/// somebody picked. Installed and *down* is a failure, because something was set
+/// up and is not working — which is precisely the state the shell's own
+/// tailscale step exists to notice.
+pub fn mesh(installed: bool, up: Option<bool>) -> Verdict {
+    match (installed, up) {
+        (false, _) => Verdict::Skipped,
+        (true, None) => Verdict::Unknown,
+        (true, Some(true)) => Verdict::Passed,
+        (true, Some(false)) => Verdict::Failed,
+    }
+}
+
+/// The ticket board, when there is one to reach.
+///
+/// Two things have to be true and they fail differently: the program has to be
+/// here, and the app has to be able to get an answer out of it. `installed` is
+/// the first; `answered` is the body of a request that carried the key, which is
+/// `None` when the request could not be made at all.
+pub fn board(installed: bool, answered: Option<&str>) -> Verdict {
+    if !installed {
+        return Verdict::Skipped;
+    }
+    match answered {
+        None => Verdict::Unknown,
+        Some(body) if body.contains("\"keys\"") => Verdict::Passed,
+        Some(_) => Verdict::Failed,
     }
 }
 
@@ -419,6 +479,12 @@ pub fn acceleration(build: Acceleration, machine: &Machine) -> Check {
         claim,
         verdict,
         detail,
+        // Every arm's claim already carries its own reason — "the graphics card
+        // is too small to be any use", "ayeaye cannot use an AMD graphics card".
+        // These are facts about the machine, and the default qualification for a
+        // skip is "you did not ask for this", which would tell somebody they
+        // declined a card they never had the option of using.
+        explains_itself: true,
     }
 }
 
@@ -438,8 +504,8 @@ fn describe(machine: &Machine) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, Outcome, Report, Verdict, acceleration, agents, hosts, https, insecure_warning,
-        local, service, service_claim, tmux, unauthenticated,
+        Check, Outcome, Report, Verdict, acceleration, agents, board, hosts, https,
+        insecure_warning, local, mesh, service, service_claim, tmux, unauthenticated,
     };
     use crate::machine::{Acceleration, Machine, Probes, Usability};
 
@@ -460,6 +526,7 @@ mod tests {
             claim: "something".to_string(),
             verdict,
             detail: None,
+            explains_itself: false,
         }
     }
 
@@ -696,16 +763,73 @@ mod tests {
         assert!(service_claim(true).contains("registered"));
     }
 
-    // AYEAYE-62 — the agents are detected and verified, never installed, and a
-    // machine that was not asked for one has nothing missing.
+    // AYEAYE-62 — the agents are detected and verified, never installed. A
+    // deliberate departure from the shell, because the question changed:
+    // `_health_check_agents` reports the agents somebody *chose* and nobody
+    // chooses any more, so "you asked for codex and it is not here" is a sentence
+    // with no one to say it to. What is left is what ayeaye actually depends on.
     #[test]
-    fn only_the_agents_that_are_here_are_checked_and_none_is_installed() {
-        assert_eq!(agents(&[]), Verdict::Skipped);
-        assert_eq!(agents(&[("claude", true)]), Verdict::Passed);
+    fn a_machine_with_no_coding_agent_at_all_is_a_panel_with_nothing_in_it() {
+        // None anywhere: the thing ayeaye exists to show you is not here, and
+        // that is a real failure rather than a preference.
         assert_eq!(
-            agents(&[("claude", true), ("codex", false)]),
+            agents(&[("claude", false), ("codex", false)]),
             Verdict::Failed
         );
+        // One is enough, and the second missing is not a fault.
+        assert_eq!(
+            agents(&[("claude", true), ("codex", false)]),
+            Verdict::Passed
+        );
+        assert_eq!(
+            agents(&[("claude", false), ("codex", true)]),
+            Verdict::Passed
+        );
+        assert_eq!(
+            agents(&[("claude", true), ("codex", true)]),
+            Verdict::Passed
+        );
+        // A build that knows of no agents has nothing to report on.
+        assert_eq!(agents(&[]), Verdict::Skipped);
+    }
+
+    // AYEAYE-62 — a mesh network is detected and verified and never configured.
+    // Not installed is not a failure: it is one of several ways to reach this
+    // machine and ayeaye has no opinion about which somebody picked. Installed
+    // and down *is* a failure, because something was set up and is not working.
+    #[test]
+    fn a_mesh_network_is_verified_where_there_is_one_and_never_configured() {
+        assert_eq!(mesh(false, None), Verdict::Skipped);
+        assert_eq!(
+            mesh(false, Some(false)),
+            Verdict::Skipped,
+            "not installed is not installed, whatever else answered"
+        );
+        assert_eq!(mesh(true, Some(true)), Verdict::Passed);
+        assert_eq!(mesh(true, Some(false)), Verdict::Failed);
+        assert_eq!(
+            mesh(true, None),
+            Verdict::Unknown,
+            "installed, and its own status would not say"
+        );
+    }
+
+    // AYEAYE-62 — the board fails in two different ways, and they are different
+    // facts: the program is not here, or it is here and the app cannot get an
+    // answer out of it.
+    #[test]
+    fn the_board_is_checked_by_what_the_app_can_get_out_of_it() {
+        assert_eq!(board(false, None), Verdict::Skipped);
+        assert_eq!(
+            board(true, Some("{\"keys\": [\"AYEAYE\"]}")),
+            Verdict::Passed
+        );
+        assert_eq!(
+            board(true, Some("{\"error\": \"no\"}")),
+            Verdict::Failed,
+            "cliban is here and the app could not read it"
+        );
+        assert_eq!(board(true, None), Verdict::Unknown, "no answer at all");
     }
 
     // AYEAYE-62 — tmux is a real answer either way. The question was asked and

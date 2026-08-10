@@ -172,10 +172,14 @@ fn setup_with_nobody_to_ask_writes_its_own_files_and_nothing_else() {
     let (code, out, err) = ayeaye_on_a_bare_machine(&["setup", "--no-model"], &home);
 
     // The health checks are the last thing it does, and on a machine with
-    // nothing running they do not pass — so setup does not claim success.
+    // nothing running most of them cannot be made — but setup still *finishes*.
+    // `lib/steps/80-health.sh` answers PENDING for everything it can be unhappy
+    // about, and a pending step never stops a run: needing tmux installed is not
+    // setup having failed at its job. `ayeaye check` reports the same thing and
+    // exits 1, because that one was asked as a question.
     assert_eq!(
-        code, 1,
-        "an unfinished install is not a finished one: {out}{err}"
+        code, 0,
+        "an unfinished check is not a failed run: {out}{err}"
     );
     assert!(out.contains("looking at this computer"), "{out}");
 
@@ -255,6 +259,8 @@ fn a_second_setup_keeps_the_key_the_first_one_made() {
 fn check_runs_the_health_report_on_its_own() {
     let home = scratch("check");
     let (code, out, err) = ayeaye_on_a_bare_machine(&["check"], &home);
+    // `check` is asked as a question, so its exit code is the answer — unlike
+    // `setup`, which reports the same thing and still finishes.
     assert_eq!(code, 1, "nothing is running, so nothing is finished");
     assert!(out.contains("checking what is here"), "{out}");
     assert!(out.contains(" ok, "), "the summary line: {out}");

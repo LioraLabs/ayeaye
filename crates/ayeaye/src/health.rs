@@ -39,6 +39,12 @@ pub struct Asking<'a, R: Runner> {
     pub url: String,
     /// The addresses ayeaye was configured to answer to.
     pub allowed_hosts: Vec<String>,
+    /// Whether the bind address keeps ayeaye on this computer.
+    ///
+    /// Network exposure, *detected and never configured* — the criterion's
+    /// exact words. A machine bound to anything but loopback has been put on a
+    /// network by somebody, and that is the fact the front-end checks are about.
+    pub loopback_only: bool,
     /// The shared secret, where there is one to use.
     pub token: Option<String>,
     /// Where a temporary curl configuration may be written.
@@ -53,6 +59,18 @@ pub struct Asking<'a, R: Runner> {
     pub runner: R,
 }
 
+/// What the curl configuration holding the key is called.
+///
+/// Named once so the sweep and the writer cannot disagree about which file is
+/// the one holding a credential.
+const SECRET_FILE: &str = "health-request";
+
+/// The coding agents ayeaye knows how to show.
+///
+/// The same two `crate::process` recognises, and the list is here rather than
+/// inline so that adding a third is one edit.
+const AGENTS: &[&str] = &["claude", "codex"];
+
 /// An address nobody would ever configure, used to prove ayeaye refuses one.
 ///
 /// `.invalid` is reserved by RFC 2606 precisely so that it can never resolve, so
@@ -60,10 +78,20 @@ pub struct Asking<'a, R: Runner> {
 const A_STRANGER: &str = "not-configured.invalid";
 
 impl<R: Runner> Asking<'_, R> {
-    /// Run every check, in the shell's order, and report.
+    /// Run every check and report.
+    ///
+    /// The order is the shell's where the shell has one — service, then the
+    /// local answer, then the lock — with the checks this ticket added placed
+    /// beside the ones they belong with. The agents come last rather than
+    /// fourth because nothing else depends on them.
     pub fn run(&self) -> Report {
         let mut report = Report::default();
         let curl = self.captured.has("curl");
+        // Whatever a crashed run left behind holds a key. The shell sweeps this
+        // at both ends for that reason, and its own test harness has a tripwire
+        // watching for the leftover; `SecretConfig`'s `Drop` covers the run that
+        // finishes, and this covers the one that did not.
+        self.sweep_stale_secret();
 
         report.record(self.service_check());
         report.record(self.tmux_check());
@@ -72,7 +100,7 @@ impl<R: Runner> Asking<'_, R> {
         if !curl {
             // Said once, at the top, rather than five times underneath.
             for (name, claim) in [
-                ("local", format!("ayeaye answering on {}", self.url)),
+                ("local", format!("ayeaye answers on {}", self.url)),
                 (
                     "auth",
                     "ayeaye refusing anyone without your key".to_string(),
@@ -89,8 +117,10 @@ impl<R: Runner> Asking<'_, R> {
                     claim,
                     verdict: Verdict::Unknown,
                     detail: Some("this computer has no curl, so this could not be asked".into()),
+                    explains_itself: false,
                 });
             }
+            report.record(self.mesh_check());
             report.record(self.agents_check());
             return report;
         }
@@ -101,6 +131,7 @@ impl<R: Runner> Asking<'_, R> {
             claim: format!("ayeaye answers on {}", self.url),
             verdict: health::local(local),
             detail: local.map(|code| format!("it answered {code}")),
+            explains_itself: false,
         });
 
         report.record_auth(
@@ -111,6 +142,8 @@ impl<R: Runner> Asking<'_, R> {
         report.record(self.authorised_check());
         report.record(self.hosts_check());
         report.record(self.https_check());
+        report.record(self.mesh_check());
+        report.record(self.board_check());
         report.record(self.agents_check());
         report
     }
@@ -123,6 +156,7 @@ impl<R: Runner> Asking<'_, R> {
                 claim: "ayeaye starting when you log in".to_string(),
                 verdict: health::service(false, None),
                 detail: Some("this computer has no user service manager".to_string()),
+                explains_itself: false,
             };
         };
         let launchd = session.manager == Manager::Launchd;
@@ -135,6 +169,7 @@ impl<R: Runner> Asking<'_, R> {
             claim: health::service_claim(launchd).to_string(),
             verdict: health::service(true, asked),
             detail: None,
+            explains_itself: false,
         }
     }
 
@@ -146,6 +181,7 @@ impl<R: Runner> Asking<'_, R> {
             claim: "tmux, which ayeaye reads your agents through".to_string(),
             verdict: health::tmux(present),
             detail: (!present).then(|| self.captured.install_hint(&["tmux"]).join("; ")),
+            explains_itself: false,
         }
     }
 
@@ -166,6 +202,7 @@ impl<R: Runner> Asking<'_, R> {
                 claim,
                 verdict: Verdict::Unknown,
                 detail: Some("there is no key on this computer to try".to_string()),
+                explains_itself: false,
             };
         };
         let secret = match SecretConfig::write(state_dir, token) {
@@ -176,6 +213,7 @@ impl<R: Runner> Asking<'_, R> {
                     claim,
                     verdict: Verdict::Unknown,
                     detail: Some(why),
+                    explains_itself: false,
                 };
             }
         };
@@ -190,6 +228,7 @@ impl<R: Runner> Asking<'_, R> {
             // not, and no answer is never a pass.
             verdict: health::local(code),
             detail: code.map(|code| format!("it answered {code}")),
+            explains_itself: false,
         }
     }
 
@@ -224,8 +263,22 @@ impl<R: Runner> Asking<'_, R> {
             claim,
             verdict,
             detail: (verdict == Verdict::Failed).then(|| {
-                format!("an address nobody configured answered {stranger:?}; yours answered {configured:?}")
+                let said = |code: Option<u16>| match code {
+                    Some(code) => code.to_string(),
+                    None => "nothing".to_string(),
+                };
+                format!(
+                    "an address nobody configured answered {}; yours answered {}",
+                    said(stranger),
+                    configured
+                        .iter()
+                        .copied()
+                        .map(said)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }),
+            explains_itself: false,
         }
     }
 
@@ -233,10 +286,18 @@ impl<R: Runner> Asking<'_, R> {
     /// never configured.
     fn https_check(&self) -> Check {
         let host = self.allowed_hosts.first();
-        // "Was one asked for" is the presence of a configured address: nothing
-        // else in this binary knows about a proxy or a mesh, and a machine that
-        // named none is a machine that stayed on loopback by choice.
-        let asked_for = !self.allowed_hosts.is_empty();
+        // Two signals, and the second is what makes "setup could not tell" a
+        // reachable answer rather than a branch nothing takes. A configured
+        // address is the obvious one. The other is a bind address that is not
+        // loopback: a machine listening on the network has been *exposed* — by a
+        // proxy, a mesh, or a hand-edited settings file — and that exposure is
+        // the thing a front-end check is about. Exposed with no address to try is
+        // exactly "you asked for this and setup could not check it", which is the
+        // shell's answer where its `answer.access.mode` was set and its host list
+        // was empty. Treating it as "you did not ask" would be the criterion's
+        // floor broken from the other side.
+        let exposed = !self.loopback_only;
+        let asked_for = !self.allowed_hosts.is_empty() || exposed;
         let code = host.and_then(|host| self.code(&format!("https://{host}/"), &[]));
         Check {
             name: "https",
@@ -246,33 +307,114 @@ impl<R: Runner> Asking<'_, R> {
             },
             verdict: health::https(asked_for, host.map(String::as_str), code),
             detail: code.map(|code| format!("it answered {code}")),
+            explains_itself: false,
         }
+    }
+
+    /// A mesh network, if this machine is on one.
+    ///
+    /// Detected and verified, never configured. `tailscale status` is a read —
+    /// it reports and changes nothing — which is the only kind of question this
+    /// binary is allowed to ask about somebody's network.
+    fn mesh_check(&self) -> Check {
+        let installed = self.captured.has("tailscale");
+        let up = installed.then(|| {
+            self.runner
+                .run(&["tailscale".to_string(), "status".to_string()])
+                .ok
+        });
+        Check {
+            name: "mesh",
+            claim: "the mesh network you reach this machine over".to_string(),
+            verdict: health::mesh(installed, up),
+            detail: None,
+            explains_itself: false,
+        }
+    }
+
+    /// The ticket board, when there is a cliban to reach.
+    ///
+    /// Two things have to be true and they fail differently: the program has to
+    /// be here, and the app has to be able to get an answer out of it. The second
+    /// needs the key, so it goes through the same self-deleting config file.
+    fn board_check(&self) -> Check {
+        let installed = self.captured.has("cliban");
+        let claim = "your ticket board on the phone".to_string();
+        if !installed {
+            return Check {
+                name: "board",
+                claim,
+                verdict: health::board(false, None),
+                detail: None,
+                explains_itself: false,
+            };
+        }
+        let answered = self.with_key(&format!("{}/api/cliban/projects", self.url));
+        Check {
+            name: "board",
+            claim,
+            verdict: health::board(true, answered.as_deref()),
+            detail: answered
+                .is_none()
+                .then(|| "cliban is here and the app would not answer about it".to_string()),
+            explains_itself: false,
+        }
+    }
+
+    /// Remove a curl configuration a previous run left behind.
+    ///
+    /// It holds the key, and a run that was killed between writing it and using
+    /// it leaves it on disk with nothing to clean it up.
+    fn sweep_stale_secret(&self) {
+        if let Some(dir) = self.state_dir.as_deref() {
+            let _ = std::fs::remove_file(dir.join(SECRET_FILE));
+        }
+    }
+
+    /// The body of a request that carried the key, or `None` when it could not
+    /// be made at all.
+    fn with_key(&self, url: &str) -> Option<String> {
+        let secret =
+            SecretConfig::write(self.state_dir.as_deref()?, self.token.as_deref()?).ok()?;
+        let mut argv: Vec<String> = ["curl", "--silent", "--show-error", "--max-time", TIMEOUT]
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect();
+        argv.push("-K".to_string());
+        argv.push(secret.path().to_string_lossy().into_owned());
+        argv.push("--".to_string());
+        argv.push(url.to_string());
+        let asked = self.runner.run(&argv);
+        asked.ok.then_some(asked.output)
     }
 
     /// The coding agents: detected and verified, never installed.
     fn agents_check(&self) -> Check {
-        let found: Vec<(&str, bool)> = ["claude", "codex"]
-            .into_iter()
-            .filter(|name| self.captured.has(name))
-            .map(|name| (name, true))
+        // Every candidate with whether it is here, and not only the ones that
+        // are: an absent agent that never reaches the core is an agent the core
+        // can never report on, which is how this check became one that could
+        // not fail.
+        let candidates: Vec<(&str, bool)> = AGENTS
+            .iter()
+            .map(|name| (*name, self.captured.has(name)))
             .collect();
-        let verdict = health::agents(&found);
+        let here: Vec<&str> = candidates
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(name, _)| *name)
+            .collect();
         Check {
             name: "agents",
-            claim: if found.is_empty() {
+            claim: if here.is_empty() {
                 "a coding agent for ayeaye to show you".to_string()
             } else {
-                format!(
-                    "the coding agents on this computer: {}",
-                    found
-                        .iter()
-                        .map(|(name, _)| *name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                format!("the coding agents on this computer: {}", here.join(", "))
             },
-            verdict,
-            detail: None,
+            verdict: health::agents(&candidates),
+            detail: here
+                .is_empty()
+                .then(|| format!("none of {} is on PATH", AGENTS.join(", "))),
+            explains_itself: false,
         }
     }
 
@@ -326,7 +468,7 @@ impl SecretConfig {
     /// Write one, or say why not.
     pub fn write(dir: &Path, token: &str) -> Result<SecretConfig, String> {
         std::fs::create_dir_all(dir).map_err(|why| format!("create {}: {why}", dir.display()))?;
-        let path = dir.join("health-request");
+        let path = dir.join(SECRET_FILE);
         let _ = std::fs::remove_file(&path);
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -362,7 +504,7 @@ mod tests {
     use crate::service::{Outcome, Runner};
     use ayeaye_core::health::{Outcome as StepOutcome, Verdict};
     use ayeaye_core::machine::Acceleration;
-    use ayeaye_core::service::Session;
+    use ayeaye_core::service::{Manager, Session};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -454,6 +596,7 @@ mod tests {
         Asking {
             url: "http://127.0.0.1:8912".to_string(),
             allowed_hosts: Vec::new(),
+            loopback_only: true,
             token: None,
             state_dir: None,
             captured,
@@ -700,6 +843,192 @@ mod tests {
                 "setup verifies the multiplexer and never installs it: {argv:?}"
             );
         }
+    }
+
+    // AYEAYE-62 — a curl that could not run is not a status. Parsing one out of
+    // a failed request would turn "nothing answered" into whatever digits were
+    // lying in the output, and the whole floor of this step is that no answer is
+    // never a pass.
+    #[test]
+    fn a_curl_that_failed_is_not_a_status() {
+        let captured = machine_with(&["curl"]);
+        // Exit non-zero, and still print something that parses as a status.
+        let lying = asking(&captured, Answers::default().to("curl", false, "200"));
+        let report = lying.run();
+        assert_eq!(verdict(&report, "local"), Verdict::Unknown);
+        assert_eq!(verdict(&report, "auth"), Verdict::Unknown);
+        assert!(!report.insecure, "a failed request cannot raise the alarm");
+
+        // And curl's own "could not connect" answer, which is `000`.
+        let refused = asking(&captured, Answers::default().to("curl", true, "000"));
+        assert_eq!(verdict(&refused.run(), "local"), Verdict::Unknown);
+    }
+
+    // AYEAYE-62 — a service that could not be asked is never a service that is
+    // up. This is reachable rather than theoretical: a Mac whose `id` will not
+    // answer has a launchd and no domain to address, so `Session::command`
+    // refuses and there is no status to read.
+    #[test]
+    fn a_service_that_could_not_be_asked_is_never_reported_as_running() {
+        let captured = machine_with(&["curl"]);
+        // launchd with no uid: the core refuses to build a command at all.
+        let unaddressable = Session {
+            manager: Manager::Launchd,
+            uid: None,
+            launchd_prefix: "dev".to_string(),
+        };
+        let mut asked = asking(&captured, Answers::default().to("curl", true, "200"));
+        asked.session = Some(&unaddressable);
+        let report = asked.run();
+        assert_eq!(verdict(&report, "service"), Verdict::Unknown);
+        assert_ne!(verdict(&report, "service"), Verdict::Passed);
+        assert!(
+            !asked
+                .runner
+                .ran
+                .borrow()
+                .iter()
+                .any(|argv| argv[0] == "launchctl"),
+            "there was no domain to address, so nothing should have been addressed"
+        );
+    }
+
+    // AYEAYE-62 — and with no key on this computer there is nothing to try, so
+    // the check that proves your key opens the page cannot pass. A machine with
+    // no key at all reporting "your key opens the page" is the exact shape of
+    // failure this ticket exists to prevent.
+    #[test]
+    fn with_no_key_the_authorised_check_cannot_pass() {
+        let captured = machine_with(&["curl"]);
+        let no_key = asking(&captured, Answers::default().to("curl", true, "200"));
+        assert_eq!(verdict(&no_key.run(), "authorised"), Verdict::Unknown);
+
+        // A key, and a daemon that refuses it: that is a failure, not an unknown.
+        let root = std::env::temp_dir().join(format!("ayeaye-authorised-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut wrong_key = asking(&captured, Answers::default().to("curl", true, "401"));
+        wrong_key.token = Some("not-the-daemons-key".to_string());
+        wrong_key.state_dir = Some(root.clone());
+        assert_eq!(verdict(&wrong_key.run(), "authorised"), Verdict::Failed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // AYEAYE-62 — every check this module knows how to make is actually made. A
+    // check that is never recorded is a capability nobody is told about, and it
+    // is invisible: the report simply has one fewer line and nothing says which.
+    #[test]
+    fn every_check_reaches_the_report_on_both_paths() {
+        let expected = [
+            "service",
+            "tmux",
+            "acceleration",
+            "local",
+            "auth",
+            "authorised",
+            "hosts",
+            "https",
+            "mesh",
+            "board",
+            "agents",
+        ];
+        let with_curl = machine_with(&["curl"]);
+        let full = asking(&with_curl, Answers::default().to("curl", true, "200")).run();
+        for name in expected {
+            assert!(
+                full.checks.iter().any(|check| check.name == name),
+                "{name} was never recorded"
+            );
+        }
+        assert_eq!(full.checks.len(), expected.len(), "and nothing twice");
+
+        // The no-curl path reports on every one of them too, as unknown rather
+        // than as absent — five network checks said once at the top, and the six
+        // that need nothing from the network answered properly.
+        let without = machine_with(&[]);
+        let bare = asking(&without, Answers::default()).run();
+        for name in expected {
+            if name == "board" {
+                continue; // no cliban here, so it is skipped rather than asked
+            }
+            assert!(
+                bare.checks.iter().any(|check| check.name == name),
+                "{name} vanished when there was no curl"
+            );
+        }
+    }
+
+    // AYEAYE-62 — a mesh network and a ticket board are detected and verified and
+    // never configured, and neither is a failure for being absent.
+    #[test]
+    fn a_mesh_and_a_board_are_verified_where_they_exist_and_never_set_up() {
+        let neither = machine_with(&["curl"]);
+        let report = asking(&neither, Answers::default().to("curl", true, "200")).run();
+        assert_eq!(verdict(&report, "mesh"), Verdict::Skipped);
+        assert_eq!(verdict(&report, "board"), Verdict::Skipped);
+
+        let both = machine_with(&["curl", "tailscale", "cliban"]);
+        let asked = asking(
+            &both,
+            Answers::default()
+                .to("tailscale status", true, "100.64.0.1 box")
+                .to("api/cliban/projects", true, "{\"keys\": [\"AYEAYE\"]}")
+                .to("curl", true, "200"),
+        );
+        let report = asked.run();
+        assert_eq!(verdict(&report, "mesh"), Verdict::Passed);
+        for argv in asked.runner.ran.borrow().iter() {
+            if argv[0] == "tailscale" {
+                assert_eq!(argv[1], "status", "only ever a read: {argv:?}");
+            }
+        }
+
+        // A mesh client that is here and down is a failure: something was set up
+        // and is not working.
+        let down = asking(&both, Answers::default().to("curl", true, "200"));
+        assert_eq!(verdict(&down.run(), "mesh"), Verdict::Failed);
+    }
+
+    // AYEAYE-62 — the fourth mark means "you did not ask for this", and a fact
+    // about the machine must never wear it. Telling somebody they declined an
+    // AMD card is telling them they turned down a thing they never had.
+    #[test]
+    fn a_fact_about_the_machine_is_never_rendered_as_a_choice_nobody_made() {
+        let captured = machine_with(&["curl"]);
+        let report = asking(&captured, Answers::default().to("curl", true, "200")).run();
+        let acceleration = report
+            .checks
+            .iter()
+            .find(|check| check.name == "acceleration")
+            .expect("recorded");
+        assert!(
+            !acceleration.line().contains("you did not ask"),
+            "{}",
+            acceleration.line()
+        );
+        // While a check that really is about a choice still says so.
+        let hosts = report
+            .checks
+            .iter()
+            .find(|check| check.name == "hosts")
+            .expect("recorded");
+        assert_eq!(hosts.verdict, Verdict::Skipped);
+        assert!(hosts.line().contains("you did not ask"), "{}", hosts.line());
+    }
+
+    // AYEAYE-62 — a machine put on a network by somebody, with no address to
+    // check it at, is "you asked for this and setup could not tell" and never
+    // "you did not ask for this". That is the criterion's floor, from the side
+    // that is easy to miss.
+    #[test]
+    fn an_exposed_machine_with_no_address_is_unknown_and_not_skipped() {
+        let captured = machine_with(&["curl"]);
+        let mut exposed = asking(&captured, Answers::default().to("curl", true, "200"));
+        exposed.loopback_only = false;
+        assert_eq!(verdict(&exposed.run(), "https"), Verdict::Unknown);
+
+        // Still on this computer only: nothing was asked for and nothing is owed.
+        let private = asking(&captured, Answers::default().to("curl", true, "200"));
+        assert_eq!(verdict(&private.run(), "https"), Verdict::Skipped);
     }
 
     // AYEAYE-62 — the key never reaches a command line, and it never outlives

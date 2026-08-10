@@ -301,7 +301,10 @@ fn setup_verb(args: &[String]) -> ExitCode {
     if let Some(reason) = machine.verdict.reason {
         println!("  {reason}");
     }
-    let session = probe::session(&probe::System);
+    // Out of the capture that already happened, rather than asking this machine
+    // the same three questions a second time — and so setup cannot end up with
+    // two ideas of what it is running on.
+    let session = captured.session();
 
     let run = setup::Run {
         captured: &captured,
@@ -320,10 +323,6 @@ fn setup_verb(args: &[String]) -> ExitCode {
         setup::decide(&run, &setup::Assumed(false))
     };
 
-    if let Err(why) = setup::record_consent(&places.state_dir, &plan, &stamp()) {
-        return complain(&format!("ayeaye: {why}"));
-    }
-
     let did = match setup::carry_out(&plan, &run, Subprocess, &models::Curl, &stamp()) {
         Ok(did) => did,
         Err(why) => return complain(&format!("ayeaye: {why}")),
@@ -339,7 +338,15 @@ fn setup_verb(args: &[String]) -> ExitCode {
     }
 
     println!();
-    check(&captured, session.as_ref(), &places)
+    // `setup` reports what is unfinished and still *finishes*. The shell's health
+    // step answers PENDING for everything it can be unhappy about, and a pending
+    // step never stops a run: a machine that needs tmux installed, or that has no
+    // curl, is a machine setup did its job on. Only the lock being off is a
+    // failure, and it is the same failure here as in `check`.
+    match check(&captured, session.as_ref(), &places) {
+        Report::Insecure => ExitCode::from(2),
+        Report::Unfinished | Report::Fine => ExitCode::SUCCESS,
+    }
 }
 
 /// `ayeaye check` — the health checks, on their own.
@@ -357,7 +364,24 @@ fn check_verb() -> ExitCode {
     };
     let places = setup::Places::from(&layout, &state_dir);
     let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
-    check(&captured, probe::session(&probe::System).as_ref(), &places)
+    // Asked as a question, so the exit code is the answer: 0 for a machine with
+    // nothing outstanding, 1 for one that has something, 2 for the lock being
+    // off. `setup` treats the middle one differently on purpose — see there.
+    match check(&captured, probe::session(&probe::System).as_ref(), &places) {
+        Report::Fine => ExitCode::SUCCESS,
+        Report::Unfinished => ExitCode::FAILURE,
+        Report::Insecure => ExitCode::from(2),
+    }
+}
+
+/// How a health run came out, for the two callers that read it differently.
+enum Report {
+    /// Everything asked for was checked and works.
+    Fine,
+    /// Something did not work, or could not be checked.
+    Unfinished,
+    /// The lock is off.
+    Insecure,
 }
 
 /// Run the checks and print them, four marks and all.
@@ -371,20 +395,32 @@ fn check(
     captured: &ayeaye::probe::Captured,
     session: Option<&ayeaye_core::service::Session>,
     places: &setup::Places,
-) -> ExitCode {
+) -> Report {
+    let bind = setup::effective(&places.config_file, "BIND", config::DEFAULT_BIND);
     let asking = ayeaye::health::Asking {
+        // Read the way the daemon would read it: the environment first, then
+        // the file setup wrote, then the default. `config::env_var` alone reads
+        // only the environment, which a *unit* fills from that file — so a check
+        // run from a shell, right after setup configured a port, would ask about
+        // the default one and call a healthy install dead.
         url: format!(
             "http://{}:{}",
-            config::env_var("BIND").unwrap_or_else(|| config::DEFAULT_BIND.to_string()),
-            config::env_var("DEV_PORT").unwrap_or_else(|| config::DEFAULT_DEV_PORT.to_string())
+            bind,
+            setup::effective(
+                &places.config_file,
+                "DEV_PORT",
+                &config::DEFAULT_DEV_PORT.to_string()
+            )
         ),
-        allowed_hosts: config::env_var("ALLOWED_HOSTS")
-            .unwrap_or_default()
+        allowed_hosts: setup::effective(&places.config_file, "ALLOWED_HOSTS", "")
             .split(',')
             .map(str::trim)
             .filter(|host| !host.is_empty())
             .map(str::to_string)
             .collect(),
+        // Anything but loopback is this machine on a network, which is the fact
+        // the front-end checks are about. Detected, and never configured.
+        loopback_only: bind == config::DEFAULT_BIND || bind == "localhost" || bind == "::1",
         token: config::load_token().ok(),
         state_dir: Some(places.state_dir.clone()),
         captured,
@@ -406,14 +442,14 @@ fn check(
     println!("\n{}", report.summary());
 
     match report.outcome() {
-        ayeaye_core::health::Outcome::Done => ExitCode::SUCCESS,
-        ayeaye_core::health::Outcome::Unfinished => ExitCode::FAILURE,
+        ayeaye_core::health::Outcome::Done => Report::Fine,
+        ayeaye_core::health::Outcome::Unfinished => Report::Unfinished,
         ayeaye_core::health::Outcome::Insecure => {
             eprintln!();
             for line in ayeaye_core::health::insecure_warning(&asking.url) {
                 eprintln!("{line}");
             }
-            ExitCode::from(2)
+            Report::Insecure
         }
     }
 }
@@ -702,7 +738,10 @@ mod tests {
             let (said, finished) =
                 without_a_service_manager(Some(verb), "/opt/ayeaye", "/conf/env").expect("a verb");
             assert!(finished, "{verb} has nothing left to do");
-            assert!(said.contains("run the server with: /opt/ayeaye"), "{said}");
+            assert!(
+                said.contains("run the server with: /opt/ayeaye serve"),
+                "{said}"
+            );
             assert!(said.contains("/conf/env"), "{said}");
         }
         for verb in ["enable", "disable", "start", "stop", "status", "remove"] {
