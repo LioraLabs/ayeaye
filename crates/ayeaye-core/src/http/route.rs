@@ -23,6 +23,8 @@ pub enum Route {
     Panes,
     /// Start an agent in a new pane.
     Spawn,
+    /// Kill one pane.
+    Kill,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -56,6 +58,10 @@ const PANES: &str = "/api/panes";
 /// Starting an agent. A write, so the gate below refuses it without a token
 /// whatever the route table says.
 const SPAWN: &str = "/api/spawn";
+
+/// Killing a pane. The same, and the one endpoint here that destroys
+/// something.
+const KILL: &str = "/api/kill";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -118,6 +124,7 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
         return match path {
             PANES => Route::Panes,
             SPAWN => Route::Spawn,
+            KILL => Route::Kill,
             _ => Route::Api,
         };
     }
@@ -149,7 +156,7 @@ pub fn gate(method: &str, route: Route) -> Gate {
         return Gate::Token;
     }
     match route {
-        Route::Api | Route::Panes | Route::Spawn => Gate::Token,
+        Route::Api | Route::Panes | Route::Spawn | Route::Kill => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -332,6 +339,24 @@ mod tests {
         // Only that path, so a neighbouring endpoint cannot arrive by accident.
         assert_eq!(resolve("/api/spawn/now", false), Route::Api);
         assert_eq!(resolve("/api/spawner", false), Route::Api);
+    }
+
+    // AYEAYE-51 — and killing one. Its own route for the same reason: the
+    // endpoint that can end somebody's work should be a line in this table
+    // rather than a string comparison somewhere in a handler.
+    #[test]
+    fn killing_a_pane_is_a_route_and_is_gated_like_the_rest_of_the_api() {
+        assert_eq!(resolve("/api/kill", false), Route::Kill);
+        assert_eq!(resolve("/api/kill", true), Route::Kill);
+        for method in ["GET", "HEAD", "POST", "DELETE"] {
+            assert_eq!(
+                gate(method, Route::Kill),
+                Gate::Token,
+                "{method} /api/kill must need a token"
+            );
+        }
+        assert_eq!(resolve("/api/kill/all", false), Route::Api);
+        assert_eq!(resolve("/api/killall", false), Route::Api);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at

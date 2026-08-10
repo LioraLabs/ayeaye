@@ -117,11 +117,15 @@ async fn handle(
         Route::Spawn if method == Method::POST => {
             answered(crate::agent::spawn(&settings, &body).await)
         }
+        Route::Kill if method == Method::POST => {
+            answered(crate::agent::kill(&settings, &body).await)
+        }
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
         Route::Panes
         | Route::Spawn
+        | Route::Kill
         | Route::Api
         | Route::NotFound
         | Route::Login

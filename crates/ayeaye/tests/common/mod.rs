@@ -37,6 +37,16 @@ impl Private {
 
     /// One tmux command against this server, or `None` if tmux is not here.
     pub fn tmux(&self, args: &[&str]) -> Option<()> {
+        self.output(args).map(|_| ())
+    }
+
+    /// The same, keeping what tmux printed.
+    ///
+    /// A test that is about what the server *still holds* — a pane that must
+    /// have survived a refusal, an id the endpoint under test will not reveal —
+    /// has to ask this server directly. Asking through the endpoint would be
+    /// asking the thing on trial.
+    pub fn output(&self, args: &[&str]) -> Option<String> {
         let ran = Command::new("tmux")
             .args(["-f", "/dev/null", "-L", &self.socket])
             .args(args)
@@ -47,7 +57,20 @@ impl Private {
             "the test's own tmux refused {args:?}: {}",
             String::from_utf8_lossy(&ran.stderr)
         );
-        Some(())
+        Some(String::from_utf8_lossy(&ran.stdout).into_owned())
+    }
+
+    /// Every session on this server, hidden ones included.
+    ///
+    /// `dead_code` because this file is compiled into *every* test binary in
+    /// this crate and only `serve.rs` needs this one — the alternative is a
+    /// second copy of the guard, which is the thing this module exists to
+    /// prevent.
+    #[allow(dead_code)]
+    pub fn sessions(&self) -> Vec<String> {
+        self.output(&["list-sessions", "-F", "#{session_name}"])
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     /// The layer under test, pointed at this server.

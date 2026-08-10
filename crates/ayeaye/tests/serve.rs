@@ -1057,6 +1057,220 @@ async fn spawning_needs_a_token_and_is_refused_from_another_site() {
     );
 }
 
+/// The panes `/api/panes` is currently reporting, as `(id, session)`.
+///
+/// Read through the endpoint rather than off the tmux server, because that is
+/// what the panel reads: "the panel reflects it" is a claim about this list.
+async fn listed_panes(server: &Server) -> Vec<(String, String)> {
+    let body = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await
+        .body_text();
+    assert!(
+        !body.contains(r#""error""#),
+        "the pane list could not be read: {body}"
+    );
+    body.split(r#"{"id":""#)
+        .skip(1)
+        .map(|card| {
+            let id = card.split('"').next().expect("an id").to_string();
+            let session = card
+                .split(r#""session":""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("a session")
+                .to_string();
+            (id, session)
+        })
+        .collect()
+}
+
+// AYEAYE-51 — a kill, end to end: a window this test made disappears from the
+// pane list the panel reads. Asserted by reading that list again rather than by
+// trusting the 200 — "the panel reflects it" is a fact about tmux, and only the
+// list can say it happened.
+#[tokio::test]
+async fn killing_a_pane_removes_it_from_the_list_the_panel_reads() {
+    let Some(tmux) = common::Private::named("serve-kill") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    tmux.tmux(&[
+        "new-window",
+        "-t",
+        "=work",
+        "-n",
+        "ayeaye-51-doomed",
+        "-d",
+        "/bin/sh",
+    ]);
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    // The safety property of this test, asserted before anything is signalled:
+    // the pane about to be killed is one *this test* made, on a tmux server
+    // this test started. A test pointed at the wrong tmux fails here, with
+    // nothing killed, rather than after.
+    let before = listed_panes(&server).await;
+    let doomed = before
+        .iter()
+        .find(|(_, session)| session == "work")
+        .map(|(id, _)| id.clone())
+        .expect("the private server's own pane");
+    assert_eq!(before.len(), 2, "this test made two panes: {before:?}");
+    assert!(doomed.starts_with("desktop/%"), "{doomed}");
+
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"{doomed}"}}"#))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    assert_eq!(answer.body_text(), r#"{"ok":true}"#);
+
+    let after = listed_panes(&server).await;
+    assert!(
+        !after.iter().any(|(id, _)| *id == doomed),
+        "{doomed} is still listed: {after:?}"
+    );
+    assert_eq!(after.len(), 1, "only the one pane went: {after:?}");
+}
+
+// AYEAYE-51 — the membership check, and the reason it is membership rather than
+// syntax. A pane in a `_`-prefixed session is a real, live, perfectly killable
+// tmux target that `list-panes` deliberately hides — somebody's floating
+// scratch pane. It is exactly what a caller would name to reach a pane the
+// panel never offered, and it has to be refused *and survive*.
+//
+// Without this case the whole check could be deleted and every other test here
+// would stay green.
+#[tokio::test]
+async fn a_pane_the_list_hides_is_refused_and_is_still_there_afterwards() {
+    let Some(tmux) = common::Private::named("serve-kill-hidden") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    // A floating scratch session, of the kind a tmux configuration makes and
+    // the pane list drops. Its pane id is a real target on this server.
+    tmux.tmux(&["new-session", "-d", "-s", "_scratch", "/bin/sh"]);
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let listed = listed_panes(&server).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "the scratch session must be hidden from the list: {listed:?}"
+    );
+
+    // The hidden pane's real id, asked of the tmux server rather than of the
+    // endpoint — the endpoint is precisely the thing that will not reveal it,
+    // and it is the thing on trial.
+    let hidden = tmux
+        .output(&["list-panes", "-t", "=_scratch", "-F", "#{pane_id}"])
+        .expect("the scratch session's pane")
+        .trim()
+        .to_string();
+    assert!(hidden.starts_with('%'), "{hidden:?} is not a pane id");
+
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"desktop/{hidden}"}}"#))
+        .await;
+    assert_eq!(answer.status, 400);
+    assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
+
+    // And it is still running. This is the assertion that makes the test about
+    // the check rather than about the status code: a server that answered 400
+    // and killed it anyway would pass everything above.
+    let survivors = tmux.sessions();
+    assert!(
+        survivors.iter().any(|name| name == "_scratch"),
+        "the hidden session was killed: {survivors:?}"
+    );
+}
+
+// AYEAYE-51 — the other ways a target can fail to be one of ours. A bare id
+// names no machine, a machine nobody registered is not ours, and a pane id that
+// is well-formed but was never listed is the ordinary case of a stale panel.
+#[tokio::test]
+async fn a_target_that_is_not_one_of_ours_is_refused_before_anything_is_signalled() {
+    let Some(tmux) = common::Private::named("serve-kill-refusals") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    for body in [
+        // Bare: names no machine at all. "Bare means here" is the assumption
+        // qualified ids exist to delete.
+        r#"{"pane":"%0"}"#,
+        // A machine this deployment has never heard of.
+        r#"{"pane":"gpu-box/%0"}"#,
+        // Well-formed, ours, and never listed.
+        r#"{"pane":"desktop/%99"}"#,
+        // Shapes tmux itself would take as a target.
+        r#"{"pane":"desktop/work"}"#,
+        r#"{"pane":"desktop/=work"}"#,
+    ] {
+        let answer = server.post_as_us("/api/kill", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(
+            answer.body_text(),
+            r#"{"error":"no such pane"}"#,
+            "for {body}"
+        );
+    }
+
+    // A request that named no pane, and one that is not a request.
+    for (body, expected) in [
+        (r#"{}"#, "no pane"),
+        (r#"{"pane":""}"#, "no pane"),
+        ("[1,2,3]", "bad json"),
+    ] {
+        let answer = server.post_as_us("/api/kill", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(
+            answer.body_text(),
+            format!(r#"{{"error":"{expected}"}}"#),
+            "for {body}"
+        );
+    }
+
+    // Everything this server had is still there.
+    assert_eq!(listed_panes(&server).await.len(), 1);
+}
+
+// AYEAYE-51 — a kill is a write, so it is behind both gates, and it is a POST
+// for the same reason a spawn is: the CSRF gate exempts reads.
+#[tokio::test]
+async fn killing_needs_a_token_and_is_refused_from_another_site() {
+    let server = Server::started().await;
+    let body = r#"{"pane":"desktop/%0"}"#;
+
+    assert_eq!(server.post("/api/kill", body, &[]).await.status, 401);
+    for headers in [
+        vec![("Sec-Fetch-Site", "cross-site")],
+        vec![("Sec-Fetch-Site", "cross-site"), ("X-Voice-Token", TOKEN)],
+    ] {
+        assert_eq!(
+            server.post("/api/kill", body, &headers).await.status,
+            403,
+            "with {headers:?}"
+        );
+    }
+    assert_eq!(
+        server
+            .request("GET", "/api/kill", &[("X-Voice-Token", TOKEN)])
+            .await
+            .status,
+        404
+    );
+}
+
 // AYEAYE-43 — and it is gated like everything else under /api/, by header or by
 // the login cookie. A pane list names every session on the machine.
 #[tokio::test]

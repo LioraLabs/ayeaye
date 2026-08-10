@@ -123,8 +123,8 @@ pub async fn kill(settings: &Settings, body: &[u8]) -> Answered {
         return Answered::refused(bad_request::NO_PANE);
     };
 
-    // The destination is read out of the id the client handed back, not out of
-    // a second field beside it that could disagree with it.
+    // The machine is read out of the id the client handed back, rather than out
+    // of a second field beside it that could disagree with it.
     let Ok((peer, id)) = settings.peers.route(named) else {
         return Answered::refused(refused::NO_SUCH_PANE);
     };
@@ -132,16 +132,20 @@ pub async fn kill(settings: &Settings, body: &[u8]) -> Answered {
         return Answered::refused(refused::not_reachable_yet(peer.name().as_str()));
     }
 
-    // **Membership, not syntax.** `%7` is a well-formed pane id on every
-    // machine, so a check that the target *looks* like one is a remote
-    // off-switch for every tmux the user runs — including the floating
-    // `_`-prefixed scratch panes the listing deliberately hides. The defence is
-    // that the pane has to be one this server just listed.
+    // **Membership, not syntax.** `%1` is a well-formed pane id on every
+    // machine there is, so a check that the target merely *looks* like one
+    // leaves this endpoint a remote off-switch for every tmux the user runs —
+    // including the floating `_`-prefixed scratch panes the pane list
+    // deliberately hides, which are exactly what a caller would name to reach
+    // something the panel never offered. The defence is that the pane has to be
+    // one this server just listed, and it is the same defence `bin/ayeaye`'s
+    // `kill_pane` makes at `:1933`.
     //
-    // A pane list that could not be read is *not* an empty pane list. The
-    // daemon's `kill_pane` cannot tell those apart and answers "no such pane"
-    // to both; here a tmux that could not be asked says so, because "there is
-    // no such pane" and "I could not look" are opposite answers.
+    // A pane list that could not be read is **not** an empty pane list. The
+    // daemon cannot tell those apart and answers "no such pane" to both; here a
+    // tmux that could not be asked says so, because "there is no such pane" and
+    // "I could not look" are opposite answers — and only one of them means the
+    // pane is safe.
     let listed = match settings.tmux.panes(peer.name()).await {
         Ok(listed) => listed,
         Err(trouble) => return Answered::refused(trouble.to_string()),
@@ -150,8 +154,12 @@ pub async fn kill(settings: &Settings, body: &[u8]) -> Answered {
         return Answered::refused(refused::NO_SUCH_PANE);
     }
 
-    // tmux handles the cascade: the window dies with its last pane, the session
-    // with its last window.
+    // The bare id, because that is what tmux understands — and it is the pane
+    // half of an id that was just found in tmux's own output, not a string the
+    // request supplied.
+    //
+    // tmux handles the cascade from here: the window dies with its last pane,
+    // and the session with its last window.
     match settings.tmux.ask(&["kill-pane", "-t", id.pane()]).await {
         Ok(_) => Answered::done(agent::killed_body()),
         Err(Trouble::Refused(said)) => Answered::refused(refused::could_not_kill(&said)),
