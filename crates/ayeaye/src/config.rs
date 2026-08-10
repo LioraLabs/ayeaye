@@ -145,8 +145,10 @@ impl Settings {
     ///
     /// `env` is a lookup rather than `std::env` so this is a decision a test
     /// can drive. It is handed the *bare* name — `BIND`, `DEV_PORT` — and is
-    /// expected to try `AYEAYE_<name>` before the legacy `VOICE_REMOTE_<name>`,
-    /// which is what [`env_var`] does.
+    /// expected to try `AYEAYE_<name>` before the legacy `VOICE_REMOTE_<name>`.
+    /// The daemon hands it [`env_then_file`], which layers the settings file
+    /// `ayeaye setup` owns beneath the environment; [`env_var`] is the
+    /// environment half alone.
     ///
     /// Arguments win over the environment, which wins over the defaults.
     pub fn resolve(
@@ -332,6 +334,61 @@ fn prefixed(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<Strin
         }
     }
     None
+}
+
+/// The settings file's answer for one bare name, or `None`.
+///
+/// `parse_env_file` hands keys back with the `AYEAYE_` prefix stripped, so an
+/// `AYEAYE_BIND=` line and a bare `BIND=` line both answer to `BIND` — and a
+/// legacy `VOICE_REMOTE_BIND=` line answers only when neither does, which is
+/// [`prefixed`]'s order applied to the file. Within each name the *last* line
+/// wins, as it does when systemd or a shell loads the same file, and an empty
+/// value is unset rather than the empty string, as everywhere else here.
+fn file_var(text: &str, name: &str) -> Option<String> {
+    let pairs = ayeaye_core::model::settings::parse_env_file(text);
+    let legacy = format!("VOICE_REMOTE_{name}");
+    for wanted in [name, legacy.as_str()] {
+        let answer = pairs
+            .iter()
+            .rev()
+            .find(|(key, _)| key == wanted)
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if answer.is_some() {
+            return answer;
+        }
+    }
+    None
+}
+
+/// One bare name, resolved the way the running daemon resolves every setting:
+/// the environment first, then the settings file `ayeaye setup` owns.
+///
+/// The environment as an argument, so the order — the part that can be got
+/// wrong — is a decision a test can drive without setting a real variable.
+pub(crate) fn layered(
+    name: &str,
+    env: impl Fn(&str) -> Option<String>,
+    file: &str,
+) -> Option<String> {
+    prefixed(name, env).or_else(|| file_var(file, name))
+}
+
+/// A lookup for [`Settings::resolve`]: the environment, then the settings file.
+///
+/// This is what makes "configuration is a file the binary writes and reads"
+/// true on every path the daemon starts from. The systemd unit also injects the
+/// same file with `EnvironmentFile=`, so there the two layers agree about
+/// everything; the launchd agent and a server started by hand inject nothing,
+/// and without this the daemon on those paths would ignore the file setup had
+/// just written — while `ayeaye check` read it, and the two would disagree
+/// about which port was even being discussed.
+///
+/// The file is read once, here, so four settings do not cost four reads — and a
+/// file that is not there is simply no second layer.
+pub fn env_then_file(config_file: &Path) -> impl Fn(&str) -> Option<String> {
+    let file = std::fs::read_to_string(config_file).unwrap_or_default();
+    move |name| layered(name, |key| std::env::var(key).ok(), &file)
 }
 
 /// The shared secret, from the environment or from the file the Python daemon
@@ -584,6 +641,55 @@ mod tests {
             super::prefixed("BIND", |_| Some(" 0.0.0.0\n".to_string())),
             Some("0.0.0.0".to_string())
         );
+    }
+
+    // AYEAYE-62 — the daemon reads the settings file setup writes, underneath
+    // the environment. Without the file layer, `ayeaye setup --port 9000` on a
+    // machine whose service manager injects nothing — launchd, or no manager at
+    // all — writes configuration the daemon then ignores, while `ayeaye check`
+    // reads it and probes a port nothing is listening on.
+    #[test]
+    fn the_daemon_reads_the_file_setup_writes_and_the_environment_still_wins() {
+        let silent = |_: &str| None;
+        // The file answers when the environment is silent, whichever spelling
+        // the line uses — setup's own, a bare name, or the legacy prefix.
+        assert_eq!(
+            super::layered("DEV_PORT", silent, "AYEAYE_DEV_PORT=9005\n"),
+            Some("9005".to_string())
+        );
+        assert_eq!(
+            super::layered("DEV_PORT", silent, "DEV_PORT=9006\n"),
+            Some("9006".to_string())
+        );
+        assert_eq!(
+            super::layered("BIND", silent, "VOICE_REMOTE_BIND=10.0.0.9\n"),
+            Some("10.0.0.9".to_string())
+        );
+        // The current spelling beats the legacy one wherever it sits in the
+        // file, which is the same order the environment is read in.
+        assert_eq!(
+            super::layered(
+                "BIND",
+                silent,
+                "VOICE_REMOTE_BIND=10.0.0.9\nAYEAYE_BIND=10.0.0.1\n"
+            ),
+            Some("10.0.0.1".to_string())
+        );
+        // The environment wins over the file, so a unit that injects the file
+        // with EnvironmentFile= and this layer cannot disagree.
+        let unit = |key: &str| (key == "AYEAYE_DEV_PORT").then(|| "9100".to_string());
+        assert_eq!(
+            super::layered("DEV_PORT", unit, "AYEAYE_DEV_PORT=9005\n"),
+            Some("9100".to_string())
+        );
+        // The last line wins, as it would when a shell sourced the file; a key
+        // mentioned with nothing after it is not an answer; no file, no layer.
+        assert_eq!(
+            super::layered("BIND", silent, "AYEAYE_BIND=first\nAYEAYE_BIND=second\n"),
+            Some("second".to_string())
+        );
+        assert_eq!(super::layered("BIND", silent, "AYEAYE_BIND=\n"), None);
+        assert_eq!(super::layered("BIND", silent, ""), None);
     }
 
     // AYEAYE-42 — "the port is configurable so both daemons can run side by

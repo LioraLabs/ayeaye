@@ -10,6 +10,7 @@
 
 pub mod graphics;
 pub mod network;
+pub mod packages;
 pub mod platform;
 pub mod share;
 pub mod size;
@@ -23,6 +24,7 @@ pub mod tier;
 // have to rename half of them to stay unambiguous.
 pub use graphics::{Acceleration, Graphics};
 pub use network::Network;
+pub use packages::Privilege;
 pub use platform::{Family, Homebrew, Os, PackageManager, Packaging, Platform, ServiceManager};
 pub use share::{Limit, Limits, Share};
 pub use tier::{Cause, Tier, Usability, Verdict};

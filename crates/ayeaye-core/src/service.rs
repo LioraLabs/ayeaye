@@ -81,12 +81,20 @@ impl Definition {
     /// is a *system* target a user manager has never heard of, so the line was
     /// an ordering guarantee that did not exist. ayeaye binds when it starts and
     /// the restart policy covers the rest.
+    /// **The `serve` is load-bearing.** The shell's `bin/ayeaye` is the server
+    /// and running it bare starts one, which is why the captured unit says only
+    /// `@REPO@/bin/ayeaye`. This binary is not: run bare it prints its banner and
+    /// exits 0. A unit without the verb installs perfectly, starts, prints one
+    /// line, exits successfully, and — because the policy is `on-failure` — is
+    /// never restarted. Nothing is running and nothing anywhere says so, which
+    /// is the failure mode this whole ticket's health checks exist to catch, so
+    /// it would be a poor thing to ship.
     pub fn ayeaye(program: &str) -> Self {
         Definition {
             name: "ayeaye".to_string(),
             title: "voice remote for tmux (phone web UI)".to_string(),
             after: None,
-            argv: vec![program.to_string()],
+            argv: vec![program.to_string(), "serve".to_string()],
         }
     }
 
@@ -230,6 +238,30 @@ impl Session {
             manager: Manager::Launchd,
             uid: Some(uid.to_string()),
             launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
+        }
+    }
+
+    /// The session for the manager [`crate::machine`] detected, if there is one.
+    ///
+    /// This is where the detector and the verbs meet, and `None` is the third
+    /// answer [`Manager`] refuses to carry: a machine with neither manager. It
+    /// is not a failure — a container and a stripped-down Linux both really are
+    /// one, and `lib/steps/70-service.sh` treats starting ayeaye by hand as a
+    /// supported way to use it — so the caller is expected to reach for
+    /// [`manual_instructions`] rather than to give up.
+    ///
+    /// The uid is only ever launchd's. systemd's user manager is addressed as
+    /// whoever is calling, so handing it one would be describing a thing that
+    /// does not exist.
+    pub fn for_manager(manager: crate::machine::ServiceManager, uid: Option<&str>) -> Option<Self> {
+        match manager {
+            crate::machine::ServiceManager::None => None,
+            crate::machine::ServiceManager::Systemd => Some(Session::systemd()),
+            crate::machine::ServiceManager::Launchd => Some(Session {
+                manager: Manager::Launchd,
+                uid: uid.map(str::to_string),
+                launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
+            }),
         }
     }
 
@@ -479,6 +511,30 @@ fn xml_text(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// What to tell somebody whose machine has nowhere to install a service.
+///
+/// The port of install.sh's `_manual_instructions` and the line
+/// `_service_manual_fallback` adds after it. Three sentences, and each one
+/// answers a question the person is about to have: what do I run, where do its
+/// settings come from, and where does its output go.
+///
+/// Deliberately not phrased as an apology. `tests/cases/service_fallback_test.sh`
+/// is explicit that a machine with no user service manager is a machine where
+/// setup has nothing left to do, and that telling somebody to come back to it
+/// later would be telling them to fix something that is not broken.
+/// The `serve` is the same load-bearing word as in [`Definition::ayeaye`], and
+/// for the same reason. `install.sh` says `run the server with: $REPO/bin/ayeaye`
+/// because that script *is* the server; telling somebody to run this binary bare
+/// would have them watch it print one line and exit, on the one path where there
+/// is no service manager to notice.
+pub fn manual_instructions(program: &str, env_file: &str) -> [String; 3] {
+    [
+        format!("run the server with: {program} serve"),
+        format!("(it reads {env_file} by itself)"),
+        "its log is whatever the terminal you start it in shows.".to_string(),
+    ]
+}
+
 /// Whether systemd can name every one of these paths in a unit, and which one
 /// it cannot.
 ///
@@ -616,8 +672,75 @@ fn undress<'a>(name: &'a str, launchd_prefix: &str) -> &'a str {
 mod tests {
     use super::{
         DEFAULT_LAUNCHD_PREFIX, Definition, Install, Layout, Manager, Operation, Session,
-        Unavailable, plan_install, systemd_arg, unrepresentable_in_systemd,
+        Unavailable, manual_instructions, plan_install, systemd_arg, unrepresentable_in_systemd,
     };
+    use crate::machine::ServiceManager;
+
+    // AYEAYE-62 — the third answer AYEAYE-61 recorded as owed. A machine with
+    // neither manager is not a broken machine: a container and a stripped-down
+    // Linux both really are one, and the shell treats running ayeaye by hand as
+    // a supported way to use it. It stays out of `Manager` deliberately — every
+    // function taking a `Manager` would otherwise have to invent a reply — so
+    // the answer is the absence of a session.
+    #[test]
+    fn a_machine_with_no_service_manager_has_no_session_to_address() {
+        assert_eq!(Session::for_manager(ServiceManager::None, None), None);
+        assert_eq!(
+            Session::for_manager(ServiceManager::None, Some("501")),
+            None,
+            "a uid does not conjure a manager to address with it"
+        );
+    }
+
+    // AYEAYE-62 — and where there is one, it is the one the detector named,
+    // addressed the way that platform is addressed.
+    #[test]
+    fn the_detected_manager_is_the_one_the_session_addresses() {
+        let systemd = Session::for_manager(ServiceManager::Systemd, Some("1000"))
+            .expect("systemd is a manager");
+        assert_eq!(systemd.manager, Manager::Systemd);
+        assert_eq!(
+            systemd.uid, None,
+            "systemd --user addresses the caller's own session and never a uid"
+        );
+
+        let launchd =
+            Session::for_manager(ServiceManager::Launchd, Some("501")).expect("launchd is one too");
+        assert_eq!(launchd.manager, Manager::Launchd);
+        assert_eq!(launchd.uid.as_deref(), Some("501"));
+        assert_eq!(launchd.launchd_prefix, DEFAULT_LAUNCHD_PREFIX);
+
+        // A Mac whose `id` would not answer. The session exists — launchctl is
+        // there — and every command through it refuses rather than addressing
+        // the malformed `gui//label`, which is the pre-existing behaviour.
+        let unaddressable =
+            Session::for_manager(ServiceManager::Launchd, None).expect("launchctl is still here");
+        assert_eq!(unaddressable.uid, None);
+        assert_eq!(
+            unaddressable.command("ayeaye", Operation::Start, None),
+            Err(Unavailable::Machine(
+                "no uid, so no launchd domain to address"
+            ))
+        );
+    }
+
+    // AYEAYE-62 — the port of install.sh's `_manual_instructions` and the third
+    // line `_service_manual_fallback` adds, pinned to the sentences
+    // tests/cases/service_fallback_test.sh asserts on. Not an apology and not a
+    // failure: it is the whole of the right answer on a machine with nothing to
+    // install into.
+    #[test]
+    fn a_machine_with_no_manager_is_told_how_to_run_it() {
+        let said = manual_instructions("/opt/ayeaye/bin/ayeaye", "/home/tester/.config/ayeaye/env");
+        assert_eq!(
+            said,
+            [
+                "run the server with: /opt/ayeaye/bin/ayeaye serve",
+                "(it reads /home/tester/.config/ayeaye/env by itself)",
+                "its log is whatever the terminal you start it in shows.",
+            ]
+        );
+    }
 
     /// The unit this session would install for that definition.
     ///
@@ -720,8 +843,47 @@ mod tests {
         }
     }
 
+    /// The definition the *shell* installs, which is what the golden files
+    /// captured: its `bin/ayeaye` is the server, so its `ExecStart` is the
+    /// program and nothing else.
+    ///
+    /// Written out here rather than taken from [`Definition::ayeaye`] because
+    /// AYEAYE-62 gave the real one a `serve`, without which the unit starts a
+    /// process that prints a banner and exits. The goldens pin the *renderer*,
+    /// and the test below pins the difference between the two on purpose.
     fn ayeaye() -> Definition {
-        Definition::ayeaye(&format!("{REPO}/bin/ayeaye"))
+        Definition {
+            name: "ayeaye".to_string(),
+            title: "voice remote for tmux (phone web UI)".to_string(),
+            after: None,
+            argv: vec![format!("{REPO}/bin/ayeaye")],
+        }
+    }
+
+    // AYEAYE-62 — the one place the port deliberately differs from the file it
+    // was captured from, so that the difference is a decision rather than a
+    // drift. The shell's `bin/ayeaye` serves when run bare; this binary prints
+    // its banner and exits 0, and `Restart=on-failure` never restarts a process
+    // that exited successfully. A unit without the verb is a service that
+    // installs cleanly, runs once, stops, and says nothing.
+    #[test]
+    fn the_installed_unit_tells_this_binary_to_serve() {
+        let real = Definition::ayeaye("/opt/ayeaye");
+        assert_eq!(real.argv, ["/opt/ayeaye", "serve"]);
+        let unit = render_systemd(&real, &layout());
+        assert!(
+            unit.contains("ExecStart=/opt/ayeaye serve"),
+            "a unit that starts nothing: {unit}"
+        );
+        // And it differs from the shell's unit in that line and nothing else.
+        let shell = render_systemd(&ayeaye(), &layout());
+        let differing: Vec<(&str, &str)> = shell
+            .lines()
+            .zip(unit.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(differing.len(), 1, "{differing:?}");
+        assert!(differing[0].0.starts_with("ExecStart="));
     }
 
     // AYEAYE-61 — the port is only a port if it agrees with the file the shell
@@ -826,7 +988,7 @@ mod tests {
         let spaced = Definition::ayeaye("/Users/John Smith/ayeaye/bin/ayeaye");
         assert!(
             render_systemd(&spaced, &layout())
-                .contains("ExecStart=\"/Users/John Smith/ayeaye/bin/ayeaye\"\n"),
+                .contains("ExecStart=\"/Users/John Smith/ayeaye/bin/ayeaye\" serve\n"),
             "systemd splits an unquoted argument on the space"
         );
         assert!(
@@ -844,7 +1006,7 @@ mod tests {
         let awkward = Definition::ayeaye("/srv/100% $path/bin/ayeaye");
         assert!(
             render_systemd(&awkward, &layout())
-                .contains("ExecStart=\"/srv/100%% $$path/bin/ayeaye\"\n"),
+                .contains("ExecStart=\"/srv/100%% $$path/bin/ayeaye\" serve\n"),
         );
         assert!(
             render_launchd(&awkward, &layout())
@@ -865,7 +1027,7 @@ mod tests {
         );
         assert_eq!(
             program_arguments(&agent),
-            vec![path.to_string()],
+            vec![path.to_string(), "serve".to_string()],
             "the path has to come back out of the XML exactly as it went in"
         );
     }

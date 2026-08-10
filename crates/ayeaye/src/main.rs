@@ -4,8 +4,6 @@
 //! server can be driven by an integration test over a real socket rather than
 //! only by starting the process and hoping.
 
-mod service;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,9 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ayeaye::config::{self, Settings};
 use ayeaye::models;
+use ayeaye::probe;
 use ayeaye::server;
-use ayeaye_core::service::{DEFAULT_LAUNCHD_PREFIX, Definition, Layout, Manager, Session};
-use service::{Runner, Services, Subprocess};
+use ayeaye::service::{Runner, Services, Subprocess};
+use ayeaye::setup;
+use ayeaye_core::service::{Definition, Layout, manual_instructions};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +24,8 @@ fn main() -> ExitCode {
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
         Some("dictate") => dictate_verb(&args[1..]),
+        Some("setup") => setup_verb(&args[1..]),
+        Some("check") => check_verb(),
         None => report(),
         Some("--version" | "-V") => report(),
         Some("--help" | "-h") => {
@@ -39,16 +41,28 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
+       ayeaye setup [--yes] [--no-service] [--no-model] [--model ID]
+                    [--bind ADDR] [--port N]
+       ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
        ayeaye model <ls|pull ID|use ID|rm ID>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
+  setup      make this computer ready to run ayeaye, and check that it is
+  check      re-run the health checks on their own
   service    manage the service this binary installs for itself
   model      fetch and choose the models this binary runs
   dictate    toggle dictation for one pane; bind it to a key in tmux
   --version  print the version and what this build can do
   --help     this
+
+setup asks before two things and nothing else: downloading a model, which
+goes to the internet, and starting a service, which runs whenever you log
+in. --yes answers both. With no terminal it does neither and prints the
+command that would. Everything else it finds — how you reach this machine
+from outside, a reverse proxy, a mesh network, your coding agents, tmux —
+it checks and reports, and never configures.
 
 a model ID is owner/name, as in openai/whisper-small.en, optionally
 @revision. ayeaye ships the inference, not the weights.
@@ -159,9 +173,15 @@ fn serve(args: &[String]) -> ExitCode {
         ayeaye::audio::CONVERTER.to_string(),
         selection.clone(),
     ));
+    // The environment first, then the settings file `ayeaye setup` owns, then
+    // the defaults. The file layer is what `manual_instructions` promises with
+    // "it reads the settings file by itself": the systemd unit injects the same
+    // file into the environment, but launchd and a hand-started server inject
+    // nothing, and on those paths a daemon reading only the environment would
+    // ignore what setup just wrote.
     let settings = match Settings::resolve(
         args,
-        config::env_var,
+        config::env_then_file(&config_file),
         token,
         nodename(&Subprocess),
         cliban,
@@ -504,20 +524,220 @@ fn human(bytes: u64) -> String {
     format!("{bytes} bytes")
 }
 
+/// `ayeaye setup` — make this computer ready, and then check that it is.
+///
+/// The one command somebody with the binary and nothing else runs. It decides
+/// before it does anything, says what it is about to do, asks about the two acts
+/// with a consequence, carries the rest out, and finishes by checking what it
+/// just built.
+///
+/// It ends on the health report rather than on "done", and that is the point of
+/// the whole ticket: a run that installed everything perfectly and cannot reach
+/// the result is not a successful run, and the only way to find that out is to
+/// ask.
+fn setup_verb(args: &[String]) -> ExitCode {
+    let flags = match setup::parse(args) {
+        Ok(flags) => flags,
+        Err(why) => return complain(&format!("ayeaye: {why}\n\n{USAGE}")),
+    };
+    let layout = layout(from_environment);
+    let Some(state_dir) = config::state_dir() else {
+        return complain(
+            "ayeaye: cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let places = setup::Places::from(&layout, &state_dir);
+    let program = match std::env::current_exe() {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(error) => {
+            return complain(&format!(
+                "ayeaye: cannot tell where this binary is: {error}"
+            ));
+        }
+    };
+
+    println!("looking at this computer…");
+    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
+    let machine = captured.machine();
+    println!("  {}", machine.summary());
+    println!("  {}", machine.verdict.tier.as_str());
+    if let Some(reason) = machine.verdict.reason {
+        println!("  {reason}");
+    }
+    // Out of the capture that already happened, rather than asking this machine
+    // the same three questions a second time — and so setup cannot end up with
+    // two ideas of what it is running on.
+    let session = captured.session();
+
+    let run = setup::Run {
+        captured: &captured,
+        places: &places,
+        session: session.as_ref(),
+        layout: &layout,
+        program: &program,
+        flags: &flags,
+    };
+
+    // Asked only where there is somebody to ask. A pipe is not a person, and
+    // taking silence for consent is the one thing this must never do.
+    let plan = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        setup::decide(&run, &setup::Tty)
+    } else {
+        setup::decide(&run, &setup::Assumed(false))
+    };
+
+    let did = match setup::carry_out(&plan, &run, Subprocess, &models::Curl, &stamp()) {
+        Ok(did) => did,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    for line in &did.lines {
+        println!("  {line}");
+    }
+    if !did.declined.is_empty() {
+        println!("\nnot done, because you did not ask for it:");
+        for line in &did.declined {
+            println!("  {line}");
+        }
+    }
+
+    println!();
+    // `setup` reports what is unfinished and still *finishes*. The shell's health
+    // step answers PENDING for everything it can be unhappy about, and a pending
+    // step never stops a run: a machine that needs tmux installed, or that has no
+    // curl, is a machine setup did its job on. Only the lock being off is a
+    // failure, and it is the same failure here as in `check`.
+    match check(&captured, session.as_ref(), &places) {
+        Report::Insecure => ExitCode::from(2),
+        Report::Unfinished | Report::Fine => ExitCode::SUCCESS,
+    }
+}
+
+/// `ayeaye check` — the health checks, on their own.
+///
+/// The same report `setup` ends on. Separate because the answer changes without
+/// setup running again: a certificate expires, a proxy is reconfigured, somebody
+/// stops the service. "Is this still working" is a question worth being able to
+/// ask on its own.
+fn check_verb() -> ExitCode {
+    let layout = layout(from_environment);
+    let Some(state_dir) = config::state_dir() else {
+        return complain(
+            "ayeaye: cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let places = setup::Places::from(&layout, &state_dir);
+    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
+    // Asked as a question, so the exit code is the answer: 0 for a machine with
+    // nothing outstanding, 1 for one that has something, 2 for the lock being
+    // off. `setup` treats the middle one differently on purpose — see there.
+    match check(&captured, probe::session(&probe::System).as_ref(), &places) {
+        Report::Fine => ExitCode::SUCCESS,
+        Report::Unfinished => ExitCode::FAILURE,
+        Report::Insecure => ExitCode::from(2),
+    }
+}
+
+/// How a health run came out, for the two callers that read it differently.
+enum Report {
+    /// Everything asked for was checked and works.
+    Fine,
+    /// Something did not work, or could not be checked.
+    Unfinished,
+    /// The lock is off.
+    Insecure,
+}
+
+/// Run the checks and print them, four marks and all.
+///
+/// The exit code is the report's outcome, and the three are not two. A failed or
+/// unfinished check leaves work outstanding and exits 1; the lock being off
+/// exits 2, because "anybody who can reach this address can run commands on this
+/// computer" is not the same news as "your https certificate has expired" and a
+/// script reading exit codes should not have to guess which happened.
+fn check(
+    captured: &ayeaye::probe::Captured,
+    session: Option<&ayeaye_core::service::Session>,
+    places: &setup::Places,
+) -> Report {
+    let bind = setup::effective(&places.config_file, "BIND", config::DEFAULT_BIND);
+    let asking = ayeaye::health::Asking {
+        // Read the way the daemon reads it: the environment first, then the
+        // file setup wrote, then the default — the same layers `serve` hands
+        // `Settings::resolve`, so the check and the daemon cannot disagree
+        // about which address is even being discussed.
+        url: format!(
+            "http://{}:{}",
+            bind,
+            setup::effective(
+                &places.config_file,
+                "DEV_PORT",
+                &config::DEFAULT_DEV_PORT.to_string()
+            )
+        ),
+        allowed_hosts: setup::effective(&places.config_file, "ALLOWED_HOSTS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .collect(),
+        // Anything but loopback is this machine on a network, which is the fact
+        // the front-end checks are about. Detected, and never configured.
+        loopback_only: bind == config::DEFAULT_BIND || bind == "localhost" || bind == "::1",
+        token: config::load_token().ok(),
+        state_dir: Some(places.state_dir.clone()),
+        captured,
+        session,
+        build: setup::build_acceleration(),
+        runner: Subprocess,
+    };
+
+    println!("checking what is here. each line is one of:");
+    println!("  ok       it works             FAILED   it does not");
+    println!("  skipped  you did not ask      unknown  could not tell\n");
+    let report = asking.run();
+    for check in &report.checks {
+        println!("{}", check.line());
+        if let Some(detail) = &check.detail {
+            println!("         {detail}");
+        }
+    }
+    println!("\n{}", report.summary());
+
+    match report.outcome() {
+        ayeaye_core::health::Outcome::Done => Report::Fine,
+        ayeaye_core::health::Outcome::Unfinished => Report::Unfinished,
+        ayeaye_core::health::Outcome::Insecure => {
+            eprintln!();
+            for line in ayeaye_core::health::insecure_warning(&asking.url) {
+                eprintln!("{line}");
+            }
+            Report::Insecure
+        }
+    }
+}
+
 /// `ayeaye service <verb>` — the service this binary installs for itself.
 ///
 /// `ayeaye setup` is AYEAYE-62's and will drive the same verbs; this is the
 /// door that proves they work and gives somebody a way to repair an install by
 /// hand without one.
 fn service_verb(verb: Option<&str>) -> ExitCode {
-    let services = Services {
-        session: session(&Subprocess, cfg!(target_os = "macos")),
-        layout: layout(from_environment),
-        runner: Subprocess,
-    };
+    let layout = layout(from_environment);
     let program = match std::env::current_exe() {
         Ok(path) => path.to_string_lossy().into_owned(),
         Err(error) => return complain(&format!("cannot tell where this binary is: {error}")),
+    };
+    // The third answer, and the whole of what AYEAYE-61 recorded as owed here:
+    // a machine with neither service manager. Asked before anything is rendered
+    // or run, because every verb below would otherwise exec a `systemctl` that
+    // is not there.
+    let Some(session) = probe::session(&probe::System) else {
+        return no_service_manager(verb, &program, &layout.env_file);
+    };
+    let services = Services {
+        session,
+        layout,
+        runner: Subprocess,
     };
     let definition = Definition::ayeaye(&program);
     let name = definition.name.clone();
@@ -625,32 +845,56 @@ fn nodename(runner: &impl Runner) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Which service manager to talk to.
+/// What to say on a machine with nowhere to install a service.
 ///
-/// Provisional, and deliberately the smallest thing that is not a guess:
-/// AYEAYE-60 detects the user session properly, including the answer this
-/// cannot give — that a machine has *neither* manager, which a container and a
-/// stripped-down Linux both really are. AYEAYE-62 is where the two meet, and
-/// this should be replaced by that detector there rather than grown here.
+/// Not an apology and not a failure. `lib/steps/70-service.sh` calls this the
+/// documented manual mode and returns a *finished* run from it: ayeaye works
+/// perfectly well started by hand, and a container, a stripped-down Linux or a
+/// Mac without launchctl is a machine where saying so plainly is the whole of
+/// the right answer.
 ///
-/// Which platform this is arrives as an argument rather than as a `cfg!` read
-/// inside, so that both answers can be asked for on one machine. A branch that
-/// only exists on a Mac is a branch nobody here can test.
-fn session(runner: &impl Runner, macos: bool) -> Session {
-    if !macos {
-        return Session::systemd();
+/// So `install` and `repair` — the two verbs setup itself drives — succeed,
+/// because there is nothing left for them to do. The six that address a manager
+/// fail, because they were asked to change or report the state of a service and
+/// no such thing happened. Reporting either as the other would be the lie this
+/// path exists to avoid.
+fn no_service_manager(verb: Option<&str>, program: &str, env_file: &str) -> ExitCode {
+    let Some((said, finished)) = without_a_service_manager(verb, program, env_file) else {
+        return complain(
+            "usage: ayeaye service <install|repair|enable|disable|start|stop|status|remove>",
+        );
+    };
+    if finished {
+        println!("{said}");
+        ExitCode::SUCCESS
+    } else {
+        complain(&said)
     }
-    // Every launchd command addresses a domain by uid, and `id` is where the
-    // shell has always read it from.
-    let asked = runner.run(&["id".to_string(), "-u".to_string()]);
-    Session {
-        manager: Manager::Launchd,
-        uid: asked
-            .ok
-            .then(|| asked.output.trim().to_string())
-            .filter(|uid| !uid.is_empty()),
-        launchd_prefix: DEFAULT_LAUNCHD_PREFIX.to_string(),
-    }
+}
+
+/// What that verb comes to on such a machine, and whether it is a finished run.
+///
+/// Split out from the printing so the exit codes can be asserted, which is the
+/// only part of this a service manager or a script reads.
+fn without_a_service_manager(
+    verb: Option<&str>,
+    program: &str,
+    env_file: &str,
+) -> Option<(String, bool)> {
+    let (kind, finished) = match verb? {
+        "install" | "repair" => ("install a service into", true),
+        "enable" | "disable" | "start" | "stop" | "status" | "remove" => {
+            ("start services for you from", false)
+        }
+        _ => return None,
+    };
+    Some((
+        format!(
+            "this computer has no user service manager, so there is nothing to {kind}.\n{}",
+            manual_instructions(program, env_file).join("\n")
+        ),
+        finished,
+    ))
 }
 
 /// What a kept copy of a replaced definition is named after.
@@ -667,9 +911,8 @@ fn stamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{layout, nodename, session, stamp};
-    use crate::service::{Outcome, Runner};
-    use ayeaye_core::service::Manager;
+    use super::{layout, nodename, stamp, without_a_service_manager};
+    use ayeaye::service::{Outcome, Runner};
     use std::cell::RefCell;
 
     /// A stand-in for `id`.
@@ -697,37 +940,11 @@ mod tests {
         }
     }
 
-    // AYEAYE-61 — every launchd command addresses a domain by uid, and `id` is
-    // where the shell has always read it from.
-    #[test]
-    fn a_mac_is_launchd_addressed_by_the_uid_id_reports() {
-        let runner = Answers::with(true, "501\n");
-        let session = session(&runner, true);
-        assert_eq!(session.manager, Manager::Launchd);
-        assert_eq!(session.uid.as_deref(), Some("501"));
-        assert_eq!(
-            runner.asked.borrow().as_slice(),
-            [vec!["id".to_string(), "-u".to_string()]]
-        );
-    }
-
-    // AYEAYE-61 — without a uid the target would be the malformed `gui//label`.
-    // No uid is better than a wrong one; the core refuses on it rather than
-    // addressing nothing.
-    #[test]
-    fn a_mac_with_no_answer_from_id_carries_no_uid() {
-        assert_eq!(session(&Answers::with(false, ""), true).uid, None);
-        assert_eq!(session(&Answers::with(true, " \n"), true).uid, None);
-    }
-
-    // AYEAYE-61 — and nothing is asked of `id` where nothing addresses a domain.
-    #[test]
-    fn anything_else_is_systemd_and_asks_nothing() {
-        let runner = Answers::with(true, "1000\n");
-        let session = session(&runner, false);
-        assert_eq!(session.manager, Manager::Systemd);
-        assert!(runner.asked.borrow().is_empty());
-    }
+    // The three tests that stood here — a Mac addressed by the uid `id` reports,
+    // a Mac whose `id` will not answer, and everything else being systemd — moved
+    // to `probe::tests` with the detector they were about. AYEAYE-62 replaced
+    // main's provisional `session()` with AYEAYE-60's detector, which can also
+    // answer that a machine has *neither* manager, and the tests followed it.
 
     // AYEAYE-43 — what this machine calls itself is `uname -n`, which is what
     // the daemon reads it from, and it is asked through the same runner the
@@ -769,6 +986,44 @@ mod tests {
         assert_eq!(moved.env_file, "/elsewhere/config/ayeaye/env");
         assert_eq!(moved.unit_dir, "/elsewhere/config/systemd/user");
         assert_eq!(moved.state_home, "/elsewhere/state");
+    }
+
+    // AYEAYE-62 — the third answer, at the door. `install` and `repair` are the
+    // verbs setup itself drives, and on a machine with nowhere to install a
+    // service they are *finished*: lib/steps/70-service.sh returns SKIP here and
+    // ends the run successfully, because running ayeaye by hand is a supported
+    // way to use it and not a fault to come back and fix. The six that address a
+    // manager did not happen, so they say so and fail.
+    #[test]
+    fn with_no_manager_installing_is_finished_and_starting_is_not() {
+        for verb in ["install", "repair"] {
+            let (said, finished) =
+                without_a_service_manager(Some(verb), "/opt/ayeaye", "/conf/env").expect("a verb");
+            assert!(finished, "{verb} has nothing left to do");
+            assert!(
+                said.contains("run the server with: /opt/ayeaye serve"),
+                "{said}"
+            );
+            assert!(said.contains("/conf/env"), "{said}");
+        }
+        for verb in ["enable", "disable", "start", "stop", "status", "remove"] {
+            let (said, finished) =
+                without_a_service_manager(Some(verb), "/opt/ayeaye", "/conf/env").expect("a verb");
+            assert!(!finished, "{verb} was asked for and did not happen");
+            assert!(said.contains("no user service manager"), "{said}");
+            // Still told what to do instead — the point of the path is the
+            // instructions, not the refusal.
+            assert!(said.contains("run the server with:"), "{said}");
+        }
+        assert_eq!(
+            without_a_service_manager(Some("polish"), "/opt/ayeaye", "/conf/env"),
+            None,
+            "a verb that is not a verb is a usage error, not a fact about this machine"
+        );
+        assert_eq!(
+            without_a_service_manager(None, "/opt/ayeaye", "/conf/env"),
+            None
+        );
     }
 
     // AYEAYE-61 — a stamp that is empty, or that a filename cannot hold, would
