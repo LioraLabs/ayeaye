@@ -17,6 +17,7 @@ pub mod json;
 pub mod logits;
 pub mod machine;
 pub mod mel;
+pub mod pane;
 pub mod peer;
 pub mod service;
 pub mod sha1;
