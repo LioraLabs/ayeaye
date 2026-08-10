@@ -250,9 +250,11 @@ fn open_tracked(root: &str, path: &str) -> Option<File> {
             here = open_dir_at(Some(&here), component)?;
         } else {
             let file = open_at(&here, component, libc::O_RDONLY)?;
-            // A FIFO would block the read and a device is nobody's preview:
-            // only a regular file is a file here, which is the daemon's
-            // `S_ISREG` check.
+            // Only a regular file is a file here — the daemon's `S_ISREG`
+            // check. It refuses a device and a directory; a FIFO would park
+            // this thread at the *open*, before any check runs, which is the
+            // daemon's exposure too and needs write access to the repository
+            // to arrange — git cannot track a FIFO.
             return file.metadata().ok()?.is_file().then_some(file);
         }
     }

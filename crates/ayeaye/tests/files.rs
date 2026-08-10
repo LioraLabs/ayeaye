@@ -214,12 +214,17 @@ fn repository(what: &str) -> PathBuf {
 /// pane's id as the server hands it out.
 ///
 /// `None` is a skip: no tmux or no git on this machine.
+/// `None` is a skip, and the message is printed here so a missing program is
+/// named once, correctly, rather than guessed at by every caller.
 async fn harness(what: &str) -> Option<(common::Private, Server, String)> {
     if !have_git() {
         eprintln!("skipped: no git on this machine");
         return None;
     }
-    let tmux = common::Private::named(&format!("files-{what}"))?;
+    let Some(tmux) = common::Private::named(&format!("files-{what}")) else {
+        eprintln!("skipped: no tmux on this machine");
+        return None;
+    };
     let repo = repository(what);
     // A second window working in the repository. `-P -F` prints the new
     // pane's id, so the test does not have to guess which pane is where.

@@ -9,7 +9,11 @@
 //!
 //! The daemon this ports is `bin/ayeaye`'s `resolve_file_reference` and
 //! `file_preview`, and the response shapes are `share/app.html`'s to read, so
-//! none of them may drift.
+//! none of them may drift. The knowing exceptions are written where they
+//! live: a `:line` too big for `usize` stays part of the path
+//! ([`reference`]), and a file of exactly the scan cap with a line past its
+//! end answers the tail where the daemon's exhausted-scan heuristic answers
+//! the head ([`excerpt`]) — both invisible to the page, neither an accident.
 
 use crate::json;
 use crate::paths;
