@@ -44,11 +44,11 @@ const SUBAGENT: &str = "subagent";
 /// Negative, and small: the two clocks are the same clock, and this is only
 /// granularity — a start time truncated to the second against a filename
 /// rounded the other way.
-pub const EARLIEST: f64 = -5.0;
+const EARLIEST: f64 = -5.0;
 
 /// How late it may appear. Generous, for a first turn that takes a while to
 /// write anything.
-pub const LATEST: f64 = 120.0;
+const LATEST: f64 = 120.0;
 
 /// What a rollout's first line says about the session it holds.
 ///

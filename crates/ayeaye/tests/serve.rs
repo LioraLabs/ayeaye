@@ -1042,11 +1042,11 @@ async fn none_of_the_board_endpoints_answer_without_a_token() {
     );
 }
 
-// AYEAYE-45 — the endpoint the panel names a pane's session with. `kind` is
-// always there and is null when the pane is not an agent, so the page can tell
-// "not an agent" from "something went wrong" without reading a status code.
+// AYEAYE-45 — a request naming no pane at all. `kind` is always there and is
+// null, so the page can tell "not an agent" from "something went wrong"
+// without reading a status code.
 #[tokio::test]
-async fn the_session_endpoint_answers_for_a_pane_that_is_not_an_agent() {
+async fn the_session_endpoint_answers_a_request_that_names_no_pane() {
     let server = Server::started().await;
     let answer = server
         .request("GET", "/api/session", &[("X-Voice-Token", TOKEN)])
@@ -1055,13 +1055,15 @@ async fn the_session_endpoint_answers_for_a_pane_that_is_not_an_agent() {
     assert_eq!(answer.body_text(), r#"{"kind":null}"#);
 }
 
-// AYEAYE-45 — **membership, not syntax.** A pane id that is not in the list
-// this process just read never reaches tmux as a target, and the answer is the
-// ordinary "not an agent" rather than a refusal: the panel asks about whatever
-// is selected, and a pane that has just closed is a race rather than a caller
-// doing something wrong.
+// AYEAYE-45 — an id shaped like a tmux target, or like nothing at all, is
+// *answered* rather than refused: the panel asks about whatever is selected,
+// and a pane that has just closed is a race rather than a caller doing
+// something wrong. This says nothing about membership on its own — the server
+// here has no panes at all — and the test that does is
+// `a_pane_the_list_excludes_is_never_a_target` in `tests/session.rs`, which
+// needs a real tmux to have a real pane to exclude.
 #[tokio::test]
-async fn a_pane_nobody_offered_is_never_a_target() {
+async fn an_odd_pane_id_is_answered_rather_than_refused() {
     let server = Server::started().await;
     for pane in [
         "desktop/%99",

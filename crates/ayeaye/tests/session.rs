@@ -62,6 +62,68 @@ impl Scene {
         path
     }
 
+    /// The same agent, in a session `list-panes` deliberately drops.
+    ///
+    /// A leading `_` is somebody's floating scratch pane, and the panel must
+    /// never offer one as a target. Everything else about it is a resolvable
+    /// pane, which is what makes it the only honest test of membership.
+    async fn scratch_codex(&self, server: &Private) -> String {
+        let script = format!(
+            "set -m; {} -c 'exec 9< {}; read line'; :",
+            self.home.join("codex").display(),
+            self.rollout_path().display()
+        );
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "_scratch",
+            "/bin/sh",
+            "-c",
+            &script,
+        ]);
+        assert!(
+            until_running_in(server, "_scratch", "codex").await,
+            "the scratch pane never came up running codex"
+        );
+        server
+            .layer()
+            .ask(&["display-message", "-p", "-t", "_scratch", "#{pane_id}"])
+            .await
+            .expect("a running tmux answers")
+            .trim()
+            .to_string()
+    }
+
+    /// Settings pointed at this scene's tmux and home.
+    ///
+    /// Resolved and then adjusted rather than written out field by field, so a
+    /// field somebody adds to `Settings` next week does not land here.
+    fn settings(&self, server: &Private) -> ayeaye::config::Settings {
+        let mut settings = ayeaye::config::Settings::resolve(
+            &[],
+            |_| None,
+            "test-token-not-a-real-secret".to_string(),
+            Some("desktop".to_string()),
+            ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
+        )
+        .expect("settings a test can drive");
+        settings.tmux = server.layer();
+        settings.agents = Agents::under(&self.home);
+        settings
+    }
+
+    /// Where `holding_codex` files its rollout.
+    fn rollout_path(&self) -> PathBuf {
+        self.home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("01")
+            .join("rollout-2026-03-01T09-00-02-7777.jsonl")
+    }
+
     /// One rollout, filed the way codex files them.
     fn rollout(&self, day: &str, name: &str, line: &str) -> PathBuf {
         let mut dir = self.home.join(".codex").join("sessions");
@@ -127,6 +189,11 @@ impl Drop for Scene {
 /// argument and fork before any of this is true, and how long that takes is a
 /// property of the machine running the suite.
 async fn until_running(server: &Private, command: &str) -> bool {
+    until_running_in(server, "agent", command).await
+}
+
+/// The same, for a target other than the window this file usually makes.
+async fn until_running_in(server: &Private, target: &str, command: &str) -> bool {
     let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline {
         let said = server
@@ -135,7 +202,7 @@ async fn until_running(server: &Private, command: &str) -> bool {
                 "display-message",
                 "-p",
                 "-t",
-                "agent",
+                target,
                 "#{pane_current_command}",
             ])
             .await
@@ -221,16 +288,7 @@ async fn the_endpoint_names_the_session_running_in_a_pane() {
     let scene = Scene::new("endpoint");
     let rollout = scene.holding_codex(&server).await;
 
-    let mut settings = ayeaye::config::Settings::resolve(
-        &[],
-        |_| None,
-        "test-token-not-a-real-secret".to_string(),
-        Some("desktop".to_string()),
-        ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
-    )
-    .expect("settings a test can drive");
-    settings.tmux = server.layer();
-    settings.agents = Agents::under(&scene.home);
+    let settings = scene.settings(&server);
 
     let panes = settings
         .tmux
@@ -258,14 +316,11 @@ async fn the_endpoint_names_the_session_running_in_a_pane() {
 // what keeps the server's 404 reachable for a path nobody has written yet.
 #[tokio::test]
 async fn the_module_owns_one_path_and_no_other() {
-    let settings = ayeaye::config::Settings::resolve(
-        &[],
-        |_| None,
-        "test-token-not-a-real-secret".to_string(),
-        Some("desktop".to_string()),
-        ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
-    )
-    .expect("settings a test can drive");
+    let Some(server) = Private::named("paths") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let settings = Scene::new("paths").settings(&server);
     for path in ["/api/sessions", "/api/session/", "/api/panes", "/", ""] {
         assert!(
             ayeaye::session::answer(&settings, path, None)
@@ -274,4 +329,104 @@ async fn the_module_owns_one_path_and_no_other() {
             "{path} is not this module's"
         );
     }
+}
+
+// AYEAYE-45 — **membership, not syntax**, and this is the test that can tell
+// the difference. The scratch pane below is real, is running the same agent,
+// and is holding the same rollout open — everything the resolution needs. The
+// only reason it must not resolve is that `list-panes` deliberately drops a
+// session whose name starts with `_`, and the endpoint answers out of that
+// list. Delete the membership check and this pane starts resolving; no test
+// that asks about an id nobody ever offered can say that.
+#[tokio::test]
+async fn a_pane_the_list_excludes_is_never_a_target() {
+    let Some(server) = Private::named("membership") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let scene = Scene::new("membership");
+    scene.holding_codex(&server).await;
+    let scratch = scene.scratch_codex(&server).await;
+
+    let settings = scene.settings(&server);
+    let panes = settings
+        .tmux
+        .panes(&host())
+        .await
+        .expect("a running tmux answers");
+
+    // The pane in `work` is offered, and resolves.
+    let offered = panes
+        .iter()
+        .find(|pane| pane.name == "agent")
+        .expect("the window the test made");
+    let (_, body) = ayeaye::session::answer(
+        &settings,
+        "/api/session",
+        Some(&format!(
+            "pane=desktop/{}",
+            scratch_query(offered.id.pane())
+        )),
+    )
+    .await
+    .expect("the session endpoint owns this path");
+    assert_eq!(body, r#"{"kind":"codex","id":"77770000"}"#);
+
+    // The pane in `_scratch` is not offered, and must not resolve — even though
+    // it is running the same agent, holding the same kind of file open.
+    assert!(
+        !panes.iter().any(|pane| pane.id.pane() == scratch),
+        "a scratch session must not be in the list at all"
+    );
+    let (status, body) = ayeaye::session::answer(
+        &settings,
+        "/api/session",
+        Some(&format!("pane=desktop/{}", scratch_query(&scratch))),
+    )
+    .await
+    .expect("the session endpoint owns this path");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body, r#"{"kind":null}"#,
+        "a pane the list excludes resolved anyway: {scratch}"
+    );
+}
+
+/// Percent-encode a bare tmux pane id for a query string.
+fn scratch_query(pane: &str) -> String {
+    pane.replace('%', "%25")
+}
+
+// AYEAYE-45 — the local-time conversion, pinned against the C library rather
+// than against itself. Every other test that touches it derives both sides from
+// `instant`, so a `tm_mon` or `tm_year` off by one would leave them all green
+// while `started_with` silently never matched a real kernel start time.
+#[test]
+fn a_local_moment_agrees_with_the_c_library_about_now() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock")
+        .as_secs() as i64;
+    // What this machine's timezone says the moment is called, from the same
+    // library the conversion goes back through.
+    let mut broken: libc::tm = unsafe { std::mem::zeroed() };
+    let seconds = now as libc::time_t;
+    assert!(
+        !unsafe { libc::localtime_r(&seconds, &mut broken) }.is_null(),
+        "the C library can name this moment"
+    );
+
+    let stamp = ayeaye_core::session::codex::Stamp {
+        year: broken.tm_year + 1900,
+        month: (broken.tm_mon + 1) as u32,
+        day: broken.tm_mday as u32,
+        hour: broken.tm_hour as u32,
+        minute: broken.tm_min as u32,
+        second: broken.tm_sec as u32,
+    };
+    assert_eq!(
+        ayeaye::session::instant(stamp),
+        Some(now as f64),
+        "the round trip through local civil time lost the moment"
+    );
 }

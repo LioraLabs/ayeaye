@@ -89,12 +89,6 @@ pub struct Agents {
     codex_sessions: PathBuf,
 }
 
-impl Default for Agents {
-    fn default() -> Agents {
-        Agents::here()
-    }
-}
-
 impl Agents {
     /// The directories in this user's home.
     ///
@@ -122,22 +116,29 @@ impl Agents {
     /// `list-panes` this process just read, so the id below cannot be a target
     /// nobody offered.
     ///
-    /// The backend is built and dropped inside the block that uses it, which is
-    /// what keeps this future spawnable: `Box<dyn Processes>` is neither `Send`
-    /// nor `Sync`, and holding one across an await would make the whole request
-    /// handler unspawnable. Widening that trait to please this one caller would
-    /// be the tail wagging the dog — the macOS backend is generic over an
-    /// injectable tool, and several of the tools a test injects record what
-    /// they were asked.
+    /// The half that reads the disk runs on a **blocking** thread, and that is
+    /// a decision rather than a habit. Resolving one claude pane lists every
+    /// directory under `~/.claude/projects`; resolving one codex pane by its
+    /// start time lists every day directory it has ever had. That is defensible
+    /// once per request and not once per *pane*, and the overview this port
+    /// still owes calls exactly this for every pane on the machine, on a poll.
+    /// Putting it on the blocking pool now is cheaper than finding out then.
+    ///
+    /// It is also what lets the backend be built where it is used: `Box<dyn
+    /// Processes>` is neither `Send` nor `Sync`, so it could not be held across
+    /// an await even if the reads were free.
     pub async fn behind(&self, tmux: &Tmux, pane: &Pane) -> Option<Session> {
         let said = tmux
             .ask(&["display-message", "-p", "-t", pane.id.pane(), FIELDS])
             .await
             .ok()?;
-        let next = {
+        let agents = self.clone();
+        let next = tokio::task::spawn_blocking(move || {
             let processes = crate::process::here();
-            self.behind_process(processes.as_ref(), &said)
-        };
+            agents.behind_process(processes.as_ref(), &said)
+        })
+        .await
+        .ok()?;
         match next {
             Behind::Found(session) => Some(session),
             Behind::Nothing => None,
@@ -151,7 +152,7 @@ impl Agents {
                     .ask(&["capture-pane", "-p", "-t", pane.id.pane(), "-S", SCROLLBACK])
                     .await
                     .ok()?;
-                self.from_marker(&text)
+                self.through_marker(&text)
             }
         }
     }
@@ -191,7 +192,7 @@ impl Agents {
     /// That file is keyed by pid, so the descendant walk the codex route
     /// already does is the whole lookup: no guessing from a working directory
     /// and an mtime, which is ambiguous the moment two agents share a repo.
-    pub fn claude(&self, processes: &dyn Processes, pane_pid: u32) -> Option<Session> {
+    fn claude(&self, processes: &dyn Processes, pane_pid: u32) -> Option<Session> {
         let pid = processes.descendant(pane_pid, Kind::Claude.as_str(), DEPTH)?;
         let recorded = text(&self.claude_sessions.join(format!("{pid}.json")))?;
         let started = processes.start_time(pid)?;
@@ -200,7 +201,7 @@ impl Agents {
     }
 
     /// The claude session a statusline printed into a pane.
-    pub fn from_marker(&self, pane_text: &str) -> Option<Session> {
+    fn through_marker(&self, pane_text: &str) -> Option<Session> {
         let id = claude::marker(pane_text)?;
         Some(Session::new(Kind::Claude, &id, &self.transcript(&id)?))
     }
@@ -211,7 +212,7 @@ impl Agents {
     /// process rather than an inference about it — and because it is the only
     /// thing that resolves a *resumed* session, whose rollout was written days
     /// before the process that reopened it.
-    pub fn codex(&self, processes: &dyn Processes, pane_pid: u32) -> Option<Session> {
+    fn codex(&self, processes: &dyn Processes, pane_pid: u32) -> Option<Session> {
         let pid = processes.descendant(pane_pid, Kind::Codex.as_str(), DEPTH)?;
         if let Some(session) = self.held(processes, pid) {
             return Some(session);
@@ -248,13 +249,15 @@ impl Agents {
             };
             // More than one survivor is not expected. Deciding between them by
             // last write rather than by whichever descriptor came back first is
-            // what keeps the answer the same on two machines; the path breaks a
-            // tie, because two files written in the same second must not depend
-            // on the order the kernel listed them in.
-            if best
+            // what keeps the answer the same on two machines, and the *first*
+            // path breaks a tie — the same way round as the other two scans in
+            // this file, because two rules that both say "deterministic" and
+            // disagree is how one of them gets changed to match the other by
+            // somebody who did not know there were two.
+            let better = best
                 .as_ref()
-                .is_none_or(|(when, at, _)| (written, &path) > (*when, at))
-            {
+                .is_none_or(|(when, at, _)| written > *when || (written == *when && &path < at));
+            if better {
                 best = Some((written, path, meta.id));
             }
         }
@@ -346,10 +349,22 @@ pub async fn answer(
 /// **The pane list is what makes the id safe**, and it is membership rather
 /// than syntax that does it: the id is looked up in the panes this process just
 /// read, and the [`Pane`] found is what goes to tmux. A pattern over the id
-/// would not be a substitute.
+/// would not be a substitute — and neither would a check that the id is
+/// *shaped* like a pane, since the list deliberately excludes real, resolvable
+/// panes: a dead one, and one in a scratch session.
+///
+/// Only this machine's panes are consulted, so a pane on a peer answers as
+/// though it were not an agent. That is the daemon's answer too, and it is the
+/// thing a qualified [`PaneId`](ayeaye_core::peer::PaneId) exists to let a
+/// later ticket tell apart.
 async fn session(settings: &Settings, query: Option<&str>) -> (StatusCode, String) {
+    let Some(asked) = first(query, "pane") else {
+        // Nothing named, nothing to look up. The daemon short-circuits here
+        // too, and the cost of not doing so is a `list-panes` per request that
+        // was never going to match anything.
+        return (StatusCode::OK, session_body(None));
+    };
     let here = settings.peers.here().name();
-    let asked = first(query, "pane").unwrap_or_default();
     let panes = settings.tmux.panes(here).await.unwrap_or_default();
     let Some(pane) = panes.iter().find(|pane| pane.id.qualified() == asked) else {
         return (StatusCode::OK, session_body(None));
@@ -373,9 +388,14 @@ fn first(query: Option<&str>, name: &str) -> Option<String> {
 /// are each one `starts_with` and one `ends_with` once the wildcards are gone,
 /// and a glob crate would be a dependency and a wider surface for that.
 ///
-/// Nothing below the depth is opened and nothing above it is followed: a
-/// directory that will not read costs itself, which is what keeps one
+/// A directory that will not read costs itself, which is what keeps one
 /// unreadable project from emptying the answer for every pane.
+///
+/// A symlinked directory **is** followed, because the daemon's `glob` follows
+/// one and a project directory that is a link to somewhere else is an ordinary
+/// thing to have. That is safe here for the reason the whole scan is: nothing
+/// below is opened by a name the caller chose, only by a name that was already
+/// in the directory.
 fn walk(root: &Path, depth: usize, wanted: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut here = vec![root.to_path_buf()];
     for _ in 0..depth {
@@ -384,11 +404,13 @@ fn walk(root: &Path, depth: usize, wanted: &dyn Fn(&str) -> bool) -> Vec<PathBuf
             let Ok(entries) = fs::read_dir(&directory) else {
                 continue;
             };
-            next.extend(
-                entries
-                    .flatten()
-                    .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path())),
-            );
+            next.extend(entries.flatten().filter_map(|entry| {
+                let path = entry.path();
+                // `path.is_dir()` follows a link where `entry.file_type()` does
+                // not, which is the difference between finding a symlinked
+                // project and silently skipping it.
+                path.is_dir().then_some(path)
+            }));
         }
         here = next;
     }
@@ -429,17 +451,23 @@ fn text(path: &Path) -> Option<String> {
 fn first_line(path: &Path) -> Option<String> {
     use std::io::Read;
 
-    let mut file = fs::File::open(path).ok()?;
-    let mut head = vec![0; FIRST_LINE];
-    let read = file.read(&mut head).ok()?;
-    head.truncate(read);
+    let mut head = Vec::new();
+    // `take` then `read_to_end`, never one `read`: a single read is allowed to
+    // return less than was asked for, and treating a short one as the end of
+    // the file would truncate a first line that was all there.
+    fs::File::open(path)
+        .ok()?
+        .take(FIRST_LINE as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    let full = head.len() < FIRST_LINE;
     let text = String::from_utf8_lossy(&head).into_owned();
     match text.split_once('\n') {
         Some((line, _)) => Some(line.to_string()),
-        // No terminator in the bound: either the file is shorter than one line,
-        // which is a rollout being written right now, or its first line is
-        // longer than any `session_meta` has ever been.
-        None => (read < FIRST_LINE).then_some(text),
+        // No terminator inside the bound: either the file is shorter than one
+        // line, which is a rollout being written right now, or its first line
+        // is longer than any `session_meta` has ever been.
+        None => full.then_some(text),
     }
 }
 
@@ -467,7 +495,7 @@ fn modified(path: &Path) -> Option<f64> {
 /// rollout's stamp in the machine's local time, and only the C library knows
 /// what that was on the day in question. `tm_isdst = -1` is what asks it to
 /// work out whether summer time was in force, rather than being told.
-fn instant(stamp: codex::Stamp) -> Option<f64> {
+pub fn instant(stamp: codex::Stamp) -> Option<f64> {
     // Zeroed rather than fielded one by one: `tm` has members beyond the seven
     // set here on every platform that has it, and a stack full of whatever was
     // there before is not an input to give a C function.
@@ -685,7 +713,7 @@ mod tests {
         let marker = format!("output\n{}cc:0123abcd{} ~/dev\n", '\u{27ea}', '\u{27eb}');
         let session = home
             .agents()
-            .from_marker(&marker)
+            .through_marker(&marker)
             .expect("the marker names a session that is on disk");
         assert_eq!(session.id, "0123abcd");
     }
