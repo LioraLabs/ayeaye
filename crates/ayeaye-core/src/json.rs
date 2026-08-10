@@ -6,8 +6,12 @@
 //! reach nothing — and a pure crate whose whole job is "text and structs in,
 //! text and structs out" can spell a string literal itself.
 //!
-//! There is no reader here, and there should not be: nothing this daemon is
-//! handed arrives as JSON it has to parse.
+//! There is no general reader here, and there should not be: nothing this
+//! daemon is *handed* arrives as JSON it has to parse. The one exception is a
+//! model's `config.json`, which AYEAYE-56 has to read one field of before it
+//! will download the weights beside it — and that lives in
+//! [`crate::model::config`], narrow enough to stay an exception rather than
+//! becoming a parser by increments.
 
 /// One JSON string literal, quotes included.
 ///
