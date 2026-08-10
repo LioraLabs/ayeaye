@@ -90,6 +90,11 @@ pub fn walk(
                 if !seen.insert(child.clone()) {
                     continue;
                 }
+                // A name UTF-8 cannot spell arrives with a replacement
+                // character in it, and the picker will offer a directory that
+                // cannot then be opened. That is the price of `Candidate.path`
+                // being a `String`, which is what lets the ranker be pure —
+                // and the daemon mangles the same name on its way into JSON.
                 let path = child.to_string_lossy().into_owned();
                 // Descended into whatever the query says: a project can sit
                 // under a parent that does not match either.
@@ -443,6 +448,14 @@ mod tests {
         ]);
         let (found, _) = collect(&tree, &["/root"], 6, 0, &never);
         assert_eq!(found, vec!["/root/inner"]);
+
+        // And a query changes none of that: a directory is remembered when it
+        // is *reached*, not when it is returned, or a cycle whose names match
+        // nothing would expand again at every level for ever.
+        let cycle = Tree::of(&[("/a", &[("/b", false)]), ("/b", &[("/a", false)])]);
+        let (found, stopped) = walked(&cycle, &["/a"], 20, 0, "no-such-thing", &never);
+        assert!(found.is_empty());
+        assert_eq!(stopped, Stopped::Exhausted, "a cycle still terminates");
     }
 
     // AYEAYE-50 — the deadline and the cancel flag are one seam, so a test can
@@ -547,6 +560,13 @@ mod tests {
         assert_eq!(cache.remembered(), 3);
         cache.list_at(Path::new("/one-too-many"), now);
         assert_eq!(cache.remembered(), 1, "cleared, then refilled from empty");
+
+        // And the daemon's own memo is bounded by the daemon's own number,
+        // rather than by whatever the last test happened to pass in.
+        assert_eq!(
+            Cached::new(Nothing, Duration::from_secs(60)).max,
+            super::LIST_MAX
+        );
     }
 
     // AYEAYE-50 — listing the same directory once per keystroke is what would

@@ -16,6 +16,10 @@ pub struct Candidate {
 
 /// Rank candidates and keep the best `limit`.
 ///
+/// A `limit` of zero returns nothing — this is the picker's answer, and the
+/// caller says how long it is. That is the opposite of the walk's `limit`,
+/// where zero means no early stop; both follow the daemon.
+///
 /// Git repositories first and everything else after: "does it hold a `.git`"
 /// is the strongest signal available that a directory is a project rather than
 /// a folder something was once unzipped into.
@@ -278,6 +282,52 @@ mod tests {
         );
     }
 
+    // AYEAYE-50 — the rungs in the order they are in, which is the module's
+    // whole user-visible contract and the one thing every "does this rung
+    // exist" test above leaves free. Each pair below puts two rungs in tension
+    // and says which one wins, so swapping any two lines of the comparator
+    // turns this red — where isolating a rung cannot.
+    #[test]
+    fn the_rungs_are_in_this_order_and_no_other() {
+        let store = Recents::parse(concat!(
+            "{\"picks\":{",
+            "\"/src/plain\":{\"n\":50,\"t\":100},",
+            "\"/src/ayeaye/sub\":{\"n\":50,\"t\":100},",
+            "\"/deep/a/b/ayeaye\":{\"n\":50,\"t\":100}",
+            "}}"
+        ));
+        let win = |better: Candidate, worse: Candidate| {
+            let found = vec![worse.clone(), better.clone()];
+            assert_eq!(
+                paths(&order(&found, &store, 100.0, "ayeaye", 10)),
+                vec![better.path.as_str(), worse.path.as_str()]
+            );
+        };
+
+        // 1 over 2: a repository with no history beats a plain directory
+        // picked fifty times.
+        win(
+            candidate("/src/ayeaye", true, 2),
+            candidate("/src/plain", false, 2),
+        );
+        // 2 over 3: history beats a match on the name. A directory you work in
+        // every day is the answer even when its name is not what you typed.
+        win(
+            candidate("/src/ayeaye/sub", true, 3),
+            candidate("/src/ayeaye", true, 2),
+        );
+        // 3 over 4: a match on the name beats a shallower path.
+        win(
+            candidate("/deep/a/b/ayeaye-two", true, 4),
+            candidate("/ayeaye/shallow", true, 2),
+        );
+        // 4 over 5: the shallower path beats the alphabet.
+        win(
+            candidate("/z/ayeaye", true, 1),
+            candidate("/a/b/ayeaye", true, 2),
+        );
+    }
+
     // AYEAYE-50 — the picker asks for more candidates than it shows, because
     // the first forty a breadth-first walk meets are not the best forty.
     #[test]
@@ -403,7 +453,7 @@ mod tests {
     // has it. A renamed field is a picker that renders nothing, and nothing
     // else in the tree would notice.
     #[test]
-    fn the_body_carries_the_five_fields_the_page_reads() {
+    fn the_body_carries_the_fields_the_page_reads() {
         let rows = vec![
             Row {
                 dir: "/home/a/ayeaye".to_string(),
