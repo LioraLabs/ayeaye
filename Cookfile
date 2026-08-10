@@ -109,11 +109,17 @@ recipe suite
 # cacheable at all. The sources themselves are the sealed probe above: cargo
 # consumes them, but it does not take them as arguments.
 
+#
+# `fixtures` is sealed here as well as on the bash suite: the Rust tests read
+# the captured unit fixtures through `include_str!`, so a golden file is an
+# input to `cargo test` that the `rust` probe - a glob under crates/ - cannot
+# see. Without it, editing a fixture replays yesterday's green.
 recipe rust-suite
     ingredients "Cargo.toml"
     seal rust
     seal rust:toolchain
     seal rust:tools
+    seal fixtures
     test { cargo test --workspace --locked }
 
 # Separate from the suite so a lint failure and a test failure are two
