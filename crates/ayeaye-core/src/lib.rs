@@ -12,6 +12,7 @@
 
 pub mod audio;
 pub mod identity;
+pub mod mel;
 
 pub use audio::Pcm16kMono;
 pub use identity::Identity;
