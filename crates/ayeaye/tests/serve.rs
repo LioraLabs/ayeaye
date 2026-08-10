@@ -231,3 +231,130 @@ async fn every_page_manifest_and_icon_is_served_with_its_type() {
         );
     }
 }
+
+// AYEAYE-42 — the Host gate applies to everything, pages included. A page on
+// an attacker's origin that resolves their name to this address still sends
+// their Host, and that is what has to be refused — before any route is even
+// looked up.
+#[tokio::test]
+async fn a_foreign_host_is_refused_even_for_the_panel() {
+    let server = Server::started().await;
+    for path in ["/", "/board", "/favicon.ico", "/api/panes"] {
+        let answer = server
+            .request("GET", path, &[("Host", "evil.example")])
+            .await;
+        assert_eq!(answer.status, 403, "status for {path}");
+        assert_eq!(
+            answer.body_text(),
+            r#"{"error":"forbidden"}"#,
+            "body for {path}"
+        );
+    }
+    // And the same request with the right Host is not refused, or the test
+    // above would pass on a server that refused everything.
+    assert_eq!(server.get("/").await.status, 200);
+}
+
+// AYEAYE-42 — the token gate, observed as the difference between 401 and 404:
+// an /api/ path is refused before anyone learns whether it exists, and is
+// answered once a token arrives, by header or by the login cookie.
+#[tokio::test]
+async fn the_api_needs_a_token_by_header_or_by_cookie() {
+    let server = Server::started().await;
+
+    let anonymous = server.get("/api/panes").await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
+
+    let wrong = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", "not-the-token")])
+        .await;
+    assert_eq!(wrong.status, 401, "a wrong token is not a token");
+
+    // 404, not 401: the gate let it through and nothing answers there yet.
+    let by_header = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(by_header.status, 404);
+    assert_eq!(by_header.body_text(), r#"{"error":"not found"}"#);
+
+    let by_cookie = server
+        .request(
+            "GET",
+            "/api/panes",
+            &[("Cookie", &format!("theme=dark; voice_token={TOKEN}"))],
+        )
+        .await;
+    assert_eq!(
+        by_cookie.status, 404,
+        "the login cookie should authenticate"
+    );
+}
+
+// AYEAYE-42 — anything that could write is gated whatever it names, which is
+// what the daemon's do_POST does before it looks at the path.
+#[tokio::test]
+async fn a_post_needs_a_token_even_for_a_page() {
+    let server = Server::started().await;
+    for path in ["/", "/board", "/nope"] {
+        let answer = server.request("POST", path, &[]).await;
+        assert_eq!(answer.status, 401, "POST {path} must need a token");
+    }
+}
+
+// AYEAYE-42 — the handshake a phone does once: a token in the query comes back
+// as the cookie, and the browser is sent on to where it was going.
+#[tokio::test]
+async fn the_login_handshake_sets_the_cookie_and_redirects() {
+    let server = Server::started().await;
+
+    let answer = server
+        .get(&format!("/login?token={TOKEN}&next=/board"))
+        .await;
+    assert_eq!(answer.status, 303);
+    assert_eq!(answer.header("location"), Some("/board"));
+    assert_eq!(
+        answer.header("set-cookie"),
+        Some(
+            format!("voice_token={TOKEN}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict")
+                .as_str()
+        )
+    );
+
+    // The app's own URL is the same handshake, so one bookmarked link works.
+    let at_root = server.get(&format!("/?token={TOKEN}")).await;
+    assert_eq!(at_root.status, 303);
+    assert_eq!(at_root.header("location"), Some("/"));
+
+    let wrong = server.get("/login?token=not-the-token").await;
+    assert_eq!(wrong.status, 401);
+    assert_eq!(
+        wrong.header("set-cookie"),
+        None,
+        "a refusal must set nothing"
+    );
+}
+
+// AYEAYE-42 — `next` is attacker-supplied, and it arrives percent-encoded. A
+// check that looked at the raw text would pass `%2F%2Fevil.example` straight
+// through to a browser that reads it as a host.
+#[tokio::test]
+async fn a_hostile_next_cannot_bounce_the_browser_off_this_origin() {
+    let server = Server::started().await;
+    for hostile in [
+        "//evil.example",
+        "%2F%2Fevil.example",
+        "https://evil.example",
+        "/%5Cevil.example",
+    ] {
+        let answer = server
+            .get(&format!("/login?token={TOKEN}&next={hostile}"))
+            .await;
+        assert_eq!(answer.status, 303, "status for {hostile}");
+        assert_eq!(
+            answer.header("location"),
+            Some("/"),
+            "{hostile} must not survive as a redirect target"
+        );
+    }
+}
