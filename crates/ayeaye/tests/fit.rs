@@ -216,7 +216,10 @@ async fn a_window_a_dead_process_left_fitted_is_restored_at_the_next_start() {
     let restarted = Fits::new(60_000, Some(path.clone()));
     restarted.recover(&tmux, &here()).await;
     assert_eq!(window(&tmux, id.pane()).await, (100, 40));
-    assert!(!path.exists(), "the file has to be consumed, or a later start restores again");
+    assert!(
+        !path.exists(),
+        "the file has to be consumed, or a later start restores again"
+    );
 
     // And a third start, after somebody has resized by hand, leaves it alone.
     ayeaye::fit::resize(&tmux, id.pane(), 90, 30).await;

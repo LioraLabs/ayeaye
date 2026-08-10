@@ -228,7 +228,7 @@ async fn terminal(settings: &Settings, query: &Query) -> Response {
         // right thing to do about a pane nobody could look at.
         Err(trouble) => {
             eprintln!("ayeaye: {trouble}");
-            return json_body(json_object(&[("error", &trouble.to_string())]));
+            return json_body(refusal(&trouble.to_string()));
         }
     };
     let (cols, rows) = grid(settings, &id).await;
@@ -241,14 +241,18 @@ async fn terminal(settings: &Settings, query: &Query) -> Response {
         return json_body(pane::whole_body(&pane::whole(&lines), cols, rows));
     }
     let view = pane::View::split(lines, rows);
-    let diff = settings.pane_cache.lock().unwrap_or_else(|held| held.into_inner()).diff(
-        &id.qualified(),
-        &view,
-        cols,
-        rows,
-        query.hh.as_deref().unwrap_or(""),
-        query.sh.as_deref().unwrap_or(""),
-    );
+    let diff = settings
+        .pane_cache
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .diff(
+            &id.qualified(),
+            &view,
+            cols,
+            rows,
+            query.hh.as_deref().unwrap_or(""),
+            query.sh.as_deref().unwrap_or(""),
+        );
     json_body(diff.body())
 }
 
@@ -315,10 +319,20 @@ const MAX_BODY: usize = 64 * 1024;
 /// - a peer's pane is not this machine's to capture — the transport for that is
 ///   the multi-host milestone's;
 /// - and **membership, not syntax**, is the defence against a forged target.
-///   `PaneId` only says an id could live in a qualified id; the daemon checks
-///   the id against the pane list it just read, and so does this. It costs one
-///   `list-panes` per poll, which is the price of not re-deriving the "not a
-///   scratch session, not dead" rule a second time somewhere it could drift.
+///   `PaneId` only says an id *could* live in a qualified id.
+///
+/// The membership check is a **hardening, not a port**: `bin/ayeaye` makes it in
+/// `kill_pane` and `resolve_file_reference` and does not make it on `/api/pane`
+/// or `/api/resize` at all. It is needed here because these ids are qualified
+/// and arrive from a client, and because the pane list already hides the panes
+/// the panel must never offer as targets — a `_`-prefixed scratch session, and a
+/// pane `remain-on-exit` has left dead. Those two are consequently 404 here and
+/// capturable from the daemon, which is the divergence this buys.
+///
+/// It costs one `list-panes` per poll — three tmux calls where the daemon makes
+/// two. The alternative is re-deriving the "not a scratch session, not dead"
+/// rule a second time inside a `display-message` format, and two spellings of
+/// one rule drift.
 async fn local_pane(settings: &Settings, asked: &str) -> Option<PaneId> {
     let (peer, id) = settings.peers.route(asked).ok()?;
     if !peer.is_here() {
@@ -384,21 +398,12 @@ fn number(asked: &serde_json::Value, field: &str) -> Option<i64> {
     }
 }
 
-/// A JSON object of string fields, escaped.
-fn json_object(fields: &[(&str, &str)]) -> String {
-    let mut out = String::from("{");
-    for (index, (name, value)) in fields.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{}:{}",
-            ayeaye_core::json::string(name),
-            ayeaye_core::json::string(value)
-        ));
-    }
-    out.push('}');
-    out
+/// What this server says when it could not look.
+///
+/// Escaped, because the reason is whatever tmux wrote and a quote in it would
+/// otherwise end the string that carries it.
+fn refusal(why: &str) -> String {
+    format!("{{\"error\":{}}}", ayeaye_core::json::string(why))
 }
 
 /// A JSON body this server built at runtime.

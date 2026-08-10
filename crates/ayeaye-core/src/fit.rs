@@ -369,7 +369,14 @@ mod tests {
     #[test]
     fn acquiring_a_held_lease_renews_it_rather_than_re_recording_it() {
         let mut leases = Leases::new(1_000);
-        assert!(leases.acquire("desktop/%1", Prev::Manual { cols: 100, rows: 40 }, 0));
+        assert!(leases.acquire(
+            "desktop/%1",
+            Prev::Manual {
+                cols: 100,
+                rows: 40
+            },
+            0
+        ));
         assert!(leases.holds("desktop/%1"));
 
         // The window is at phone width now, so this is what a second acquire
@@ -380,7 +387,10 @@ mod tests {
         assert!(leases.due(1_200).is_empty());
         assert_eq!(
             leases.release("desktop/%1"),
-            Some(Prev::Manual { cols: 100, rows: 40 }),
+            Some(Prev::Manual {
+                cols: 100,
+                rows: 40
+            }),
             "the state recorded first is the state restored"
         );
         assert!(!leases.holds("desktop/%1"));
@@ -398,7 +408,10 @@ mod tests {
 
         leases.acquire("desktop/%1", Prev::Auto, 0);
         assert!(leases.touch("desktop/%1", 900));
-        assert!(leases.due(1_500).is_empty(), "renewed at 900, lives to 1900");
+        assert!(
+            leases.due(1_500).is_empty(),
+            "renewed at 900, lives to 1900"
+        );
         assert_eq!(leases.due(1_900).len(), 1, "and no further");
     }
 
@@ -438,7 +451,14 @@ mod tests {
     #[test]
     fn forgetting_a_lease_leaves_nothing_to_restore() {
         let mut leases = Leases::new(1_000);
-        leases.acquire("desktop/%1", Prev::Manual { cols: 100, rows: 40 }, 0);
+        leases.acquire(
+            "desktop/%1",
+            Prev::Manual {
+                cols: 100,
+                rows: 40,
+            },
+            0,
+        );
         assert!(leases.forget("desktop/%1"));
         assert!(!leases.forget("desktop/%1"));
         assert!(leases.due(9_999).is_empty());

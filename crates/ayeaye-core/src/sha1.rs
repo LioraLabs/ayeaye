@@ -27,7 +27,13 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// The five words of the digest, in order.
 fn digest(bytes: &[u8]) -> [u32; 5] {
-    let mut state: [u32; 5] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+    let mut state: [u32; 5] = [
+        0x6745_2301,
+        0xefcd_ab89,
+        0x98ba_dcfe,
+        0x1032_5476,
+        0xc3d2_e1f0,
+    ];
 
     // The message, then a 1 bit, then zeros, then the length in bits as a
     // big-endian u64 — padded so the whole thing is a multiple of 64 bytes.
@@ -104,10 +110,8 @@ mod tests {
         // 112 bytes: two blocks, so a length that is only correct for the first
         // one shows up here and nowhere above.
         assert_eq!(
-            hex(
-                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
-                  hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
-            ),
+            hex(b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+                  hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"),
             "a49b2446a02c645bf419f995b67091253a04a259"
         );
     }

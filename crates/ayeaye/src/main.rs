@@ -107,10 +107,7 @@ fn serve(args: &[String]) -> ExitCode {
         // Before the first request, and only here: a window a previous process
         // left at phone width goes back now, and the file it was recorded in is
         // consumed so a later start cannot restore it a second time.
-        settings
-            .fits
-            .recover(&settings.tmux, &settings.peers)
-            .await;
+        settings.fits.recover(&settings.tmux, &settings.peers).await;
         if let Err(why) = server::serve(listener, Arc::new(settings)).await {
             eprintln!("ayeaye: server stopped: {why}");
             return ExitCode::FAILURE;

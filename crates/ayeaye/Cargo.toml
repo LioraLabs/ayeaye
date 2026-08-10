@@ -25,7 +25,7 @@ ayeaye-infer.workspace = true
 # here: ayeaye-core is synchronous, and the constitution's effect budget
 # refuses `tokio` inside it.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time", "sync"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.

@@ -40,6 +40,26 @@ pub const MIN_SWEEP: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub struct Fits {
     leases: Mutex<Leases>,
+    /// Held for the whole of an acquire, a release, a forget or a sweep.
+    ///
+    /// The lock above guards the *map* and is dropped before any tmux call, as
+    /// it must be — an `await` under a blocking lock is a deadlock waiting to
+    /// happen. But that leaves a gap with teeth in it: a sweep takes the lease
+    /// out of the map and then awaits the restore, and an `/api/resize` landing
+    /// in that gap sees no lease, reads the pre-fit state off a window that is
+    /// **still at phone width**, and records phone width as the state to go back
+    /// to. The desktop would then be pinned there for good — and the page
+    /// re-asserts its fit on drift every five seconds, so the trigger is
+    /// ordinary rather than exotic.
+    ///
+    /// So the four operations that pair a map change with a tmux call take their
+    /// turn here. `touch` does not: it is the per-poll hot path, it changes no
+    /// window, and a renewal that loses a race with a sweep is a lease that had
+    /// already run out.
+    ///
+    /// `bin/ayeaye` has the same gap — `del _fits[p]` and then `_fit_restore`
+    /// outside the lock — so this is a deliberate divergence rather than a port.
+    turn: tokio::sync::Mutex<()>,
     /// Where the leases are written, or `None` for a deployment with no state
     /// directory to write to. `None` is a working daemon that cannot survive its
     /// own restart, which is better than one that will not start.
@@ -57,6 +77,7 @@ impl Fits {
     pub fn new(ttl_ms: u64, path: Option<PathBuf>) -> Fits {
         Fits {
             leases: Mutex::new(Leases::new(ttl_ms)),
+            turn: tokio::sync::Mutex::new(()),
             path,
             started: Instant::now(),
         }
@@ -100,6 +121,12 @@ impl Fits {
         if self.touch(id) {
             return;
         }
+        let _turn = self.turn.lock().await;
+        // Again, under the turn: a restore may have finished while this call was
+        // waiting for it, and the window it was about to record has moved.
+        if self.touch(id) {
+            return;
+        }
         let prev = pre_fit(tmux, id.pane()).await;
         let now = self.now();
         // `Leases::acquire` keeps whichever state was recorded first, so two
@@ -111,6 +138,7 @@ impl Fits {
 
     /// End a lease and put the window back. `false` if there was none.
     pub async fn release(&self, tmux: &Tmux, id: &PaneId) -> bool {
+        let _turn = self.turn.lock().await;
         let Some(prev) = self.locked().release(&id.qualified()) else {
             return false;
         };
@@ -125,6 +153,7 @@ impl Fits {
     /// asked for it to be automatic, and a lease still holding the old state
     /// would undo that the moment it expired.
     pub async fn forget(&self, tmux: &Tmux, id: &PaneId) {
+        let _turn = self.turn.lock().await;
         self.locked().forget(&id.qualified());
         self.save();
         restore(tmux, id.pane(), &Prev::Auto).await;
@@ -136,12 +165,14 @@ impl Fits {
     /// a client that stops polling for any reason at all — including having
     /// ceased to exist — is handled by exactly this and by nothing else.
     pub async fn sweep(&self, tmux: &Tmux) -> usize {
+        let _turn = self.turn.lock().await;
         let now = self.now();
         let due = self.locked().due(now);
         for (pane, prev) in &due {
-            // Skipped rather than guessed at: an id in here was routed and
-            // checked against the pane list before it ever became a lease, so
-            // one that will not parse is a file somebody has edited.
+            // Every key in here arrived as a `PaneId` and was written back out
+            // with `qualified()`, so this cannot fail — but the key is a
+            // `String` by the time it comes back and the alternative is an
+            // `expect` in a sweeper nobody is watching.
             if let Ok(id) = PaneId::parse(pane) {
                 restore(tmux, id.pane(), prev).await;
             }

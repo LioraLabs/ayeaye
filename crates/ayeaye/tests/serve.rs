@@ -803,14 +803,37 @@ async fn the_terminal_view_answers_about_the_id_the_pane_list_gave() {
     let (hh, sh) = (field(&first_body, "hh"), field(&first_body, "sh"));
     assert_eq!(hh.len(), 12, "{first_body}");
 
-    // Echo the tokens back, as the poll does. An idle pane costs a header.
-    let again = server
-        .api(&format!("{asked}&df=1&hh={hh}&sh={sh}"))
-        .await
-        .body_text();
+    // Echo the tokens back, as the poll does. An **idle** pane costs a header.
+    //
+    // Polled until it settles rather than exactly twice, because the shell in
+    // this pane is still drawing its prompt when the first request lands: a
+    // single second poll asserts "same" against a pane that genuinely changed
+    // between the two, and fails for the one reason that is not the claim. The
+    // property under test is about a pane that is not changing, so waiting for
+    // one is part of stating it — and a server that never answered `same` still
+    // fails, because the loop runs out.
+    let (mut hh, mut sh) = (hh, sh);
+    let mut last = String::new();
+    for _ in 0..40 {
+        last = server
+            .api(&format!("{asked}&df=1&hh={hh}&sh={sh}"))
+            .await
+            .body_text();
+        if last.contains(r#""same":1"#) {
+            break;
+        }
+        hh = field(&last, "hh");
+        sh = field(&last, "sh");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert!(
-        again.contains(r#""same":1"#),
-        "an unchanged pane should cost nothing: {again}"
+        last.contains(r#""same":1"#),
+        "an unchanged pane should cost nothing: {last}"
+    );
+    // And `same` really is all of it: no lines, no screen, nothing to render.
+    assert!(
+        !last.contains(r#""screen":"#) && !last.contains(r#""hist":"#),
+        "a matching poll must carry no text at all: {last}"
     );
 }
 
@@ -841,7 +864,12 @@ async fn only_a_pane_this_machine_actually_lists_can_be_read() {
         "/api/pane?id=desktop%2Fwork:0.0",
     ] {
         let answer = server.api(asked).await;
-        assert_eq!(answer.status, 404, "{asked} was not refused: {}", answer.body_text());
+        assert_eq!(
+            answer.status,
+            404,
+            "{asked} was not refused: {}",
+            answer.body_text()
+        );
         assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
     }
     // And no id at all is a different mistake, told apart from a wrong one.
@@ -902,7 +930,10 @@ async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
     assert_eq!(window_size(&layer, &pane).await, (40, 10));
 
     let released = server
-        .post("/api/resize", &format!(r#"{{"pane":"{id}","release":true}}"#))
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","release":true}}"#),
+        )
         .await;
     assert_eq!(released.body_text(), r#"{"ok":true,"restored":true}"#);
     assert_eq!(
@@ -912,7 +943,10 @@ async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
     );
     // Releasing again restores nothing: there is no lease left to end.
     let twice = server
-        .post("/api/resize", &format!(r#"{{"pane":"{id}","release":true}}"#))
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","release":true}}"#),
+        )
         .await;
     assert_eq!(twice.body_text(), r#"{"ok":true,"restored":false}"#);
 }
@@ -977,4 +1011,156 @@ async fn window_size(tmux: &ayeaye::tmux::Tmux, pane: &str) -> (u16, u16) {
         .await
         .expect("tmux should describe a window it has");
     ayeaye_core::fit::size(&said).unwrap_or_else(|| panic!("not a size: {said:?}"))
+}
+
+// AYEAYE-47 — "the pane poll renews the lease as a side effect of watching",
+// and the sweeper is what ends it when the watching stops. Both halves at once,
+// through the running server: the lease outlives several TTLs while the terminal
+// is being polled, and dies on its own once the polling stops. Nothing here
+// calls `Fits::sweep` — the sweeper `server::serve` spawned is what has to
+// notice, or the claim is about a function nobody runs in production.
+#[tokio::test]
+async fn watching_the_terminal_holds_the_fit_and_stopping_lets_it_go() {
+    let Some(tmux) = common::Private::named("serve-lease") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let layer = tmux.layer();
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    // A lease that runs out in a third of a second, so this proves expiry in
+    // real time without waiting out the production twelve.
+    settings.fits = Arc::new(Fits::new(300, None));
+    let fits = Arc::clone(&settings.fits);
+    let server = Server::start(settings).await;
+
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+    let pane = id.split_once('/').expect("a qualified id").1.to_string();
+    let asked = format!("/api/pane?id={}", id.replace('/', "%2F"));
+    ayeaye::fit::resize(&layer, &pane, 100, 40).await;
+
+    server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
+        )
+        .await;
+    let held = ayeaye_core::peer::PaneId::parse(&id).expect("a qualified id");
+    assert!(fits.holds(&held), "the resize should have taken a lease");
+
+    // Watched for well over three lease lifetimes. The sweeper is running the
+    // whole time and must not take a window somebody is looking at.
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(server.api(&asked).await.status, 200);
+    }
+    assert!(
+        fits.holds(&held),
+        "watching the pane is what holds the fit, and it did not"
+    );
+    assert_eq!(window_size(&layer, &pane).await, (40, 10));
+
+    // Then the phone goes into a pocket. Nobody releases anything.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert!(
+        !fits.holds(&held),
+        "an unwatched lease has to expire on its own"
+    );
+    assert_eq!(
+        window_size(&layer, &pane).await,
+        (100, 40),
+        "the sweeper should have given the desktop its window back"
+    );
+}
+
+// AYEAYE-47 — the resize acts on a pane, so membership matters there at least as
+// much as on the read. Every id here is well-formed and none of them is a pane
+// this machine listed.
+#[tokio::test]
+async fn only_a_pane_this_machine_lists_can_be_resized() {
+    let Some(tmux) = common::Private::named("serve-resize-forged") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let layer = tmux.layer();
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+    let pane = id.split_once('/').expect("a qualified id").1.to_string();
+    ayeaye::fit::resize(&layer, &pane, 100, 40).await;
+
+    for forged in ["%0", "gpu-box/%0", "desktop/%99", "desktop/work:0.0"] {
+        for shape in [
+            format!(r#"{{"pane":"{forged}","auto":true,"cols":40,"rows":10}}"#),
+            format!(r#"{{"pane":"{forged}","release":true}}"#),
+            format!(r#"{{"pane":"{forged}","restore":true}}"#),
+        ] {
+            let answer = server.post("/api/resize", &shape).await;
+            assert_eq!(answer.status, 404, "{shape} was not refused");
+            assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
+        }
+    }
+    // And nothing reached tmux: the one real window is the size it was.
+    assert_eq!(window_size(&layer, &pane).await, (100, 40));
+}
+
+// AYEAYE-47 — the manual escape hatch. `restore` hands sizing back to tmux
+// outright, whatever the window was before, and drops the lease — because a
+// lease still holding the old state would undo the user's choice the moment it
+// expired. It is the one branch that ignores the recorded state, so it is the
+// one most able to lose somebody's manual sizing by accident.
+#[tokio::test]
+async fn restore_hands_sizing_back_to_tmux_and_leaves_no_lease() {
+    let Some(tmux) = common::Private::named("serve-restore") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let layer = tmux.layer();
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    settings.fits = Arc::new(Fits::new(300, None));
+    let fits = Arc::clone(&settings.fits);
+    let server = Server::start(settings).await;
+
+    let id = first_pane_id(&server.api("/api/panes").await.body_text());
+    let pane = id.split_once('/').expect("a qualified id").1.to_string();
+    let held = ayeaye_core::peer::PaneId::parse(&id).expect("a qualified id");
+
+    ayeaye::fit::resize(&layer, &pane, 100, 40).await;
+    server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
+        )
+        .await;
+    assert!(fits.holds(&held));
+
+    let restored = server
+        .post(
+            "/api/resize",
+            &format!(r#"{{"pane":"{id}","restore":true}}"#),
+        )
+        .await;
+    assert_eq!(restored.status, 200);
+    assert_eq!(restored.body_text(), r#"{"ok":true,"restored":true}"#);
+    assert!(!fits.holds(&held), "the lease has to go with the sizing");
+    assert!(
+        !window_is_manual(&layer, &pane).await,
+        "sizing should be tmux's again, not pinned to the recorded size"
+    );
+
+    // And it stays that way: an expired lease that had survived would put the
+    // window back to 100x40 a third of a second from now.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert!(!window_is_manual(&layer, &pane).await);
+}
+
+/// Whether tmux says this window is sized by hand.
+async fn window_is_manual(tmux: &ayeaye::tmux::Tmux, pane: &str) -> bool {
+    let shown = tmux
+        .ask(&["show-options", "-w", "-t", pane, "window-size"])
+        .await
+        .unwrap_or_default();
+    ayeaye_core::fit::manual(&shown)
 }

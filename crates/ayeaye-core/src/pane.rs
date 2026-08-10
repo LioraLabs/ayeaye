@@ -27,6 +27,11 @@ const TOKEN_LEN: usize = 12;
 /// milliseconds of `capture-pane`, and the diff protocol resends only what
 /// changed since the client last asked — so depth costs the server memory, not
 /// the phone's radio.
+///
+/// Fixed, where `bin/ayeaye:163` reads `_env("LINES", "500")`. The default is the
+/// same, so only a deployment that overrode it diverges — and the option is not
+/// carried over because a scrollback depth is a decision about the protocol
+/// rather than about the machine, and nothing in the milestone needs it to move.
 pub const LINES: usize = 500;
 
 /// The token naming this text.
@@ -459,11 +464,7 @@ mod tests {
         let raw = "plain   \n\u{1b}[44mpainted   \u{1b}[0m   \nlast";
         assert_eq!(
             lines(raw),
-            owned(&[
-                "plain",
-                "\u{1b}[44mpainted   \u{1b}[0m   ",
-                "last"
-            ])
+            owned(&["plain", "\u{1b}[44mpainted   \u{1b}[0m   ", "last"])
         );
         assert!(lines("").is_empty());
         // A trailing newline is a line ending, not an extra line — `str::lines`
@@ -487,7 +488,10 @@ mod tests {
         let short = View::split(owned(&["s1", "s2"]), 3);
         assert!(short.hist.is_empty());
         assert_eq!(short.screen, owned(&["s1", "s2"]));
-        assert_eq!(View::split(owned(&["a", "b", "c"]), 3).hist, Vec::<String>::new());
+        assert_eq!(
+            View::split(owned(&["a", "b", "c"]), 3).hist,
+            Vec::<String>::new()
+        );
     }
 
     // AYEAYE-47 — a grid size that could not be read means the whole capture is
@@ -723,7 +727,14 @@ mod tests {
         // An emptied window and an emptied client both reconstruct.
         let mut edges = Cache::default();
         let none = edges.diff("desktop/%1", &view(&[], &["s"]), 80, 24, "", "");
-        let some = edges.diff("desktop/%1", &view(&["a"], &["s"]), 80, 24, &none.hh, &none.sh);
+        let some = edges.diff(
+            "desktop/%1",
+            &view(&["a"], &["s"]),
+            80,
+            24,
+            &none.hh,
+            &none.sh,
+        );
         assert_eq!(applied(&[], &some), owned(&["a"]));
         let gone = edges.diff("desktop/%1", &view(&[], &["s"]), 80, 24, &some.hh, &some.sh);
         assert_eq!(applied(&owned(&["a"]), &gone), Vec::<String>::new());
@@ -753,7 +764,14 @@ mod tests {
             "",
         );
         assert!(matches!(kept.answer, Answer::Patch { .. }), "{kept:?}");
-        let evicted = cache.diff("desktop/%1", &view(&["a", "d"], &["s"]), 80, 24, &first.hh, "");
+        let evicted = cache.diff(
+            "desktop/%1",
+            &view(&["a", "d"], &["s"]),
+            80,
+            24,
+            &first.hh,
+            "",
+        );
         assert!(matches!(evicted.answer, Answer::Full { .. }), "{evicted:?}");
         assert_eq!(Cache::DEFAULT_MAX, 32);
         assert!(Cache::default().is_empty());
