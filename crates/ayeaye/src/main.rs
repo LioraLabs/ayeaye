@@ -14,6 +14,7 @@ use ayeaye::models;
 use ayeaye::probe;
 use ayeaye::server;
 use ayeaye::service::{Runner, Services, Subprocess};
+use ayeaye::setup;
 use ayeaye_core::service::{Definition, Layout, manual_instructions};
 
 fn main() -> ExitCode {
@@ -22,6 +23,8 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[1..]),
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
+        Some("setup") => setup_verb(&args[1..]),
+        Some("check") => check_verb(),
         None => {
             println!("{}", banner());
             ExitCode::SUCCESS
@@ -43,14 +46,26 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
+       ayeaye setup [--yes] [--no-service] [--no-model] [--model ID]
+                    [--bind ADDR] [--port N]
+       ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
        ayeaye model <ls|pull ID|use ID|rm ID>
 
   serve      run the HTTP server
+  setup      make this computer ready to run ayeaye, and check that it is
+  check      re-run the health checks on their own
   service    manage the service this binary installs for itself
   model      fetch and choose the models this binary runs
   --version  print the version and what this build can do
   --help     this
+
+setup asks before two things and nothing else: downloading a model, which
+goes to the internet, and starting a service, which runs whenever you log
+in. --yes answers both. With no terminal it does neither and prints the
+command that would. Everything else it finds — how you reach this machine
+from outside, a reverse proxy, a mesh network, your coding agents, tmux —
+it checks and reports, and never configures.
 
 a model ID is owner/name, as in openai/whisper-small.en, optionally
 @revision. ayeaye ships the inference, not the weights.
@@ -244,6 +259,172 @@ fn human(bytes: u64) -> String {
         }
     }
     format!("{bytes} bytes")
+}
+
+/// `ayeaye setup` — make this computer ready, and then check that it is.
+///
+/// The one command somebody with the binary and nothing else runs. It decides
+/// before it does anything, says what it is about to do, asks about the two acts
+/// with a consequence, carries the rest out, and finishes by checking what it
+/// just built.
+///
+/// It ends on the health report rather than on "done", and that is the point of
+/// the whole ticket: a run that installed everything perfectly and cannot reach
+/// the result is not a successful run, and the only way to find that out is to
+/// ask.
+fn setup_verb(args: &[String]) -> ExitCode {
+    let flags = match setup::parse(args) {
+        Ok(flags) => flags,
+        Err(why) => return complain(&format!("ayeaye: {why}\n\n{USAGE}")),
+    };
+    let layout = layout(from_environment);
+    let Some(state_dir) = config::state_dir() else {
+        return complain(
+            "ayeaye: cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let places = setup::Places::from(&layout, &state_dir);
+    let program = match std::env::current_exe() {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(error) => {
+            return complain(&format!(
+                "ayeaye: cannot tell where this binary is: {error}"
+            ));
+        }
+    };
+
+    println!("looking at this computer…");
+    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
+    let machine = captured.machine();
+    println!("  {}", machine.summary());
+    println!("  {}", machine.verdict.tier.as_str());
+    if let Some(reason) = machine.verdict.reason {
+        println!("  {reason}");
+    }
+    let session = probe::session(&probe::System);
+
+    // Asked only where there is somebody to ask. A pipe is not a person, and
+    // taking silence for consent is the one thing this must never do.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let plan = if interactive {
+        setup::decide(&captured, &places, session.as_ref(), &flags, &setup::Tty)
+    } else {
+        setup::decide(
+            &captured,
+            &places,
+            session.as_ref(),
+            &flags,
+            &setup::Assumed(false),
+        )
+    };
+
+    if let Err(why) = setup::record_consent(&places.state_dir, &plan, &stamp()) {
+        return complain(&format!("ayeaye: {why}"));
+    }
+
+    let did = match setup::carry_out(
+        &plan,
+        &captured,
+        &places,
+        session.as_ref(),
+        &layout,
+        &program,
+        &flags,
+        Subprocess,
+        &models::Curl,
+        &stamp(),
+    ) {
+        Ok(did) => did,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    for line in &did.lines {
+        println!("  {line}");
+    }
+    if !did.declined.is_empty() {
+        println!("\nnot done, because you did not ask for it:");
+        for line in &did.declined {
+            println!("  {line}");
+        }
+    }
+
+    println!();
+    check(&captured, session.as_ref(), &places)
+}
+
+/// `ayeaye check` — the health checks, on their own.
+///
+/// The same report `setup` ends on. Separate because the answer changes without
+/// setup running again: a certificate expires, a proxy is reconfigured, somebody
+/// stops the service. "Is this still working" is a question worth being able to
+/// ask on its own.
+fn check_verb() -> ExitCode {
+    let layout = layout(from_environment);
+    let Some(state_dir) = config::state_dir() else {
+        return complain(
+            "ayeaye: cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let places = setup::Places::from(&layout, &state_dir);
+    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
+    check(&captured, probe::session(&probe::System).as_ref(), &places)
+}
+
+/// Run the checks and print them, four marks and all.
+///
+/// The exit code is the report's outcome, and the three are not two. A failed or
+/// unfinished check leaves work outstanding and exits 1; the lock being off
+/// exits 2, because "anybody who can reach this address can run commands on this
+/// computer" is not the same news as "your https certificate has expired" and a
+/// script reading exit codes should not have to guess which happened.
+fn check(
+    captured: &ayeaye::probe::Captured,
+    session: Option<&ayeaye_core::service::Session>,
+    places: &setup::Places,
+) -> ExitCode {
+    let asking = ayeaye::health::Asking {
+        url: format!(
+            "http://{}:{}",
+            config::env_var("BIND").unwrap_or_else(|| config::DEFAULT_BIND.to_string()),
+            config::env_var("DEV_PORT").unwrap_or_else(|| config::DEFAULT_DEV_PORT.to_string())
+        ),
+        allowed_hosts: config::env_var("ALLOWED_HOSTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .collect(),
+        token: config::load_token().ok(),
+        state_dir: Some(places.state_dir.clone()),
+        captured,
+        session,
+        build: setup::build_acceleration(),
+        runner: Subprocess,
+    };
+
+    println!("checking what is here. each line is one of:");
+    println!("  ok       it works             FAILED   it does not");
+    println!("  skipped  you did not ask      unknown  could not tell\n");
+    let report = asking.run();
+    for check in &report.checks {
+        println!("{}", check.line());
+        if let Some(detail) = &check.detail {
+            println!("         {detail}");
+        }
+    }
+    println!("\n{}", report.summary());
+
+    match report.outcome() {
+        ayeaye_core::health::Outcome::Done => ExitCode::SUCCESS,
+        ayeaye_core::health::Outcome::Unfinished => ExitCode::FAILURE,
+        ayeaye_core::health::Outcome::Insecure => {
+            eprintln!();
+            for line in ayeaye_core::health::insecure_warning(&asking.url) {
+                eprintln!("{line}");
+            }
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `ayeaye service <verb>` — the service this binary installs for itself.

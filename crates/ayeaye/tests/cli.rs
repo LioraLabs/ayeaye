@@ -156,3 +156,134 @@ fn scratch(what: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
 }
+
+// AYEAYE-62 — `ayeaye setup` as the binary, on a machine where no service
+// manager can be found and no consent was given.
+//
+// **The empty `PATH` is the safety property, not a convenience.** It means the
+// binary cannot find `systemctl`, so it never asks the live user bus anything
+// and never runs a service verb against it — and it cannot find `curl` either,
+// so no request leaves this machine. AYEAYE-61 disabled the developer's own
+// ayeaye service by assuming a redirected `HOME` was a sandbox; it is not, and
+// this is what a sandbox actually looks like from here.
+#[test]
+fn setup_with_nobody_to_ask_writes_its_own_files_and_nothing_else() {
+    let home = scratch("setup");
+    let (code, out, err) = ayeaye_on_a_bare_machine(&["setup", "--no-model"], &home);
+
+    // The health checks are the last thing it does, and on a machine with
+    // nothing running they do not pass — so setup does not claim success.
+    assert_eq!(
+        code, 1,
+        "an unfinished install is not a finished one: {out}{err}"
+    );
+    assert!(out.contains("looking at this computer"), "{out}");
+
+    // It minted a key, and only its owner can read it.
+    let token = home.join("state/ayeaye/token");
+    assert!(token.exists(), "no key was made: {out}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "the key is readable by others: {mode:o}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&token).unwrap().trim().len(),
+        43,
+        "the shape secrets.token_urlsafe(32) makes"
+    );
+
+    // It wrote the settings file it owns.
+    assert!(home.join("config/ayeaye/env").exists(), "{out}");
+
+    // It found no service manager and said how to run ayeaye by hand.
+    assert!(out.contains("run the server with:"), "{out}");
+    assert!(
+        !home.join("config/systemd").exists(),
+        "nothing may be installed where nothing can run it"
+    );
+
+    // Every check reported, and the four marks are the four marks.
+    assert!(out.contains("skipped  you did not ask"), "{out}");
+    assert!(out.contains("unknown  could not tell"), "{out}");
+    assert!(out.contains(" ok, "), "the summary line: {out}");
+    // Nothing could be asked over the network, and none of it passed.
+    assert!(out.contains("unknown"), "{out}");
+    assert!(
+        !err.contains("panicked"),
+        "setup must not panic on a bare machine: {err}"
+    );
+
+    // And the consent record exists, saying what was declined rather than
+    // silently dropping it.
+    let consent = std::fs::read_to_string(home.join("state/ayeaye/consent")).unwrap_or_default();
+    assert!(
+        consent.is_empty() || consent.contains("declined"),
+        "a record that only holds agreements is not a record: {consent}"
+    );
+}
+
+// AYEAYE-62 — re-runnable, and does not damage an existing install. The key a
+// second run finds is the key a phone is already logged in with.
+#[test]
+fn a_second_setup_keeps_the_key_the_first_one_made() {
+    let home = scratch("setup-twice");
+    ayeaye_on_a_bare_machine(&["setup", "--no-model"], &home);
+    let token = home.join("state/ayeaye/token");
+    let first = std::fs::read_to_string(&token).expect("a key");
+    std::fs::write(home.join("config/ayeaye/env"), "AYEAYE_CLIBAN=/opt/mine\n").unwrap();
+
+    ayeaye_on_a_bare_machine(&["setup", "--no-model"], &home);
+    assert_eq!(
+        std::fs::read_to_string(&token).expect("still a key"),
+        first,
+        "a new key would log every phone out"
+    );
+    assert!(
+        std::fs::read_to_string(home.join("config/ayeaye/env"))
+            .unwrap()
+            .contains("AYEAYE_CLIBAN=/opt/mine"),
+        "settings setup did not ask about belong to whoever put them there"
+    );
+}
+
+// AYEAYE-62 — `ayeaye check` runs the same report on its own, because the answer
+// changes without setup running again: a certificate expires, a proxy is
+// reconfigured, somebody stops the service.
+#[test]
+fn check_runs_the_health_report_on_its_own() {
+    let home = scratch("check");
+    let (code, out, err) = ayeaye_on_a_bare_machine(&["check"], &home);
+    assert_eq!(code, 1, "nothing is running, so nothing is finished");
+    assert!(out.contains("checking what is here"), "{out}");
+    assert!(out.contains(" ok, "), "the summary line: {out}");
+    assert!(!err.contains("panicked"), "{err}");
+    // It checks; it does not set anything up.
+    assert!(
+        !home.join("state/ayeaye/token").exists(),
+        "check must not mint a key"
+    );
+    assert!(
+        !home.join("config/ayeaye/env").exists(),
+        "check must not write settings"
+    );
+}
+
+// AYEAYE-62 — the help names the two verbs and says what setup will ask about,
+// because "it asks before two things and nothing else" is the promise somebody
+// is trusting when they run it on a machine they care about.
+#[test]
+fn help_says_what_setup_will_and_will_not_do() {
+    let (code, out, _) = ayeaye(&["--help"]);
+    assert_eq!(code, 0);
+    for said in [
+        "ayeaye setup",
+        "ayeaye check",
+        "--yes",
+        "asks before two things",
+        "never configures",
+    ] {
+        assert!(out.contains(said), "--help does not mention {said:?}");
+    }
+}
