@@ -579,7 +579,10 @@ impl<S: Slot> Residents<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Curl, Fetcher, Policy, PullError, Residents, install, installed, pull, remove};
+    use super::{
+        Curl, Fetcher, Policy, PullError, Residents, cleanup_policy, install, installed, pull,
+        remove,
+    };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, TOKENIZER_FILE, WEIGHTS_FILE};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
@@ -951,6 +954,79 @@ mod tests {
             !dir.with_extension("replaced").exists(),
             "and nothing may be left sitting beside it under another name"
         );
+    }
+
+    // AYEAYE-58 — the cleanup pass is configured through `Policy::resolve`, not
+    // assembled by hand out of the prompt.
+    //
+    // The difference is not tidiness. A hand-built policy pairs somebody's own
+    // prompt with the *default* prompt's echo phrases — guarding against
+    // instructions nobody is giving, and refusing a legitimate rewrite that
+    // happens to contain the words — and leaves the template and the token
+    // budget reading nothing at all, which on a Llama-3 model is a cleanup pass
+    // that quietly answers dictations instead of rewriting them.
+    #[test]
+    fn the_cleanup_pass_is_configured_rather_than_assembled() {
+        let scratch = Scratch::named("cleanup-policy");
+        let file = scratch.0.join("env");
+        std::fs::write(
+            &file,
+            "AYEAYE_CLEANUP_PROMPT=Say it back in French.\n\
+             AYEAYE_CLEANUP_ECHOES=say it back, en francais\n\
+             AYEAYE_CLEANUP_TEMPLATE=llama3\n\
+             AYEAYE_CLEANUP_MAX_TOKENS=64\n",
+        )
+        .expect("a configuration file");
+
+        let policy = cleanup_policy(&file).expect("it should resolve");
+
+        assert_eq!(policy.system_prompt, "Say it back in French.");
+        assert_eq!(policy.echoes, vec!["say it back", "en francais"]);
+        assert_eq!(policy.template, ayeaye_core::chat::Template::llama3());
+        assert_eq!(policy.max_new_tokens, 64);
+        // Which is observable rather than bookkeeping: the prompt really is
+        // rendered in the family the file named.
+        assert!(
+            policy.prompt("bonjour").starts_with("<|begin_of_text|>"),
+            "{}",
+            policy.prompt("bonjour")
+        );
+    }
+
+    // AYEAYE-58 — a prompt on its own drops the default prompt's tells with it,
+    // which is the coupling `Policy::resolve` exists to keep and the one a
+    // hand-built policy breaks silently.
+    #[test]
+    fn naming_only_a_prompt_leaves_the_old_prompts_tells_behind() {
+        let scratch = Scratch::named("cleanup-echoes");
+        let file = scratch.0.join("env");
+        std::fs::write(&file, "AYEAYE_CLEANUP_PROMPT=Say it back in French.\n")
+            .expect("a configuration file");
+
+        let policy = cleanup_policy(&file).expect("it should resolve");
+
+        assert_eq!(policy.system_prompt, "Say it back in French.");
+        assert!(
+            policy.echoes.is_empty(),
+            "the default prompt's tells guard nothing on somebody else's prompt: {:?}",
+            policy.echoes
+        );
+    }
+
+    // AYEAYE-58 — a machine nobody has configured is not an error, and a
+    // template nobody implements is. Falling back to the default there would
+    // leave a model answering dictations with no symptom but worse output.
+    #[test]
+    fn no_file_is_the_default_pass_and_a_template_nobody_has_is_refused() {
+        let scratch = Scratch::named("cleanup-absent");
+
+        let bare = cleanup_policy(&scratch.0.join("nothing-here")).expect("no file resolves");
+        assert_eq!(bare, super::CleanupPolicy::default());
+
+        let file = scratch.0.join("env");
+        std::fs::write(&file, "AYEAYE_CLEANUP_TEMPLATE=alpaca\n").expect("a configuration file");
+        let refused = cleanup_policy(&file).expect_err("a template nobody implements");
+        assert!(refused.to_string().contains("alpaca"), "{refused}");
     }
 
     // AYEAYE-56 — `--fail` and `--location` are not decoration. Without the

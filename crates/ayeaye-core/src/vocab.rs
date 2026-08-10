@@ -130,7 +130,7 @@ fn continues_a_name(c: char) -> bool {
 /// dash, a dot with letters both sides — or an internal capital. Plain prose
 /// fails all of them, which is the point: a hint diluted with the words of the
 /// sentence is a hint the model reads past.
-pub fn looks_like_code(word: &str) -> bool {
+fn looks_like_code(word: &str) -> bool {
     let length = word.chars().count();
     if !(SHORTEST..=LONGEST).contains(&length) {
         return false;

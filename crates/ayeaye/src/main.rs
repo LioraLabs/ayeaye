@@ -374,7 +374,6 @@ async fn recording_peer(
     pane: &str,
     passed: Option<&str>,
 ) -> Option<String> {
-
     // The methods below belong to `ayeaye::process::Processes`, and the trait is
     // not imported: `here()` hands back a `dyn Processes`, whose methods are
     // callable without it.

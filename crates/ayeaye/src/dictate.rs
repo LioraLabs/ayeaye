@@ -74,10 +74,12 @@ pub fn hear(
     names: &str,
     policy: &Policy,
 ) -> Outcome {
+    // Measured once. `is_silence` walks every sample again to answer the same
+    // question, and a clip is up to two minutes at sixteen kilohertz.
     let rms = audio.rms();
     let seconds = audio.duration_secs();
 
-    if audio.is_silence() {
+    if rms < ayeaye_core::audio::SILENCE_RMS {
         return Outcome::Silence { rms, seconds };
     }
 
@@ -340,9 +342,21 @@ where
         // as the model takes.
         let outcome = in_place(|| {
             if loaded {
-                hear(speech_models.slot_mut(), language.slot_mut(), audio, names, policy)
+                hear(
+                    speech_models.slot_mut(),
+                    language.slot_mut(),
+                    audio,
+                    names,
+                    policy,
+                )
             } else {
-                hear(speech_models.slot_mut(), &mut AsSpoken, audio, names, policy)
+                hear(
+                    speech_models.slot_mut(),
+                    &mut AsSpoken,
+                    audio,
+                    names,
+                    policy,
+                )
             }
         });
         // Stamped *after* the work, not before. A model is idle from the moment

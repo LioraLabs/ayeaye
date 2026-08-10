@@ -481,7 +481,10 @@ async fn sweeping_a_voice_that_has_never_been_used_lets_go_of_nothing() {
     );
 
     assert!(!voice.sweep(std::time::Instant::now()).await);
-    assert!(!voice.probe().await.speech_ready, "nothing was loaded to sweep");
+    assert!(
+        !voice.probe().await.speech_ready,
+        "nothing was loaded to sweep"
+    );
 }
 
 // ------------------------------------------------------------- the tmux path
@@ -1018,7 +1021,10 @@ fn the_converter_is_asked_for_the_one_shape_a_speech_model_reads() {
 
     assert_eq!(argv[0], "ffmpeg");
     for flag in ["-nostdin", "-ac", "-ar", "-f", "-y"] {
-        assert!(argv.iter().any(|arg| arg == flag), "{flag} is missing: {argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == flag),
+            "{flag} is missing: {argv:?}"
+        );
     }
     let after = |flag: &str| {
         let at = argv.iter().position(|arg| arg == flag).expect("the flag");
