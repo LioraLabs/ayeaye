@@ -114,6 +114,13 @@ pub async fn spawn(settings: &Settings, body: &[u8]) -> Answered {
         ));
     }
 
+    // Starting an agent somewhere is the strongest possible signal that this
+    // is one of your projects, so it is what teaches the picker — the daemon's
+    // own placement, after the typing and before the body. The directory goes
+    // exactly as the request spelled it; `store::key_for` is the one place
+    // that decides what the row is called.
+    note_pick(settings, dir).await;
+
     Answered::done(agent::spawned_body(&pane, &session, &made, agent))
 }
 
@@ -215,6 +222,30 @@ async fn type_into(settings: &Settings, pane: &str, command_line: &str) -> Resul
         .ask(&["send-keys", "-t", pane, "Enter"])
         .await?;
     Ok(())
+}
+
+/// Record the pick in the store the picker ranks by.
+///
+/// Best effort in every direction, as `store::note_pick` itself is: a settings
+/// with no store path, a write that fails, even a panic on the blocking thread
+/// all cost ranking quality and nothing else — no failure here may reach the
+/// spawn response. On a blocking thread because it is file I/O on the request
+/// path, and **awaited** because the daemon writes before it answers: the row
+/// is on disk by the time the caller sees the pane, which is also the only
+/// ordering a test can assert against.
+async fn note_pick(settings: &Settings, dir: &str) {
+    let Some(store) = settings.store.clone() else {
+        return;
+    };
+    let dir = dir.to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64())
+        .unwrap_or(0.0);
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::projects::store::note_pick(&store, &dir, now);
+    })
+    .await;
 }
 
 /// Whether this is a directory an agent could be started in.

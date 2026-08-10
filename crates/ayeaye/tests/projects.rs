@@ -167,6 +167,10 @@ async fn the_picker_answers_over_a_socket() {
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
         )),
+        // This test never spawns, and a `None` store is the same guarantee
+        // the `fits: None` above makes: nothing here writes into the state
+        // of whoever is running the suite.
+        store: None,
     };
     let listener = ayeaye::server::listen(&settings)
         .await

@@ -24,12 +24,9 @@ pub fn load(at: &Path) -> Recents {
 
 /// Record that an agent was started here.
 ///
-/// **Nothing in this binary calls this yet.** The daemon's call site is inside
-/// spawn (`note_project_pick` in `bin/ayeaye`), and spawning is AYEAYE-51 —
-/// which was written against a base where this function did not exist. Until
-/// its handler calls this, the picker reads a history nothing writes and
-/// "recent picks are recorded" holds in the tests and not on a running
-/// machine. AYEAYE-71 is the wiring.
+/// Called from `crate::agent::spawn`, as the daemon calls `note_project_pick`
+/// from its spawn: what you started an agent in is one of your projects, so
+/// it is what teaches the picker.
 ///
 /// Best effort in every direction: a store that cannot be written costs
 /// ranking quality and nothing else, so no failure here may reach the

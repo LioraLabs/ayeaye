@@ -79,6 +79,16 @@ pub struct Settings {
     /// there is one of each per machine and inference is this process's own
     /// arithmetic: two requests must take turns rather than each load a model.
     pub voice: Arc<Voice>,
+    /// Where spawn records a pick, so the picker has a history to rank by.
+    ///
+    /// The same file `projects::Settings::from_env` points the picker at —
+    /// both derive it from [`state_dir`], which is what keeps the write where
+    /// the read looks. `None` where there is no state directory, exactly as
+    /// `fits` has no path there: a machine with no home loses ranking history,
+    /// and nothing else. A field rather than a call inside spawn for the same
+    /// reason `tmux` is one — without it, the suite writes into the state
+    /// directory of whoever is running it.
+    pub store: Option<PathBuf>,
 }
 
 /// Why a configuration could not be resolved.
@@ -193,6 +203,7 @@ impl Settings {
             pane_cache: Arc::new(Mutex::new(pane::Cache::default())),
             fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, fits_path())),
             voice,
+            store: state_dir().map(|dir| dir.join(crate::projects::store::FILE)),
         })
     }
 
