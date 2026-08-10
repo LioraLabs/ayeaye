@@ -40,6 +40,21 @@ pub fn children(text: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Who this process's parent is, from `/proc/<pid>/stat` field 4.
+///
+/// Same split as [`start_time`], for the same reason: the name is in
+/// parentheses and may contain one, so what is left of the line starts at field
+/// 3 and the parent is the one after it.
+///
+/// This is the answer of last resort. A kernel built without `CONFIG_PROC_CHILDREN`
+/// publishes no children file, and the only way left to find a process's
+/// children is to ask every process who its parent is — which is what `pgrep`
+/// does, and what the targeted read exists to avoid.
+pub fn parent(stat: &str) -> Option<u32> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// The address a process was reached from, out of `/proc/<pid>/environ`.
 ///
 /// `None` means the process is sitting at the machine, or that nothing could be
@@ -70,7 +85,7 @@ pub fn ssh_peer(environ: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{children, ssh_peer, start_time};
+    use super::{children, parent, ssh_peer, start_time};
 
     /// A `/proc/<pid>/stat` line, shaped like the real thing.
     ///
@@ -152,6 +167,17 @@ mod tests {
         assert_eq!(children("101 102 103 \n"), [101, 102, 103]);
         assert_eq!(children("\n"), []);
         assert_eq!(children(""), []);
+    }
+
+    // AYEAYE-44 — the fallback when the kernel publishes no children file:
+    // field 4, found by the same split from the right, so a process called
+    // `co)de(x` does not make somebody else its parent.
+    #[test]
+    fn the_parent_is_the_field_after_the_state() {
+        assert_eq!(parent(&stat("bash", 0)), Some(1));
+        assert_eq!(parent("900 (co)de(x) S 100 0 0\n"), Some(100));
+        assert_eq!(parent("42 (bash) S\n"), None);
+        assert_eq!(parent(""), None);
     }
 
     // AYEAYE-44 — this file is written while the processes it names are
