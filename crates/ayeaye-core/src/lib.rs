@@ -29,6 +29,7 @@ pub mod prompt;
 pub mod service;
 pub mod sha1;
 pub mod tmux;
+pub mod vocab;
 
 pub use audio::Pcm16kMono;
 pub use identity::Identity;

@@ -1,0 +1,24 @@
+audio.rs  cleanup.rs  identity.rs  logits.rs  model    process	   sha1.rs
+board.rs  fit.rs      json.rs	   machine    pane.rs  prompt.rs   tmux.rs
+chat.rs   http	      lib.rs	   mel.rs     peer.rs  service.rs
+crates/ayeaye-core/src/audio.rs:24:pub struct Pcm16kMono {
+crates/ayeaye-core/src/cleanup.rs:66:    pub max_new_tokens: usize,
+crates/ayeaye-core/src/cleanup.rs:80:            max_new_tokens: DEFAULT_MAX_NEW
+_TOKENS,
+crates/ayeaye-core/src/cleanup.rs:175:            policy.max_new_tokens = budget
+;
+crates/ayeaye-core/src/cleanup.rs:264:pub fn worth_cleaning(raw: &str) -> bool {
+crates/ayeaye-core/src/cleanup.rs:611:        assert_eq!(policy.max_new_tokens,
+64);
+the tests are failing again, run them and tell me why
+$
+
+
+
+
+
+
+
+
+
+

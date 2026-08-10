@@ -18,7 +18,21 @@ impl LanguageModel {
     /// input: the attention blocks carry a key-value cache that this walks
     /// forward, and drops by starting each generation at position zero.
     pub fn rewrite(&mut self, raw: &str, policy: &Policy) -> Result<String, LanguageError> {
-        let prompt = policy.prompt(raw);
+        self.rewrite_with(raw, "", policy)
+    }
+
+    /// The same, told which names are on the speaker's screen.
+    ///
+    /// The names are an argument rather than a field on the [`Policy`] because
+    /// they are a photograph of one pane at one moment: the policy is
+    /// configuration and outlives the process, and the screen does not.
+    pub fn rewrite_with(
+        &mut self,
+        raw: &str,
+        names: &str,
+        policy: &Policy,
+    ) -> Result<String, LanguageError> {
+        let prompt = policy.prompt_with(raw, names);
         // `false`: the template already spells every special token it wants,
         // and a post-processor that added its own would put a second
         // beginning-of-text marker in front of the one Llama-3's prefix wrote.
