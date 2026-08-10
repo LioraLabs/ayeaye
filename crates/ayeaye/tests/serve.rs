@@ -1168,6 +1168,89 @@ async fn a_second_agent_joins_its_own_session_even_when_the_project_is_named_lik
     );
 }
 
+// AYEAYE-71 — starting an agent somewhere is the strongest signal that this is
+// one of your projects, so a spawn teaches the picker: the row lands in the
+// pick store on disk, under the key `bin/ayeaye` would write for the same
+// directory. Asserted on the file, not on a spy — the file is the interface
+// the two daemons share, and it is what AYEAYE-50 reads back for ranking.
+#[tokio::test]
+async fn a_spawn_records_the_pick_where_the_picker_reads_it() {
+    let Some(tmux) = common::Private::named("serve-spawn-pick") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    // The stand-in PATH, as every spawn test sets it: what gets typed into the
+    // pane is `claude`, and the one this machine really has must stay out of
+    // reach.
+    tmux.tmux(&[
+        "set-option",
+        "-g",
+        "default-command",
+        &format!(
+            "PATH={} AYEAYE_51_ARGV={} /bin/sh",
+            stand_in_root().join("bin").display(),
+            stand_in_root().join("argv-pick").display()
+        ),
+    ]);
+    let project = stand_in_root().join("ayeaye-71-project");
+    std::fs::create_dir_all(&project).expect("a project directory");
+
+    let store = stand_in_root().join("ayeaye-71-state").join("projects.json");
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    settings.store = Some(store.clone());
+    let server = Server::start(settings).await;
+
+    // The directory is spelled with the trailing slash `_recents_key` strips,
+    // so a row under the slashless key is proof the store's own `key_for`
+    // produced it rather than the request's spelling landing raw.
+    let spelled = format!("{}/", project.to_string_lossy());
+    let answer = server
+        .post_as_us(
+            "/api/spawn",
+            &format!(
+                r#"{{"dir":{},"agent":"claude"}}"#,
+                serde_json::to_string(&spelled).unwrap()
+            ),
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+
+    // On disk by the time the response has left, as the daemon writes it:
+    // `note_project_pick` runs before `spawn_agent` returns its body.
+    let written = std::fs::read_to_string(&store).unwrap_or_default();
+    let key = project.to_string_lossy();
+    assert!(
+        written.contains(&format!(r#""{key}":{{"n":1"#)),
+        "the pick store should hold one row under {key}: {written:?}"
+    );
+
+    // And a store that cannot be written costs ranking and nothing else: a
+    // directory where the file should be refuses every write, and the spawn
+    // response never hears about it.
+    let blocked = stand_in_root().join("ayeaye-71-blocked").join("projects.json");
+    std::fs::create_dir_all(&blocked).expect("a directory where the file should be");
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    settings.store = Some(blocked);
+    let second = Server::start(settings).await;
+    let answer = second
+        .post_as_us(
+            "/api/spawn",
+            &format!(
+                r#"{{"dir":{},"agent":"claude"}}"#,
+                serde_json::to_string(&project.to_string_lossy().into_owned()).unwrap()
+            ),
+        )
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "an unwritable store must not reach the response: {}",
+        answer.body_text()
+    );
+}
+
 // AYEAYE-51 — the prompt is the most attacker-influenceable string in the app,
 // and the quoting can refuse it. A refusal is a stated 400 that says what to do
 // about it, and nothing is started: a pane left behind by a request that failed
