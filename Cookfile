@@ -53,6 +53,19 @@ probe commit
 probe scripts
     files { "scripts/*.sh" }
 
+# Every input to `cargo test --workspace`. cargo iterates the workspace, not a
+# file list, so none of this appears on the command line and nothing else would
+# tell cook the answer had changed. The lockfile is in here because the suite
+# runs `--locked`: a moved dependency is a different answer.
+probe rust
+    files { "Cargo.toml" "Cargo.lock" "crates/*/Cargo.toml" "crates/*/build.rs" "crates/*/src/*.rs" "crates/*/src/**/*.rs" "crates/*/tests/*.rs" "crates/*/tests/**/*.rs" }
+
+# The compiler is a determinant of what the suite says: a lint that fires on
+# one toolchain and not the next is exactly the drift `-D warnings` exists to
+# catch, and a cached green from the old one would hide it.
+probe rust:tools
+    tools { cargo rustc cargo-clippy }
+
 # --- the suite ----------------------------------------------------------
 # One unit per case file, so editing one test re-runs one test. The whole
 # suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
@@ -67,6 +80,31 @@ recipe suite
     seal scripts
     test { bash tests/run.sh $<in.stem> }
 
+# The Rust workspace is one unit, not one per crate: cargo already builds the
+# whole graph to test any part of it, so fanning out would compile the same
+# crates several times over and cache none of it better. It is its own unit
+# rather than a step inside the bash suite so that an edit to a shell test does
+# not recompile Rust, and an edit to Rust does not re-run 69 shell files.
+#
+# The ingredient is the workspace manifest - a source, which is what makes this
+# cacheable at all. The sources themselves are the sealed probe above: cargo
+# consumes them, but it does not take them as arguments.
+
+recipe rust-suite
+    ingredients "Cargo.toml"
+    seal rust
+    seal rust:tools
+    test { cargo test --workspace --locked }
+
+# Separate from the suite so a lint failure and a test failure are two
+# different red units rather than one. `-D warnings` is the gate the milestone
+# asked for; without it clippy is advice nobody reads.
+recipe rust-lint
+    ingredients "Cargo.toml"
+    seal rust
+    seal rust:tools
+    test { cargo clippy --workspace --all-targets --locked -- -D warnings }
+
 # --- release gates ------------------------------------------------------
 
 recipe release-version
@@ -80,7 +118,7 @@ recipe release-version
 # Sealed on the sources because `git archive` names none of them, so nothing
 # else would tell cook the artifact is stale.
 
-recipe dist: suite release-version
+recipe dist: suite release-version rust-suite rust-lint
     seal commit
     seal scripts
     cook "dist/ayeaye-v0.2.2.tar.gz" { bash scripts/release-archive.sh $<out> }
@@ -105,7 +143,7 @@ chore stamp: dist
 # still stand in the way of a red tree. The dirty-tree refusal lives in the
 # script, which can tell an uncommitted stamp from ordinary dirt and say
 # "commit it and go" rather than only "no".
-chore publish version="v0.2.2": suite release-version
+chore publish version="v0.2.2": suite release-version rust-suite rust-lint
     bash scripts/release-publish.sh $<version>
 
 chore bump version
