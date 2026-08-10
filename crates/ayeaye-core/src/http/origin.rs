@@ -27,6 +27,14 @@
 //!   `https://` on an allowlisted netloc are both allowed, because the netloc
 //!   is what identifies the origin and the Host allow-list carries no scheme
 //!   to compare it against.
+//! - Python's `str.strip()` also strips `\x1c`–`\x1f`, which Rust's `trim` does
+//!   not. On an `Origin` that leaves this stricter; on `Sec-Fetch-Site` it
+//!   leaves it *weaker* — CPython refuses `\x1ccross-site` and this reads it as
+//!   an unrecognised label. Unreachable over the wire, since an HTTP parser
+//!   refuses header bytes below `0x20` other than tab and no page can set
+//!   `Sec-Fetch-Site` in the first place; recorded because the direction is the
+//!   dangerous one and a future caller that passes something other than a
+//!   header value would inherit it.
 
 use super::hosts::AllowedHosts;
 
@@ -94,12 +102,19 @@ pub fn gate(
 /// therefore names no host however hostlike its text; and unbalanced IPv6
 /// brackets, which is where `urlsplit` raises `ValueError` and `_origin_ok`
 /// answers False from its `except`.
+///
+/// `urlsplit` has one other way to raise, and this does not reproduce it: a
+/// non-ASCII netloc that NFKC-normalises to contain `/?#@:` is refused there
+/// and allowed here. It is unreachable without a non-ASCII entry in
+/// `AYEAYE_ALLOWED_HOSTS`, because an ASCII entry can never equal a netloc
+/// that trips the check, and carrying a Unicode normalisation table into the
+/// pure core to close it would cost more than the case is worth.
 fn netloc(origin: &str) -> Option<&str> {
-    let netloc = strip_scheme(origin)
-        .strip_prefix("//")?
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let after_slashes = strip_scheme(origin).strip_prefix("//")?;
+    let end = after_slashes
+        .find(['/', '?', '#'])
+        .unwrap_or(after_slashes.len());
+    let netloc = &after_slashes[..end];
     if netloc.contains('[') != netloc.contains(']') {
         return None;
     }
@@ -152,9 +167,37 @@ mod tests {
         }
     }
 
+    // AYEAYE-69 — the daemon reads this header as `.strip().lower()`, and this
+    // is the clause where dropping either half is invisible: the value arrives
+    // as raw header bytes, browsers send it lowercase today, and a comparison
+    // that only handles what they send now would refuse nothing the day one
+    // sends `Cross-Site`.
+    #[test]
+    fn the_label_is_read_the_way_the_daemon_reads_it() {
+        for label in ["Cross-Site", "CROSS-SITE", " cross-site ", "\tcross-site"] {
+            assert_eq!(
+                gate("POST", Some(label), None, &allowed()),
+                Site::Cross,
+                "{label:?} is the cross-site label, however it is spelled"
+            );
+        }
+        // And the trim does not turn a different label into this one.
+        assert_eq!(
+            gate("POST", Some(" cross-site-ish "), None, &allowed()),
+            Site::Same
+        );
+    }
+
     // AYEAYE-69 — `null` is the origin of a sandboxed iframe, a `file://` page
     // and a redirected cross-origin POST. It names no host, so no allow-list
     // can admit it, and the daemon refuses it by name before it parses.
+    //
+    // The named clause is belt and braces, here and in the daemon: `null` has
+    // no `//`, so the netloc parse below would refuse it anyway. Deleting
+    // either the clause or this test would leave the suite green, which is
+    // worth saying out loud rather than leaving for the next reader to
+    // rediscover — the clause stays because `_origin_ok` has it and this is a
+    // port, and because it says in one line what the parse says in ten.
     #[test]
     fn an_opaque_origin_is_refused() {
         for origin in ["null", "NULL", " null "] {
