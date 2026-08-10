@@ -12,6 +12,8 @@
 //! hands the text over, which is what lets this be held to screens really
 //! captured from real sessions rather than to screens somebody typed out.
 
+use crate::json;
+
 /// One option the pane is offering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
@@ -257,6 +259,109 @@ fn capped(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
+/// The body `/api/prompt` answers with.
+///
+/// `{"prompt":null}` when the pane is not stopped on anything, which is not the
+/// same as an error and must not be sent as one: `share/app.html`'s `pollPrompt`
+/// reads `d && d.prompt` and clears the card on a null, while a failed request
+/// leaves the last card standing for the next poll to correct.
+pub fn body(prompt: Option<&Prompt>) -> String {
+    let Some(prompt) = prompt else {
+        return r#"{"prompt":null}"#.to_string();
+    };
+    let mut out = format!(
+        r#"{{"prompt":{{"question":{},"options":["#,
+        json::string(&prompt.question)
+    );
+    for (index, choice) in prompt.options.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"key":{},"label":{}}}"#,
+            json::string(&choice.key),
+            json::string(&choice.label)
+        ));
+    }
+    out.push_str("]}}");
+    out
+}
+
+/// One keypress the remote is allowed to make.
+///
+/// There is no way to build one but through [`press`], which is the point: this
+/// endpoint is reachable over the network and must not become a general
+/// `send-keys` hole. What crosses the boundary is a value from a table, never a
+/// string somebody sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Press {
+    /// The argument `send-keys` is given.
+    key: &'static str,
+    /// Whether it goes with `-l`, meaning "this is text, not a key name".
+    literal: bool,
+}
+
+impl Press {
+    /// What `send-keys` is given.
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+
+    /// Whether `send-keys` is told to read it literally.
+    pub fn literal(&self) -> bool {
+        self.literal
+    }
+}
+
+/// The key this name means, or `None` if it means nothing.
+///
+/// **A digit is a press on its own and is never paired with Enter.** Claude's
+/// multi-select uses digits to toggle checkboxes and Enter to submit, so pairing
+/// them toggled and submitted in a single tap. Codex's approve prompt needs the
+/// same two steps. Confirming is always explicit — which is also what you want
+/// from a remote that can approve `git restore`.
+///
+/// Stricter than the daemon this replaces, deliberately. That one asked
+/// `key.isdigit() and 1 <= int(key) <= 9`, which says yes to `"05"` — and then
+/// sends `"05"`, two keystrokes, one of them the `0` the range was written to
+/// exclude — and yes to the digits of other alphabets, which `int()` accepts and
+/// no terminal produces. A table of the nine keys says neither.
+pub fn press(key: &str) -> Option<Press> {
+    if let Some((_, sent)) = NAV_KEYS.iter().find(|(name, _)| *name == key) {
+        return Some(Press {
+            key: sent,
+            literal: false,
+        });
+    }
+    DIGITS
+        .iter()
+        .find(|digit| **digit == key)
+        .map(|digit| Press {
+            key: digit,
+            literal: true,
+        })
+}
+
+/// The named keys the remote may press, and what tmux calls each.
+///
+/// An allow-list, transcribed from `bin/ayeaye`'s `NAV_KEYS`. Between these and
+/// the numbers, most of working with an agent is confirming, backing out, or
+/// moving the cursor.
+pub const NAV_KEYS: &[(&str, &str)] = &[
+    ("enter", "Enter"),
+    ("esc", "Escape"),
+    ("up", "Up"),
+    ("down", "Down"),
+    ("left", "Left"),
+    ("right", "Right"),
+    ("tab", "Tab"),
+    ("space", "Space"),
+];
+
+/// The option numbers a prompt can be answered with, spelled out so that what
+/// reaches `send-keys` is a `&'static str` from this file.
+const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
 /// The box-drawing characters a preview column is recognised by.
 const BOX: &[char] = &[
     '─', '━', '│', '┃', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╌', '┈', '✂',
@@ -286,7 +391,7 @@ const HINTS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::read;
+    use super::{Choice, NAV_KEYS, Prompt, body, press, read};
 
     /// An `AskUserQuestion` whose options carry previews.
     ///
@@ -467,5 +572,131 @@ mod tests {
             None
         );
         assert_eq!(read(""), None);
+    }
+
+    // AYEAYE-48 — the allow-list, key by key, transcribed from `bin/ayeaye`'s
+    // NAV_KEYS. This endpoint is reachable over the network, and anything that
+    // is not on the list is a general send-keys hole.
+    #[test]
+    fn only_the_named_keys_and_the_nine_numbers_can_be_pressed() {
+        for (name, sent) in [
+            ("enter", "Enter"),
+            ("esc", "Escape"),
+            ("up", "Up"),
+            ("down", "Down"),
+            ("left", "Left"),
+            ("right", "Right"),
+            ("tab", "Tab"),
+            ("space", "Space"),
+        ] {
+            let pressed = press(name).unwrap_or_else(|| panic!("{name} is a key"));
+            assert_eq!(pressed.key(), sent);
+            assert!(!pressed.literal(), "{name} is a key name, not text");
+        }
+        assert_eq!(NAV_KEYS.len(), 8, "a key arrived or left without a reason");
+
+        for number in ["1", "5", "9"] {
+            let pressed = press(number).unwrap_or_else(|| panic!("{number} is an option"));
+            assert_eq!(pressed.key(), number);
+            assert!(pressed.literal(), "a number is typed, not named");
+        }
+    }
+
+    // AYEAYE-48 — everything else. `Enter` and `C-c` are what a caller reaches
+    // for first when probing this for a send-keys hole; `0`, `10` and `05` are
+    // what the daemon's `key.isdigit() and 1 <= int(key) <= 9` lets through or
+    // nearly does — `"05"` passes that test and then sends two keystrokes, one
+    // of them the `0` the range was written to exclude.
+    #[test]
+    fn nothing_else_is_a_key_at_all() {
+        for hostile in [
+            "",
+            "0",
+            "10",
+            "05",
+            "1 ",
+            " 1",
+            "Enter",
+            "ENTER",
+            "C-c",
+            "C-d",
+            "kill-server",
+            ";",
+            "Escape",
+            "\u{661}",
+            "\u{665}",
+            "1;2",
+        ] {
+            assert_eq!(press(hostile), None, "{hostile:?} must not be a key");
+        }
+    }
+
+    // AYEAYE-48 — the body `share/app.html`'s pollPrompt reads. A pane that is
+    // not stopped on anything answers a null prompt rather than an error: the
+    // page clears its card on a null and keeps the last one on a failure, and
+    // those are opposite instructions.
+    #[test]
+    fn the_body_carries_the_question_and_a_card_per_option() {
+        assert_eq!(body(None), r#"{"prompt":null}"#);
+        let prompt = Prompt {
+            question: "Hook range?".to_string(),
+            options: vec![
+                Choice {
+                    key: "1".to_string(),
+                    label: "Explicit".to_string(),
+                },
+                Choice {
+                    key: "2".to_string(),
+                    label: "Span it".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            body(Some(&prompt)),
+            concat!(
+                r#"{"prompt":{"question":"Hook range?","options":["#,
+                r#"{"key":"1","label":"Explicit"},"#,
+                r#"{"key":"2","label":"Span it"}"#,
+                r#"]}}"#,
+            )
+        );
+    }
+
+    // AYEAYE-48 — a label is whatever an agent drew on a screen, escape bytes
+    // and quotes included. One badly-drawn option must not end the string that
+    // carries it, or the panel gets no prompt at all for the pane that has one.
+    #[test]
+    fn a_label_off_a_real_screen_cannot_break_the_body() {
+        let prompt = Prompt {
+            question: "say \"hi\"".to_string(),
+            options: vec![Choice {
+                key: "1".to_string(),
+                label: "a\u{1b}[31mb".to_string(),
+            }],
+        };
+        assert_eq!(
+            body(Some(&prompt)),
+            concat!(
+                r#"{"prompt":{"question":"say \"hi\"","options":["#,
+                r#"{"key":"1","label":"a\u001b[31mb"}]}}"#,
+            )
+        );
+    }
+
+    // AYEAYE-48 — and the two halves meet: a real captured screen goes in and
+    // the body the phone reads comes out, which is the claim neither the parser
+    // test nor the writer test makes on its own.
+    #[test]
+    fn a_captured_screen_becomes_the_body_the_phone_reads() {
+        let answered = body(read(COLUMNS).as_ref());
+        assert!(
+            answered.starts_with(r#"{"prompt":{"question":"Hook range How should"#),
+            "{answered}"
+        );
+        assert!(
+            answered.contains(r#"{"key":"1","label":"Explicit per-poke range (Recommended)"}"#),
+            "{answered}"
+        );
+        assert_eq!(body(read(ANSWERED).as_ref()), r#"{"prompt":null}"#);
     }
 }
