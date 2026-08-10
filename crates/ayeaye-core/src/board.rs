@@ -12,6 +12,11 @@
 /// lines and garbled ones are dropped. That last part is the daemon's
 /// behaviour and worth keeping deliberately: a line cliban truncated costs one
 /// row rather than the whole board.
+///
+/// A line ends at a newline and nothing else, where Python's `splitlines`
+/// would also break on the vertical tab, the form feed and U+2028. Those are
+/// legal raw inside a JSON string, so a ticket titled across one of them is a
+/// row the daemon splits in half and drops, and one this keeps.
 pub fn rows(stdout: &str) -> Vec<&str> {
     stdout
         .lines()
@@ -42,8 +47,9 @@ pub fn payload(projects: &[&str], milestones: &[&str], issues: &[&str]) -> Strin
         if index > 0 {
             out.push(',');
         }
-        out.push_str(&crate::json::quote(name));
-        out.push_str(":[");
+        out.push('"');
+        out.push_str(name);
+        out.push_str("\":[");
         out.push_str(&rows.join(","));
         out.push(']');
     }
@@ -85,14 +91,16 @@ pub fn project_keys(rows: &[&str]) -> String {
 /// arguments. Not a lookup — cliban decides whether the issue exists; this
 /// decides only whether the question is one worth asking it.
 ///
-/// Stricter than the daemon's `re.match` in one place, deliberately: Python's
-/// `$` also matches before a trailing newline, so `AYEAYE-53\n` passes there
-/// and not here. Nothing legitimate sends it, and an argument with a newline in
-/// it is exactly what this check exists to refuse.
+/// Stricter than the daemon's `re.match` in two places, both deliberate.
+/// Python's `$` also matches before a trailing newline, so `AYEAYE-53\n` passes
+/// there and not here; and Python's `\d` matches every Unicode digit, so
+/// `AYE-` followed by Arabic-Indic digits is a key there and not here. Nothing
+/// legitimate sends either, and an argument carrying a newline is exactly what
+/// this check exists to refuse.
 pub fn is_issue_key(key: &str) -> bool {
-    // The project part admits no dash, so there is exactly one to split on and
-    // the first is it: `AYE-AYE-53` has to fail, and splitting on the last
-    // would let it through.
+    // The project part admits no dash, so a key has exactly one and either end
+    // finds it. Splitting at the first keeps the failure legible: `AYE-AYE-53`
+    // fails on the number rather than on a project name nobody would recognise.
     let Some((project, number)) = key.split_once('-') else {
         return false;
     };
@@ -118,6 +126,10 @@ mod tests {
         "\n",
     );
 
+    /// One line of `cliban issue ls --json`, nested `relations` and all: the
+    /// shape that actually flows through `rows` on a real board.
+    const ISSUE: &str = r#"{"key":"AYEAYE-16","labels":["feature"],"milestone":"Car mode","priority":"urgent","relations":[{"type":"blocks","target":"AYEAYE-18"}],"status":"backlog","title":"Server-side risk classification","updated_at":"2026-08-08T16:11:06Z"}"#;
+
     // AYEAYE-53 — the rows the board renders are the lines that parse, and the
     // ones that do not are dropped rather than carried: half an object in the
     // payload is a page that cannot render at all, where a missing row is a
@@ -140,6 +152,9 @@ mod tests {
         );
         // Trimmed, so the payload does not carry the pipe's whitespace.
         assert_eq!(rows("  {\"a\":1}  \n"), vec![r#"{"a":1}"#]);
+        // A row with a nested array of objects in it, which every issue row
+        // has and no fixture above did.
+        assert_eq!(rows(&format!("{ISSUE}\n")), vec![ISSUE]);
         // Not NDJSON at all: a human-readable table, or an error on stdout.
         assert!(rows("KEY  NAME\nAYEAYE  AyeAye\n").is_empty());
     }
@@ -154,12 +169,15 @@ mod tests {
             payload(
                 &[r#"{"key":"AYEAYE"}"#],
                 &[r#"{"name":"One binary","project":"AYEAYE"}"#],
-                &[r#"{"key":"AYEAYE-53"}"#, r#"{"key":"AYEAYE-66"}"#],
+                &[ISSUE],
             ),
-            concat!(
-                r#"{"projects":[{"key":"AYEAYE"}],"#,
-                r#""milestones":[{"name":"One binary","project":"AYEAYE"}],"#,
-                r#""issues":[{"key":"AYEAYE-53"},{"key":"AYEAYE-66"}]}"#,
+            format!(
+                concat!(
+                    r#"{{"projects":[{{"key":"AYEAYE"}}],"#,
+                    r#""milestones":[{{"name":"One binary","project":"AYEAYE"}}],"#,
+                    r#""issues":[{}]}}"#,
+                ),
+                ISSUE
             )
         );
         // An empty board is still a board, and still has to parse.
@@ -200,6 +218,14 @@ mod tests {
             project_keys(&[r#"{"name":"no key here"}"#, r#"{"key":"COOK"}"#]),
             r#"{"keys":["COOK"]}"#
         );
+        // An empty key is skipped, which is `if p.get("key")` and not a
+        // formality: app.html joins these with `|` into
+        // `\b(?:AYEAYE||CLI)-\d+\b`, and the empty alternative matches the
+        // empty string — so every `-123` in a terminal becomes a ticket link.
+        assert_eq!(
+            project_keys(&[r#"{"key":""}"#, r#"{"key":"CLI"}"#]),
+            r#"{"keys":["CLI"]}"#
+        );
     }
 
     // AYEAYE-53 — the key goes into a subprocess argv, so this is the check
@@ -225,6 +251,13 @@ mod tests {
             "--help",
             "AYEAYE-5.3",
             "AYE-AYE-53",
+            // ASCII letters and digits only: the key is spliced into a regular
+            // expression by the page and into an argv by the shell, and a
+            // Unicode digit or a word character that merely looks like one has
+            // no business in either.
+            "A_1-2",
+            "Aé-1",
+            "AYE-١٢",
         ] {
             assert!(!is_issue_key(key), "should not be a key: {key:?}");
         }
