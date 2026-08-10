@@ -6,7 +6,7 @@
 //! rule that is never run against the tree is decoration.
 
 use constitution::corpus::{self, Corpus, workspace_root};
-use constitution::{deps, effect_budget, finding::report, strata, toolchain};
+use constitution::{deps, duplication, effect_budget, finding::report, strata, toolchain, waiver};
 
 /// The floor the whole corpus walk has to clear.
 ///
@@ -262,6 +262,75 @@ fn the_default_build_resolves_to_no_acceleration_package() {
         findings.is_empty(),
         "the portable build needs a CUDA toolchain:\n{}",
         report(&findings)
+    );
+}
+
+// AYEAYE-64
+//
+// The duplication tiers, held green by the waiver ratchet: every violation
+// the tree already had is waived with a written reason, so what this test
+// refuses is only what is new. The waiver file is read from beside this test
+// by include_str! — and the non-empty waiver list doubles as the canary
+// against a scanner gone blind, because a scanner that stops finding the
+// waived violations turns every entry stale at once, loudly.
+#[test]
+fn no_decision_is_implemented_twice() {
+    let corpus = corpus();
+    let sources = duplication::scope(&corpus);
+
+    // A scope that emptied out would pass both rules vacuously: prove it
+    // still covers the three shipped crates, with a real number of files.
+    let crates: std::collections::BTreeSet<&str> =
+        sources.iter().map(|s| s.crate_name.as_str()).collect();
+    assert!(
+        crates.len() >= 3,
+        "the duplication scope covers {crates:?}, not the three shipped crates"
+    );
+    assert!(
+        sources.len() >= NON_TRIVIAL,
+        "the duplication scope holds {} files, which is not a real workspace",
+        sources.len()
+    );
+
+    // ...and a rule that finds nothing in sources it is not really reading
+    // would also pass vacuously. Hand it a planted pair and it has to fire.
+    let planted = duplication::literals(
+        &[
+            duplication::CrateSource {
+                crate_name: "one".to_string(),
+                path: "crates/one/src/lib.rs".to_string(),
+                text: "const A: &str = \"a planted decision\";".to_string(),
+            },
+            duplication::CrateSource {
+                crate_name: "two".to_string(),
+                path: "crates/two/src/lib.rs".to_string(),
+                text: "const B: &str = \"a planted decision\";".to_string(),
+            },
+        ],
+        duplication::LITERAL_FLOOR,
+    );
+    assert!(
+        !planted.is_empty(),
+        "the literal rule found nothing in a planted two-crate duplication; it is blind"
+    );
+
+    let mut findings = duplication::literals(&sources, duplication::LITERAL_FLOOR);
+    findings.extend(duplication::runs(&sources, duplication::RUN_LINES));
+
+    let waivers =
+        waiver::parse(include_str!("../waivers.toml")).expect("waivers.toml should parse");
+    let remaining = waiver::apply(&findings, &waivers, "crates/constitution/waivers.toml");
+
+    let rendered: String = remaining
+        .iter()
+        .map(|finding| format!("  {finding}\n    waiver key: {}\n", finding.key()))
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "a decision is implemented twice (or the waiver file is wrong):\n{rendered}\n\
+         Either remove the duplication, or add a [[waiver]] with a written justification \
+         to crates/constitution/waivers.toml — `cargo run -p constitution --example \
+         ratchet` prints paste-ready entries."
     );
 }
 

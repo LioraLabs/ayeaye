@@ -77,8 +77,14 @@ probe scripts
 # would notice. Editing one changes what the suite asserts while leaving every
 # sealed path untouched - a cached pass over assertions that have moved, which
 # is the same stale green the benches/ omission produced.
+#
+# The waiver file is the same shape again: the duplication gate reads
+# crates/constitution/waivers.toml through `include_str!`, so deleting an
+# entry - the ratchet's whole verb - changes what the suite refuses while
+# matching no glob here. Named explicitly or the ratchet only turns when a
+# .rs file happens to move with it.
 probe rust
-    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "share/*" "crates/**/tests/fixtures/*" }
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "share/*" "crates/**/tests/fixtures/*" "crates/constitution/waivers.toml" }
 
 # The compiler is a determinant of what the suite says: a lint that fires on
 # one toolchain and not the next is exactly the drift `-D warnings` exists to

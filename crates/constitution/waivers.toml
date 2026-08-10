@@ -1,0 +1,156 @@
+# The waiver ratchet — the duplication the tree already had when the tier-2
+# rules landed (AYEAYE-64), each entry with the reason it may persist.
+#
+# This list only shrinks. A waiver whose violation is gone is itself a
+# violation, and so is an entry with a blank justification or a key listed
+# twice. New duplication gets no entry here without the same argument these
+# carry: say why the copy is the design, or fix it instead.
+#
+#   cargo run -p constitution --example ratchet
+#
+# prints every unwaived finding as a paste-ready skeleton, and every problem
+# with this file as a comment. The non-empty list is also the gate's canary:
+# if the scanner ever goes blind, every entry here goes stale at once and the
+# gate fails loudly instead of passing silently.
+
+# --- the asset list: the core routes by name, the shell embeds by name -----
+# route.rs maps URLs to asset file names; assets.rs pairs the same names with
+# include_bytes!. Predates the gate. The real fix is one asset manifest the
+# shell derives its embed table from, not deleting either side's spelling.
+
+[[waiver]]
+key = 'duplicate-literal/"app.html"/ayeaye+ayeaye-core'
+justification = "the core's route table and the shell's include_bytes! table both name the file; one asset manifest is the real fix, and it predates the gate"
+
+[[waiver]]
+key = 'duplicate-literal/"board.html"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"favicon.ico"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-64.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-180.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-192.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-512.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-maskable-192.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"icon-maskable-512.png"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+[[waiver]]
+key = 'duplicate-literal/"manifest.webmanifest"/ayeaye+ayeaye-core'
+justification = "same shape as app.html: route table and embed table each name the file"
+
+# --- response bodies the core exports and the shell re-spells --------------
+# refused.rs and agent.rs export the words as constants; server.rs writes
+# them inline inside larger JSON bodies instead of formatting through them.
+
+[[waiver]]
+key = 'duplicate-literal/"bad json"/ayeaye+ayeaye-core'
+justification = "the core exports refused::BAD_JSON but server.rs inlines the word inside its JSON bodies; route the shell through the constant and this entry goes"
+
+[[waiver]]
+key = 'duplicate-literal/"no such pane"/ayeaye+ayeaye-core'
+justification = "the core exports agent::NO_SUCH_PANE but server.rs inlines the word inside its JSON bodies; same fix as bad json"
+
+[[waiver]]
+key = 'duplicate-literal/"{\"ok\":true}"/ayeaye+ayeaye-core'
+justification = "the smallest success body, spelled by the core's agent replies and by the shell's handlers; predates the gate"
+
+[[waiver]]
+key = 'duplicate-literal/"{{\"error\":{}}}"/ayeaye+ayeaye-core'
+justification = "the error-envelope format template, written in the core's board and dictation answers and again by the shell; predates the gate"
+
+[[waiver]]
+key = 'duplicate-literal/"{{\\\"error\\\":{}}}"/ayeaye+ayeaye-core'
+justification = "the escaped spelling of the same error envelope, in the core's json helpers and the shell; predates the gate"
+
+# --- the machine vocabulary: the core decides, the shell runs --------------
+# platform.rs and service.rs decide which service manager a machine has and
+# plan its commands; probe.rs and health.rs execute and observe. The command
+# name is the vocabulary of that decision, written on both sides.
+
+[[waiver]]
+key = 'duplicate-literal/"launchctl"/ayeaye+ayeaye-core'
+justification = "the core decides a Mac means launchctl, the shell probes for and runs it; the tool name is the decision's vocabulary on both sides of the tier"
+
+[[waiver]]
+key = 'duplicate-literal/"systemctl"/ayeaye+ayeaye-core'
+justification = "same shape as launchctl: verdict in the core, execution in the shell"
+
+[[waiver]]
+key = 'duplicate-literal/"container"/ayeaye+ayeaye-core'
+justification = "the cgroup tier verdict word, decided in the core and probed by the shell; predates the gate"
+
+[[waiver]]
+key = 'duplicate-literal/"{prefix}/bin/brew"/ayeaye+ayeaye-core'
+justification = "the Homebrew path template, planned in the core's platform verdicts and checked by the shell's probe; predates the gate"
+
+# --- the loopback boundary -------------------------------------------------
+
+[[waiver]]
+key = 'duplicate-literal/"127.0.0.1"/ayeaye+ayeaye-core'
+justification = "loopback is the protocol constant both tiers meet at: the core validates Host headers and dictation upstreams against it, the shell binds and defaults to it"
+
+[[waiver]]
+key = 'duplicate-literal/"localhost"/ayeaye+ayeaye-core'
+justification = "the other spelling of loopback: the core allows it as a Host, the shell defaults to and prints it"
+
+[[waiver]]
+key = 'duplicate-literal/"X-Voice-Token"/ayeaye+ayeaye-core'
+justification = "the auth header is the wire contract: the core checks it, the recorder page the shell generates sends it"
+
+# --- model files: the hub contract between core and infer ------------------
+# The core's model manifest names the HuggingFace files a model needs; infer
+# opens the same names when it loads. The file name is the contract.
+
+[[waiver]]
+key = 'duplicate-literal/"config.json"/ayeaye-core+ayeaye-infer'
+justification = "the HuggingFace file name is the contract between the core's model manifest and infer's loader; predates the gate"
+
+[[waiver]]
+key = 'duplicate-literal/"model.safetensors"/ayeaye-core+ayeaye-infer'
+justification = "same shape as config.json: manifest in the core, loader in infer"
+
+[[waiver]]
+key = 'duplicate-literal/"tokenizer.json"/ayeaye-core+ayeaye-infer'
+justification = "same shape as config.json: manifest in the core, loader in infer"
+
+# --- tmux vocabulary -------------------------------------------------------
+
+[[waiver]]
+key = 'duplicate-literal/"set-option"/ayeaye+ayeaye-core'
+justification = "tmux's own verb: the core plans the command line, the shell asks tmux directly elsewhere; both spell tmux's vocabulary, not each other's"
+
+[[waiver]]
+key = 'duplicate-literal/"window-size"/ayeaye+ayeaye-core'
+justification = "tmux's own option name, in the core's fit planning and the shell's fit query; same shape as set-option"
+
+# --- a homonym, not a copy -------------------------------------------------
+
+[[waiver]]
+key = 'duplicate-literal/"projects"/ayeaye+ayeaye-core'
+justification = "one common word, three meanings: a board section, a session grouping, a ranked directory; a coincidence of spelling the floor cannot tell apart, and a human can"
+
+# --- the one copied run ----------------------------------------------------
+
+[[waiver]]
+key = "duplicate-code/ae6943dadb9f02cc/ayeaye+ayeaye-core"
+justification = "both matches enumerate the full Route surface for different verdicts — the token gate in the core, the method-fallback 404 in the shell; a new variant already forces both through exhaustiveness, so the copy is compiler-supervised"
