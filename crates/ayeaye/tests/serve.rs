@@ -263,6 +263,15 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // is running the suite. Recovery across a restart is proved in
         // `tests/fit.rs`, where the file is the test's own.
         fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
+        // No models and a converter that is not there, so nothing here can load
+        // a model or start a process by accident. The cases that care about
+        // voice say so.
+        voice: Arc::new(ayeaye::dictate::Voice::new(
+            std::path::PathBuf::from("/nonexistent/store"),
+            ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
+                .expect("the defaults resolve"),
+            "ayeaye-58-no-such-converter".to_string(),
+        )),
     }
 }
 

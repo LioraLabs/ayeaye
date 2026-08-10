@@ -27,7 +27,7 @@ use ayeaye_core::model::residency::{self, Plan, Policy};
 use ayeaye_core::model::settings::{self, BadSetting, ModelSettings};
 use ayeaye_core::model::verify::{self, Unusable};
 use ayeaye_core::model::{Architecture, ModelId, Unsupported, architecture};
-use ayeaye_infer::{SpeechError, SpeechSlot};
+use ayeaye_infer::{LanguageError, LanguageSlot, SpeechError, SpeechSlot};
 
 /// Something that can fetch one URL into one file.
 ///
@@ -424,22 +424,45 @@ pub struct Residents<S: Slot> {
 
 /// Somewhere a model can be resident.
 ///
-/// [`SpeechSlot`] is the real one. The trait exists for the reason above and
-/// has exactly its shape, so it is a boundary rather than an abstraction.
+/// [`SpeechSlot`] and [`LanguageSlot`] are the real ones. The trait exists for
+/// the reason above and has exactly their shape, so it is a boundary rather than
+/// an abstraction.
+///
+/// The error is associated rather than fixed, because the two slots fail for
+/// different reasons and neither should have to be described in the other's
+/// words. A single error type here would mean a corrupt GGUF arriving at a
+/// caller as a `SpeechError`, which is a sentence nobody could act on.
 pub trait Slot {
+    /// Why this kind of model would not load.
+    type Error;
+
     /// Load the model in `dir`, replacing whatever was resident.
-    fn load(&mut self, dir: &Path) -> Result<(), SpeechError>;
+    fn load(&mut self, dir: &Path) -> Result<(), Self::Error>;
     /// Release the resident model, saying whether there was one.
     fn unload(&mut self) -> bool;
 }
 
 impl Slot for SpeechSlot {
+    type Error = SpeechError;
+
     fn load(&mut self, dir: &Path) -> Result<(), SpeechError> {
         SpeechSlot::load(self, dir)
     }
 
     fn unload(&mut self) -> bool {
         SpeechSlot::unload(self)
+    }
+}
+
+impl Slot for LanguageSlot {
+    type Error = LanguageError;
+
+    fn load(&mut self, dir: &Path) -> Result<(), LanguageError> {
+        LanguageSlot::load(self, dir)
+    }
+
+    fn unload(&mut self) -> bool {
+        LanguageSlot::unload(self)
     }
 }
 
@@ -459,13 +482,25 @@ impl<S: Slot> Residents<S> {
         self.loaded.as_ref()
     }
 
+    /// The slot itself, for the one caller that has something to ask the model
+    /// in it.
+    ///
+    /// Deliberately narrow. Everything about *lifetime* goes through
+    /// [`Residents::ensure`] and [`Residents::sweep`]; this is only how a
+    /// request reaches the model those two decided should be resident, and a
+    /// caller that used it to load or unload would be taking the decision back
+    /// out of the one place that makes it.
+    pub fn slot_mut(&mut self) -> &mut S {
+        &mut self.slot
+    }
+
     /// Make the resident model be the one that is wanted.
     ///
     /// This is the only thing that loads. `wanted` comes from the configuration
     /// as it stands *now*, so a reconfiguration is not an event anything has to
     /// be told about: the next request notices that what is resident is not
     /// what is chosen, and the plan says to let go of it first.
-    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
         match residency::on_demand(self.loaded.as_ref(), wanted) {
             Plan::Keep => Ok(()),
             Plan::Release => {
@@ -501,7 +536,7 @@ impl<S: Slot> Residents<S> {
         self.slot.unload()
     }
 
-    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
         let Some(wanted) = wanted else {
             return Ok(());
         };
@@ -607,6 +642,8 @@ mod tests {
     }
 
     impl super::Slot for Recording {
+        type Error = ayeaye_infer::SpeechError;
+
         fn load(&mut self, dir: &Path) -> Result<(), ayeaye_infer::SpeechError> {
             self.resident = Some(dir.to_path_buf());
             self.at_once += 1;
@@ -693,6 +730,8 @@ mod tests {
     fn a_load_that_fails_leaves_nothing_claimed() {
         struct Refuses;
         impl super::Slot for Refuses {
+            type Error = ayeaye_infer::SpeechError;
+
             fn load(&mut self, _: &Path) -> Result<(), ayeaye_infer::SpeechError> {
                 Err(ayeaye_infer::SpeechError::NotLoaded)
             }

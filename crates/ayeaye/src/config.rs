@@ -14,6 +14,7 @@ use ayeaye_core::http::hosts::AllowedHosts;
 use ayeaye_core::pane;
 use ayeaye_core::peer::{BadName, HostName, Peer, Registry};
 
+use crate::dictate::Voice;
 use crate::fit::{Fits, STATE_FILE};
 use crate::tmux::Tmux;
 
@@ -69,6 +70,10 @@ pub struct Settings {
     /// The windows held at somebody's phone's size, and the file that outlives
     /// this process.
     pub fits: Arc<Fits>,
+    /// The models a dictation runs through, and their lifetime. Shared because
+    /// there is one of each per machine and inference is this process's own
+    /// arithmetic: two requests must take turns rather than each load a model.
+    pub voice: Arc<Voice>,
 }
 
 /// Why a configuration could not be resolved.
@@ -119,8 +124,9 @@ impl Settings {
     /// Resolve the settings from arguments, the environment, and a token the
     /// caller has already found.
     ///
-    /// `token` and `cliban` arrive resolved, for the same reason: finding them
-    /// means reading a file and walking a PATH, and neither is a decision.
+    /// `token`, `cliban` and `voice` arrive resolved, for the same reason:
+    /// finding them means reading a file and walking a PATH, and none of it is
+    /// a decision.
     ///
     /// `env` is a lookup rather than `std::env` so this is a decision a test
     /// can drive. It is handed the *bare* name — `BIND`, `DEV_PORT` — and is
@@ -134,6 +140,7 @@ impl Settings {
         token: String,
         nodename: Option<String>,
         cliban: Cliban,
+        voice: Arc<Voice>,
     ) -> Result<Settings, ConfigError> {
         let mut bind = env("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let mut port = match env("DEV_PORT") {
@@ -180,6 +187,7 @@ impl Settings {
             cliban,
             pane_cache: Arc::new(Mutex::new(pane::Cache::default())),
             fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, fits_path())),
+            voice,
         })
     }
 
@@ -381,6 +389,17 @@ mod tests {
         None
     }
 
+    /// A voice with no models and a converter that is not there, so nothing in
+    /// this file can reach a model or start a process by accident.
+    fn silent() -> std::sync::Arc<super::Voice> {
+        std::sync::Arc::new(super::Voice::new(
+            std::path::PathBuf::from("/nonexistent/store"),
+            ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
+                .expect("the defaults resolve"),
+            "ayeaye-58-no-such-converter".to_string(),
+        ))
+    }
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
     }
@@ -395,6 +414,7 @@ mod tests {
             "s3cret".to_string(),
             Some("box".to_string()),
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
     }
 
@@ -592,6 +612,7 @@ mod tests {
             "s3cret".to_string(),
             Some("box".to_string()),
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
         .expect("a named machine");
         assert_eq!(configured.peers.here().name().as_str(), "desktop");
@@ -606,6 +627,7 @@ mod tests {
             "s3cret".to_string(),
             Some("box".to_string()),
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
         .expect("an unnamed machine still has a nodename");
         assert_eq!(from_uname.peers.here().name().as_str(), "box");
@@ -618,6 +640,7 @@ mod tests {
             "s3cret".to_string(),
             None,
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
         .expect("a nameless machine");
         assert_eq!(anonymous.peers.here().name().as_str(), "localhost");
@@ -627,6 +650,7 @@ mod tests {
             "s3cret".to_string(),
             Some("  ".to_string()),
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
         .expect("a blank nodename is no nodename");
         assert_eq!(blank.peers.here().name().as_str(), "localhost");
@@ -648,6 +672,7 @@ mod tests {
             "s3cret".to_string(),
             None,
             super::Cliban::new("/nonexistent/cliban".to_string()),
+            silent(),
         )
         .unwrap_err();
         assert_eq!(

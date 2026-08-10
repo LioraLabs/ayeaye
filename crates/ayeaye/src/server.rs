@@ -77,6 +77,9 @@ pub async fn serve(
     // test has the sweeper a real one has. A lease that only expired in
     // production would be a lease nothing ever proved expires.
     crate::fit::sweeper(Arc::clone(&settings));
+    // The same argument for the models: they are released because nobody is
+    // dictating, so a policy that only ran during a dictation would never fire.
+    crate::dictate::sweeper(Arc::clone(&settings));
     axum::serve(listener, router(settings)).await
 }
 

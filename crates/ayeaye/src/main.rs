@@ -90,14 +90,36 @@ fn serve(args: &[String]) -> ExitCode {
     // is: both are the machine's answer rather than the caller's, and neither
     // should depend on which flags were typed.
     let cliban = ayeaye::cliban::Cliban::new(config::locate_cliban());
-    let settings =
-        match Settings::resolve(args, config::env_var, token, nodename(&Subprocess), cliban) {
-            Ok(settings) => settings,
-            Err(why) => {
-                eprintln!("ayeaye: {why}\n\n{USAGE}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // Voice is a progressive enhancement: a machine with no models and no
+    // converter serves everything else, and the probe is what tells the page so.
+    // A configuration file it cannot read is a different matter — that is a typo
+    // somebody has to be told about rather than a feature to switch off.
+    let models = match models::settings(&PathBuf::from(layout(from_environment).env_file)) {
+        Ok(models) => models,
+        Err(why) => {
+            eprintln!("ayeaye: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let voice = Arc::new(ayeaye::dictate::Voice::new(
+        config::state_dir().unwrap_or_else(|| PathBuf::from(".")),
+        models,
+        ayeaye::audio::CONVERTER.to_string(),
+    ));
+    let settings = match Settings::resolve(
+        args,
+        config::env_var,
+        token,
+        nodename(&Subprocess),
+        cliban,
+        voice,
+    ) {
+        Ok(settings) => settings,
+        Err(why) => {
+            eprintln!("ayeaye: {why}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The runtime is built here rather than with `#[tokio::main]` so that the
     // banner and the argument errors above cost nothing to reach: they are the
