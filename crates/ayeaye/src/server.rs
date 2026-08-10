@@ -14,6 +14,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 
+use ayeaye_core::dictation;
 use ayeaye_core::http::origin::{Origin, Site};
 use ayeaye_core::http::route::{Asset, Gate, Route};
 use ayeaye_core::http::{auth, login, origin, route};
@@ -22,6 +23,7 @@ use ayeaye_core::pane;
 use ayeaye_core::peer::PaneId;
 use ayeaye_core::prompt;
 use ayeaye_core::tmux::Pane;
+use ayeaye_core::vocab;
 
 /// The header a browser labels a request's provenance with. `http` has no
 /// constant for it: it is a fetch-metadata header, newer than the crate's
@@ -41,6 +43,15 @@ const SEC_FETCH_SITE: &str = "sec-fetch-site";
 /// is near the limit — the largest real body is a dictated sentence — so the
 /// distinction buys a caller nothing it did not already know.
 pub const MAX_BODY: usize = 1 << 20;
+
+/// The most body the dictation endpoint will read.
+///
+/// `bin/ayeaye`'s `MAX_AUDIO_BODY`, and the same thirty-two megabytes: a couple
+/// of minutes of recorded audio is real data, where every other body here is a
+/// pane id and a line of text. It is a separate limit rather than a raised
+/// [`MAX_BODY`] because raising the one would let every other endpoint be handed
+/// thirty-two megabytes of JSON to parse.
+pub const MAX_AUDIO_BODY: usize = 32 << 20;
 
 use crate::assets;
 use crate::board;
@@ -159,6 +170,10 @@ async fn handle(
             asked(&settings, query.pane.as_deref().unwrap_or("")).await
         }
         Route::Answer if method == Method::POST => answer(&settings, body).await,
+        Route::Dictate if method == Method::POST => dictate(&settings, &query, body).await,
+        Route::Voice if method == Method::GET || method == Method::HEAD => {
+            json_body(settings.voice.probe().body())
+        }
         Route::Send if method == Method::POST => send(&settings, body).await,
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
@@ -169,6 +184,8 @@ async fn handle(
         | Route::Prompt
         | Route::Answer
         | Route::Send
+        | Route::Dictate
+        | Route::Voice
         | Route::Api
         | Route::NotFound
         | Route::Login
@@ -558,6 +575,104 @@ async fn send(settings: &Settings, body: Body) -> Response {
     body_of(StatusCode::OK, r#"{"ok":true}"#.to_string())
 }
 
+/// A clip of audio, transcribed and cleaned up.
+///
+/// The answer is `{"raw": …, "final": …}`, which is the shape `share/app.html`
+/// reads and cannot be changed: it takes `final` for the draft and compares it
+/// against `raw` to decide whether to say "cleaned up". **This endpoint does not
+/// type anything.** The page shows the draft, and the person sends it with
+/// `/api/send`, which is the review step the whole feature is built around —
+/// nothing dictated reaches a terminal without somebody looking at it first.
+///
+/// The capability probe comes first, so a server that cannot dictate says so
+/// before it spends a process on the clip. That is `bin/ayeaye`'s order too.
+///
+/// A pane that is not this machine's is no vocabulary rather than a refusal. The
+/// names are an improvement to the spelling; losing them must not cost the
+/// dictation, and a client asking about somebody else's pane still gets its
+/// words.
+async fn dictate(settings: &Settings, query: &Query, body: Body) -> Response {
+    let capability = settings.voice.probe();
+    if !capability.ok() {
+        return body_of(
+            StatusCode::SERVICE_UNAVAILABLE,
+            dictation::Outcome::Unavailable(
+                capability
+                    .why()
+                    .unwrap_or_else(|| "voice is not available".to_string()),
+            )
+            .body(),
+        );
+    }
+
+    let Ok(clip) = axum::body::to_bytes(body, MAX_AUDIO_BODY).await else {
+        return refused(StatusCode::BAD_REQUEST, "bad body");
+    };
+    if clip.is_empty() {
+        return refused(StatusCode::BAD_REQUEST, "no audio");
+    }
+
+    // The daemon's default, and the one the page sends when it cannot tell what
+    // the browser recorded in.
+    let ext = query.ext.as_deref().unwrap_or("webm");
+    let names = pane_vocabulary(settings, query.pane.as_deref().unwrap_or("")).await;
+
+    let outcome = settings.voice.dictate(&clip, ext, &names).await;
+    // On stderr, because that is where a dictation's history is read today and
+    // because telling a bad microphone from a bad transcription from a bad
+    // rewrite is the whole reason `bin/voice-dictate` writes one line each.
+    eprintln!("ayeaye: dictation: {}", outcome.why());
+    body_of(status_of(&outcome), outcome.body())
+}
+
+/// What a dictation answers with.
+///
+/// Silence and "nothing recognised" are 200, and that is the daemon's answer
+/// too: nobody spoke is a fact about the room rather than a fault in the
+/// request, and the page draws the `error` field either way.
+fn status_of(outcome: &dictation::Outcome) -> StatusCode {
+    match outcome {
+        dictation::Outcome::Heard { .. }
+        | dictation::Outcome::Silence { .. }
+        | dictation::Outcome::Empty { .. } => StatusCode::OK,
+        dictation::Outcome::Undecodable(_) => StatusCode::BAD_REQUEST,
+        dictation::Outcome::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// The identifiers on a pane's screen, or nothing at all.
+///
+/// Nothing is a legitimate answer at every step — no pane named, a pane on
+/// another machine, a pane that has gone, a tmux that would not answer — and
+/// every one of them is the same answer here, because a hint that could not be
+/// gathered is a hint the model does without.
+///
+/// Public so the suite can watch it against a tmux of its own. The dictation it
+/// feeds needs a loaded speech model to observe from the outside, and the thing
+/// worth proving here — that a real capture becomes the names on it, and that a
+/// pane this machine does not list contributes none — needs no model at all.
+pub async fn pane_vocabulary(settings: &Settings, qualified: &str) -> String {
+    if qualified.trim().is_empty() {
+        return String::new();
+    }
+    let Some(id) = local_pane(settings, qualified).await else {
+        return String::new();
+    };
+    let captured = settings
+        .tmux
+        .ask(&[
+            "capture-pane",
+            "-p",
+            "-t",
+            id.pane(),
+            "-S",
+            &format!("-{}", vocab::LINES),
+        ])
+        .await
+        .unwrap_or_default();
+    vocab::on_screen(&captured)
+}
+
 /// The live pane this id names, or the refusal to send.
 ///
 /// **Membership, not syntax.** The id is compared against the list tmux has just
@@ -752,6 +867,8 @@ struct Query {
     /// The token naming the screen it says it holds.
     sh: Option<String>,
     pane: Option<String>,
+    /// The container the clip is in, as the recorder named it.
+    ext: Option<String>,
 }
 
 impl Query {
@@ -764,6 +881,7 @@ impl Query {
             hh: None,
             sh: None,
             pane: None,
+            ext: None,
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             if value.is_empty() {
@@ -780,6 +898,7 @@ impl Query {
                 "hh" if query.hh.is_none() => query.hh = Some(value.into_owned()),
                 "sh" if query.sh.is_none() => query.sh = Some(value.into_owned()),
                 "pane" if query.pane.is_none() => query.pane = Some(value.into_owned()),
+                "ext" if query.ext.is_none() => query.ext = Some(value.into_owned()),
                 _ => {}
             }
         }

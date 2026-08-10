@@ -32,6 +32,10 @@ pub enum Route {
     Answer,
     /// Some text, typed into one pane.
     Send,
+    /// A clip of audio, transcribed and cleaned up.
+    Dictate,
+    /// What this machine can do about a dictation.
+    Voice,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -76,6 +80,16 @@ const RESIZE: &str = "/api/resize";
 const PROMPT: &str = "/api/prompt";
 const ANSWER: &str = "/api/answer";
 const SEND: &str = "/api/send";
+
+/// A clip of audio. A POST, and the only endpoint whose body is not text.
+const DICTATE: &str = "/api/dictate";
+
+/// The capability probe. A GET, and gated like every other read under `/api/`.
+///
+/// Its own path rather than a field on `/api/overview`, which is AYEAYE-49's to
+/// write: two tickets landing in one handler is a merge nobody needs, and the
+/// answer is one `Capability` either way — see `ayeaye_core::dictation`.
+const VOICE: &str = "/api/voice";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -142,6 +156,8 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
             PROMPT => Route::Prompt,
             ANSWER => Route::Answer,
             SEND => Route::Send,
+            DICTATE => Route::Dictate,
+            VOICE => Route::Voice,
             _ => Route::Api,
         };
     }
@@ -179,7 +195,9 @@ pub fn gate(method: &str, route: Route) -> Gate {
         | Route::Resize
         | Route::Prompt
         | Route::Answer
-        | Route::Send => Gate::Token,
+        | Route::Send
+        | Route::Dictate
+        | Route::Voice => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -371,6 +389,33 @@ mod tests {
         assert_eq!(resolve("/api/pane/extra", false), Route::Api);
         assert_eq!(resolve("/api/panel", false), Route::Api);
         assert_eq!(resolve("/api/resizes", false), Route::Api);
+    }
+
+    // AYEAYE-58 — the two paths voice answers on, each a route of its own rather
+    // than one more unknown path under `/api/`. Both are gated by every method:
+    // a POST here records nothing but it does start a model and read a pane, and
+    // the probe says what is installed on somebody's machine.
+    #[test]
+    fn the_voice_paths_are_routes_and_every_method_needs_a_token() {
+        for (path, expected) in [
+            ("/api/dictate", Route::Dictate),
+            ("/api/voice", Route::Voice),
+        ] {
+            assert_eq!(resolve(path, false), expected);
+            // A token in the query does not turn one into a login.
+            assert_eq!(resolve(path, true), expected);
+            for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+                assert_eq!(
+                    gate(method, resolve(path, false)),
+                    Gate::Token,
+                    "{method} {path} must need a token"
+                );
+            }
+            // Only that path, so a new endpoint cannot arrive by accident under
+            // a name that merely starts with an old one.
+            assert_eq!(resolve(&format!("{path}/extra"), false), Route::Api);
+            assert_eq!(resolve(&format!("{path}2"), false), Route::Api);
+        }
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at
