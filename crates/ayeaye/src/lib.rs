@@ -9,6 +9,7 @@
 //! an integration test over a real socket, rather than only by starting the
 //! process and hoping.
 
+pub mod agent;
 pub mod assets;
 pub mod board;
 pub mod cliban;

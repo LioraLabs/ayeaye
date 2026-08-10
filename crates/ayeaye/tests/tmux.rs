@@ -321,7 +321,7 @@ async fn the_live_sessions_of_a_real_tmux_come_back_one_to_a_line() {
 
     let mut sessions = server
         .layer()
-        .sessions()
+        .session_names()
         .await
         .expect("a running tmux answers");
     sessions.sort();
@@ -341,7 +341,7 @@ async fn a_socket_with_no_server_has_no_sessions_and_no_complaint() {
         return;
     }
     assert_eq!(
-        common::nowhere("no-sessions").sessions().await,
+        common::nowhere("no-sessions").session_names().await,
         Ok(Vec::new())
     );
 }

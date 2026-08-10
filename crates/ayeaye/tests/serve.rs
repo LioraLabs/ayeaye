@@ -91,6 +91,34 @@ impl Server {
         self.request_raw(method, path, &raw).await
     }
 
+    /// A POST carrying a JSON body, from this server's own origin.
+    ///
+    /// The `Origin` is not decoration. AYEAYE-69's CSRF gate refuses a write
+    /// that a browser labelled cross-site, and it sits above route resolution —
+    /// so a write test that presents no acceptable origin is refused with a 403
+    /// that looks exactly like a bug in the endpoint under test.
+    async fn post(&self, path: &str, body: &str, headers: &[(&str, &str)]) -> Answer {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        let length = body.len().to_string();
+        let mut all: Vec<(&str, &str)> = vec![
+            ("Origin", origin.as_str()),
+            ("Content-Type", "application/json"),
+            ("Content-Length", length.as_str()),
+        ];
+        all.extend_from_slice(headers);
+        let raw: Vec<(&str, &[u8])> = all
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        self.request_with_body("POST", path, &raw, body.as_bytes())
+            .await
+    }
+
+    /// The same, already carrying the token every gated call needs.
+    async fn post_as_us(&self, path: &str, body: &str) -> Answer {
+        self.post(path, body, &[("X-Voice-Token", TOKEN)]).await
+    }
+
     /// The same, with header *values* as bytes rather than text.
     ///
     /// A header value is bytes on the wire and only sometimes text, and the
@@ -98,6 +126,17 @@ impl Server {
     /// cannot hold is exactly the one that must not read as "no header sent".
     /// A test that could only send `&str` could never send that request.
     async fn request_raw(&self, method: &str, path: &str, headers: &[(&str, &[u8])]) -> Answer {
+        self.request_with_body(method, path, headers, b"").await
+    }
+
+    /// The same again, with a body after the headers.
+    async fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &[u8])],
+        body: &[u8],
+    ) -> Answer {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port))
             .await
             .expect("the server should be listening");
@@ -117,6 +156,7 @@ impl Server {
             request.extend_from_slice(format!("Host: 127.0.0.1:{}\r\n", self.port).as_bytes());
         }
         request.extend_from_slice(b"Connection: close\r\n\r\n");
+        request.extend_from_slice(body);
 
         stream
             .write_all(&request)
@@ -139,28 +179,6 @@ impl Server {
         self.request("GET", path, &[("X-Voice-Token", TOKEN)]).await
     }
 
-    /// A POST carrying the token and a JSON body, as the page sends.
-    async fn post(&self, path: &str, body: &str) -> Answer {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port))
-            .await
-            .expect("the server should be listening");
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Voice-Token: {TOKEN}\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            self.port,
-            body.len()
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("the request should be writable");
-        let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .await
-            .expect("the response should be readable");
-        parse(&raw)
-    }
     /// A write, presented the way the panel presents one.
     ///
     /// The `Origin` is this server's own and the token is the test token,
@@ -168,52 +186,7 @@ impl Server {
     /// a body: a write test that sent neither would be refused at that gate and
     /// would look exactly like the endpoint being broken.
     async fn write(&self, path: &str, body: &str) -> Answer {
-        let origin = format!("http://127.0.0.1:{}", self.port);
-        let length = body.len().to_string();
-        self.request_with_body(
-            "POST",
-            path,
-            &[
-                ("Origin", origin.as_str()),
-                ("X-Voice-Token", TOKEN),
-                ("Content-Type", "application/json"),
-                ("Content-Length", length.as_str()),
-            ],
-            body,
-        )
-        .await
-    }
-
-    /// The same as [`Server::request`], with a body after the headers.
-    async fn request_with_body(
-        &self,
-        method: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-        body: &str,
-    ) -> Answer {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port))
-            .await
-            .expect("the server should be listening");
-
-        let mut request = format!("{method} {path} HTTP/1.1\r\n").into_bytes();
-        for (name, value) in headers {
-            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
-        }
-        request.extend_from_slice(format!("Host: 127.0.0.1:{}\r\n", self.port).as_bytes());
-        request.extend_from_slice(b"Connection: close\r\n\r\n");
-        request.extend_from_slice(body.as_bytes());
-
-        stream
-            .write_all(&request)
-            .await
-            .expect("the request should be writable");
-        let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .await
-            .expect("the response should be readable");
-        parse(&raw)
+        self.post_as_us(path, body).await
     }
 }
 
@@ -914,6 +887,670 @@ async fn a_machine_with_no_tmux_server_answers_an_empty_list() {
     assert_eq!(answer.body_text(), r#"{"host":"desktop","panes":[]}"#);
 }
 
+/// Where this test binary keeps the files it has to put on a disk.
+///
+/// One directory per run of the suite, so two runs cannot read each other's,
+/// and everything under it is written **once, before any test forks**. Rust
+/// integration tests run as threads in one process: a `fork` in one thread
+/// while another still holds a script open for writing hands the child an
+/// inherited write handle to the file it is about to exec, and Linux answers
+/// `ETXTBSY`. That failure reads as a bug in the code under test and only
+/// appears under load, which is why the stand-in is written from a `OnceLock`
+/// rather than per test.
+fn stand_in_root() -> &'static std::path::Path {
+    static SCRATCH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    SCRATCH.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("ayeaye-51-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("bin")).expect("a scratch directory");
+
+        // A stand-in `claude`, which records the arguments it was given and
+        // exits. A stand-in that *answers* would prove less: what this has to
+        // show is that the prompt arrived as one argument, byte for byte, and
+        // only the argv can show that.
+        //
+        // One argument per line, and the log is written whole in one `printf`,
+        // so a reader either sees nothing or sees all of it.
+        let claude = root.join("bin/claude");
+        std::fs::write(
+            &claude,
+            // Where it records is `$AYEAYE_51_ARGV`, set per test through the
+            // pane's own environment. One shared log would be appended to by
+            // whichever spawn test ran beside this one -- and the tests run as
+            // threads in one process, so "what the agent was given" would
+            // become a claim about the whole file rather than about this test.
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"$AYEAYE_51_ARGV\"\n",
+        )
+        .expect("the stand-in agent should be writable");
+        std::fs::set_permissions(
+            &claude,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("the stand-in agent should be executable");
+        root
+    })
+}
+
+/// What the stand-in agent recorded, once it has run.
+///
+/// Polled rather than read once: the command is *typed into a shell*, so
+/// between the response and the argv landing there is a shell to read the line
+/// and a process to start. Giving up is a failure with what was there.
+async fn recorded_argv(log: &std::path::Path) -> Vec<String> {
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(log) {
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            // The first line is `$#`, so a log with that many lines after it is
+            // a complete one rather than a half-written one.
+            if lines.first().and_then(|count| count.parse::<usize>().ok())
+                == Some(lines.len().saturating_sub(1))
+            {
+                return lines;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "the agent never recorded its arguments in {}",
+        log.display()
+    );
+}
+
+// AYEAYE-51 — the whole of a spawn, from the seam a phone reads: a real socket,
+// a real tmux, a real project directory, and an agent that really starts in it.
+// The prompt is the part only this can prove — it is typed into a shell, and
+// what the shell made of it is visible nowhere but in the argv the agent was
+// given.
+#[tokio::test]
+async fn spawning_starts_the_agent_in_the_project_with_the_prompt_as_one_argument() {
+    let Some(tmux) = common::Private::named("serve-spawn") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    // Every pane this server opens runs `/bin/sh` with a `PATH` holding
+    // *nothing but* the stand-in, and this option is set on a tmux server this
+    // test started on a socket of its own.
+    //
+    // Both halves are load-bearing, and both were learned the hard way here:
+    //
+    // - `default-command` rather than `set-environment PATH`, because tmux
+    //   starts a **login** shell by default and `/etc/profile` rewrites `PATH`.
+    //   An earlier version of this test set the environment, watched the
+    //   profile overwrite it, and started the machine's real `claude`.
+    // - `PATH` holding only the stand-in, rather than the stand-in in front of
+    //   the real one. This test asserts what an agent was given, and the agent
+    //   it must never reach is the real one on the machine running the suite.
+    //   Prepending would make that a matter of ordering; replacing makes
+    //   "the stand-in is missing" a `claude: not found` and a failed test
+    //   instead of somebody's actual agent starting in a temporary directory.
+    let log = stand_in_root().join("argv-spawn");
+    tmux.tmux(&[
+        "set-option",
+        "-g",
+        "default-command",
+        &format!(
+            "PATH={} AYEAYE_51_ARGV={} /bin/sh",
+            stand_in_root().join("bin").display(),
+            log.display()
+        ),
+    ]);
+
+    let project = stand_in_root().join("ayeaye-51-project");
+    std::fs::create_dir_all(&project).expect("a project directory");
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    // An apostrophe, a double quote, a `$`, a backtick and a glob: everything
+    // a shell would act on if the quoting were not doing its job.
+    let prompt = "it's a \"test\" of $HOME and `id` and *.rs";
+    let answer = server
+        .post_as_us(
+            "/api/spawn",
+            &format!(
+                r#"{{"dir":{},"agent":"claude","prompt":{}}}"#,
+                serde_json::to_string(&project.to_string_lossy().into_owned()).unwrap(),
+                serde_json::to_string(prompt).unwrap()
+            ),
+        )
+        .await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    let body = answer.body_text();
+    assert!(
+        body.contains(r#""pane":"desktop/%"#),
+        "the pane has to be qualified, or the panel cannot select it: {body}"
+    );
+    assert!(
+        body.contains(r#""session":"ayeaye-51-project""#),
+        "the session is named after the project: {body}"
+    );
+    assert!(
+        body.contains(r#""created":"session""#) && body.contains(r#""agent":"claude""#),
+        "{body}"
+    );
+
+    // The agent really ran, in that directory, with the prompt as exactly one
+    // argument — unsplit, unexpanded, and byte for byte what was sent.
+    let argv = recorded_argv(&log).await;
+    assert_eq!(argv, ["1", prompt], "the agent was given {argv:?}");
+
+    // And the panel can see the pane it was told about.
+    let panes = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await
+        .body_text();
+    let pane = body
+        .split(r#""pane":""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a pane id in the reply");
+    assert!(
+        panes.contains(&format!(r#""id":"{pane}""#)),
+        "the spawned pane is not in the pane list: {panes}"
+    );
+}
+
+// AYEAYE-51 — the second agent for a project joins the first one's session
+// rather than starting a second, and it does so **by that session's id**.
+//
+// Found at the final gate. A tmux target is a grammar — `session:window.pane`,
+// with a leading `$` meaning a session id — so a session *name* used as a
+// target is a directory's name being read as syntax. This is the case that
+// proves it: the machine already has a session whose tmux id is `$0`, and the
+// project is a directory literally called `$0`. Targeting by name sends the
+// second window into `important-work`; targeting by id sends it where it
+// belongs. Verified against a real tmux before it was written.
+#[tokio::test]
+async fn a_second_agent_joins_its_own_session_even_when_the_project_is_named_like_a_target() {
+    let Some(tmux) = common::Private::named("serve-spawn-twice") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    tmux.tmux(&[
+        "set-option",
+        "-g",
+        "default-command",
+        &format!(
+            "PATH={} AYEAYE_51_ARGV={} /bin/sh",
+            stand_in_root().join("bin").display(),
+            stand_in_root().join("argv-twice").display()
+        ),
+    ]);
+    // The session that must not gain a window. It is the first session on this
+    // server, so tmux calls it `$0` — which is also what the project below is
+    // called.
+    let hijackable = tmux
+        .output(&["list-sessions", "-F", "#{session_name}\t#{session_id}"])
+        .expect("the private server's own session");
+    assert!(
+        hijackable.contains("work\t$0"),
+        "this test needs `work` to be session $0: {hijackable}"
+    );
+
+    let project = stand_in_root().join("$0");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let body = format!(
+        r#"{{"dir":{},"agent":"claude"}}"#,
+        serde_json::to_string(&project.to_string_lossy().into_owned()).unwrap()
+    );
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let first = server.post_as_us("/api/spawn", &body).await;
+    assert_eq!(first.status, 200, "{}", first.body_text());
+    assert!(
+        first.body_text().contains(r#""created":"session""#),
+        "{}",
+        first.body_text()
+    );
+
+    let second = server.post_as_us("/api/spawn", &body).await;
+    assert_eq!(second.status, 200, "{}", second.body_text());
+    assert!(
+        second.body_text().contains(r#""created":"window""#),
+        "the second agent should join the first one's session: {}",
+        second.body_text()
+    );
+
+    // Where the windows actually are. Asked of tmux by listing everything, not
+    // by naming a session — naming one is the very thing under test.
+    let windows = tmux
+        .output(&["list-windows", "-a", "-F", "#{session_name}"])
+        .expect("the window list");
+    let in_session = |name: &str| windows.lines().filter(|line| *line == name).count();
+    assert_eq!(
+        in_session("work"),
+        1,
+        "session `work` gained a window that belongs to the project: {windows}"
+    );
+    assert_eq!(
+        in_session("$0"),
+        2,
+        "both agents should be in the project's own session: {windows}"
+    );
+}
+
+// AYEAYE-51 — the prompt is the most attacker-influenceable string in the app,
+// and the quoting can refuse it. A refusal is a stated 400 that says what to do
+// about it, and nothing is started: a pane left behind by a request that failed
+// is a pane nobody knows about.
+#[tokio::test]
+async fn a_prompt_that_cannot_be_typed_starts_nothing_and_says_why() {
+    let Some(tmux) = common::Private::named("serve-unquotable") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let project = stand_in_root().join("ayeaye-51-unquotable");
+    std::fs::create_dir_all(&project).expect("a project directory");
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let answer = server
+        .post_as_us(
+            "/api/spawn",
+            &format!(
+                r#"{{"dir":{},"agent":"claude","prompt":"escape the \\n in it"}}"#,
+                serde_json::to_string(&project.to_string_lossy().into_owned()).unwrap()
+            ),
+        )
+        .await;
+    assert_eq!(answer.status, 400);
+    let said = answer.body_text();
+    assert!(said.contains("backslash"), "{said}");
+    assert!(said.contains("take it out"), "{said}");
+
+    // Nothing was made. The pane list is the only thing that can say so, and it
+    // is what the panel would be reading a moment later. This server was
+    // started with one session of one pane, so anything else is a pane a
+    // refused request left behind.
+    //
+    // Asserted against that known state rather than against a reading taken
+    // before the request: two live readings can differ because *either* of them
+    // failed, and comparing them turns a tmux that was busy into a failure
+    // claiming a pane was created. The `error` check is what keeps this test
+    // honest about which of the two happened.
+    let after = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await
+        .body_text();
+    assert!(
+        !after.contains(r#""error""#),
+        "the pane list could not be read, so this test proves nothing: {after}"
+    );
+    assert_eq!(
+        after.matches(r#""id""#).count(),
+        1,
+        "a refused spawn left a pane behind: {after}"
+    );
+    assert!(after.contains(r#""session":"work""#), "{after}");
+}
+
+// AYEAYE-51 — the agent is an allowlist and the directory has to exist. Both
+// refusals are the daemon's own words, because they are put on screen unchanged
+// by a page this ticket does not touch.
+#[tokio::test]
+async fn a_spawn_is_refused_for_an_unknown_agent_or_a_directory_that_is_not_there() {
+    let Some(tmux) = common::Private::named("serve-spawn-refusals") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    for (body, expected) in [
+        (r#"{"dir":"/tmp","agent":"bash"}"#, "unknown agent"),
+        (r#"{"dir":"/tmp","agent":"sh -c id"}"#, "unknown agent"),
+        (r#"{"dir":"/tmp"}"#, "unknown agent"),
+        (
+            r#"{"dir":"/nope/ayeaye-51","agent":"claude"}"#,
+            "no such directory",
+        ),
+        // A file is not a directory, and neither is nothing.
+        (
+            r#"{"dir":"/etc/hostname","agent":"claude"}"#,
+            "no such directory",
+        ),
+        (r#"{"agent":"claude"}"#, "no such directory"),
+        (r#"{"dir":"","agent":"claude"}"#, "no such directory"),
+    ] {
+        let answer = server.post_as_us("/api/spawn", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(
+            answer.body_text(),
+            format!(r#"{{"error":"{expected}"}}"#),
+            "for {body}"
+        );
+    }
+
+    // A body that is not a request at all.
+    for body in ["[1,2,3]", "{not json", r#""hello""#] {
+        let answer = server.post_as_us("/api/spawn", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(answer.body_text(), r#"{"error":"bad json"}"#, "for {body}");
+    }
+}
+
+// AYEAYE-51 — "the spawn request body carries an optional host field defaulting
+// to this machine, so the shape is right for federation without implementing
+// it". Optional is the half the panel depends on today; resolved through the
+// registry is the half that makes it a shape rather than a decoration — this
+// machine by name works, and a machine nobody registered is refused by name
+// rather than quietly started here.
+#[tokio::test]
+async fn the_host_field_defaults_to_this_machine_and_is_resolved_rather_than_ignored() {
+    let Some(tmux) = common::Private::named("serve-spawn-host") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    // Naming this machine is the same request as naming nothing: both get as
+    // far as the agent check rather than being refused for their host.
+    for host in [r#""host":"desktop","#, r#""host":"DESKTOP","#, ""] {
+        let answer = server
+            .post_as_us(
+                "/api/spawn",
+                &format!(r#"{{{host}"dir":"/tmp","agent":"nonesuch"}}"#),
+            )
+            .await;
+        assert_eq!(
+            answer.body_text(),
+            r#"{"error":"unknown agent"}"#,
+            "host {host:?} is this machine and must not be refused for its host"
+        );
+    }
+
+    // A machine this deployment has never heard of is refused by name, and
+    // nothing is started here on its behalf.
+    let elsewhere = server
+        .post_as_us(
+            "/api/spawn",
+            r#"{"host":"gpu-box","dir":"/tmp","agent":"claude"}"#,
+        )
+        .await;
+    assert_eq!(elsewhere.status, 400);
+    assert!(
+        elsewhere.body_text().contains("gpu-box"),
+        "{}",
+        elsewhere.body_text()
+    );
+}
+
+// AYEAYE-51 — a spawn is a write, so it is behind both gates the daemon puts in
+// front of one. Worth its own test rather than trusted to the route table: the
+// CSRF gate lives above route resolution, so an endpoint added to the router
+// instead of to the handler would pass every unit test and sit outside it.
+#[tokio::test]
+async fn spawning_needs_a_token_and_is_refused_from_another_site() {
+    let server = Server::started().await;
+    let body = r#"{"dir":"/tmp","agent":"claude"}"#;
+
+    assert_eq!(
+        server.post("/api/spawn", body, &[]).await.status,
+        401,
+        "a spawn with no token must be refused"
+    );
+
+    // 403 and *before* the token, so a stolen token buys nothing here.
+    for headers in [
+        vec![("Sec-Fetch-Site", "cross-site")],
+        vec![("Sec-Fetch-Site", "cross-site"), ("X-Voice-Token", TOKEN)],
+    ] {
+        let answer = server.post("/api/spawn", body, &headers).await;
+        assert_eq!(answer.status, 403, "with {headers:?}");
+        assert_eq!(answer.body_text(), r#"{"error":"forbidden"}"#);
+    }
+
+    // And a GET of it is nothing at all: this endpoint acts, and an action
+    // behind a GET would be an action outside the CSRF gate.
+    assert_eq!(
+        server
+            .request("GET", "/api/spawn", &[("X-Voice-Token", TOKEN)])
+            .await
+            .status,
+        404
+    );
+}
+
+/// The panes `/api/panes` is currently reporting, as `(id, session)`.
+///
+/// Read through the endpoint rather than off the tmux server, because that is
+/// what the panel reads: "the panel reflects it" is a claim about this list.
+async fn listed_panes(server: &Server) -> Vec<(String, String)> {
+    let body = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await
+        .body_text();
+    assert!(
+        !body.contains(r#""error""#),
+        "the pane list could not be read: {body}"
+    );
+    body.split(r#"{"id":""#)
+        .skip(1)
+        .map(|card| {
+            let id = card.split('"').next().expect("an id").to_string();
+            let session = card
+                .split(r#""session":""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("a session")
+                .to_string();
+            (id, session)
+        })
+        .collect()
+}
+
+// AYEAYE-51 — a kill, end to end: a window this test made disappears from the
+// pane list the panel reads. Asserted by reading that list again rather than by
+// trusting the 200 — "the panel reflects it" is a fact about tmux, and only the
+// list can say it happened.
+#[tokio::test]
+async fn killing_a_pane_removes_it_from_the_list_the_panel_reads() {
+    let Some(tmux) = common::Private::named("serve-kill") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    tmux.tmux(&[
+        "new-window",
+        "-t",
+        "=work",
+        "-n",
+        "ayeaye-51-doomed",
+        "-d",
+        "/bin/sh",
+    ]);
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    // The safety property of this test, asserted before anything is signalled:
+    // the pane about to be killed is one *this test* made, on a tmux server
+    // this test started. A test pointed at the wrong tmux fails here, with
+    // nothing killed, rather than after.
+    let before = listed_panes(&server).await;
+    let doomed = before
+        .iter()
+        .find(|(_, session)| session == "work")
+        .map(|(id, _)| id.clone())
+        .expect("the private server's own pane");
+    assert_eq!(before.len(), 2, "this test made two panes: {before:?}");
+    assert!(doomed.starts_with("desktop/%"), "{doomed}");
+
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"{doomed}"}}"#))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    assert_eq!(answer.body_text(), r#"{"ok":true}"#);
+
+    let after = listed_panes(&server).await;
+    assert!(
+        !after.iter().any(|(id, _)| *id == doomed),
+        "{doomed} is still listed: {after:?}"
+    );
+    assert_eq!(after.len(), 1, "only the one pane went: {after:?}");
+
+    // And the host half is matched the way the registry matches it. `route`
+    // folds case because DNS does — AYEAYE-43 has a test insisting on it — so a
+    // membership check that compared whole ids would route `DESKTOP/%1` to this
+    // machine and then answer "no such pane" about it, with the two layers
+    // disagreeing about how many machines there are.
+    let (survivor, _) = after.first().expect("one pane left").clone();
+    let shouted = survivor.replace("desktop/", "DESKTOP/");
+    assert_ne!(
+        shouted, survivor,
+        "this asserts nothing unless the case moved"
+    );
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"{shouted}"}}"#))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    assert!(listed_panes(&server).await.is_empty());
+}
+
+// AYEAYE-51 — the membership check, and the reason it is membership rather than
+// syntax. A pane in a `_`-prefixed session is a real, live, perfectly killable
+// tmux target that `list-panes` deliberately hides — somebody's floating
+// scratch pane. It is exactly what a caller would name to reach a pane the
+// panel never offered, and it has to be refused *and survive*.
+//
+// Without this case the whole check could be deleted and every other test here
+// would stay green.
+#[tokio::test]
+async fn a_pane_the_list_hides_is_refused_and_is_still_there_afterwards() {
+    let Some(tmux) = common::Private::named("serve-kill-hidden") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    // A floating scratch session, of the kind a tmux configuration makes and
+    // the pane list drops. Its pane id is a real target on this server.
+    tmux.tmux(&["new-session", "-d", "-s", "_scratch", "/bin/sh"]);
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let listed = listed_panes(&server).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "the scratch session must be hidden from the list: {listed:?}"
+    );
+
+    // The hidden pane's real id, asked of the tmux server rather than of the
+    // endpoint — the endpoint is precisely the thing that will not reveal it,
+    // and it is the thing on trial.
+    let hidden = tmux
+        .output(&["list-panes", "-t", "=_scratch", "-F", "#{pane_id}"])
+        .expect("the scratch session's pane")
+        .trim()
+        .to_string();
+    assert!(hidden.starts_with('%'), "{hidden:?} is not a pane id");
+
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"desktop/{hidden}"}}"#))
+        .await;
+    assert_eq!(answer.status, 400);
+    assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
+
+    // And it is still running. This is the assertion that makes the test about
+    // the check rather than about the status code: a server that answered 400
+    // and killed it anyway would pass everything above.
+    let survivors = tmux.sessions();
+    assert!(
+        survivors.iter().any(|name| name == "_scratch"),
+        "the hidden session was killed: {survivors:?}"
+    );
+}
+
+// AYEAYE-51 — the other ways a target can fail to be one of ours. A bare id
+// names no machine, a machine nobody registered is not ours, and a pane id that
+// is well-formed but was never listed is the ordinary case of a stale panel.
+#[tokio::test]
+async fn a_target_that_is_not_one_of_ours_is_refused_before_anything_is_signalled() {
+    let Some(tmux) = common::Private::named("serve-kill-refusals") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    for body in [
+        // Bare: names no machine at all. "Bare means here" is the assumption
+        // qualified ids exist to delete.
+        r#"{"pane":"%0"}"#,
+        // A machine this deployment has never heard of.
+        r#"{"pane":"gpu-box/%0"}"#,
+        // Well-formed, ours, and never listed.
+        r#"{"pane":"desktop/%99"}"#,
+        // Shapes tmux itself would take as a target.
+        r#"{"pane":"desktop/work"}"#,
+        r#"{"pane":"desktop/=work"}"#,
+    ] {
+        let answer = server.post_as_us("/api/kill", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(
+            answer.body_text(),
+            r#"{"error":"no such pane"}"#,
+            "for {body}"
+        );
+    }
+
+    // A request that named no pane, and one that is not a request.
+    for (body, expected) in [
+        (r#"{}"#, "no pane"),
+        (r#"{"pane":""}"#, "no pane"),
+        ("[1,2,3]", "bad json"),
+    ] {
+        let answer = server.post_as_us("/api/kill", body).await;
+        assert_eq!(answer.status, 400, "for {body}");
+        assert_eq!(
+            answer.body_text(),
+            format!(r#"{{"error":"{expected}"}}"#),
+            "for {body}"
+        );
+    }
+
+    // Everything this server had is still there.
+    assert_eq!(listed_panes(&server).await.len(), 1);
+}
+
+// AYEAYE-51 — a kill is a write, so it is behind both gates, and it is a POST
+// for the same reason a spawn is: the CSRF gate exempts reads.
+#[tokio::test]
+async fn killing_needs_a_token_and_is_refused_from_another_site() {
+    let server = Server::started().await;
+    let body = r#"{"pane":"desktop/%0"}"#;
+
+    assert_eq!(server.post("/api/kill", body, &[]).await.status, 401);
+    for headers in [
+        vec![("Sec-Fetch-Site", "cross-site")],
+        vec![("Sec-Fetch-Site", "cross-site"), ("X-Voice-Token", TOKEN)],
+    ] {
+        assert_eq!(
+            server.post("/api/kill", body, &headers).await.status,
+            403,
+            "with {headers:?}"
+        );
+    }
+    assert_eq!(
+        server
+            .request("GET", "/api/kill", &[("X-Voice-Token", TOKEN)])
+            .await
+            .status,
+        404
+    );
+}
+
 // AYEAYE-43 — and it is gated like everything else under /api/, by header or by
 // the login cookie. A pane list names every session on the machine.
 #[tokio::test]
@@ -1321,7 +1958,7 @@ async fn the_terminal_view_and_the_resize_need_a_token() {
     // A GET of the resize is not the resize, and a POST of the view is not the
     // view: the method is half of what a route means.
     assert_eq!(server.api("/api/resize").await.status, 404);
-    assert_eq!(server.post("/api/pane", "{}").await.status, 404);
+    assert_eq!(server.post_as_us("/api/pane", "{}").await.status, 404);
 }
 
 // AYEAYE-47 — the whole lease, over the wire: the phone asks for its width, the
@@ -1346,7 +1983,7 @@ async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
     ayeaye::fit::resize(&layer, &pane, 100, 40).await;
 
     let fitted = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
         )
@@ -1356,7 +1993,7 @@ async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
     assert_eq!(window_size(&layer, &pane).await, (40, 10));
 
     let released = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","release":true}}"#),
         )
@@ -1369,7 +2006,7 @@ async fn a_resize_takes_the_lease_and_a_release_gives_the_window_back() {
     );
     // Releasing again restores nothing: there is no lease left to end.
     let twice = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","release":true}}"#),
         )
@@ -1391,7 +2028,7 @@ async fn a_preposterous_size_is_clamped_and_a_bad_body_is_refused() {
     let id = first_pane_id(&server.api("/api/panes").await.body_text());
 
     let tiny = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","cols":1,"rows":1}}"#),
         )
@@ -1399,7 +2036,7 @@ async fn a_preposterous_size_is_clamped_and_a_bad_body_is_refused() {
     assert_eq!(tiny.body_text(), r#"{"ok":true,"cols":20,"rows":5}"#);
 
     let huge = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","cols":99999,"rows":99999}}"#),
         )
@@ -1410,12 +2047,12 @@ async fn a_preposterous_size_is_clamped_and_a_bad_body_is_refused() {
         ("not json at all", r#"{"error":"bad json"}"#),
         ("{}", r#"{"error":"no pane"}"#),
     ] {
-        let answer = server.post("/api/resize", body).await;
+        let answer = server.post_as_us("/api/resize", body).await;
         assert_eq!(answer.status, 400, "{body}");
         assert_eq!(answer.body_text(), refused);
     }
     let bad_size = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","cols":"wide","rows":10}}"#),
         )
@@ -1466,7 +2103,7 @@ async fn watching_the_terminal_holds_the_fit_and_stopping_lets_it_go() {
     ayeaye::fit::resize(&layer, &pane, 100, 40).await;
 
     server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
         )
@@ -1522,7 +2159,7 @@ async fn only_a_pane_this_machine_lists_can_be_resized() {
             format!(r#"{{"pane":"{forged}","release":true}}"#),
             format!(r#"{{"pane":"{forged}","restore":true}}"#),
         ] {
-            let answer = server.post("/api/resize", &shape).await;
+            let answer = server.post_as_us("/api/resize", &shape).await;
             assert_eq!(answer.status, 404, "{shape} was not refused");
             assert_eq!(answer.body_text(), r#"{"error":"no such pane"}"#);
         }
@@ -1555,7 +2192,7 @@ async fn restore_hands_sizing_back_to_tmux_and_leaves_no_lease() {
 
     ayeaye::fit::resize(&layer, &pane, 100, 40).await;
     server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","auto":true,"cols":40,"rows":10}}"#),
         )
@@ -1563,7 +2200,7 @@ async fn restore_hands_sizing_back_to_tmux_and_leaves_no_lease() {
     assert!(fits.holds(&held));
 
     let restored = server
-        .post(
+        .post_as_us(
             "/api/resize",
             &format!(r#"{{"pane":"{id}","restore":true}}"#),
         )

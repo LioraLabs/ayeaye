@@ -10,6 +10,7 @@
 //! fails the build. The rules, and how to amend one, are in
 //! `crates/constitution/README.md`.
 
+pub mod agent;
 pub mod audio;
 pub mod board;
 pub mod chat;
@@ -28,6 +29,7 @@ pub mod peer;
 pub mod process;
 pub mod projects;
 pub mod prompt;
+pub mod quoting;
 pub mod service;
 pub mod session;
 pub mod sha1;

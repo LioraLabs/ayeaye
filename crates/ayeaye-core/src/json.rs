@@ -7,11 +7,10 @@
 //! text and structs out" can spell a string literal itself.
 //!
 //! **This file used to say there was no reader here and should not be, because
-//! nothing the daemon was handed arrived as JSON.** Three tickets falsified that
-//! in one wave, in three different ways. Two readers live here; a third lives in
-//! [`crate::model::config`]. Keeping them apart is a decision, and it is the
-//! kind of decision the duplication ratchet exists to re-examine — see
-//! AYEAYE-64.
+//! nothing the daemon was handed arrived as JSON.** Four tickets falsified that
+//! in one wave, in four different ways, and they did not agree with each other.
+//! What is here is the result, written down rather than tidied away — see
+//! AYEAYE-64, which owns deciding how much of it should survive.
 //!
 //! [`is_value`] and [`string_member`] scan **borrowed text and build nothing**.
 //! The board endpoints pass cliban's JSON through verbatim, so the only
@@ -22,17 +21,21 @@
 //! asked for: a number that comes back out as different text than cliban put in.
 //!
 //! [`parse`] does build a tree, because `/api/answer` and `/api/send` are handed
-//! a body a phone wrote and the fields have to be reached. Reading it is a
-//! decision about text — this crate's work, not the socket's. It is deliberately
+//! a body a phone wrote and the fields have to be reached. It is deliberately
 //! the smallest reader that can be trusted with a body from the network: it
 //! allocates nothing it was not shown, it refuses rather than guesses, and it
 //! will not recurse further than [`MAX_DEPTH`].
 //!
-//! [`crate::model::config`] walks a model's `config.json` for one field before
-//! any weights are downloaded beside it. It is narrow on purpose, and stays an
-//! exception rather than becoming a parser by increments.
+//! **The spawn and kill endpoints disagree with that last decision**, and read
+//! their bodies with `serde_json` in the shell instead, on the reasoning that a
+//! hostile document is the one job worth a real parser and this crate is the one
+//! place that cannot have one. Both positions are defensible and both are
+//! currently true, which is the part that should not last.
 //!
-//! The writer, [`string`], is shared.
+//! [`crate::model::config`] walks a model's `config.json` for one field before
+//! any weights are downloaded beside it — narrow on purpose.
+//!
+//! The writer, [`string`], is shared by all of them.
 
 /// How deep a value may nest before the scanner refuses it.
 ///
@@ -739,6 +742,19 @@ impl Reader<'_> {
     }
 }
 
+/// The body every refusal answers with.
+///
+/// One shape for all of them, because `share/app.html` reads exactly one thing
+/// off a failed call — `if(d.error) return msg(d.error, true)` — and a refusal
+/// that spelled it differently would be a call the page thinks succeeded.
+///
+/// The reason is a *sentence*, not a code: it is put in front of whoever is
+/// holding the phone, and "no such directory" is worth more to them than any
+/// enumeration this could return instead.
+pub fn error(said: &str) -> String {
+    format!("{{\"error\":{}}}", string(said))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1005,6 +1021,7 @@ mod tests {
         // which is the property the response body actually needs.
         assert!(is_value(&string("cliban: no such file\u{0}\"")));
     }
+    use super::error;
 
     // AYEAYE-43 — a pane's window name is whatever somebody typed, and it lands
     // in a body the panel parses. A quote or a newline in it must escape rather
@@ -1178,5 +1195,19 @@ mod tests {
     fn a_name_written_twice_is_read_as_the_first_of_them() {
         let body = r#"{"pane":"desktop/%3","pane":"desktop/%9"}"#;
         assert_eq!(text_of(body, "pane").as_deref(), Some("desktop/%3"));
+    }
+
+    // AYEAYE-51 — every refusal answers in the one shape the page reads. The
+    // reason often quotes what tmux said, and what tmux said is not a string
+    // literal somebody chose — so it goes through the escaping like any other
+    // text, or the first refusal mentioning a quoted path is a body nothing
+    // can parse.
+    #[test]
+    fn a_refusal_is_a_sentence_in_the_shape_the_page_reads() {
+        assert_eq!(error("no such pane"), r#"{"error":"no such pane"}"#);
+        assert_eq!(
+            error("could not kill pane: can't find pane: \"%9\"\n"),
+            r#"{"error":"could not kill pane: can't find pane: \"%9\"\n"}"#
+        );
     }
 }

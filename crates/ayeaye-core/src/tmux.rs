@@ -18,6 +18,60 @@ pub const PANE_FORMAT: &str = concat!(
     "\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 );
 
+/// The `list-sessions -F` format the session list is read out of.
+///
+/// The name *and* the id, because the name is what a project is matched by and
+/// the id is what it is then targeted by. Asking for only the name — which is
+/// all `bin/ayeaye`'s `live_sessions()` asks for — is what makes the id
+/// unavailable at the moment it is needed. See [`Session`].
+pub const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}";
+
+/// A live session: what it is called, and what it is.
+///
+/// **These are different questions and only one of them has an answer tmux can
+/// be given safely.** A name is matched against a project; an id is what a
+/// window is then opened in. Targeting by name means handing tmux a string a
+/// directory was named after, and tmux's target grammar reads several
+/// characters in it as syntax — `session:window.pane`, and a leading `$` for a
+/// session id — so a project called `$0` or `work:9` resolves to *somebody
+/// else's session*, with `=` powerless to stop it because the name has already
+/// ended by the time it is consulted. Both were reproduced against a real tmux.
+///
+/// An id is tmux's own, unambiguous, and needs no escaping — and tmux reads
+/// `$1` as an id even when a different session is *named* `$1`, so a hostile
+/// name cannot shadow one. That is what makes this a closure rather than a
+/// longer list of characters to fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// What the session is called.
+    pub name: String,
+    /// What tmux calls it: `$3`. The only safe way to name it back to tmux.
+    pub id: String,
+}
+
+/// Read `list-sessions -F SESSION_FORMAT` output.
+///
+/// A line that is not two fields is skipped rather than guessed at, for the
+/// reason the pane parse skips one: a session nobody can read must not take the
+/// others with it.
+pub fn sessions(text: &str) -> Vec<Session> {
+    let mut sessions = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [name, id] = fields[..] else {
+            continue;
+        };
+        if name.is_empty() || id.is_empty() {
+            continue;
+        }
+        sessions.push(Session {
+            name: name.to_string(),
+            id: id.to_string(),
+        });
+    }
+    sessions
+}
+
 /// A live pane, as the panel needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
@@ -135,18 +189,6 @@ pub fn no_server_running(stderr: &str) -> bool {
 /// socket that was never there, and a server that has since gone.
 const NO_SERVER: &[&str] = &["no server running", "server exited unexpectedly"];
 
-/// The `list-sessions -F` format the live-session set is read out of.
-///
-/// One field, and it lives beside its parser for the same reason
-/// [`PANE_FORMAT`] does.
-pub const SESSION_FORMAT: &str = "#{session_name}";
-
-/// The `.tmux.yaml` key a project names its own session with.
-const DECLARED: &str = "session_name:";
-
-/// What a session is called when the path names nothing — `/`, or nothing.
-const ROOT: &str = "root";
-
 /// Every session name `list-sessions -F SESSION_FORMAT` printed.
 ///
 /// Read as **lines**, where the daemon splits on whitespace. That is a
@@ -155,10 +197,9 @@ const ROOT: &str = "root";
 /// two called `my` and `work` — and then reports the project that owns it as
 /// having no session, which is the one thing this answer is used for.
 pub fn session_names(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
+    sessions(text)
+        .into_iter()
+        .map(|session| session.name)
         .collect()
 }
 
@@ -174,38 +215,18 @@ pub fn session_names(text: &str) -> Vec<String> {
 /// callers that want this — spawning an agent, and telling the picker which
 /// projects are already open — must agree on the answer.
 pub fn session_name(path: &str, tmux_yaml: Option<&str>) -> String {
-    let named = crate::paths::file_name(path.trim_end_matches('/'));
-    let named = if named.is_empty() { ROOT } else { named };
-    // A project that names itself wins, and a `session_name:` with nothing
-    // after it names nothing: the fallback is the path, not the empty string.
-    let declared = tmux_yaml.and_then(declared_name);
-    declared
-        .unwrap_or_else(|| named.to_string())
-        .replace('.', "_")
-}
-
-/// The first `session_name:` a `.tmux.yaml` declares, if it declares one.
-///
-/// Read line by line rather than parsed. This is one key out of a file another
-/// tool owns, and a YAML parser would be a dependency, a wider surface, and a
-/// new way to disagree with the shell script that has been reading it this way
-/// for years.
-fn declared_name(tmux_yaml: &str) -> Option<String> {
-    // The *first* such line, and then no further looking, which is where the
-    // daemon stops. A second one is a file that contradicts itself, and the two
-    // readers must not resolve that differently.
-    let value = tmux_yaml
-        .lines()
-        .find_map(|line| line.strip_prefix(DECLARED))?
-        .trim();
-    (!value.is_empty()).then(|| value.to_string())
+    // One implementation, and it is [`crate::agent::session_name`]. Two tickets
+    // wrote this in the same wave and they did not agree: this one folded only
+    // the dot, the other folds the colon as well, because `work:9` as a session
+    // name is window 9 of `work` at a tmux prompt. The stricter answer wins.
+    crate::agent::session_name(path, tmux_yaml)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PANE_FORMAT, SESSION_FORMAT, no_server_running, panes, panes_body, session_name,
-        session_names,
+        PANE_FORMAT, SESSION_FORMAT, Session, no_server_running, panes, panes_body, session_name,
+        session_names, sessions,
     };
     use crate::peer::HostName;
 
@@ -260,6 +281,47 @@ mod tests {
                 "one field per format specifier in {line:?}"
             );
         }
+    }
+
+    // AYEAYE-51 — the session list carries the id as well as the name, because
+    // matching a project and targeting its session are different questions. A
+    // session name is whatever a directory was called, and tmux reads several
+    // characters in a target as syntax; the id is tmux's own and reads as
+    // nothing else.
+    #[test]
+    fn a_session_comes_back_with_the_id_it_has_to_be_targeted_by() {
+        let listed = sessions("work\t$0\nayeaye\t$3\n");
+        assert_eq!(
+            listed,
+            [
+                Session {
+                    name: "work".to_string(),
+                    id: "$0".to_string()
+                },
+                Session {
+                    name: "ayeaye".to_string(),
+                    id: "$3".to_string()
+                },
+            ]
+        );
+        // A name that is itself a tmux target is carried whole, and is exactly
+        // why the id is here: `$0` is a real session name and also the way tmux
+        // spells a different session.
+        let awkward = sessions("$0\t$1\nwork:9\t$2\nmy project\t$4\n");
+        let names: Vec<&str> = awkward.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["$0", "work:9", "my project"]);
+        assert_eq!(awkward[0].id, "$1");
+    }
+
+    // AYEAYE-51 — a line that is not two fields is skipped and takes only
+    // itself, for the reason a short pane line does: one unreadable session
+    // must not cost the others.
+    #[test]
+    fn an_unreadable_session_line_costs_only_itself() {
+        let listed = sessions("work\t$0\nnot a session\n\t$1\nlater\t\nayeaye\t$3\n");
+        let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["work", "ayeaye"]);
+        assert!(sessions("").is_empty());
     }
 
     // AYEAYE-43 — a machine with no tmux server has no panes, which is not the
@@ -393,18 +455,20 @@ this is not a pane
         );
     }
 
-    // AYEAYE-45 — the format lives beside its parser, and one field is the
-    // whole of it: this answer is only ever asked "is this project open".
+    // AYEAYE-45, amended by AYEAYE-51 — the format lives beside its parser.
+    // It asked for the name alone until spawning needed to *target* a session,
+    // and a name is not a target: `work:9` names window 9 of `work`. The id is
+    // what the spawn path addresses, so it is read here rather than derived.
     #[test]
-    fn the_session_format_asks_for_the_name_and_nothing_else() {
-        assert_eq!(SESSION_FORMAT, "#{session_name}");
+    fn the_session_format_asks_for_the_name_and_the_id() {
+        assert_eq!(SESSION_FORMAT, "#{session_name}\t#{session_id}");
     }
 
     // AYEAYE-45 — what `list-sessions -F` prints, one session to a line.
     #[test]
     fn every_line_of_the_session_list_is_a_session() {
         assert_eq!(
-            session_names("work\nayeaye\ncliban\n"),
+            session_names("work\t$0\nayeaye\t$1\ncliban\t$2\n"),
             ["work", "ayeaye", "cliban"]
         );
         assert_eq!(session_names(""), Vec::<String>::new());
@@ -418,7 +482,10 @@ this is not a pane
     // thing this answer is used for.
     #[test]
     fn a_session_name_with_a_space_in_it_is_one_session() {
-        assert_eq!(session_names("my work\nother\n"), ["my work", "other"]);
+        assert_eq!(
+            session_names("my work\t$0\nother\t$1\n"),
+            ["my work", "other"]
+        );
     }
 
     // AYEAYE-45 — the ftz convention: the project directory's own name.

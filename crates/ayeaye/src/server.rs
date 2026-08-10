@@ -206,6 +206,21 @@ async fn handle(
         }
         Route::Answer if method == Method::POST => answer(&settings, body).await,
         Route::Send if method == Method::POST => send(&settings, body).await,
+        // A write, and a POST — which is not incidental. The CSRF gate above
+        // exempts GET and HEAD, so it is safe only while every write is a POST;
+        // mounting this on a GET would put it outside that gate with no test
+        // able to notice.
+        //
+        // The bytes are taken here rather than as a `Bytes` extractor so the
+        // body is still unread until below the gates.
+        Route::Spawn if method == Method::POST => match body_bytes(body).await {
+            Ok(bytes) => answered(crate::agent::spawn(&settings, &bytes).await),
+            Err(response) => response,
+        },
+        Route::Kill if method == Method::POST => match body_bytes(body).await {
+            Ok(bytes) => answered(crate::agent::kill(&settings, &bytes).await),
+            Err(response) => response,
+        },
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
@@ -215,6 +230,8 @@ async fn handle(
         | Route::Prompt
         | Route::Answer
         | Route::Send
+        | Route::Spawn
+        | Route::Kill
         | Route::Api
         | Route::NotFound
         | Route::Login
@@ -234,6 +251,21 @@ async fn api(settings: &Settings, uri: &Uri) -> Option<(StatusCode, String)> {
         return Some(answered);
     }
     session::answer(settings, uri.path(), uri.query()).await
+}
+
+/// An answer one of the write endpoints decided on.
+///
+/// The status comes back as a number rather than a `StatusCode` so that
+/// `crate::agent` names no HTTP type and can be driven without one.
+fn answered(answered: crate::agent::Answered) -> Response {
+    let status = StatusCode::from_u16(answered.status)
+        .expect("the endpoints answer 200 or 400 and nothing else");
+    build(
+        status,
+        "application/json",
+        Body::from(answered.body),
+        |response| response,
+    )
 }
 
 /// The one-time handshake: a token in the query becomes a cookie.
@@ -694,6 +726,17 @@ impl NotAPane {
 /// Below every gate, so a cross-site write is refused without a byte of its
 /// body being read, and bounded, so a client that announced a gigabyte is not
 /// given one.
+/// The request body as bytes, read below every gate and bounded.
+///
+/// The `Body` is taken unread by `handle` so a refused write costs nothing;
+/// this is the one place that drains it, and the endpoints that want raw bytes
+/// rather than a parsed value call it directly.
+async fn body_bytes(body: Body) -> Result<axum::body::Bytes, Response> {
+    axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|_| refused(StatusCode::BAD_REQUEST, "bad body"))
+}
+
 async fn read_body(body: Body) -> Result<json::Value, Response> {
     let bytes = axum::body::to_bytes(body, MAX_BODY)
         .await

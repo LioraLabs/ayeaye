@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ayeaye_core::peer::HostName;
 use ayeaye_core::prompt::{Press, Typed};
-use ayeaye_core::tmux::{PANE_FORMAT, Pane, SESSION_FORMAT, no_server_running, session_names};
+use ayeaye_core::tmux::{PANE_FORMAT, Pane, SESSION_FORMAT, Session, no_server_running};
 
 use crate::command::{self, Failed};
 
@@ -96,6 +96,33 @@ impl Tmux {
         }
     }
 
+    /// The sessions on this machine: what each is called, and its id.
+    ///
+    /// Two departures from `bin/ayeaye`'s `live_sessions()`, both of which it
+    /// gets wrong for the same reason — it asks only for the name and then
+    /// treats the name as a target.
+    ///
+    /// The id comes back because that is what a session must be *targeted* by;
+    /// [`ayeaye_core::tmux::Session`] has the three ways a name fails there.
+    ///
+    /// And the output is split on lines rather than on whitespace. The daemon
+    /// does `set(output.split())`, so a project directory called `my project`
+    /// produces the session `my project` and a live-session set holding `my`
+    /// and `project` — neither of which matches, so the next spawn there tries
+    /// to create a session that already exists and fails instead of adding a
+    /// window to it. A session name cannot contain a newline, so lines are
+    /// exact.
+    ///
+    /// A machine with no server has no sessions, for the same reason it has no
+    /// panes: that is an answer, not a failure.
+    pub async fn sessions(&self) -> Result<Vec<Session>, Trouble> {
+        match self.ask(&["list-sessions", "-F", SESSION_FORMAT]).await {
+            Ok(text) => Ok(ayeaye_core::tmux::sessions(&text)),
+            Err(Trouble::Refused(said)) if no_server_running(&said) => Ok(Vec::new()),
+            Err(trouble) => Err(trouble),
+        }
+    }
+
     /// Every live pane on this machine, qualified with the name it goes by.
     ///
     /// A machine with no tmux server has no panes, and that is an answer rather
@@ -169,18 +196,18 @@ impl Tmux {
             .map(|_| ())
     }
 
-    /// Every live session on this machine, by name.
+    /// Every live session's name, for callers that do not target by id.
     ///
-    /// What the project picker asks to say which projects are already open,
-    /// and what spawning asks to decide between a new window and a new
-    /// session. A machine with no tmux server has no sessions, which is an
-    /// answer rather than a failure — the same reading [`Tmux::panes`] gives.
-    pub async fn sessions(&self) -> Result<Vec<String>, Trouble> {
-        match self.ask(&["list-sessions", "-F", SESSION_FORMAT]).await {
-            Ok(text) => Ok(session_names(&text)),
-            Err(Trouble::Refused(said)) if no_server_running(&said) => Ok(Vec::new()),
-            Err(trouble) => Err(trouble),
-        }
+    /// What the project picker asks to say which projects are already open.
+    /// Spawning wants [`Tmux::sessions`] instead, because it targets a session
+    /// by its id and a name is not a target.
+    pub async fn session_names(&self) -> Result<Vec<String>, Trouble> {
+        Ok(self
+            .sessions()
+            .await?
+            .into_iter()
+            .map(|session| session.name)
+            .collect())
     }
 }
 
