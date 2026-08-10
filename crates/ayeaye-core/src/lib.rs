@@ -18,6 +18,7 @@ pub mod logits;
 pub mod machine;
 pub mod mel;
 pub mod peer;
+pub mod prompt;
 pub mod service;
 pub mod tmux;
 
