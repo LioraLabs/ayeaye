@@ -39,7 +39,18 @@ pub struct Unsupported {
 impl fmt::Display for Unsupported {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.found {
-            Some(found) => write!(out, "{found} is not an architecture this build can run")?,
+            // Quoted and shortened, because this string came out of a stranger's
+            // `config.json` and lands in somebody's terminal. Raw it can carry
+            // ANSI escapes, newlines that forge a second line of output, or a
+            // couple of megabytes of nothing. `{:?}` escapes the control bytes;
+            // `shorten` deals with the length. It also reads better for the
+            // ordinary case, where the name differs from a supported one only
+            // by whitespace nobody can see.
+            Some(found) => write!(
+                out,
+                "{:?} is not an architecture this build can run",
+                shorten(found)
+            )?,
             None => write!(
                 out,
                 "this model's config.json names no architecture: it has neither an \
@@ -97,6 +108,19 @@ pub fn judge(found: &str) -> Result<Architecture, Unsupported> {
         .ok_or_else(|| Unsupported {
             found: Some(found.to_string()),
         })
+}
+
+/// As much of an untrusted name as is worth putting in a message.
+///
+/// A repository can call itself anything, including two megabytes of it. The
+/// refusal has to name what was found, and naming the first eighty characters
+/// of it does that; naming all of it turns an error message into the payload.
+fn shorten(found: &str) -> String {
+    const MOST: usize = 80;
+    match found.char_indices().nth(MOST) {
+        Some((at, _)) => format!("{}…", &found[..at]),
+        None => found.to_string(),
+    }
 }
 
 /// Judge the architecture a model's `config.json` declares.
@@ -161,6 +185,37 @@ mod tests {
         let said = refused.to_string();
         assert!(said.contains("LlamaForCausalLM"), "{said}");
         assert!(said.contains("WhisperForConditionalGeneration"), "{said}");
+    }
+
+    // AYEAYE-56 — the name in a refusal came out of a stranger's config.json
+    // and is printed to somebody's terminal. Raw, it can repaint the screen,
+    // forge a second line of output, or run to megabytes.
+    #[test]
+    fn a_hostile_name_cannot_reach_a_terminal_intact() {
+        let nasty = judge("\u{1b}[2J\u{1b}[31mfake error\nayeaye: all good")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !nasty.contains('\u{1b}'),
+            "an escape byte survived: {nasty:?}"
+        );
+        assert!(
+            !nasty.contains('\n'),
+            "a newline survived, so the message can forge a line: {nasty:?}"
+        );
+
+        let huge = judge(&"a".repeat(2_000)).unwrap_err().to_string();
+        assert!(
+            huge.len() < 400,
+            "a refusal became the payload: {} bytes",
+            huge.len()
+        );
+        // Still says enough of it to be recognisable.
+        assert!(huge.contains("aaaa"), "{huge}");
+
+        // And an ordinary name is still readable rather than mangled.
+        let plain = judge("LlamaForCausalLM").unwrap_err().to_string();
+        assert!(plain.contains("LlamaForCausalLM"), "{plain}");
     }
 
     // AYEAYE-56 — and the one architecture AYEAYE-54 shipped is admitted, by

@@ -13,8 +13,9 @@
 //!
 //! **Skipping and reading are different jobs, and they are different functions.**
 //! [`end_of_string`] finds where a string ends without decoding it; [`decode`]
-//! turns one into text. Every string in the document is skipped and at most two
-//! are decoded, so an escape this module cannot make sense of — a surrogate
+//! turns one into text. Every string in the document is skipped; only the keys
+//! walked past and the one value being read are decoded, so an escape this
+//! module cannot make sense of — a surrogate
 //! pair, a `\x` — costs nothing unless it is in the name actually being read.
 //! Sharing one function between the two jobs is how a smiley in a model's
 //! `_name_or_path` came to make its architecture unreadable.
@@ -26,8 +27,12 @@
 /// once per alternation between `{` and `[`. Without this, a few hundred
 /// kilobytes of `[{[{` ends the **process** — a stack overflow aborts and
 /// cannot be caught — and it would do it inside the one function whose whole
-/// purpose is to judge a stranger's file safely. Real configs nest three or
-/// four deep.
+/// purpose is to judge a stranger's file safely.
+///
+/// It counts *alternations* between the two kinds of container, not levels of
+/// nesting: same-kind nesting stays iterative and costs no stack at all. So
+/// this admits about 32 `[{` pairs rather than 64 of anything, which is still
+/// an order of magnitude past the three or four levels a real config has.
 const MAX_DEPTH: usize = 64;
 
 /// What this model calls its architecture, if it says.
@@ -54,7 +59,7 @@ fn top_level<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let bytes = json.as_bytes();
     // A byte-order mark is not whitespace and not `{`, and a file that opens
     // with one is still a config.
-    let opens = json.strip_prefix('\u{feff}').map_or(0, |_| 3);
+    let opens = if json.starts_with('\u{feff}') { 3 } else { 0 };
     let mut at = skip_space(bytes, opens);
     if bytes.get(at) != Some(&b'{') {
         return None;

@@ -54,9 +54,10 @@ pub const WANTED: &[Wanted] = &[
 /// Trailing slashes on the host are absorbed: a host configured as
 /// `https://example.test/` must not produce a URL with `//` in the middle of it.
 ///
-/// `file` is a [`Wanted`] rather than a string, and that is the point: the
-/// files a model needs are a fixed list this crate owns, so there is no way to
-/// reach this with a name the hub supplied. The id's segments are already
+/// `file` is a [`Wanted`] rather than a string, and the guarantee comes from
+/// its `file` being `&'static str`: a name that arrived from the hub at runtime
+/// cannot be one. `Wanted` is `Copy` with public fields, so it is that lifetime
+/// doing the work and not the newtype. The id's segments are already
 /// refused at [`ModelId::parse`] if they carry anything a path should not, so
 /// every part of the URL below is something this crate has already judged.
 pub fn url(host: &str, id: &ModelId, file: &Wanted) -> String {
