@@ -47,14 +47,18 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # does not contradict `ayeaye-core`'s `machine::graphics`, which declines to
 # call an Intel Mac `metal`: that is a recommendation about which machine is
 # worth pointing at a model, and this is what the build can do if asked.
-# The version requirement is repeated from `[dependencies]` below, where the
-# long note on why candle is held at 0.9 lives. Both copies must move together;
-# they cannot silently disagree, because cargo intersects them and an empty
-# intersection is a resolution error rather than a quiet pick.
+# The version is `workspace = true` on both this table and `[dependencies]`
+# below, and that is not tidiness. Cargo does **not** intersect two
+# requirements for one crate across two dependency tables: `0.8` here against
+# `0.9.1` there resolves *both*, one per target edge, and the 0.8 tree pulls
+# `cc`. The failure that shape produces is the Apple release row silently
+# shipping a different candle from every other row with a C compiler in it —
+# so there is one requirement, in the root manifest, and neither edge can
+# drift from the other.
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9.1", features = ["metal"] }
-candle-nn = { version = "0.9.1", features = ["metal"] }
-candle-transformers = { version = "0.9.1", features = ["metal"] }
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }
 
 [dependencies]
 ayeaye-core.workspace = true
@@ -81,9 +85,13 @@ ayeaye-core.workspace = true
 # Upgrading is not a routine bump. Before moving off 0.9, check whether
 # candle-core still names tokenizers/onig, and if it does, say out loud that
 # the build is gaining a C toolchain rather than discovering it later.
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
-candle-transformers = "0.9.1"
+#
+# The requirement itself lives in the root manifest's `[workspace.dependencies]`
+# because this crate names candle from two tables; see the note on the macOS
+# table above for what goes wrong when the two are written separately.
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
 
 # The same trap one level down, and here it *is* a feature we control.
 # `tokenizers` defaults to `onig` too, so default features are off and the
