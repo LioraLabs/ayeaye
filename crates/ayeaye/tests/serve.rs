@@ -916,6 +916,48 @@ async fn a_pane_with_no_question_on_it_answers_a_null_prompt() {
     assert_eq!(asked.body_text(), r#"{"prompt":null}"#);
 }
 
+// AYEAYE-48 — a pane that is not there has no question on it, and that is an
+// answer rather than a refusal. `share/app.html`'s pollPrompt keeps its last
+// card on a failed request, so refusing here would leave a dead pane's question
+// on screen for as long as the transcript view stayed open. Naming no pane at
+// all is still a refusal, because that is a caller mistake and not a fact about
+// a pane — which is exactly the daemon's split too.
+#[tokio::test]
+async fn a_pane_that_is_not_there_has_no_question_on_it() {
+    let Some((_tmux, server, pane)) = server_on_its_own_tmux("gone", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+    for missing in [
+        "desktop/%9999".to_string(),
+        bare.clone(),
+        format!("gpu-box/{bare}"),
+        format!("desktop/{bare} ; kill-server"),
+    ] {
+        let asked = server
+            .request(
+                "GET",
+                &format!("/api/prompt?pane={}", encoded(&missing)),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(asked.status, 200, "for {missing:?}");
+        assert_eq!(asked.body_text(), r#"{"prompt":null}"#, "for {missing:?}");
+    }
+    for blank in ["", "%20%20"] {
+        let asked = server
+            .request(
+                "GET",
+                &format!("/api/prompt?pane={blank}"),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(asked.status, 400, "for {blank:?}");
+        assert_eq!(asked.body_text(), r#"{"error":"no pane"}"#);
+    }
+}
+
 // AYEAYE-48 — **the check between a request and somebody's terminal.** A pane id
 // that parses is not a pane. Every id here is refused, and the pane that really
 // exists is untouched afterwards — which is the assertion that matters, since a

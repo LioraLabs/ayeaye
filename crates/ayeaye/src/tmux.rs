@@ -8,7 +8,7 @@ use std::fmt;
 use std::time::Duration;
 
 use ayeaye_core::peer::HostName;
-use ayeaye_core::prompt::Press;
+use ayeaye_core::prompt::{Press, Typed};
 use ayeaye_core::tmux::{PANE_FORMAT, Pane, no_server_running};
 
 use crate::command::{self, Failed};
@@ -147,10 +147,11 @@ impl Tmux {
     /// the text as one element of an argument vector and writes those bytes to
     /// the pane's terminal.
     ///
-    /// The text has to have come through `ayeaye_core::prompt::typed`, which is
-    /// what keeps a newline — a submit — out of it.
-    pub async fn type_text(&self, pane: &Pane, text: &str) -> Result<(), Trouble> {
-        self.ask(&["send-keys", "-t", pane.id.pane(), "-l", "--", text])
+    /// The text is a [`Typed`], which can only be built by
+    /// `ayeaye_core::prompt::typed` — so the rule that keeps a newline out of
+    /// it, a newline being a submit, is enforced here rather than asked for.
+    pub async fn type_text(&self, pane: &Pane, text: Typed<'_>) -> Result<(), Trouble> {
+        self.ask(&["send-keys", "-t", pane.id.pane(), "-l", "--", text.text()])
             .await
             .map(|_| ())
     }

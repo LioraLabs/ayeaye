@@ -372,11 +372,32 @@ pub fn press(key: &str) -> Option<Press> {
 /// Stricter than the daemon this replaces, which types whatever it is handed.
 /// Every key worth pressing on purpose is on [`NAV_KEYS`] and goes through
 /// [`press`], so nothing legitimate is refused here.
-pub fn typed(text: &str) -> Option<&str> {
+pub fn typed(text: &str) -> Option<Typed<'_>> {
     if text.is_empty() || text.chars().any(char::is_control) {
         return None;
     }
-    Some(text)
+    Some(Typed(text))
+}
+
+/// Some text a pane may be sent.
+///
+/// A newtype for the same reason [`Press`] is one: there is no way to build
+/// it but through [`typed`], so the rule above is enforced by the compiler
+/// rather than by a comment asking the next caller to remember. The first
+/// draft did ask, and a comment on `Tmux::type_text` claiming the check had
+/// already happened is exactly the comment a later caller trusts instead of
+/// checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Typed<'a>(&'a str);
+
+impl<'a> Typed<'a> {
+    /// The text, to hand to whatever does the typing.
+    ///
+    /// Borrowed from the body it was read out of rather than from the wrapper,
+    /// so the wrapper can be a copied value that costs nothing to pass around.
+    pub fn text(&self) -> &'a str {
+        self.0
+    }
 }
 
 /// The named keys the remote may press, and what tmux calls each.
@@ -745,7 +766,11 @@ mod tests {
     #[test]
     fn text_that_would_submit_itself_is_not_text_a_pane_may_be_sent() {
         for submits in ["ls -la\n", "\n", "a\r\nb", "first\rsecond"] {
-            assert_eq!(typed(submits), None, "{submits:?} submits itself");
+            assert_eq!(
+                typed(submits).map(|text| text.text()),
+                None,
+                "{submits:?} submits itself"
+            );
         }
         // And the rest of the control characters with it: an escape byte is the
         // start of a sequence the agent's TUI acts on rather than shows.
@@ -758,7 +783,11 @@ mod tests {
             "\t",
             "",
         ] {
-            assert_eq!(typed(hostile), None, "{hostile:?} is not text");
+            assert_eq!(
+                typed(hostile).map(|text| text.text()),
+                None,
+                "{hostile:?} is not text"
+            );
         }
     }
 
@@ -778,7 +807,7 @@ mod tests {
             "café ✓ 🚀",
             "-t %0",
         ] {
-            assert_eq!(typed(said), Some(said));
+            assert_eq!(typed(said).map(|text| text.text()), Some(said));
         }
     }
 }

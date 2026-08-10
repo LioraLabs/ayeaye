@@ -158,7 +158,7 @@ async fn a_prompt_drawn_in_a_real_pane_is_read_back_off_it() {
     // Drawn by the pane's own program rather than typed by us, so what is parsed
     // is what a terminal put on a screen.
     layer
-        .type_text(&pane, "Pick one? ")
+        .type_text(&pane, prompt::typed("Pick one? ").expect("typeable"))
         .await
         .expect("typing works");
     server.tmux(&[
@@ -231,7 +231,7 @@ async fn typing_sends_the_text_and_does_not_submit_it() {
     let layer = prompt_layer(&server);
 
     layer
-        .type_text(&pane, "ship it")
+        .type_text(&pane, prompt::typed("ship it").expect("typeable"))
         .await
         .expect("typing works");
     let typed = settles(&layer, &pane, |said| said.contains("ship it")).await;
@@ -277,7 +277,10 @@ async fn awkward_text_arrives_verbatim() {
         "; kill-server",
         "cafe 100%",
     ] {
-        layer.type_text(&pane, awkward).await.expect("typing works");
+        layer
+            .type_text(&pane, prompt::typed(awkward).expect("typeable"))
+            .await
+            .expect("typing works");
         let screen = settles(&layer, &pane, |said| said.contains(awkward)).await;
         assert!(
             screen.contains(awkward),

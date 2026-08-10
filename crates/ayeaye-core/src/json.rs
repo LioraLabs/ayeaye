@@ -517,8 +517,11 @@ mod tests {
 
     // AYEAYE-48 — a body of nothing but brackets. A recursive reader recurses
     // once per bracket, and a stack overflow is an abort rather than an error:
-    // it would take the whole daemon down, from a request an unauthenticated
-    // caller can shape. The limit turns that into a refusal.
+    // one request would take the whole daemon down, every pane with it, and
+    // the panel would go dark for everybody. The reader is behind the token
+    // gate, so this is a phone that has been logged in and then lost rather
+    // than a stranger — which is a smaller blast radius and not a reason to
+    // leave an abort reachable at all.
     #[test]
     fn a_body_of_nothing_but_brackets_is_refused_rather_than_recursed_into() {
         let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
