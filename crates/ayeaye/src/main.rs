@@ -317,6 +317,23 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };
 
+    // What this machine calls itself, in the same order `Settings::resolve`
+    // reads it — the two have to agree, or a pane id written by the daemon is
+    // one this toggle cannot find in its own pane list.
+    let named = config::env_var("NAME")
+        .or_else(|| nodename(&Subprocess))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| ayeaye::config::DEFAULT_NAME.to_string());
+    let here = match ayeaye_core::peer::HostName::new(&named) {
+        Ok(here) => here,
+        Err(why) => {
+            return complain(&format!(
+                "ayeaye: {:?} cannot be a machine name: {why:?}",
+                named
+            ));
+        }
+    };
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(why) => return complain(&format!("ayeaye: could not start the async runtime: {why}")),
@@ -332,6 +349,7 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         let state = store.join(ayeaye::dictate::STATE_FILE);
         let toggle = ayeaye::dictate::Toggle {
             tmux: &tmux,
+            here,
             voice: &voice,
             state: &state,
             token,
@@ -351,7 +369,15 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         }
         // The status line, because there is no window to use and nothing reads
         // this process's streams.
-        let _ = tmux.ask(&["display-message", &said]).await;
+        //
+        // `#` is doubled because `display-message` expands `#{...}` formats, and
+        // this message can carry a converter's own stderr. tmux's escape for a
+        // literal `#` is `##`, so this is the one place the text is quoted for
+        // the thing that will interpret it — the same care `send-keys -l --`
+        // takes next door, for the same reason.
+        let _ = tmux
+            .ask(&["display-message", &said.replace('#', "##")])
+            .await;
         eprintln!("{said}");
         ExitCode::FAILURE
     })
@@ -359,16 +385,9 @@ fn dictate_verb(args: &[String]) -> ExitCode {
 
 /// The address the tmux client is connected from, or `None` if it is local.
 ///
-/// Prefer the pid tmux handed the binding; fall back to the pane's own session's
-/// clients, taking the first with an address. **A remote client is the
-/// interesting one**: it is the machine the person is sitting at, and therefore
-/// the machine with the microphone.
-///
-/// Both questions are asked of `crate::process`, not of `/proc`. That is a file
-/// tree which exists on exactly one of the two platforms this supports, and
-/// reading it directly on a Mac was not an error — it was an empty answer, which
-/// made every client look local and handed the microphone to whichever one tmux
-/// listed first.
+/// This half is the asking: which clients the pane's session has. The deciding
+/// is `ayeaye::dictate::recording_peer`, which takes the process backend as an
+/// argument and is where the rule is written down and tested.
 async fn recording_peer(
     tmux: &ayeaye::tmux::Tmux,
     pane: &str,
@@ -382,12 +401,6 @@ async fn recording_peer(
         .map(|id| id.pane().to_string())
         .unwrap_or_else(|_| pane.to_string());
 
-    if let Some(pid) = passed.and_then(|pid| pid.parse::<u32>().ok())
-        && processes.exists(pid)
-    {
-        return processes.ssh_peer(pid);
-    }
-
     let session = tmux
         .ask(&["display-message", "-p", "-t", &local, "#{session_name}"])
         .await
@@ -396,10 +409,12 @@ async fn recording_peer(
         .ask(&["list-clients", "-t", session.trim(), "-F", "#{client_pid}"])
         .await
         .unwrap_or_default();
-    clients
+    let clients: Vec<u32> = clients
         .split_whitespace()
-        .filter_map(|pid| pid.parse::<u32>().ok())
-        .find_map(|pid| processes.ssh_peer(pid))
+        .filter_map(|pid| pid.parse().ok())
+        .collect();
+
+    ayeaye::dictate::recording_peer(processes.as_ref(), passed, &clients)
 }
 
 /// Where the shared secret the recording agent checks lives.
@@ -414,9 +429,15 @@ fn agent_token_path() -> PathBuf {
 }
 
 /// The port the recording agent listens on.
+///
+/// `VOICE_PORT`, plainly, because that is the name `bin/voice-agent` reads on
+/// the phone and the two have to agree. Deliberately *not* through
+/// `config::env_var`, which would also answer to `AYEAYE_VOICE_PORT` and
+/// `VOICE_REMOTE_VOICE_PORT` — doubly-prefixed names that exist nowhere else,
+/// are in no documentation, and would each be a second place this setting could
+/// come from.
 fn agent_port() -> u16 {
     from_environment("VOICE_PORT")
-        .or_else(|| config::env_var("VOICE_PORT"))
         .and_then(|port| port.trim().parse().ok())
         .unwrap_or(ayeaye::recorder::DEFAULT_PORT)
 }

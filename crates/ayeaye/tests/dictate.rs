@@ -74,7 +74,10 @@ async fn a_recorded_clip_becomes_sixteen_kilohertz_mono_audio() {
     );
     // And it is loud enough to be worth transcribing, which is the other half of
     // what this step is for.
-    assert!(!decoded.is_silence(), "a tone is not room tone");
+    assert!(
+        !ayeaye_core::audio::is_silence(decoded.rms()),
+        "a tone is not room tone"
+    );
 }
 
 // AYEAYE-58
@@ -623,6 +626,7 @@ async fn a_second_press_types_the_words_into_the_pane_and_never_submits_them() {
     let tmux = server.layer();
     let toggle = ayeaye::dictate::Toggle {
         tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
         voice: &voice,
         state: &state,
         token: "right-token".to_string(),
@@ -688,6 +692,7 @@ async fn a_recorder_that_refuses_the_token_leaves_no_recording_behind() {
     let tmux = server.layer();
     let toggle = ayeaye::dictate::Toggle {
         tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
         voice: &voice,
         state: &state,
         token: "wrong-token".to_string(),
@@ -727,6 +732,7 @@ async fn no_recorder_on_that_device_is_a_sentence_naming_it() {
     let tmux = server.layer();
     let toggle = ayeaye::dictate::Toggle {
         tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
         voice: &voice,
         state: &state,
         token: "right-token".to_string(),
@@ -1037,4 +1043,217 @@ fn the_converter_is_asked_for_the_one_shape_a_speech_model_reads() {
     // The input is named as data after `-i`, and the output is last.
     assert_eq!(after("-i"), "/tmp/x/clip.webm");
     assert_eq!(argv.last().unwrap(), "/tmp/x/clip16k.wav");
+}
+
+// AYEAYE-58
+//
+// **Membership, not syntax**, on the tmux path too. The pane the words go into
+// is read back out of a state file on disk, which outlives the process that
+// wrote it and the pane it named — so an id naming another machine, or a pane
+// that has since gone, must not act on the local pane of the same number.
+//
+// `PaneId::parse` would accept `elsewhere/%0` and hand back `%0`, which is a
+// real pane on this machine. This is the test that says the host half is
+// compared and the pane list is asked.
+#[tokio::test]
+async fn a_pane_on_another_machine_is_never_typed_into() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-elsewhere") else {
+        return;
+    };
+    let agent = Agent::started(true, b"pretend this is ogg").await;
+    let voice = Says::heard("this must not be typed anywhere");
+    let state = state_path("elsewhere");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+
+    let pane = tmux
+        .ask(&["display-message", "-p", "-t", "work", "#{pane_id}"])
+        .await
+        .expect("tmux should name its own pane");
+    let pane = pane.trim().to_string();
+
+    // A recording in progress whose pane is on another machine — which is what
+    // a state file written before the daemon was renamed looks like.
+    ayeaye::dictate::write_state(
+        &state,
+        &State {
+            host: "127.0.0.1".to_string(),
+            label: "local".to_string(),
+            pane: format!("elsewhere/{pane}"),
+        },
+    )
+    .expect("a recording in progress");
+
+    let said = toggle.press(&format!("elsewhere/{pane}"), None).await;
+
+    assert!(
+        said.contains("not a pane on this machine"),
+        "it should have refused the target: {said:?}"
+    );
+    let screen = server.captured(&pane);
+    assert!(
+        !screen.contains("this must not be typed anywhere"),
+        "another machine's pane id typed into this machine's pane: {screen:?}"
+    );
+    // And a pane that is simply not there any more is the same answer.
+    ayeaye::dictate::write_state(
+        &state,
+        &State {
+            host: "127.0.0.1".to_string(),
+            label: "local".to_string(),
+            pane: "desktop/%99".to_string(),
+        },
+    )
+    .expect("a recording in progress");
+    assert!(
+        toggle
+            .press("desktop/%99", None)
+            .await
+            .contains("not a pane"),
+        "a pane that has gone is not a pane"
+    );
+}
+
+// AYEAYE-58
+//
+// A recording agent that is running on a machine with no microphone it knows
+// how to use answers 200 and says `{"ok": false}`. Reading the status alone
+// would start a recording on a device that cannot record, and the person would
+// find out at the second press with nothing to show for it.
+#[tokio::test]
+async fn an_agent_with_no_microphone_is_told_from_one_with_a_microphone() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-backend") else {
+        return;
+    };
+    let agent = Agent::started(false, b"never recorded").await;
+    let voice = Says::heard("never reached");
+    let state = state_path("backend");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+
+    let said = toggle.press("desktop/%0", None).await;
+
+    assert!(said.contains("no recording backend"), "{said}");
+    assert!(
+        !state.exists(),
+        "a recording that could never have started must not be remembered"
+    );
+}
+
+// --------------------------------------------- which machine has the microphone
+
+/// A process table this test wrote.
+struct Machines {
+    /// pid -> the address it was reached from, where there is one.
+    peers: Vec<(u32, Option<&'static str>)>,
+}
+
+impl ayeaye_core::process::Source for Machines {
+    fn children(&self, _: u32) -> Vec<u32> {
+        Vec::new()
+    }
+
+    fn comm(&self, _: u32) -> Option<String> {
+        None
+    }
+}
+
+impl ayeaye::process::Processes for Machines {
+    fn start_time(&self, _: u32) -> Option<f64> {
+        None
+    }
+
+    fn cwd(&self, _: u32) -> Option<String> {
+        None
+    }
+
+    fn open_files(&self, _: u32) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn exists(&self, pid: u32) -> bool {
+        self.peers.iter().any(|(known, _)| *known == pid)
+    }
+
+    fn ssh_peer(&self, pid: u32) -> Option<String> {
+        self.peers
+            .iter()
+            .find(|(known, _)| *known == pid)
+            .and_then(|(_, peer)| peer.map(str::to_string))
+    }
+}
+
+// AYEAYE-58
+//
+// Recording happens where the person is, not where tmux is, so picking the
+// client is picking the room. The pid tmux handed the binding wins when it is
+// alive; when it is not — a client that has since detached — the pane's own
+// session's clients are asked, and a remote one is the interesting one.
+#[test]
+fn the_microphone_is_the_one_belonging_to_the_client_that_pressed_the_key() {
+    let machines = Machines {
+        peers: vec![
+            (100, None),                    // a client sitting at this machine
+            (200, Some("100.101.102.103")), // and one SSH'd in from a phone
+        ],
+    };
+
+    // The pid tmux passed, alive and remote: that is the room.
+    assert_eq!(
+        ayeaye::dictate::recording_peer(&machines, Some("200"), &[100]),
+        Some("100.101.102.103".to_string())
+    );
+    // Alive and local: also the room, and *not* a reason to go looking for a
+    // remote client. tmux told us which client pressed the key.
+    assert_eq!(
+        ayeaye::dictate::recording_peer(&machines, Some("100"), &[200]),
+        None,
+        "a live local client must not hand the microphone to somebody else"
+    );
+
+    // A pid that is not there any more falls through to the session's clients,
+    // preferring the remote one whatever order tmux listed them in.
+    for clients in [vec![100, 200], vec![200, 100]] {
+        assert_eq!(
+            ayeaye::dictate::recording_peer(&machines, Some("999"), &clients),
+            Some("100.101.102.103".to_string()),
+            "{clients:?}"
+        );
+    }
+    // Nothing passed at all is the same walk.
+    assert_eq!(
+        ayeaye::dictate::recording_peer(&machines, None, &[100, 200]),
+        Some("100.101.102.103".to_string())
+    );
+    // Every client on this machine: record here.
+    assert_eq!(
+        ayeaye::dictate::recording_peer(&machines, None, &[100]),
+        None
+    );
+    assert_eq!(ayeaye::dictate::recording_peer(&machines, None, &[]), None);
+    // Something that is not a pid is not a pid.
+    assert_eq!(
+        ayeaye::dictate::recording_peer(&machines, Some("not-a-pid"), &[200]),
+        Some("100.101.102.103".to_string())
+    );
 }

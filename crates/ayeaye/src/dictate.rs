@@ -79,7 +79,7 @@ pub fn hear(
     let rms = audio.rms();
     let seconds = audio.duration_secs();
 
-    if rms < ayeaye_core::audio::SILENCE_RMS {
+    if ayeaye_core::audio::is_silence(rms) {
         return Outcome::Silence { rms, seconds };
     }
 
@@ -285,9 +285,7 @@ where
         // machine with no speech model has nothing that could transcribe the
         // result of it.
         if self.settings.speech.is_none() {
-            return Outcome::Unavailable(
-                "no speech model is configured — `ayeaye model use <id>`".to_string(),
-            );
+            return Outcome::Unavailable(dictation::NO_SPEECH_MODEL.to_string());
         }
         let audio = match audio::decode_with(&self.converter, clip, ext).await {
             Ok(audio) => audio,
@@ -305,9 +303,7 @@ where
     /// needs already cut.
     pub async fn hear_decoded(&self, audio: &Pcm16kMono, names: &str) -> Outcome {
         let Some(speech) = self.settings.speech.clone() else {
-            return Outcome::Unavailable(
-                "no speech model is configured — `ayeaye model use <id>`".to_string(),
-            );
+            return Outcome::Unavailable(dictation::NO_SPEECH_MODEL.to_string());
         };
 
         let mut resident = self.resident.lock().await;
@@ -364,6 +360,17 @@ where
         // otherwise start its idle clock thirty seconds in the past.
         *used = Some(Instant::now());
         outcome
+    }
+
+    /// The two slots, for a test that has something to ask them.
+    ///
+    /// `cfg(test)`-free because the integration suite is a separate crate and
+    /// cannot see a `#[cfg(test)]` item. Narrow on purpose: it hands out a
+    /// borrow of the slots and nothing about lifetime, which stays with
+    /// [`Voice::hear_decoded`] and [`Voice::sweep`].
+    pub async fn with_both<T>(&self, ask: impl FnOnce(&S, &L) -> T) -> T {
+        let resident = self.resident.lock().await;
+        ask(resident.speech.slot(), resident.language.slot())
     }
 
     /// Let go of a model nobody has used for a while, saying whether it did.
@@ -474,6 +481,9 @@ impl Dictates for Voice {
 pub struct Toggle<'a, D: Dictates> {
     /// The tmux holding the pane and the status bar.
     pub tmux: &'a Tmux,
+    /// What this machine calls itself, so a qualified pane id can be checked
+    /// against the panes this machine actually has.
+    pub here: ayeaye_core::peer::HostName,
     /// What turns a clip into words.
     pub voice: &'a D,
     /// Where the recording state is kept between the two presses.
@@ -503,27 +513,27 @@ impl<D: Dictates> Toggle<'_, D> {
         let recorder = Recorder::at(&host, self.port, &self.token);
 
         match recorder.health().await {
-            Err(why) => return self.say(format!("voice: no recorder on {label} — {why}")),
+            Err(why) => return format!("voice: no recorder on {label} — {why}"),
             Ok(reply) if reply.status == 401 => {
-                return self.say(format!("voice: {label} rejected the token"));
+                return format!("voice: {label} rejected the token");
             }
             // A 200 that does not say `ok` is an agent running on a machine with
             // no microphone it knows how to use, which is a different thing to
             // fix and has to say so.
             Ok(reply) if !reply.healthy() => {
-                return self.say(format!("voice: {label} has no recording backend"));
+                return format!("voice: {label} has no recording backend");
             }
             Ok(_) => {}
         }
         match recorder.start().await {
             Ok(reply) if reply.status == 200 => {}
             Ok(reply) => {
-                return self.say(format!(
+                return format!(
                     "voice: {label} would not start recording ({})",
                     reply.status
-                ));
+                );
             }
-            Err(why) => return self.say(format!("voice: lost contact with {label} — {why}")),
+            Err(why) => return format!("voice: lost contact with {label} — {why}"),
         }
 
         // Written *after* the recorder is running. The other order leaves a
@@ -537,7 +547,7 @@ impl<D: Dictates> Toggle<'_, D> {
                 pane: pane.to_string(),
             },
         ) {
-            return self.say(format!("voice: could not remember the recording: {why}"));
+            return format!("voice: could not remember the recording: {why}");
         }
         self.indicate(dictation::RECORDING).await;
         String::new()
@@ -586,9 +596,25 @@ impl<D: Dictates> Toggle<'_, D> {
         }
     }
 
+    /// The pane this id names, if this machine really has it.
+    ///
+    /// **Membership, not syntax**, which is the rule everywhere else a pane is
+    /// acted on — `server::pane_of` makes the same check for the same reason.
+    /// `PaneId::parse` only says an id *could* name a pane; it compares no host
+    /// and asks no tmux, so `elsewhere/%0` would parse and then act on the local
+    /// `%0`. That matters more here than it looks: the id `type_into` uses is
+    /// read back out of a **state file on disk**, which outlives the process
+    /// that wrote it and the pane it named.
+    async fn pane_of(&self, qualified: &str) -> Option<ayeaye_core::tmux::Pane> {
+        let panes = self.tmux.panes(&self.here).await.ok()?;
+        panes
+            .into_iter()
+            .find(|pane| pane.id.qualified() == qualified)
+    }
+
     /// The identifiers on the pane being dictated into.
     async fn vocabulary(&self, pane: &str) -> String {
-        let Ok(id) = ayeaye_core::peer::PaneId::parse(pane) else {
+        let Some(pane) = self.pane_of(pane).await else {
             return String::new();
         };
         let captured = self
@@ -597,7 +623,7 @@ impl<D: Dictates> Toggle<'_, D> {
                 "capture-pane",
                 "-p",
                 "-t",
-                id.pane(),
+                pane.id.pane(),
                 "-S",
                 &format!("-{}", ayeaye_core::vocab::LINES),
             ])
@@ -613,37 +639,25 @@ impl<D: Dictates> Toggle<'_, D> {
     /// sent, ever: the point of the whole feature is that a person reads what a
     /// model wrote before an agent acts on it.
     async fn type_into(&self, pane: &str, text: &str) -> String {
-        let Ok(id) = ayeaye_core::peer::PaneId::parse(pane) else {
-            return format!("voice: {pane} is not a pane any more");
+        let Some(target) = self.pane_of(pane).await else {
+            return format!("voice: {pane} is not a pane on this machine any more");
         };
         let Some(typed) = prompt::typed(text) else {
             return "voice: the rewrite carried something that cannot be typed".to_string();
         };
-        match self
-            .tmux
-            .ask(&["send-keys", "-t", id.pane(), "-l", "--", typed.text()])
-            .await
-        {
-            Ok(_) => String::new(),
+        // Through `Tmux::type_text`, which takes a `Pane` — and a `Pane` comes
+        // back from `Tmux::panes` and nowhere else, so the target of the
+        // `send-keys` is one this tmux itself named a moment ago. `-l --` and no
+        // Enter live in that method, which is why they are not spelled here.
+        match self.tmux.type_text(&target, typed).await {
+            Ok(()) => String::new(),
             Err(why) => format!("voice: could not type it into {pane}: {why}"),
         }
     }
 
-    /// Clear the indicator, then say whatever there is to say.
+    /// Clear the indicator, then hand back whatever there is to say.
     async fn finish(&self, said: String) -> String {
         self.indicate("").await;
-        if said.is_empty() {
-            return said;
-        }
-        self.say(said)
-    }
-
-    /// Put one line on the status line.
-    ///
-    /// The message is returned as well as displayed, because a caller — and a
-    /// test — has no other way to know what happened: `run-shell -b` discards
-    /// everything this process writes.
-    fn say(&self, said: String) -> String {
         said
     }
 
@@ -655,6 +669,39 @@ impl<D: Dictates> Toggle<'_, D> {
             .await;
         let _ = self.tmux.ask(&["refresh-client", "-S"]).await;
     }
+}
+
+/// Which tmux client's machine should record, as an address.
+///
+/// **Prefer the pid tmux handed the binding; then the pane's own session's
+/// clients, taking the first with an address.** A remote client is the
+/// interesting one: it is the machine the person is sitting at, and therefore
+/// the machine with the microphone. `None` means every client is on this
+/// machine, and so is the microphone.
+///
+/// `processes` is an argument rather than `crate::process::here()` read inside,
+/// which is what makes this decision testable at all — the real backend can only
+/// answer about processes that exist on the machine running the suite, and "the
+/// pid tmux passed is dead, so ask the session's clients instead" is not a state
+/// a test can arrange out of real pids without racing the machine.
+///
+/// Both questions go through `crate::process` rather than `/proc`, which exists
+/// on exactly one of the two platforms this supports: reading it directly on a
+/// Mac was not an error but an empty answer, and every client looked local.
+pub fn recording_peer(
+    processes: &dyn crate::process::Processes,
+    passed: Option<&str>,
+    clients: &[u32],
+) -> Option<String> {
+    if let Some(pid) = passed.and_then(|pid| pid.parse::<u32>().ok())
+        && processes.exists(pid)
+    {
+        // Asked once, and its answer taken whatever it is. A live client that is
+        // local is a local recording, not a reason to go looking for a remote
+        // one — tmux told us which client pressed the key.
+        return processes.ssh_peer(pid);
+    }
+    clients.iter().find_map(|pid| processes.ssh_peer(*pid))
 }
 
 /// The recording in progress, or `None`.
@@ -678,13 +725,26 @@ pub fn write_state(path: &Path, state: &State) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|why| format!("{}: {why}", parent.display()))?;
     }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temporary, state.encode())
+    // Written *and flushed* before the rename. Without the sync the rename can
+    // reach the disk before the bytes do, which is the one ordering that turns a
+    // power loss into a state file that exists, is named correctly, and is
+    // empty — the case the temporary name was supposed to make impossible.
+    write_and_sync(&temporary, state.encode().as_bytes())
         .map_err(|why| format!("{}: {why}", temporary.display()))?;
     std::fs::rename(&temporary, path).map_err(|why| {
         // Not left behind for somebody to find later and wonder about.
         let _ = std::fs::remove_file(&temporary);
         format!("{}: {why}", path.display())
     })
+}
+
+/// Write a file and make sure the bytes have really landed.
+fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Forget the recording. A state that is not there is already forgotten.

@@ -33,6 +33,13 @@ pub const HALLUCINATIONS: &[&str] = &[
     "peace",
 ];
 
+/// What to say when nobody has chosen a model to transcribe with.
+///
+/// A constant because three places need the same sentence — the probe, and both
+/// doors into a dictation — and three spellings of one instruction is how a
+/// person ends up told to run two different commands.
+pub const NO_SPEECH_MODEL: &str = "no speech model is configured — `ayeaye model use <id>`";
+
 /// The punctuation that is packaging rather than words.
 const TRAILING: &[char] = &['.', '"', '!', ','];
 
@@ -88,7 +95,7 @@ impl Capability {
             return Some("there is no audio converter on this machine".to_string());
         }
         match &self.speech {
-            None => Some("no speech model is configured — `ayeaye model use <id>`".to_string()),
+            None => Some(NO_SPEECH_MODEL.to_string()),
             Some(id) if !self.speech_ready => Some(format!(
                 "{id} is not on this machine yet — `ayeaye model pull {id}`"
             )),
@@ -98,8 +105,13 @@ impl Capability {
 
     /// The body the capability probe answers with.
     ///
-    /// `voice` is the field `share/app.html` reads to decide whether the talk
-    /// button is live; the rest is what somebody needs in order to fix it.
+    /// `voice` is the field name `share/app.html` reads to decide whether the
+    /// talk button is live — but it reads it off `/api/overview`, which is
+    /// AYEAYE-49's to write and does not exist here yet. **So nothing consumes
+    /// this today**, and the page's `voiceOK` defaults to `true` until it does.
+    /// The shape is here now so that AYEAYE-49 adds a field out of this
+    /// `Capability` rather than writing a second probe that can disagree with
+    /// this one. The rest is what somebody needs in order to fix it.
     pub fn body(&self) -> String {
         let model = |chosen: &Option<ModelId>| match chosen {
             Some(id) => json::string(&id.to_string()),

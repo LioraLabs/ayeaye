@@ -197,12 +197,12 @@ pub async fn decode_with(
 ///
 /// `bin/voice-dictate` gets both from `tempfile.TemporaryDirectory()`, which is
 /// `mkdtemp`: random, exclusive, and `0700`. This is that, spelled out.
-struct Scratch {
+pub(crate) struct Scratch {
     path: PathBuf,
 }
 
 impl Scratch {
-    fn new() -> Result<Scratch, DecodeError> {
+    pub(crate) fn new() -> Result<Scratch, DecodeError> {
         let mut refused = None;
         // A handful of attempts rather than one, because the name is random and
         // the only way `create_dir` fails on it twice is a collision somebody
@@ -263,5 +263,58 @@ fn create_private(path: &Path) -> std::io::Result<()> {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scratch;
+
+    // AYEAYE-58
+    //
+    // The directory a recording is decoded in is this user's alone, and is one
+    // nobody else could already own.
+    //
+    // Both halves matter and neither is visible from outside. Under the shared
+    // temporary directory a guessable name is a name somebody can create first:
+    // they would then own a directory this daemon writes a recording into, and
+    // could swap the converted audio between the converter exiting and the read
+    // — choosing what gets transcribed and offered as a draft in somebody's
+    // terminal. A regression to `create_dir_all` under the default umask passes
+    // every other test in this suite.
+    #[test]
+    #[cfg(unix)]
+    fn a_recording_is_decoded_somewhere_only_this_user_can_look() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new().expect("a private directory");
+        let path = scratch.path.clone();
+
+        let made = std::fs::metadata(&path).expect("it should be there");
+        assert!(made.is_dir());
+        assert_eq!(
+            made.permissions().mode() & 0o777,
+            0o700,
+            "somebody else can read a recording of this person's voice"
+        );
+
+        // Exclusive: the name is already taken, so making it again fails rather
+        // than adopting a directory somebody else owns. `create_dir_all` would
+        // succeed here, which is the regression this pins.
+        assert!(
+            super::create_private(&path).is_err(),
+            "a directory that already exists is not ours to decode in"
+        );
+
+        // And two dictations at once do not share one, or they would read each
+        // other's audio back by name.
+        let second = Scratch::new().expect("another private directory");
+        assert_ne!(second.path, path);
+
+        drop(scratch);
+        assert!(
+            !path.exists(),
+            "a recording of somebody's voice outlived the request"
+        );
     }
 }

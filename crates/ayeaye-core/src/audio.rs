@@ -84,11 +84,16 @@ impl Pcm16kMono {
             .sum();
         (total / self.samples.len() as f64).sqrt() as f32
     }
+}
 
-    /// Whether this is room tone rather than somebody speaking.
-    pub fn is_silence(&self) -> bool {
-        self.rms() < SILENCE_RMS
-    }
+/// Whether a measured loudness is room tone rather than somebody speaking.
+///
+/// A free function over an already-measured loudness rather than a method on the
+/// clip, because every caller has just measured it: a method would walk two
+/// minutes of samples a second time to answer a question the number in hand
+/// already answers.
+pub fn is_silence(rms: f32) -> bool {
+    rms < SILENCE_RMS
 }
 
 /// Below this, a clip is room tone rather than speech.
@@ -246,7 +251,7 @@ fn little_endian_i16(bytes: &[u8]) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BadWav, Pcm16kMono, SAMPLE_RATE_HZ, SILENCE_RMS, from_wav};
+    use super::{BadWav, Pcm16kMono, SAMPLE_RATE_HZ, SILENCE_RMS, from_wav, is_silence};
 
     /// A WAVE file, built here so a test can say what is wrong with one.
     ///
@@ -370,11 +375,14 @@ mod tests {
     fn room_tone_is_silence_and_speech_is_not() {
         let at = |level: i16| Pcm16kMono::from_i16(&[level, -level, level, -level]);
 
-        assert!(at(490).is_silence(), "a quiet room is not somebody talking");
-        assert!(!at(3_400).is_silence(), "speech is not room tone");
+        assert!(
+            is_silence(at(490).rms()),
+            "a quiet room is not somebody talking"
+        );
+        assert!(!is_silence(at(3_400).rms()), "speech is not room tone");
         // Gated on energy rather than on length, deliberately: "run the tests"
         // is a legitimately short clip that a duration cutoff would throw away.
-        assert!(!Pcm16kMono::from_i16(&[3_400]).is_silence());
+        assert!(!is_silence(Pcm16kMono::from_i16(&[3_400]).rms()));
 
         // The measurement itself, against arithmetic done by hand: a square
         // wave's RMS is its amplitude.
@@ -384,7 +392,7 @@ mod tests {
             at(16_384).rms()
         );
         assert_eq!(Pcm16kMono::from_i16(&[]).rms(), 0.0);
-        assert!(Pcm16kMono::from_i16(&[]).is_silence());
+        assert!(is_silence(Pcm16kMono::from_i16(&[]).rms()));
         assert!((SILENCE_RMS - 0.030_517_578).abs() < 1e-6);
     }
 

@@ -42,6 +42,15 @@ pub const HEALTH_LIMIT: Duration = Duration::from_secs(5);
 /// How long the agent gets to answer anything else.
 pub const LIMIT: Duration = Duration::from_secs(30);
 
+/// The most recording this will take from an agent.
+///
+/// The same thirty-two megabytes the browser's dictation endpoint caps its body
+/// at, and deliberately the same number: it is the same audio, arriving over the
+/// same kind of connection, and a couple of minutes of it is real data. Without
+/// a cap the only bound is [`LIMIT`], which on a fast link is gigabytes into
+/// this process's memory before the clock runs out.
+pub const MAX_CLIP: usize = 32 << 20;
+
 /// What the agent said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -71,6 +80,8 @@ impl Reply {
 /// Why the agent said nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreachable {
+    /// The address or the secret carries something a request line cannot.
+    Unspeakable(&'static str),
     /// Nothing answered on that address.
     NoAnswer(String),
     /// It answered with something that is not an HTTP response.
@@ -82,6 +93,9 @@ pub enum Unreachable {
 impl fmt::Display for Unreachable {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Unreachable::Unspeakable(what) => {
+                write!(out, "the {what} carries a character a request cannot")
+            }
             Unreachable::NoAnswer(why) => write!(out, "{why}"),
             Unreachable::Garbled(why) => write!(out, "it answered with {why}"),
             Unreachable::TimedOut(limit) => write!(out, "it did not answer within {limit:?}"),
@@ -130,6 +144,17 @@ impl Recorder {
     }
 
     async fn exchange(&self, method: &str, path: &str) -> Result<Reply, Unreachable> {
+        // Both go into a request line by interpolation, and a newline in either
+        // would end the header and begin one this code did not write. Neither
+        // can carry one today — the address comes from the process table and the
+        // secret from a file — but a hand-rolled client that argues it is safe
+        // to hand-roll has to be the thing that checks.
+        if speakable(&self.token) {
+            return Err(Unreachable::Unspeakable("token"));
+        }
+        if speakable(&self.host) {
+            return Err(Unreachable::Unspeakable("address"));
+        }
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .map_err(|why| Unreachable::NoAnswer(why.to_string()))?;
@@ -146,13 +171,24 @@ impl Recorder {
             .await
             .map_err(|why| Unreachable::NoAnswer(why.to_string()))?;
 
+        // Bounded. `read_to_end` on a socket is bounded only by the deadline,
+        // and one megabyte per millisecond is a plausible tailnet. A clip larger
+        // than the cap is truncated rather than refused, and the decode below
+        // says so: a truncated container is not audio, which is the honest
+        // answer and the one `BadWav` already spells.
         let mut raw = Vec::new();
-        stream
+        (&mut stream)
+            .take(MAX_CLIP as u64)
             .read_to_end(&mut raw)
             .await
             .map_err(|why| Unreachable::NoAnswer(why.to_string()))?;
         parse(&raw)
     }
+}
+
+/// Whether text would break out of the request line it is interpolated into.
+fn speakable(text: &str) -> bool {
+    text.chars().any(|c| c.is_control())
 }
 
 /// Read one HTTP response.
@@ -187,4 +223,105 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Reply, Unreachable> {
         body,
         extension,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reply, Unreachable, parse};
+
+    fn answer(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut raw = head.replace('\n', "\r\n").into_bytes();
+        raw.extend_from_slice(b"\r\n\r\n");
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    // AYEAYE-58
+    //
+    // What `/stop` answers with: the recording, and the container it is in. The
+    // header name is matched case-insensitively because HTTP says it is, and
+    // because a client that compared spellings would turn a working recorder
+    // into an undecodable clip the day the agent's server changed how it writes
+    // them.
+    #[test]
+    fn a_recording_comes_back_with_the_container_the_agent_named() {
+        let reply = parse(&answer(
+            "HTTP/1.1 200 OK\nContent-Type: application/octet-stream\nX-Audio-Ext: ogg",
+            b"the audio itself",
+        ))
+        .expect("a well-formed answer");
+
+        assert_eq!(
+            reply,
+            Reply {
+                status: 200,
+                body: b"the audio itself".to_vec(),
+                extension: Some("ogg".to_string()),
+            }
+        );
+        // Any spelling of the same header, because that is what the name means.
+        for spelled in ["x-audio-ext", "X-AUDIO-EXT", "X-Audio-Ext"] {
+            let reply = parse(&answer(&format!("HTTP/1.1 200 OK\n{spelled}: m4a"), b""))
+                .expect("a well-formed answer");
+            assert_eq!(reply.extension.as_deref(), Some("m4a"), "{spelled}");
+        }
+        // And a header that merely ends the same way is not that header.
+        let reply = parse(&answer("HTTP/1.1 200 OK\nNot-X-Audio-Ext: nope", b""))
+            .expect("a well-formed answer");
+        assert_eq!(reply.extension, None);
+    }
+
+    // AYEAYE-58
+    //
+    // `/health` answering 200 is not an answer: the agent runs on machines with
+    // no microphone it knows how to use, and says so in the body. Reading the
+    // status alone would start a recording on a device that cannot record.
+    #[test]
+    fn a_health_check_is_the_body_rather_than_the_status() {
+        let healthy = parse(&answer(
+            "HTTP/1.1 200 OK",
+            br#"{"ok":true,"recorder":"ffmpeg"}"#,
+        ))
+        .expect("a well-formed answer");
+        assert!(healthy.healthy());
+
+        for body in [
+            &br#"{"ok":false,"recorder":"none"}"#[..],
+            &b"{}"[..],
+            &b"not json at all"[..],
+            &b""[..],
+        ] {
+            let said = parse(&answer("HTTP/1.1 200 OK", body)).expect("a well-formed answer");
+            assert!(!said.healthy(), "{:?} is not a working recorder", body);
+        }
+        // A refusal is not healthy however it is worded.
+        let refused = parse(&answer("HTTP/1.1 401 Unauthorized", br#"{"ok":true}"#))
+            .expect("a well-formed answer");
+        assert_eq!(refused.status, 401);
+        assert!(!refused.healthy(), "a 401 is not a microphone");
+    }
+
+    // AYEAYE-58
+    //
+    // Something that is not an HTTP response is said out loud rather than read
+    // as an empty recording. The agent is reached over a tailnet, where the
+    // thing on that port may be somebody else's program entirely.
+    #[test]
+    fn something_that_is_not_an_http_response_is_refused_by_name() {
+        for garbled in [
+            &b""[..],
+            &b"hello?"[..],
+            &b"HTTP/1.1 OK\r\n\r\n"[..],
+            &b"\x16\x03\x01 a TLS hello\r\n\r\n"[..],
+        ] {
+            assert!(
+                matches!(parse(garbled), Err(Unreachable::Garbled(_))),
+                "{garbled:?} is not an answer"
+            );
+        }
+        // A status line and no headers at all is still an answer.
+        let bare = parse(b"HTTP/1.1 204 No Content\r\n\r\n").expect("a bare answer");
+        assert_eq!(bare.status, 204);
+        assert!(bare.body.is_empty());
+    }
 }

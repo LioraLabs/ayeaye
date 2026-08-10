@@ -510,6 +510,11 @@ impl<S: Slot> Residents<S> {
         self.loaded.as_ref()
     }
 
+    /// The slot, to look at rather than to drive.
+    pub fn slot(&self) -> &S {
+        &self.slot
+    }
+
     /// The slot itself, for the one caller that has something to ask the model
     /// in it.
     ///
