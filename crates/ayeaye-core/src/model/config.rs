@@ -267,6 +267,13 @@ mod tests {
 
     /// A real `config.json`, captured from `openai/whisper-tiny.en`.
     ///
+    /// Flat in `tests/fixtures/`, not in a subdirectory of it, because the
+    /// Cookfile's `rust` probe globs `crates/**/tests/fixtures/*` — one level.
+    /// A fixture one directory deeper is invisible to that probe, so editing it
+    /// would leave the release gate replaying a cached pass over assertions
+    /// that had moved. That is the exact stale green the probe's own comment
+    /// was written about.
+    ///
     /// Captured rather than written out here because the shape is the test.
     /// `transformers` writes these with `sort_keys=True`, so `_name_or_path`
     /// (a string), `activation_dropout` (a number) and `activation_function`
@@ -274,7 +281,7 @@ mod tests {
     /// only test that exercises skipping a scalar to reach the key. A
     /// hand-written fixture with `architectures` first matches on the first
     /// key and skips nothing, and proves correspondingly less.
-    const REAL: &str = include_str!("../../tests/fixtures/model/whisper-tiny.en-config.json");
+    const REAL: &str = include_str!("../../tests/fixtures/whisper-tiny.en-config.json");
 
     // AYEAYE-56 — the field is read out of a real config, with three keys and
     // two kinds of scalar to be walked past before it.
@@ -389,6 +396,20 @@ mod tests {
         assert_eq!(architecture_name(""), None);
         assert_eq!(architecture_name(r#"{"architectures": [] }"#), None);
         assert_eq!(architecture_name(r#"{"architectures": [1, 2]}"#), None);
+        // `architectures` is an array in every config that has one. Anything
+        // else there is not the shape, and reading it anyway would mean
+        // guessing at a file this exists to be careful about. The object is
+        // the case that matters: without the check that the value opens with
+        // `[`, the scan would walk straight into it and report the first *key*
+        // as the architecture.
+        assert_eq!(
+            architecture_name(r#"{"architectures": "WhisperForConditionalGeneration"}"#),
+            None
+        );
+        assert_eq!(
+            architecture_name(r#"{"architectures": {"WhisperForConditionalGeneration": 1}}"#),
+            None
+        );
         // Truncated: the array never closes, so there is no value to read.
         assert_eq!(architecture_name(r#"{"architectures": ["Wh"#), None);
     }

@@ -53,6 +53,12 @@ impl Curl {
     /// page ends up saved as `model.safetensors`. `--location` matters too —
     /// the hub answers `/resolve/` with a redirect to its CDN, so without it
     /// every download is a redirect notice.
+    ///
+    /// The `--` is not decoration either. curl reads options at any position,
+    /// not only before the first non-option, so a hub configured as
+    /// `-o/somewhere` arrives as a *flag* rather than as a URL. Ending the
+    /// options is what makes "the URL is the last argument" actually mean the
+    /// URL is data.
     pub fn argv(url: &str, into: &Path) -> Vec<String> {
         [
             "curl",
@@ -66,7 +72,11 @@ impl Curl {
         ]
         .iter()
         .map(|arg| (*arg).to_string())
-        .chain([into.to_string_lossy().into_owned(), url.to_string()])
+        .chain([
+            into.to_string_lossy().into_owned(),
+            "--".to_string(),
+            url.to_string(),
+        ])
         .collect()
     }
 }
@@ -261,7 +271,20 @@ pub(crate) fn install(staging: &Path, dir: &Path) -> Result<(), PullError> {
         std::fs::create_dir_all(parent).map_err(disk(format!("create {}", parent.display())))?;
     }
 
-    let displaced = dir.with_extension("replaced");
+    // Not `with_extension`, which truncates at the last dot and would turn the
+    // revision `v1.0` into `v1.replaced`. The `~` matters too: it is outside
+    // the characters `ModelId::parse` admits, so a crash between the two
+    // renames leaves something `ayeaye model ls` will not show as a phantom
+    // model.
+    let displaced = match dir.file_name() {
+        Some(name) => dir.with_file_name(format!("{}~replaced", name.to_string_lossy())),
+        None => {
+            return Err(PullError::Disk {
+                what: format!("replace {}", dir.display()),
+                why: "it has no name".to_string(),
+            });
+        }
+    };
     let had_one = dir.exists();
     if had_one {
         let _ = std::fs::remove_dir_all(&displaced);
@@ -294,9 +317,10 @@ pub(crate) fn install(staging: &Path, dir: &Path) -> Result<(), PullError> {
 /// directory is half a model.
 fn staging_dir(store: &Path, id: &ModelId) -> PathBuf {
     store.join("models").join(format!(
-        ".pulling-{}-{}-{}",
+        ".pulling-{}-{}-{}-{}",
         id.owner(),
         id.name(),
+        id.revision(),
         std::process::id()
     ))
 }
@@ -770,6 +794,54 @@ mod tests {
         assert_eq!(installed(&scratch.0), vec![id]);
     }
 
+    // AYEAYE-56 — a pull that fails leaves the store holding models and
+    // nothing else. A half-fetched staging directory left behind is a
+    // directory the next run has no way to tell from a whole one, which is
+    // why resuming one is not offered.
+    #[test]
+    fn a_failed_pull_leaves_no_staging_directory_behind() {
+        let scratch = Scratch::named("staging");
+        let mut broken = Serves::whisper();
+        broken.files[2].1 = b"<!DOCTYPE html><title>404</title>".to_vec();
+        let id = ModelId::parse("openai/whisper-tiny.en").expect("a well-formed id");
+
+        pull(&broken, &scratch.0, "https://hub.test", &id).unwrap_err();
+
+        let left: Vec<String> = std::fs::read_dir(scratch.0.join("models"))
+            .expect("the store")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a half-fetched model was left behind: {left:?}"
+        );
+    }
+
+    // AYEAYE-56 — the store is a directory on somebody's disk, so what is in
+    // it is not necessarily something ayeaye put there. Directory names are
+    // parsed rather than trusted, and anything that is not a model id is not
+    // reported as a model.
+    #[test]
+    fn a_directory_that_is_not_a_model_is_not_listed_as_one() {
+        let scratch = Scratch::named("junk");
+        let id = ModelId::parse("openai/whisper-tiny.en").expect("a well-formed id");
+        pull(&Serves::whisper(), &scratch.0, "https://hub.test", &id).expect("the real one");
+
+        // A name no model id could have — `~` is outside what `ModelId::parse`
+        // admits, and it is what a displaced directory is named with.
+        std::fs::create_dir_all(
+            scratch
+                .0
+                .join("models/openai/whisper-tiny.en/main~replaced"),
+        )
+        .expect("something that is not a model");
+        std::fs::create_dir_all(scratch.0.join("models/what is this/x y z/rev"))
+            .expect("and something nobody meant to put there");
+
+        assert_eq!(installed(&scratch.0), vec![id], "only the model is a model");
+    }
+
     // AYEAYE-56 — the restore path, reached the only way it can be: by making
     // the rename itself fail. A pull that has already moved the old model
     // aside and then cannot move the new one in must put the old one back,
@@ -820,7 +892,7 @@ mod tests {
     // `model.safetensors`; without the second, every download of a hub file is
     // a redirect notice, because `/resolve/` redirects to the CDN.
     #[test]
-    fn the_command_line_refuses_an_error_page_and_follows_the_hubs_redirect() {
+    fn the_command_line_carries_the_flags_that_stop_a_page_being_saved_as_a_model() {
         let argv = Curl::argv(
             "https://hub.test/a/b/resolve/main/config.json",
             Path::new("/tmp/x"),
@@ -828,8 +900,12 @@ mod tests {
         assert_eq!(argv[0], "curl");
         assert!(argv.iter().any(|arg| arg == "--fail"), "{argv:?}");
         assert!(argv.iter().any(|arg| arg == "--location"), "{argv:?}");
-        // The URL is the last argument, so a URL beginning with `-` cannot be
-        // read as a flag.
+        // curl reads options at any position, not only before the first
+        // non-option, so the URL is data only because `--` ends the options
+        // ahead of it. Verified against the real curl: without it, a hub
+        // configured as `-o/somewhere` is consumed as a flag and curl answers
+        // "no URL specified".
+        assert_eq!(argv[argv.len() - 2], "--", "{argv:?}");
         assert_eq!(
             argv.last().unwrap(),
             "https://hub.test/a/b/resolve/main/config.json"

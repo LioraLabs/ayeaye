@@ -118,8 +118,17 @@ impl ModelSettings {
         let from_file = parse_env_file(file);
         let value = |key: &str| {
             env(key).or_else(|| {
+                // The *last* occurrence, not the first. A key set twice is what
+                // systemd's `EnvironmentFile=` resolves to the last one, so
+                // taking the first here would mean the same file said one thing
+                // under the service unit and the opposite run by hand — which
+                // is the disagreement this module exists to prevent rather than
+                // to introduce. `upsert` never writes a duplicate, so this only
+                // ever arises in a hand-edited file, which is exactly the file
+                // whose author expects it to behave like every other env file.
                 from_file
                     .iter()
+                    .rev()
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value.clone())
             })
@@ -302,7 +311,13 @@ fn parse_duration(given: &str) -> Option<Option<Duration>> {
         },
     };
     let seconds: u64 = number.trim().parse().ok()?;
-    Some((seconds > 0).then(|| Duration::from_secs(seconds * scale)))
+    // Checked, because this is a number a person typed and `18446744073709551h`
+    // would otherwise panic in a debug build and wrap silently in a release
+    // one — into an arbitrary idle timeout. `verify.rs` is careful about
+    // exactly this for the same reason; a pure function judging a stranger's
+    // text does not get to assume the text is reasonable.
+    let total = seconds.checked_mul(scale)?;
+    Some((total > 0).then(|| Duration::from_secs(total)))
 }
 
 #[cfg(test)]
@@ -422,6 +437,42 @@ mod tests {
                 "{given:?}"
             );
         }
+    }
+
+    // AYEAYE-56 — a length of time nobody could mean must be refused rather
+    // than wrapped. In a release build the multiplication has no overflow
+    // check, so a wrapped value would become an arbitrary idle timeout; in a
+    // debug build it panics. Neither is an answer.
+    #[test]
+    fn a_length_of_time_too_large_to_be_one_is_refused() {
+        let refused =
+            ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=18446744073709551h\n").unwrap_err();
+        assert_eq!(
+            refused,
+            BadSetting::Duration {
+                key: MODEL_IDLE.to_string(),
+                given: "18446744073709551h".to_string()
+            }
+        );
+        // And the largest one that *is* a length of time still resolves.
+        let vast = ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=100000h\n")
+            .expect("a big but representable idle time");
+        assert_eq!(vast.idle, Some(Duration::from_secs(360_000_000)));
+    }
+
+    // AYEAYE-56 — a key set twice resolves the way the service manager
+    // resolves it, which is to the last one. Taking the first would mean one
+    // file gave two different answers depending on whether it was read by
+    // systemd or by this binary, which is the disagreement the whole
+    // arrangement exists to prevent.
+    #[test]
+    fn a_key_set_twice_by_hand_resolves_to_the_last_one() {
+        let by_hand = "AYEAYE_SPEECH_MODEL=openai/first\nAYEAYE_SPEECH_MODEL=openai/second\n";
+        let settings = ModelSettings::resolve(no_env, by_hand).expect("it should resolve");
+        assert_eq!(
+            settings.speech.map(|id| id.to_string()).as_deref(),
+            Some("openai/second")
+        );
     }
 
     // AYEAYE-56 — the file's own grammar, including the parts that would
