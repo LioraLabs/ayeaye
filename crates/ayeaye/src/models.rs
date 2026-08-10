@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use ayeaye_core::cleanup::{Policy as CleanupPolicy, PolicyError};
 use ayeaye_core::model::hub::{self, Wanted};
 use ayeaye_core::model::residency::{self, Plan, Policy};
 use ayeaye_core::model::settings::{self, BadSetting, ModelSettings};
 use ayeaye_core::model::verify::{self, Unusable};
 use ayeaye_core::model::{Architecture, ModelId, Unsupported, architecture};
-use ayeaye_infer::{SpeechError, SpeechSlot};
+use ayeaye_infer::{LanguageError, LanguageSlot, SpeechError, SpeechSlot};
 
 /// Something that can fetch one URL into one file.
 ///
@@ -384,6 +385,33 @@ pub fn settings(config_file: &Path) -> Result<ModelSettings, BadSetting> {
     ModelSettings::resolve(crate::config::env_var, &text)
 }
 
+/// How a cleanup pass is configured, from the file with the environment on top.
+///
+/// The same precedence `settings` reads under, and for the same reason: under
+/// the service unit the file has *become* the environment by the time this runs,
+/// and run by hand it has not.
+///
+/// Separate from [`settings`] because it answers a different question and fails
+/// for different reasons — a template nobody implements is refused by name,
+/// where an absent model is simply a machine nobody has configured yet. Reading
+/// it through `Policy::resolve` rather than assembling a `Policy` by hand is
+/// what keeps `CLEANUP_ECHOES` paired with the prompt it belongs to, and what
+/// makes `CLEANUP_TEMPLATE` and `CLEANUP_MAX_TOKENS` mean anything at all.
+pub fn cleanup_policy(config_file: &Path) -> Result<CleanupPolicy, PolicyError> {
+    let text = std::fs::read_to_string(config_file).unwrap_or_default();
+    let from_file = settings::parse_env_file(&text);
+    CleanupPolicy::resolve(|name| {
+        crate::config::env_var(name).or_else(|| {
+            // The last occurrence, as systemd's `EnvironmentFile=` resolves it.
+            from_file
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        })
+    })
+}
+
 /// Write one setting into the configuration file, leaving the rest alone.
 ///
 /// Read, change one key, write the whole file back. Not an append: appending
@@ -424,22 +452,45 @@ pub struct Residents<S: Slot> {
 
 /// Somewhere a model can be resident.
 ///
-/// [`SpeechSlot`] is the real one. The trait exists for the reason above and
-/// has exactly its shape, so it is a boundary rather than an abstraction.
+/// [`SpeechSlot`] and [`LanguageSlot`] are the real ones. The trait exists for
+/// the reason above and has exactly their shape, so it is a boundary rather than
+/// an abstraction.
+///
+/// The error is associated rather than fixed, because the two slots fail for
+/// different reasons and neither should have to be described in the other's
+/// words. A single error type here would mean a corrupt GGUF arriving at a
+/// caller as a `SpeechError`, which is a sentence nobody could act on.
 pub trait Slot {
+    /// Why this kind of model would not load.
+    type Error;
+
     /// Load the model in `dir`, replacing whatever was resident.
-    fn load(&mut self, dir: &Path) -> Result<(), SpeechError>;
+    fn load(&mut self, dir: &Path) -> Result<(), Self::Error>;
     /// Release the resident model, saying whether there was one.
     fn unload(&mut self) -> bool;
 }
 
 impl Slot for SpeechSlot {
+    type Error = SpeechError;
+
     fn load(&mut self, dir: &Path) -> Result<(), SpeechError> {
         SpeechSlot::load(self, dir)
     }
 
     fn unload(&mut self) -> bool {
         SpeechSlot::unload(self)
+    }
+}
+
+impl Slot for LanguageSlot {
+    type Error = LanguageError;
+
+    fn load(&mut self, dir: &Path) -> Result<(), LanguageError> {
+        LanguageSlot::load(self, dir)
+    }
+
+    fn unload(&mut self) -> bool {
+        LanguageSlot::unload(self)
     }
 }
 
@@ -459,13 +510,30 @@ impl<S: Slot> Residents<S> {
         self.loaded.as_ref()
     }
 
+    /// The slot, to look at rather than to drive.
+    pub fn slot(&self) -> &S {
+        &self.slot
+    }
+
+    /// The slot itself, for the one caller that has something to ask the model
+    /// in it.
+    ///
+    /// Deliberately narrow. Everything about *lifetime* goes through
+    /// [`Residents::ensure`] and [`Residents::sweep`]; this is only how a
+    /// request reaches the model those two decided should be resident, and a
+    /// caller that used it to load or unload would be taking the decision back
+    /// out of the one place that makes it.
+    pub fn slot_mut(&mut self) -> &mut S {
+        &mut self.slot
+    }
+
     /// Make the resident model be the one that is wanted.
     ///
     /// This is the only thing that loads. `wanted` comes from the configuration
     /// as it stands *now*, so a reconfiguration is not an event anything has to
     /// be told about: the next request notices that what is resident is not
     /// what is chosen, and the plan says to let go of it first.
-    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
         match residency::on_demand(self.loaded.as_ref(), wanted) {
             Plan::Keep => Ok(()),
             Plan::Release => {
@@ -501,7 +569,7 @@ impl<S: Slot> Residents<S> {
         self.slot.unload()
     }
 
-    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), S::Error> {
         let Some(wanted) = wanted else {
             return Ok(());
         };
@@ -516,7 +584,10 @@ impl<S: Slot> Residents<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Curl, Fetcher, Policy, PullError, Residents, install, installed, pull, remove};
+    use super::{
+        Curl, Fetcher, Policy, PullError, Residents, cleanup_policy, install, installed, pull,
+        remove,
+    };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, TOKENIZER_FILE, WEIGHTS_FILE};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
@@ -607,6 +678,8 @@ mod tests {
     }
 
     impl super::Slot for Recording {
+        type Error = ayeaye_infer::SpeechError;
+
         fn load(&mut self, dir: &Path) -> Result<(), ayeaye_infer::SpeechError> {
             self.resident = Some(dir.to_path_buf());
             self.at_once += 1;
@@ -693,6 +766,8 @@ mod tests {
     fn a_load_that_fails_leaves_nothing_claimed() {
         struct Refuses;
         impl super::Slot for Refuses {
+            type Error = ayeaye_infer::SpeechError;
+
             fn load(&mut self, _: &Path) -> Result<(), ayeaye_infer::SpeechError> {
                 Err(ayeaye_infer::SpeechError::NotLoaded)
             }
@@ -884,6 +959,79 @@ mod tests {
             !dir.with_extension("replaced").exists(),
             "and nothing may be left sitting beside it under another name"
         );
+    }
+
+    // AYEAYE-58 — the cleanup pass is configured through `Policy::resolve`, not
+    // assembled by hand out of the prompt.
+    //
+    // The difference is not tidiness. A hand-built policy pairs somebody's own
+    // prompt with the *default* prompt's echo phrases — guarding against
+    // instructions nobody is giving, and refusing a legitimate rewrite that
+    // happens to contain the words — and leaves the template and the token
+    // budget reading nothing at all, which on a Llama-3 model is a cleanup pass
+    // that quietly answers dictations instead of rewriting them.
+    #[test]
+    fn the_cleanup_pass_is_configured_rather_than_assembled() {
+        let scratch = Scratch::named("cleanup-policy");
+        let file = scratch.0.join("env");
+        std::fs::write(
+            &file,
+            "AYEAYE_CLEANUP_PROMPT=Say it back in French.\n\
+             AYEAYE_CLEANUP_ECHOES=say it back, en francais\n\
+             AYEAYE_CLEANUP_TEMPLATE=llama3\n\
+             AYEAYE_CLEANUP_MAX_TOKENS=64\n",
+        )
+        .expect("a configuration file");
+
+        let policy = cleanup_policy(&file).expect("it should resolve");
+
+        assert_eq!(policy.system_prompt, "Say it back in French.");
+        assert_eq!(policy.echoes, vec!["say it back", "en francais"]);
+        assert_eq!(policy.template, ayeaye_core::chat::Template::llama3());
+        assert_eq!(policy.max_new_tokens, 64);
+        // Which is observable rather than bookkeeping: the prompt really is
+        // rendered in the family the file named.
+        assert!(
+            policy.prompt("bonjour").starts_with("<|begin_of_text|>"),
+            "{}",
+            policy.prompt("bonjour")
+        );
+    }
+
+    // AYEAYE-58 — a prompt on its own drops the default prompt's tells with it,
+    // which is the coupling `Policy::resolve` exists to keep and the one a
+    // hand-built policy breaks silently.
+    #[test]
+    fn naming_only_a_prompt_leaves_the_old_prompts_tells_behind() {
+        let scratch = Scratch::named("cleanup-echoes");
+        let file = scratch.0.join("env");
+        std::fs::write(&file, "AYEAYE_CLEANUP_PROMPT=Say it back in French.\n")
+            .expect("a configuration file");
+
+        let policy = cleanup_policy(&file).expect("it should resolve");
+
+        assert_eq!(policy.system_prompt, "Say it back in French.");
+        assert!(
+            policy.echoes.is_empty(),
+            "the default prompt's tells guard nothing on somebody else's prompt: {:?}",
+            policy.echoes
+        );
+    }
+
+    // AYEAYE-58 — a machine nobody has configured is not an error, and a
+    // template nobody implements is. Falling back to the default there would
+    // leave a model answering dictations with no symptom but worse output.
+    #[test]
+    fn no_file_is_the_default_pass_and_a_template_nobody_has_is_refused() {
+        let scratch = Scratch::named("cleanup-absent");
+
+        let bare = cleanup_policy(&scratch.0.join("nothing-here")).expect("no file resolves");
+        assert_eq!(bare, super::CleanupPolicy::default());
+
+        let file = scratch.0.join("env");
+        std::fs::write(&file, "AYEAYE_CLEANUP_TEMPLATE=alpaca\n").expect("a configuration file");
+        let refused = cleanup_policy(&file).expect_err("a template nobody implements");
+        assert!(refused.to_string().contains("alpaca"), "{refused}");
     }
 
     // AYEAYE-56 — `--fail` and `--location` are not decoration. Without the

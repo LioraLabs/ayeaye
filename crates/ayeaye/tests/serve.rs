@@ -179,6 +179,27 @@ impl Server {
         self.request("GET", path, &[("X-Voice-Token", TOKEN)]).await
     }
 
+    /// A clip of audio, posted the way the page posts one.
+    ///
+    /// Not JSON: `/api/dictate` is the one endpoint whose body is the data
+    /// itself, with the pane and the container in the query.
+    async fn clip(&self, path: &str, body: &str) -> Answer {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        let length = body.len().to_string();
+        self.request_with_body(
+            "POST",
+            path,
+            &[
+                ("Origin", origin.as_bytes()),
+                ("X-Voice-Token", TOKEN.as_bytes()),
+                ("Content-Type", b"application/octet-stream"),
+                ("Content-Length", length.as_bytes()),
+            ],
+            body.as_bytes(),
+        )
+        .await
+    }
+
     /// A write, presented the way the panel presents one.
     ///
     /// The `Origin` is this server's own and the token is the test token,
@@ -241,6 +262,16 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // is running the suite. Recovery across a restart is proved in
         // `tests/fit.rs`, where the file is the test's own.
         fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
+        // No models and a converter that is not there, so nothing here can load
+        // a model or start a process by accident. The cases that care about
+        // voice say so.
+        voice: Arc::new(ayeaye::dictate::Voice::new(
+            std::path::PathBuf::from("/nonexistent/store"),
+            ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
+                .expect("the defaults resolve"),
+            ayeaye_core::cleanup::Policy::default(),
+            "ayeaye-58-no-such-converter".to_string(),
+        )),
     }
 }
 
@@ -2756,4 +2787,264 @@ async fn the_session_endpoint_is_gated_like_the_rest_of_the_api() {
 /// Percent-encode the characters a pane id can carry that a query cannot.
 fn urlencode(text: &str) -> String {
     form_urlencoded::byte_serialize(text.as_bytes()).collect()
+}
+
+/// The same settings, with a voice of the caller's own.
+///
+/// Voice is the one thing on `Settings` that can start a process and load a
+/// model, so it is spelled out per test rather than shared: a case that does not
+/// mention it gets one that can do neither.
+fn settings_with_voice(port: u16, voice: ayeaye::dictate::Voice) -> Settings {
+    Settings {
+        voice: Arc::new(voice),
+        ..settings_on_port(port)
+    }
+}
+
+/// A model store of this test's own, removed when it goes out of scope.
+struct Store(std::path::PathBuf);
+
+impl Store {
+    fn named(what: &str) -> Store {
+        let path = scratch().join(format!("store-{what}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a store");
+        Store(path)
+    }
+
+    /// Put a model in it, as a pull would have.
+    fn holding(self, id: &str) -> Store {
+        let id = ayeaye_core::model::ModelId::parse(id).expect("a well-formed id");
+        std::fs::create_dir_all(self.0.join(id.relative_dir())).expect("a model directory");
+        self
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A voice pointed at a store, with a converter that is really there or a name
+/// that is not.
+fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictate::Voice {
+    let file = speech
+        .map(|id| format!("AYEAYE_SPEECH_MODEL={id}\n"))
+        .unwrap_or_default();
+    ayeaye::dictate::Voice::new(
+        store.0.clone(),
+        ayeaye_core::model::settings::ModelSettings::resolve(|_| None, &file)
+            .expect("a readable configuration"),
+        ayeaye_core::cleanup::Policy::default(),
+        converter.to_string(),
+    )
+}
+
+// AYEAYE-58
+//
+// The capability probe, over a socket. It is what the page reads to decide
+// whether the talk button is live, so it has to be honest in both directions: a
+// machine with nothing says so and names the next thing to do, and a machine
+// with a model and a converter says it can dictate.
+#[tokio::test]
+async fn the_capability_probe_says_what_is_missing_and_what_is_not() {
+    let bare = Store::named("probe-bare");
+    let server = Server::start(settings_with_voice(
+        0,
+        voice(&bare, None, "ayeaye-58-no-such-converter"),
+    ))
+    .await;
+
+    let answer = server
+        .request("GET", "/api/voice", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert!(
+        answer.body_text().contains(r#""voice":false"#),
+        "{}",
+        answer.body_text()
+    );
+    assert!(
+        answer.body_text().contains("converter"),
+        "{}",
+        answer.body_text()
+    );
+
+    let ready = Store::named("probe-ready").holding("openai/whisper-small.en");
+    let server = Server::start(settings_with_voice(
+        0,
+        voice(&ready, Some("openai/whisper-small.en"), "sh"),
+    ))
+    .await;
+    let answer = server
+        .request("GET", "/api/voice", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert!(
+        answer.body_text().contains(r#""voice":true"#),
+        "{}",
+        answer.body_text()
+    );
+    assert!(
+        answer.body_text().contains(r#""why":null"#),
+        "{}",
+        answer.body_text()
+    );
+}
+
+// AYEAYE-58
+//
+// Both voice paths are gated. A POST here starts a model and reads a pane, and
+// the probe reports what somebody has installed on their machine.
+#[tokio::test]
+async fn neither_voice_endpoint_answers_without_a_token() {
+    let server = Server::started().await;
+
+    for (method, path) in [("GET", "/api/voice"), ("POST", "/api/dictate")] {
+        let answer = server.request(method, path, &[]).await;
+        assert_eq!(answer.status, 401, "{method} {path}");
+        assert!(answer.body_text().contains("unauthorized"));
+    }
+}
+
+// AYEAYE-58
+//
+// A server with no voice refuses up front rather than failing partway down the
+// pipeline. The page shows the reason, so it has to be the next thing to do
+// rather than "voice not configured".
+#[tokio::test]
+async fn a_server_with_no_voice_refuses_a_clip_and_says_what_to_do_about_it() {
+    let bare = Store::named("dictate-bare");
+    let server = Server::start(settings_with_voice(
+        0,
+        voice(&bare, None, "ayeaye-58-no-such-converter"),
+    ))
+    .await;
+
+    let answer = server.clip("/api/dictate", "not really audio").await;
+
+    assert_eq!(answer.status, 503);
+    let body = answer.body_text();
+    assert!(body.contains(r#""error""#), "{body}");
+    assert!(body.contains("converter"), "{body}");
+}
+
+// AYEAYE-58
+//
+// A model chosen and never pulled is the state a machine is in between two
+// commands. It is a refusal that names the model, not a stack trace and not a
+// silent empty transcription.
+#[tokio::test]
+async fn a_model_that_was_chosen_and_never_pulled_is_named_in_the_refusal() {
+    let store = Store::named("dictate-unpulled");
+    let server = Server::start(settings_with_voice(
+        0,
+        voice(&store, Some("openai/whisper-small.en"), "sh"),
+    ))
+    .await;
+
+    let answer = server.clip("/api/dictate", "not really audio").await;
+
+    assert_eq!(answer.status, 503);
+    assert!(
+        answer.body_text().contains("whisper-small.en"),
+        "{}",
+        answer.body_text()
+    );
+}
+
+// AYEAYE-58
+//
+// A container this build does not read is refused, and the answer says which
+// one it was — the client chose it, and it is the thing to change.
+#[tokio::test]
+async fn a_container_this_build_does_not_read_is_refused_over_the_socket() {
+    let store = Store::named("dictate-ext").holding("openai/whisper-small.en");
+    let server = Server::start(settings_with_voice(
+        0,
+        voice(&store, Some("openai/whisper-small.en"), "sh"),
+    ))
+    .await;
+
+    let answer = server
+        .clip("/api/dictate?ext=exe", "not really audio")
+        .await;
+
+    assert_eq!(answer.status, 400);
+    assert!(answer.body_text().contains("exe"), "{}", answer.body_text());
+}
+
+// AYEAYE-58
+//
+// A cross-site POST is refused before a byte of the clip is read, which is the
+// property the handler's ordering exists for: an attacker's thirty megabytes
+// must not be buffered on the way to a 403.
+#[tokio::test]
+async fn a_cross_site_clip_is_refused_before_it_is_read() {
+    let server = Server::started().await;
+
+    let answer = server
+        .request_with_body(
+            "POST",
+            "/api/dictate",
+            &[
+                ("X-Voice-Token", TOKEN.as_bytes()),
+                ("Origin", b"https://evil.example"),
+                ("Sec-Fetch-Site", b"cross-site"),
+                ("Content-Length", b"16"),
+            ],
+            b"not really audio",
+        )
+        .await;
+
+    assert_eq!(answer.status, 403);
+    assert!(answer.body_text().contains("forbidden"));
+}
+
+// AYEAYE-58
+//
+// The names come off the pane the request named, through the same membership
+// check every other pane-shaped endpoint makes. A pane this machine does not
+// list contributes nothing rather than refusing the dictation: the hint is an
+// improvement to the spelling, and losing it must not cost somebody their words.
+#[tokio::test]
+async fn the_names_are_read_off_the_pane_the_request_named() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = Private::named("serve-vocabulary") else {
+        return;
+    };
+    server
+        .tmux(&["send-keys", "-t", "work", "-l", "--", "ls parse_config.py"])
+        .expect("the test's own tmux should take the text");
+    server
+        .tmux(&["send-keys", "-t", "work", "Enter"])
+        .expect("and submit it");
+
+    let settings = Settings {
+        tmux: server.layer(),
+        ..settings_on_port(0)
+    };
+    let running = Server::start(settings.clone()).await;
+    let panes = running.api("/api/panes").await.body_text();
+    let pane = first_pane_id(&panes);
+
+    let names = ayeaye::server::pane_vocabulary(&settings, &pane).await;
+    assert!(
+        names.contains("parse_config.py"),
+        "the identifier on the screen is missing from {names:?}"
+    );
+
+    // A pane on another machine, and a pane that is not there at all: no names,
+    // and no refusal.
+    assert_eq!(
+        ayeaye::server::pane_vocabulary(&settings, "elsewhere/%0").await,
+        ""
+    );
+    assert_eq!(
+        ayeaye::server::pane_vocabulary(&settings, "desktop/%99").await,
+        ""
+    );
+    assert_eq!(ayeaye::server::pane_vocabulary(&settings, "").await, "");
 }

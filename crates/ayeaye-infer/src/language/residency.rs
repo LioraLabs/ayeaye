@@ -61,8 +61,18 @@ impl LanguageSlot {
     /// a log — and a dictation path should call [`LanguageSlot::clean`] instead,
     /// or pair this with `ayeaye_core::cleanup::settle` itself.
     pub fn rewrite(&mut self, raw: &str, policy: &Policy) -> Result<String, LanguageError> {
+        self.rewrite_with(raw, "", policy)
+    }
+
+    /// The same, told which names are on the speaker's screen.
+    pub fn rewrite_with(
+        &mut self,
+        raw: &str,
+        names: &str,
+        policy: &Policy,
+    ) -> Result<String, LanguageError> {
         match self.model.as_mut() {
-            Some(model) => model.rewrite(raw, policy),
+            Some(model) => model.rewrite_with(raw, names, policy),
             None => Err(LanguageError::NotLoaded),
         }
     }
@@ -79,10 +89,20 @@ impl LanguageSlot {
     /// told what `settle` already knows, and a model handed a blank dictation
     /// writes one.
     pub fn clean(&mut self, raw: &str, policy: &Policy) -> Cleaned {
+        self.clean_with(raw, "", policy)
+    }
+
+    /// The same, told which names are on the speaker's screen. **Also cannot
+    /// fail.**
+    ///
+    /// This is the method a dictation path calls. A screen that could not be
+    /// captured is no names rather than no cleanup: the hint is an improvement
+    /// to the spelling, and losing it must not cost the rewrite.
+    pub fn clean_with(&mut self, raw: &str, names: &str, policy: &Policy) -> Cleaned {
         if !worth_cleaning(raw) {
             return settle(policy, raw, None);
         }
-        let candidate = self.rewrite(raw, policy).ok();
+        let candidate = self.rewrite_with(raw, names, policy).ok();
         settle(policy, raw, candidate.as_deref())
     }
 }

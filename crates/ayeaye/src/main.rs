@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[1..]),
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
+        Some("dictate") => dictate_verb(&args[1..]),
         None => {
             println!("{}", banner());
             ExitCode::SUCCESS
@@ -46,10 +47,12 @@ const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
        ayeaye model <ls|pull ID|use ID|rm ID>
+       ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
   service    manage the service this binary installs for itself
   model      fetch and choose the models this binary runs
+  dictate    toggle dictation for one pane; bind it to a key in tmux
   --version  print the version and what this build can do
   --help     this
 
@@ -72,7 +75,8 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_PROJECT_BUDGET seconds one walk may spend (default 4)
   AYEAYE_PROJECT_WAIT   seconds a request waits for a walk (default 0.4)
   AYEAYE_PROJECT_TTL    seconds a finished search stays usable (default 60)
-  AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated";
+  AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated
+  VOICE_PORT            the port the recording agent listens on (default 8787)";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {
@@ -96,14 +100,54 @@ fn serve(args: &[String]) -> ExitCode {
     // is: both are the machine's answer rather than the caller's, and neither
     // should depend on which flags were typed.
     let cliban = ayeaye::cliban::Cliban::new(config::locate_cliban());
-    let settings =
-        match Settings::resolve(args, config::env_var, token, nodename(&Subprocess), cliban) {
-            Ok(settings) => settings,
-            Err(why) => {
-                eprintln!("ayeaye: {why}\n\n{USAGE}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // Voice is a progressive enhancement: a machine with no models and no
+    // converter serves everything else, and the probe is what tells the page so.
+    // A configuration file it cannot read is a different matter — that is a typo
+    // somebody has to be told about rather than a feature to switch off.
+    // Where models live has to be one answer, and a daemon that cannot name it
+    // is a daemon whose voice would look configured and never load anything.
+    // Refused rather than defaulted to the working directory, which is wherever
+    // a service manager happened to start this.
+    let Some(store) = config::state_dir() else {
+        return complain(
+            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+    let models = match models::settings(&config_file) {
+        Ok(models) => models,
+        Err(why) => {
+            eprintln!("ayeaye: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let policy = match models::cleanup_policy(&config_file) {
+        Ok(policy) => policy,
+        Err(why) => {
+            eprintln!("ayeaye: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let voice = Arc::new(ayeaye::dictate::Voice::new(
+        store,
+        models,
+        policy,
+        ayeaye::audio::CONVERTER.to_string(),
+    ));
+    let settings = match Settings::resolve(
+        args,
+        config::env_var,
+        token,
+        nodename(&Subprocess),
+        cliban,
+        voice,
+    ) {
+        Ok(settings) => settings,
+        Err(why) => {
+            eprintln!("ayeaye: {why}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The runtime is built here rather than with `#[tokio::main]` so that the
     // banner and the argument errors above cost nothing to reach: they are the
@@ -240,6 +284,177 @@ fn model_verb(args: &[String]) -> ExitCode {
         },
         _ => complain("usage: ayeaye model <ls|pull ID|use ID|rm ID>"),
     }
+}
+
+/// `ayeaye dictate <pane> [client-pid]` — one press of the dictation key.
+///
+/// Bound to a key in tmux, which is why it says everything on the status line
+/// and nothing on stdout: `run-shell -b` discards both streams, so a message
+/// written here would be a key that silently did nothing.
+///
+/// **The pane id must be qualified** — `desktop/%3`, like every id in this app —
+/// and the host half has to be the name this machine goes by, because the pane
+/// is looked up in the list under that name. A bare `#{pane_id}` is refused:
+/// `PaneId::parse` has nothing to split, so there is no host to compare.
+///
+/// A tmux binding therefore spells it `#{host}/#{pane_id}`, and that only agrees
+/// with this binary while nobody has set `AYEAYE_NAME` — tmux's `#{host}` is
+/// `gethostname()`, and `AYEAYE_NAME` overrides it. A machine that sets it has
+/// to write the same name into the binding, or every dictation is refused with
+/// "is not a pane on this machine". `ayeaye::config::machine_name` is the one
+/// rule; there is nothing that can reconcile it with a string in somebody's
+/// `tmux.conf`, so it is said here instead.
+fn dictate_verb(args: &[String]) -> ExitCode {
+    let Some(pane) = args.first() else {
+        return complain("usage: ayeaye dictate <pane> [client-pid]");
+    };
+    let Some(store) = config::state_dir() else {
+        return complain(
+            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let token = match std::fs::read_to_string(agent_token_path()) {
+        Ok(token) => token.trim().to_string(),
+        Err(why) => {
+            return complain(&format!(
+                "no recorder token at {}: {why}",
+                agent_token_path().display()
+            ));
+        }
+    };
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+    let models = match models::settings(&config_file) {
+        Ok(models) => models,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    let policy = match models::cleanup_policy(&config_file) {
+        Ok(policy) => policy,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+
+    // What this machine calls itself, in the same order `Settings::resolve`
+    // reads it — the two have to agree, or a pane id written by the daemon is
+    // one this toggle cannot find in its own pane list.
+    // The same function the daemon names itself with, not a second spelling of
+    // the same rule: the ids in the state file were qualified by the daemon, and
+    // a toggle that disagreed about this name could not find any of them.
+    let named = ayeaye::config::machine_name(config::env_var, nodename(&Subprocess));
+    let here = match ayeaye_core::peer::HostName::new(&named) {
+        Ok(here) => here,
+        Err(why) => {
+            return complain(&format!(
+                "ayeaye: {:?} cannot be a machine name: {why:?}",
+                named
+            ));
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(why) => return complain(&format!("ayeaye: could not start the async runtime: {why}")),
+    };
+    runtime.block_on(async move {
+        let tmux = ayeaye::tmux::Tmux::new();
+        let voice = ayeaye::dictate::Voice::new(
+            store.clone(),
+            models,
+            policy,
+            ayeaye::audio::CONVERTER.to_string(),
+        );
+        let state = store.join(ayeaye::dictate::STATE_FILE);
+        let toggle = ayeaye::dictate::Toggle {
+            tmux: &tmux,
+            here,
+            voice: &voice,
+            state: &state,
+            token,
+            port: agent_port(),
+        };
+        // Only asked on the way *in*. The second press talks to the machine the
+        // first one recorded, which is what the state file is for: a client that
+        // has since detached must not send the audio somewhere else.
+        let peer = match ayeaye::dictate::read_state(&state) {
+            Some(_) => None,
+            None => recording_peer(&tmux, pane, args.get(1).map(String::as_str)).await,
+        };
+
+        let said = toggle.press(pane, peer.as_deref()).await;
+        if said.is_empty() {
+            return ExitCode::SUCCESS;
+        }
+        // The status line, because there is no window to use and nothing reads
+        // this process's streams.
+        //
+        // `#` is doubled because `display-message` expands `#{...}` formats, and
+        // this message can carry a converter's own stderr. tmux's escape for a
+        // literal `#` is `##`, so this is the one place the text is quoted for
+        // the thing that will interpret it — the same care `send-keys -l --`
+        // takes next door, for the same reason.
+        let _ = tmux
+            .ask(&["display-message", &said.replace('#', "##")])
+            .await;
+        eprintln!("{said}");
+        ExitCode::FAILURE
+    })
+}
+
+/// The address the tmux client is connected from, or `None` if it is local.
+///
+/// This half is the asking: which clients the pane's session has. The deciding
+/// is `ayeaye::dictate::recording_peer`, which takes the process backend as an
+/// argument and is where the rule is written down and tested.
+async fn recording_peer(
+    tmux: &ayeaye::tmux::Tmux,
+    pane: &str,
+    passed: Option<&str>,
+) -> Option<String> {
+    // The methods below belong to `ayeaye::process::Processes`, and the trait is
+    // not imported: `here()` hands back a `dyn Processes`, whose methods are
+    // callable without it.
+    let processes = ayeaye::process::here();
+    let local = ayeaye_core::peer::PaneId::parse(pane)
+        .map(|id| id.pane().to_string())
+        .unwrap_or_else(|_| pane.to_string());
+
+    let session = tmux
+        .ask(&["display-message", "-p", "-t", &local, "#{session_name}"])
+        .await
+        .unwrap_or_default();
+    let clients = tmux
+        .ask(&["list-clients", "-t", session.trim(), "-F", "#{client_pid}"])
+        .await
+        .unwrap_or_default();
+    let clients: Vec<u32> = clients
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect();
+
+    ayeaye::dictate::recording_peer(processes.as_ref(), passed, &clients)
+}
+
+/// Where the shared secret the recording agent checks lives.
+///
+/// `bin/voice-dictate`'s path, and deliberately the same file: the agent on the
+/// phone is the Python one and stays that way, so the secret has to be the one
+/// it was set up with.
+fn agent_token_path() -> PathBuf {
+    let base = from_environment("XDG_CONFIG_HOME")
+        .unwrap_or_else(|| format!("{}/.config", from_environment("HOME").unwrap_or_default()));
+    PathBuf::from(base).join("voice-dictate/token")
+}
+
+/// The port the recording agent listens on.
+///
+/// `VOICE_PORT`, plainly, because that is the name `bin/voice-agent` reads on
+/// the phone and the two have to agree. Deliberately *not* through
+/// `config::env_var`, which would also answer to `AYEAYE_VOICE_PORT` and
+/// `VOICE_REMOTE_VOICE_PORT` — doubly-prefixed names that exist nowhere else,
+/// are in no documentation, and would each be a second place this setting could
+/// come from.
+fn agent_port() -> u16 {
+    from_environment("VOICE_PORT")
+        .and_then(|port| port.trim().parse().ok())
+        .unwrap_or(ayeaye::recorder::DEFAULT_PORT)
 }
 
 /// A byte count somebody can read at a glance.

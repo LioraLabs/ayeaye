@@ -15,6 +15,7 @@ pub mod audio;
 pub mod board;
 pub mod chat;
 pub mod cleanup;
+pub mod dictation;
 pub mod fit;
 pub mod http;
 pub mod identity;
@@ -34,6 +35,7 @@ pub mod service;
 pub mod session;
 pub mod sha1;
 pub mod tmux;
+pub mod vocab;
 
 pub use audio::Pcm16kMono;
 pub use identity::Identity;

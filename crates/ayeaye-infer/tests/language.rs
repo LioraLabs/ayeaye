@@ -415,3 +415,41 @@ fn a_blank_dictation_is_not_worth_a_model_and_is_never_rewritten() {
     assert_eq!(cleaned.text(), "   ");
     assert_eq!(cleaned.kept(), Some(Kept::NothingSaid));
 }
+
+// AYEAYE-58
+//
+// The names on the speaker's screen have to reach the prompt a model is really
+// given, and the only way to observe that through a model whose output is noise
+// is to make them count: the same dictation fits this window on its own and does
+// not fit it with four hundred characters of identifiers in front of it, so the
+// refusal *is* the evidence they were there.
+//
+// And the refusal is still not loss. `clean_with` is the total half of the pair,
+// so a dictation that could not be cleaned up comes back as the words the
+// speaker said rather than as nothing.
+#[test]
+fn the_names_on_the_screen_reach_the_prompt_and_a_refusal_still_returns_the_dictation() {
+    let dir = tiny_model_named("vocabulary", "qwen2");
+    let mut slot = LanguageSlot::empty();
+    slot.load(dir.path()).expect("a complete model loads");
+    let policy = Policy::default();
+    let raw = "run the parse config tests";
+
+    slot.rewrite(raw, &policy)
+        .expect("this dictation fits the window on its own");
+
+    // A full screen's worth of names, which is what `ayeaye_core::vocab` is
+    // bounded to hand over.
+    let names = "parse_config_module_name ".repeat(WINDOW);
+    let refused = slot
+        .rewrite_with(raw, &names, &policy)
+        .expect_err("the same dictation with the names in front of it does not fit");
+    assert!(
+        refused.to_string().contains(&WINDOW.to_string()),
+        "{refused}"
+    );
+
+    let cleaned = slot.clean_with(raw, &names, &policy);
+    assert_eq!(cleaned.text(), raw);
+    assert_eq!(cleaned.kept(), Some(Kept::Unavailable));
+}

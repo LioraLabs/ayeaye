@@ -32,8 +32,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # the project walk is cancelled by. `fs` because a spawn stats the project
 # directory and reads its `.tmux.yaml` from inside a request — one syscall each
 # on a local path, but `dir` arrives from the network and a blocking stat under
-# a hung mount would take a runtime worker with it.
-tokio = { version = "1", features = ["fs", "rt-multi-thread", "net", "process", "time", "sync"] }
+# a hung mount would take a runtime worker with it. `io-util` for the recording
+# agent client, which is a socket and a few hundred bytes of HTTP rather than a
+# crate — see `src/recorder.rs` for why that is not a shortcut.
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "net", "process", "time", "sync"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.

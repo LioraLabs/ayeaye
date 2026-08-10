@@ -158,6 +158,15 @@ async fn the_picker_answers_over_a_socket() {
         pane_cache: Arc::new(Mutex::new(ayeaye_core::pane::Cache::default())),
         fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
         agents: ayeaye::session::Agents::under(&tree.path),
+        // Nothing here can load a model or start a process by accident; the
+        // cases that care about voice build their own.
+        voice: std::sync::Arc::new(ayeaye::dictate::Voice::new(
+            std::path::PathBuf::from("/nonexistent/store"),
+            ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
+                .expect("the defaults resolve"),
+            ayeaye_core::cleanup::Policy::default(),
+            "ayeaye-58-no-such-converter".to_string(),
+        )),
     };
     let listener = ayeaye::server::listen(&settings)
         .await

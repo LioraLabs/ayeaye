@@ -184,6 +184,13 @@ fn settings(tmux: ayeaye::tmux::Tmux, agents: Agents) -> ayeaye::config::Setting
         "test-token-not-a-real-secret".to_string(),
         Some("desktop".to_string()),
         ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
+        std::sync::Arc::new(ayeaye::dictate::Voice::new(
+            std::path::PathBuf::from("/nonexistent/store"),
+            ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
+                .expect("the defaults resolve"),
+            ayeaye_core::cleanup::Policy::default(),
+            "ayeaye-45-no-such-converter".to_string(),
+        )),
     )
     .expect("settings a test can drive");
     settings.tmux = tmux;

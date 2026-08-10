@@ -11,14 +11,17 @@
 
 pub mod agent;
 pub mod assets;
+pub mod audio;
 pub mod board;
 pub mod cliban;
 pub mod command;
 pub mod config;
+pub mod dictate;
 pub mod fit;
 pub mod models;
 pub mod process;
 pub mod projects;
+pub mod recorder;
 pub mod server;
 pub mod session;
 pub mod tmux;
