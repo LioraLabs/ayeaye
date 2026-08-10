@@ -12,6 +12,7 @@
 
 pub mod audio;
 pub mod chat;
+pub mod cleanup;
 pub mod http;
 pub mod identity;
 pub mod json;
