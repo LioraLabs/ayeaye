@@ -316,6 +316,144 @@ fn unquote(value: &str) -> String {
     }
 }
 
+// ------------------------------------------------- who to ask to change it
+
+/// The tool that installs software on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    AptGet,
+    Dnf,
+    Yum,
+    Pacman,
+    Zypper,
+    Brew,
+    None,
+}
+
+impl PackageManager {
+    /// The command's own name, which is also the word a caller matches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageManager::AptGet => "apt-get",
+            PackageManager::Dnf => "dnf",
+            PackageManager::Yum => "yum",
+            PackageManager::Pacman => "pacman",
+            PackageManager::Zypper => "zypper",
+            PackageManager::Brew => "brew",
+            PackageManager::None => "none",
+        }
+    }
+}
+
+/// What may be installed here, and what may only be asked.
+///
+/// The two are not the same on an image-based system: dnf or zypper is right
+/// there, installing with it does not survive a reboot, and asking it what is
+/// already present is a read that makes the manual instructions much better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Packaging {
+    /// What the shell may install with. `None` sends it down the manual path.
+    pub manager: PackageManager,
+    /// The tool that is really there, whether or not installing with it lasts.
+    pub tool: PackageManager,
+}
+
+/// The service manager this project can install a *user* service into.
+///
+/// Narrower than it looks, on purpose: a machine plainly running systemd as pid
+/// 1 still answers `None` under sudo or before the session is up, because that
+/// is the honest answer to "can I install a user service here", which is the
+/// only question this project asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceManager {
+    Systemd,
+    Launchd,
+    None,
+}
+
+impl ServiceManager {
+    /// The lower-case word a caller matches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceManager::Systemd => "systemd",
+            ServiceManager::Launchd => "launchd",
+            ServiceManager::None => "none",
+        }
+    }
+}
+
+/// Which package manager this machine has, and which one it may use.
+///
+/// A family names the candidates and `available` — the commands the shell found
+/// on `PATH` — decides which is really there. Claiming apt-get on a debian
+/// container that has had it removed would send the shell off to run a command
+/// that does not exist. `has_brew` is separate from `available` because Homebrew
+/// installed in this same session is in its prefix and not yet on `PATH`.
+pub fn packaging(family: Family, immutable: bool, available: &[&str], has_brew: bool) -> Packaging {
+    let candidates: &[PackageManager] = match family {
+        Family::Debian => &[PackageManager::AptGet],
+        Family::Fedora => &[PackageManager::Dnf, PackageManager::Yum],
+        Family::Arch => &[PackageManager::Pacman],
+        Family::Suse => &[PackageManager::Zypper],
+        Family::Macos => &[PackageManager::Brew],
+        Family::Unknown => &[],
+    };
+    let tool = candidates
+        .iter()
+        .copied()
+        .find(|candidate| match candidate {
+            PackageManager::Brew => has_brew,
+            other => available.contains(&other.as_str()),
+        })
+        .unwrap_or(PackageManager::None);
+    Packaging {
+        manager: if immutable {
+            PackageManager::None
+        } else {
+            tool
+        },
+        tool,
+    }
+}
+
+/// Which service manager a user service can be installed into.
+///
+/// `user_bus_responds` is what `systemctl --user show-environment` answered: a
+/// container has the binary and no user session, and enabling a unit there fails
+/// after setup has promised it would work.
+pub fn service_manager(os: Os, available: &[&str], user_bus_responds: bool) -> ServiceManager {
+    if os == Os::Macos {
+        return if available.contains(&"launchctl") {
+            ServiceManager::Launchd
+        } else {
+            ServiceManager::None
+        };
+    }
+    if available.contains(&"systemctl") && user_bus_responds {
+        ServiceManager::Systemd
+    } else {
+        ServiceManager::None
+    }
+}
+
+/// Where Homebrew is installed, worked out from where its binary was found.
+///
+/// Path arithmetic and never `brew --prefix`, because asking would mean running
+/// it. A `command -v brew` that answered with something which is not a path at
+/// all — a shell function or an alias by that name — is not a Homebrew.
+pub fn brew_prefix_of(brew_path: &str) -> Option<String> {
+    if !brew_path.starts_with('/') {
+        return None;
+    }
+    let directory = brew_path.rsplit_once('/').map(|(head, _)| head)?;
+    let prefix = directory.strip_suffix("/bin").unwrap_or(directory);
+    Some(if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        prefix.to_string()
+    })
+}
+
 /// ASCII lower case. Deepin has shipped `ID=Deepin`, and os-release ids are
 /// compared, not displayed.
 fn lower(text: &str) -> String {
@@ -324,7 +462,10 @@ fn lower(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, Os, identify};
+    use super::{
+        Family, Os, PackageManager, ServiceManager, brew_prefix_of, identify, packaging,
+        service_manager,
+    };
 
     /// The captured probe output the shell suite reads, reaching a pure crate
     /// the only way it may: at compile time.
@@ -547,5 +688,103 @@ mod tests {
 
         assert!(!distro(fixture!("os-release/fedora-40")).immutable);
         assert!(!distro(fixture!("os-release/debian-12")).immutable);
+    }
+
+    // AYEAYE-60 — a family names the candidates and PATH decides. The
+    // fixtures under tests/fixtures/pkg-commands pin which tool each family's
+    // generated command line is built around.
+    #[test]
+    fn each_family_reaches_for_the_tool_its_pkg_command_fixture_names() {
+        let corpus: &[(Family, &[&str], &str)] = &[
+            (Family::Debian, &["apt-get"], "apt-get"),
+            (Family::Fedora, &["dnf", "yum"], "dnf"),
+            (Family::Fedora, &["yum"], "yum"),
+            (Family::Arch, &["pacman"], "pacman"),
+            (Family::Suse, &["zypper"], "zypper"),
+            (Family::Unknown, &["apt-get", "dnf", "pacman"], "none"),
+        ];
+        for (family, available, want) in corpus {
+            let got = packaging(*family, false, available, false);
+            assert_eq!(got.manager.as_str(), *want, "{family:?} with {available:?}");
+        }
+    }
+
+    // AYEAYE-60
+    #[test]
+    fn a_family_whose_tool_is_not_installed_says_none_rather_than_naming_it() {
+        // A debian container that has had apt-get removed is a real machine,
+        // and running a command that is not there is not a plan.
+        let stripped = packaging(Family::Debian, false, &["dpkg"], false);
+        assert_eq!(stripped.manager, PackageManager::None);
+        assert_eq!(stripped.tool, PackageManager::None);
+    }
+
+    // AYEAYE-60 — Homebrew is not a property of macOS: it is in its prefix
+    // before it is on PATH, and it exists on Linux too.
+    #[test]
+    fn homebrew_counts_when_it_is_installed_rather_than_when_it_is_on_the_path() {
+        assert_eq!(
+            packaging(Family::Macos, false, &[], true).manager,
+            PackageManager::Brew
+        );
+        assert_eq!(
+            packaging(Family::Macos, false, &["brew"], false).manager,
+            PackageManager::None,
+            "a shell function named brew is not a Homebrew"
+        );
+        assert_eq!(
+            brew_prefix_of("/opt/homebrew/bin/brew").as_deref(),
+            Some("/opt/homebrew")
+        );
+        assert_eq!(
+            brew_prefix_of("/home/linuxbrew/.linuxbrew/bin/brew").as_deref(),
+            Some("/home/linuxbrew/.linuxbrew")
+        );
+        assert_eq!(brew_prefix_of("/bin/brew").as_deref(), Some("/"));
+        assert_eq!(brew_prefix_of("brew is a function"), None);
+    }
+
+    // AYEAYE-60 — the tool is remembered even where installing with it does
+    // not last, because asking it what is already present is a read.
+    #[test]
+    fn an_image_based_system_may_not_install_and_is_still_asked() {
+        let silverblue = packaging(Family::Fedora, true, &["dnf"], false);
+        assert_eq!(
+            silverblue.manager,
+            PackageManager::None,
+            "installing does not last"
+        );
+        assert_eq!(
+            silverblue.tool,
+            PackageManager::Dnf,
+            "asking it is still a read"
+        );
+    }
+
+    // AYEAYE-60 — systemd has to be present *and* usable as a user session:
+    // a container has the binary and no user bus, and enabling a unit there
+    // fails after setup has promised it would work.
+    #[test]
+    fn a_user_service_is_only_promised_where_one_can_really_be_installed() {
+        let systemd = |available: &[&str], bus| service_manager(Os::Linux, available, bus);
+        assert_eq!(systemd(&["systemctl"], true), ServiceManager::Systemd);
+        assert_eq!(
+            systemd(&["systemctl"], false),
+            ServiceManager::None,
+            "the binary without a user bus is not a place to install a service"
+        );
+        assert_eq!(systemd(&[], true), ServiceManager::None);
+
+        assert_eq!(
+            service_manager(Os::Macos, &["launchctl"], false),
+            ServiceManager::Launchd,
+            "launchd asks no user-bus question"
+        );
+        assert_eq!(service_manager(Os::Macos, &[], false), ServiceManager::None);
+        assert_eq!(
+            service_manager(Os::Unknown, &["systemctl"], true),
+            ServiceManager::Systemd,
+            "a machine we cannot name can still have a user bus that answers"
+        );
     }
 }

@@ -10,4 +10,7 @@
 
 pub mod platform;
 
-pub use platform::{Family, Os, Platform};
+pub use platform::{
+    Family, Os, PackageManager, Packaging, Platform, ServiceManager, brew_prefix_of, identify,
+    packaging, service_manager,
+};
