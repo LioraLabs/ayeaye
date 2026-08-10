@@ -28,7 +28,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # `process` and `time`: the standard library has no wait-with-timeout, and a
 # request that waits forever on a wedged tmux or cliban is the broken panel
 # AYEAYE-43 and AYEAYE-53 both exist to avoid. `sync` for the async mutex that
-# holds a fit lease across the tmux restore it awaits.
+# holds a fit lease across the tmux restore it awaits, and for the supersession
+# the project walk is cancelled by.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time", "sync"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
@@ -53,4 +54,4 @@ sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 serde_json = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync"] }

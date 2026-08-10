@@ -66,7 +66,13 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use` writes it
   AYEAYE_CLEANUP_PROMPT what the cleanup model is told it is for
   AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
-  AYEAYE_MODEL_HUB      where models are fetched from";
+  AYEAYE_MODEL_HUB      where models are fetched from
+  AYEAYE_PROJECT_ROOTS  colon-separated roots the picker walks (default ~)
+  AYEAYE_PROJECT_DEPTH  how far below a root a project may sit (default 6)
+  AYEAYE_PROJECT_BUDGET seconds one walk may spend (default 4)
+  AYEAYE_PROJECT_WAIT   seconds a request waits for a walk (default 0.4)
+  AYEAYE_PROJECT_TTL    seconds a finished search stays usable (default 60)
+  AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {

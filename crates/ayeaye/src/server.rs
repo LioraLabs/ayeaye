@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 
@@ -45,6 +45,7 @@ pub const MAX_BODY: usize = 1 << 20;
 use crate::assets;
 use crate::board;
 use crate::config::Settings;
+use crate::projects;
 
 /// Build the router.
 ///
@@ -53,7 +54,37 @@ use crate::config::Settings;
 /// for every endpoint the rest of this milestone adds, and the one that was
 /// forgotten would be the hole.
 pub fn router(settings: Arc<Settings>) -> Router {
-    Router::new().fallback(handle).with_state(settings)
+    Router::new()
+        .fallback(handle)
+        .with_state(App::over(settings))
+}
+
+/// Everything the handler needs: what the server was told to be, and the
+/// things it is running.
+///
+/// The picker is built here rather than handed in, so `router`'s signature is
+/// unchanged and every server — every test — gets a registry of its own: two
+/// tests searching at once must not supersede each other.
+#[derive(Clone)]
+pub struct App {
+    settings: Arc<Settings>,
+    projects: Arc<projects::Picker>,
+}
+
+impl App {
+    fn over(settings: Arc<Settings>) -> App {
+        App {
+            settings,
+            projects: Arc::new(projects::Picker::new(projects::Settings::from_env())),
+        }
+    }
+}
+
+/// So the handler can still ask for the settings on their own.
+impl FromRef<App> for Arc<Settings> {
+    fn from_ref(app: &App) -> Arc<Settings> {
+        Arc::clone(&app.settings)
+    }
 }
 
 /// Bind the address the settings resolved to.
@@ -81,7 +112,7 @@ pub async fn serve(
 }
 
 async fn handle(
-    State(settings): State<Arc<Settings>>,
+    State(app): State<App>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -94,6 +125,7 @@ async fn handle(
     // the daemon refuses in, and keeps a refused write costing nothing.
     body: Body,
 ) -> Response {
+    let settings = Arc::clone(&app.settings);
     // The Host gate comes first and applies to everything, pages included:
     // it is what stops a page on an attacker's origin, resolving their name to
     // this address, from talking to this server at all.
@@ -146,12 +178,23 @@ async fn handle(
         // endpoints live in one module rather than on the router, so they
         // inherit every gate in this handler instead of each having to
         // remember them.
-        Route::Api if method == Method::GET => {
-            match board::answer(&settings, uri.path(), uri.query()).await {
+        // Which endpoint answers is decided here rather than in the core's
+        // route table: the table's job is the *gate*, and by this line the
+        // request has already passed it. What is left is which effect to have,
+        // and effects are this crate's.
+        Route::Api if method == Method::GET => match uri.path() {
+            "/api/projects" => {
+                let body = app
+                    .projects
+                    .body(query.q.as_deref().unwrap_or(""), projects::DEFAULT_LIMIT)
+                    .await;
+                json_owned(StatusCode::OK, body)
+            }
+            _ => match board::answer(&settings, uri.path(), uri.query()).await {
                 Some((status, body)) => json_owned(status, body),
                 None => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
-            }
-        }
+            },
+        },
         Route::Prompt if method == Method::GET || method == Method::HEAD => {
             asked(&settings, query.pane.as_deref().unwrap_or("")).await
         }
@@ -749,6 +792,8 @@ struct Query {
     /// The token naming the screen it says it holds.
     sh: Option<String>,
     pane: Option<String>,
+    /// The picker's search term.
+    q: Option<String>,
 }
 
 impl Query {
@@ -761,6 +806,7 @@ impl Query {
             hh: None,
             sh: None,
             pane: None,
+            q: None,
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             if value.is_empty() {
@@ -777,6 +823,7 @@ impl Query {
                 "hh" if query.hh.is_none() => query.hh = Some(value.into_owned()),
                 "sh" if query.sh.is_none() => query.sh = Some(value.into_owned()),
                 "pane" if query.pane.is_none() => query.pane = Some(value.into_owned()),
+                "q" if query.q.is_none() => query.q = Some(value.into_owned()),
                 _ => {}
             }
         }

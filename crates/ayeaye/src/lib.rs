@@ -17,5 +17,6 @@ pub mod config;
 pub mod fit;
 pub mod models;
 pub mod process;
+pub mod projects;
 pub mod server;
 pub mod tmux;

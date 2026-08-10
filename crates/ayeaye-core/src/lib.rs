@@ -25,6 +25,7 @@ pub mod model;
 pub mod pane;
 pub mod peer;
 pub mod process;
+pub mod projects;
 pub mod prompt;
 pub mod service;
 pub mod sha1;
