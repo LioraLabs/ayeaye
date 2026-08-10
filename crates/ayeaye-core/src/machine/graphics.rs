@@ -6,7 +6,7 @@
 //! worth using, and whether ayeaye can run inference on it at all, is the
 //! tier's business, and that is where the sizes live.
 
-use super::text::positive;
+use super::text::{labelled_line, positive};
 use super::{Os, Platform, Probes};
 
 /// What would do the arithmetic here.
@@ -116,12 +116,11 @@ fn chip_name(probes: &Probes<'_>) -> Option<String> {
     if let Some(name) = brand {
         return Some(name.to_string());
     }
-    probes.system_profiler.and_then(|text| {
-        text.lines().find_map(|line| {
-            let value = line.trim().strip_prefix("Chip:")?.trim();
-            (!value.is_empty()).then(|| value.to_string())
-        })
-    })
+    probes
+        .system_profiler
+        .and_then(|text| labelled_line(text, "Chip"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader`.
@@ -239,8 +238,9 @@ fn rocm(text: &str) -> Option<Card> {
 #[cfg(test)]
 mod tests {
     use super::{Acceleration, Graphics, classify};
+    use crate::machine::Probes;
     use crate::machine::fixture;
-    use crate::machine::{Probes, identify};
+    use crate::machine::platform::identify;
 
     /// An ordinary Linux machine, so only the graphics probes vary.
     fn on_linux(probes: Probes<'_>) -> Graphics {
@@ -426,5 +426,21 @@ mod tests {
         assert_eq!(bare.acceleration, Acceleration::Cpu);
         assert_eq!(bare.name, None);
         assert_eq!(bare.vram_mb, None);
+    }
+    // AYEAYE-60 — these words go into step.detect.hardware.acceleration and
+    // later stages branch on them, so a typo is a stage that silently stops
+    // matching.
+    #[test]
+    fn the_verdict_is_spelled_the_way_the_shell_writes_it() {
+        assert_eq!(
+            [
+                Acceleration::Metal,
+                Acceleration::Cuda,
+                Acceleration::Rocm,
+                Acceleration::Cpu,
+            ]
+            .map(Acceleration::as_str),
+            ["metal", "cuda", "rocm", "cpu"]
+        );
     }
 }

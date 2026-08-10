@@ -194,4 +194,12 @@ mod tests {
             "a table that was read is the answer; the fallback is for having none"
         );
     }
+    // AYEAYE-60 — step.detect.hardware.network is one of these three words.
+    #[test]
+    fn the_network_verdict_is_spelled_the_way_the_shell_writes_it() {
+        assert_eq!(
+            [Network::Online, Network::Offline, Network::Unknown].map(Network::as_str),
+            ["online", "offline", "unknown"]
+        );
+    }
 }

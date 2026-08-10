@@ -479,4 +479,12 @@ mod tests {
             "an upper bound is not a measurement"
         );
     }
+    // AYEAYE-60 — step.detect.hardware.limits is one of these three words.
+    #[test]
+    fn the_limits_verdict_is_spelled_the_way_the_shell_writes_it() {
+        assert_eq!(
+            [Limits::None, Limits::Known, Limits::Unknown].map(Limits::as_str),
+            ["none", "known", "unknown"]
+        );
+    }
 }

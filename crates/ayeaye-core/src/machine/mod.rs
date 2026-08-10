@@ -15,14 +15,15 @@ pub mod share;
 pub mod size;
 mod text;
 
+// The rule for this list: the *types* a consumer names, and nothing else. The
+// parsers keep their module paths — `graphics::classify` and `network::classify`
+// are two different questions with one name, and `size::cores` says what it
+// reads only because `size` is in front of it. A flat list of verbs here would
+// have to rename half of them to stay unambiguous.
 pub use graphics::{Acceleration, Graphics};
 pub use network::Network;
-pub use platform::{
-    Family, Homebrew, Os, PackageManager, Packaging, Platform, ServiceManager, homebrew, identify,
-    is_known, packaging, service_manager, summary,
-};
+pub use platform::{Family, Homebrew, Os, PackageManager, Packaging, Platform, ServiceManager};
 pub use share::{Limit, Limits, Share};
-pub use size::model_dir_ancestors;
 
 /// The captured probe output the shell suite reads, reaching a pure crate the
 /// only way it may: at compile time.

@@ -14,7 +14,7 @@
 //! recommendation rather than raising it.
 
 use super::Probes;
-use super::text::{field, first_word, positive, whole};
+use super::text::{field, first_word, labelled_line, positive, whole};
 
 /// How many processors this machine has.
 pub fn cores(probes: &Probes<'_>) -> Option<u64> {
@@ -25,8 +25,8 @@ pub fn cores(probes: &Probes<'_>) -> Option<u64> {
         .or_else(|| {
             probes
                 .system_profiler
-                .and_then(|text| hardware_overview(text, "Total Number of Cores"))
-                .and_then(|value| positive(first_word(&value)))
+                .and_then(|text| labelled_line(text, "Total Number of Cores"))
+                .and_then(|value| positive(first_word(value)))
         })
 }
 
@@ -43,8 +43,8 @@ pub fn ram_mb(probes: &Probes<'_>) -> Option<u64> {
         .or_else(|| {
             probes
                 .system_profiler
-                .and_then(|text| hardware_overview(text, "Memory"))
-                .and_then(|value| ram_from_words(&value))
+                .and_then(|text| labelled_line(text, "Memory"))
+                .and_then(ram_from_words)
         })
 }
 
@@ -56,7 +56,10 @@ pub fn disk_mb(probes: &Probes<'_>) -> Option<u64> {
     let last = probes
         .df_pk?
         .lines()
-        .rfind(|line| !line.trim().is_empty())?;
+        // Only a truly empty line is skipped, as the shell skips it. A final
+        // line of blanks is a line df printed, and reaching back past it for a
+        // number would answer where the shell answers nothing.
+        .rfind(|line| !line.is_empty())?;
     field(last, 4).and_then(whole).map(|blocks| blocks / 1024)
 }
 
@@ -128,17 +131,6 @@ fn ram_from_words(value: &str) -> Option<u64> {
         "TB" | "tb" | "TiB" => n.checked_mul(1024 * 1024),
         _ => None,
     }
-}
-
-/// One labelled line out of `system_profiler SPHardwareDataType`, indented as it
-/// arrives.
-fn hardware_overview(text: &str, label: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(label)?
-            .strip_prefix(':')
-            .map(|value| value.trim().to_string())
-    })
 }
 
 #[cfg(test)]

@@ -40,19 +40,34 @@ pub fn field(line: &str, n: usize) -> Option<&str> {
     line.split_whitespace().nth(n - 1)
 }
 
-/// The text a probe really produced, or `None` when it produced nothing.
+/// The first line a probe really produced, or `None` when it produced nothing.
 ///
-/// A file that exists and is blank has not answered. `_hw_read_line` treats an
-/// empty first line as a failed read and falls through to the next source, and
-/// so does everything here — otherwise a zero-length `memory.max` would count as
-/// "the version-two layout answered" and suppress the version-one fallback.
+/// A file that exists and is blank has not answered. `_hw_read_line` reads the
+/// *first* line and treats it being empty as a failed read, so the caller falls
+/// through to the next source — otherwise a zero-length `memory.max` would count
+/// as "the version-two layout answered" and suppress the version-one fallback.
+/// The first line and not the whole text, because a second line saying something
+/// is a file this parser does not understand, and the shell would not read it
+/// either.
 pub fn answered(text: Option<&str>) -> Option<&str> {
-    text.filter(|value| !value.trim().is_empty())
+    let first = text?.lines().next()?.trim();
+    (!first.is_empty()).then_some(first)
+}
+
+/// One `Label: value` line, wherever it is indented to.
+///
+/// `system_profiler` is the only source shaped this way, and the shell reads it
+/// with one function; so does this. The **first** matching line wins, whatever it
+/// holds — an empty value is an answer, and looking past it for a better one is a
+/// second opinion the shell never offers.
+pub fn labelled_line<'a>(text: &'a str, label: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|line| Some(line.trim().strip_prefix(label)?.strip_prefix(':')?.trim()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{answered, field, first_word, positive, whole};
+    use super::{answered, field, first_word, labelled_line, positive, whole};
 
     // AYEAYE-60
     #[test]
@@ -92,7 +107,26 @@ mod tests {
     fn a_blank_answer_is_not_an_answer() {
         assert_eq!(answered(Some("")), None);
         assert_eq!(answered(Some(" \n")), None);
-        assert_eq!(answered(Some("max\n")), Some("max\n"));
+        assert_eq!(answered(Some("max\n")), Some("max"));
         assert_eq!(answered(None), None);
+        assert_eq!(
+            answered(Some("\n1073741824\n")),
+            None,
+            "the shell reads the first line and gives up on it being blank"
+        );
+    }
+    // AYEAYE-60 — the first matching line wins, whatever it holds.
+    #[test]
+    fn a_labelled_line_is_read_wherever_it_is_indented_to() {
+        let text =
+            "Hardware:\n\n    Hardware Overview:\n\n      Chip: Apple M3\n      Memory: 24 GB\n";
+        assert_eq!(labelled_line(text, "Chip"), Some("Apple M3"));
+        assert_eq!(labelled_line(text, "Memory"), Some("24 GB"));
+        assert_eq!(labelled_line(text, "Serial Number"), None);
+        assert_eq!(
+            labelled_line("  Chip:\n  Chip: Apple M3\n", "Chip"),
+            Some(""),
+            "an empty value is an answer, and the shell does not look past it"
+        );
     }
 }
