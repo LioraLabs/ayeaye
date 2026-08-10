@@ -52,7 +52,13 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_BIND           address to bind (default 127.0.0.1)
   AYEAYE_DEV_PORT       port to bind (default 8912)
   AYEAYE_ALLOWED_HOSTS  comma-separated extra Host values to answer to
-  AYEAYE_TOKEN          the shared secret; otherwise read from the state file";
+  AYEAYE_TOKEN          the shared secret; otherwise read from the state file
+  AYEAYE_PROJECT_ROOTS  colon-separated roots the picker walks (default ~)
+  AYEAYE_PROJECT_DEPTH  how far below a root a project may sit (default 6)
+  AYEAYE_PROJECT_BUDGET seconds one walk may spend (default 4)
+  AYEAYE_PROJECT_WAIT   seconds a request waits for a walk (default 0.4)
+  AYEAYE_PROJECT_TTL    seconds a finished search stays usable (default 60)
+  AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {

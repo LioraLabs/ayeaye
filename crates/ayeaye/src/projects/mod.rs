@@ -121,15 +121,10 @@ impl Picker {
         let searches = Searches::new(
             Arc::new(lister),
             Bounds {
-                // Only the roots that are there: the walk takes its roots as
-                // absolute and existing, and a root that is neither yields
-                // candidate paths that match no pick and shorten to nothing.
-                roots: settings
-                    .roots
-                    .iter()
-                    .filter(|root| root.is_dir())
-                    .cloned()
-                    .collect(),
+                // Every configured root. Which of them exist is asked again
+                // on each walk, because a root created after this server
+                // started is still a root — the daemon asks it there too.
+                roots: settings.roots.clone(),
                 depth: settings.depth,
                 budget: settings.budget,
                 wait: settings.wait,
@@ -145,9 +140,16 @@ impl Picker {
         // `limit` directories a breadth-first walk meets are not the best
         // `limit`. Still an early stop, just not a myopic one.
         let cap = (limit * 8).max(200);
-        match self.searches.search(query, cap).await {
+        // Normalised once here, as the daemon does at the top of `projects()`.
+        // Every reader below folds case for itself, so the rows would be right
+        // either way — but the search key would not, and `Ayeaye`, `ayeaye`
+        // and ` ayeaye ` would be three walks and three cache entries
+        // producing one answer. On a phone the capitalised spelling is the
+        // common one.
+        let query = query.trim().to_lowercase();
+        match self.searches.search(&query, cap).await {
             Outcome::Superseded => rank::SUPERSEDED.to_string(),
-            Outcome::Found(found) => self.rows(found, query, limit).await,
+            Outcome::Found(found) => self.rows(found, &query, limit).await,
         }
     }
 
@@ -400,14 +402,15 @@ mod tests {
 
         let running = ["ayeaye".to_string()];
         let body = assemble(&settings, found.clone(), "", 10, &running);
-        let read = ayeaye_core::json::parse(&body).expect("a body");
-        let ayeaye_core::json::Value::Array(rows) = read.get("projects").expect("rows").clone()
+        let read = ayeaye_core::projects::json::parse(&body).expect("a body");
+        let ayeaye_core::projects::json::Value::Array(rows) =
+            read.get("projects").expect("rows").clone()
         else {
             panic!("not an array: {body}");
         };
         let exists: Vec<bool> = rows
             .iter()
-            .map(|row| row.get("exists") == Some(&ayeaye_core::json::Value::Bool(true)))
+            .map(|row| row.get("exists") == Some(&ayeaye_core::projects::json::Value::Bool(true)))
             .collect();
         assert_eq!(exists, vec![true, false], "{body}");
 

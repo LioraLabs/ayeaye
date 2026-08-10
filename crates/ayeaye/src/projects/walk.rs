@@ -228,6 +228,7 @@ impl<L: Lister> Cached<L> {
     }
 
     /// How many listings are remembered right now.
+    #[cfg(test)]
     pub fn remembered(&self) -> usize {
         self.entries
             .lock()

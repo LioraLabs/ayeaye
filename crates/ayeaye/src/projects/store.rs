@@ -24,6 +24,13 @@ pub fn load(at: &Path) -> Recents {
 
 /// Record that an agent was started here.
 ///
+/// **Nothing in this binary calls this yet.** The daemon's call site is inside
+/// spawn (`note_project_pick` in `bin/ayeaye`), and spawning is AYEAYE-51 —
+/// which was written against a base where this function did not exist. Until
+/// its handler calls this, the picker reads a history nothing writes and
+/// "recent picks are recorded" holds in the tests and not on a running
+/// machine. AYEAYE-71 is the wiring.
+///
 /// Best effort in every direction: a store that cannot be written costs
 /// ranking quality and nothing else, so no failure here may reach the
 /// response. The write is atomic, because a store half-replaced by a crash
@@ -31,7 +38,7 @@ pub fn load(at: &Path) -> Recents {
 /// beside us may be reading it at this moment.
 pub fn note_pick(at: &Path, path: &str, now: f64) {
     let mut store = load(at);
-    store.record(&recents::key(path), now);
+    store.record(&key_for(path), now);
 
     if let Some(parent) = at.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -44,6 +51,35 @@ pub fn note_pick(at: &Path, path: &str, now: f64) {
     {
         let _ = std::fs::remove_file(&temporary);
     }
+}
+
+/// The store's key for a directory somebody names.
+///
+/// The daemon's `_recents_key` is `abspath(expanduser(path)).rstrip("/")`, and
+/// all three parts are load-bearing while the two share one file: a pick
+/// written under `~/src/thing` or under a relative path is a key the Python
+/// daemon will never produce, so the history quietly splits in a file both are
+/// writing. `recents::key` is the `rstrip` — pure, and the core's. Expanding a
+/// `~` needs a home and resolving a relative path needs a working directory,
+/// and both of those are here.
+pub fn key_for(path: &str) -> String {
+    let expanded = match path.strip_prefix('~') {
+        Some("") => home(),
+        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home()),
+        _ => path.to_string(),
+    };
+    let absolute = if expanded.starts_with('/') {
+        PathBuf::from(expanded)
+    } else {
+        std::env::current_dir().unwrap_or_default().join(expanded)
+    };
+    recents::key(&absolute.to_string_lossy())
+}
+
+/// The home directory, or nothing — in which case a `~` stays a `~` and the
+/// key is at least stable rather than silently rooted somewhere else.
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -78,6 +114,41 @@ mod tests {
         // stops counting the moment something spells it differently.
         note_pick(&at, "/home/a/src/ayeaye/", 1_700_000_200.0);
         assert_eq!(load(&at).len(), 1);
+    }
+
+    // AYEAYE-50 — the daemon keys its store by
+    // `abspath(expanduser(path)).rstrip("/")`, and while the two share one
+    // file every part of that matters: a pick written under `~/src/thing` is a
+    // key the Python daemon will never produce, so the history splits in a
+    // file both of them are writing.
+    #[test]
+    fn a_key_is_expanded_and_absolute_before_it_is_written() {
+        let tree = TempTree::named("store-key");
+        let at = tree.path.join("projects.json");
+        // SAFETY: HOME is read by `key_for` and by nothing else running here.
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+
+        assert_eq!(super::key_for("~/src/thing"), "/home/tester/src/thing");
+        assert_eq!(super::key_for("~"), "/home/tester");
+        assert_eq!(super::key_for("~/"), "/home/tester");
+        // Not a home reference: `~other` is somebody else's home, and reading
+        // it needs a password database. Python's `expanduser` gives up on a
+        // name it cannot find and hands the path to `abspath` unchanged, so it
+        // ends up under the working directory — and so does this.
+        assert!(super::key_for("~other/x").ends_with("/~other/x"));
+        assert_eq!(super::key_for("/already/there/"), "/already/there");
+
+        let relative = super::key_for("src/thing");
+        assert!(relative.starts_with('/'), "{relative}");
+        assert!(relative.ends_with("/src/thing"), "{relative}");
+
+        // And the key that lands in the file is the resolved one.
+        note_pick(&at, "~/src/thing", 5.0);
+        assert!(
+            load(&at).get("/home/tester/src/thing").is_some(),
+            "{}",
+            std::fs::read_to_string(&at).unwrap_or_default()
+        );
     }
 
     // AYEAYE-50 — best effort in every direction: a store that cannot be read

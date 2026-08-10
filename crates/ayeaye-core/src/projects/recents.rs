@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::json::{Value, parse};
+use super::json::{Value, parse};
 
 /// How long a pick takes to count for half.
 ///

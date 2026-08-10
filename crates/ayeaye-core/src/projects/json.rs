@@ -1,4 +1,13 @@
-//! Enough JSON to read and write the daemon's own state.
+//! Enough JSON to read and write the picker's own state.
+//!
+//! Under `projects` rather than at the crate root, and deliberately: the
+//! milestone branch carries an `ayeaye_core::json` that is a *scanner* over
+//! borrowed text, for passing cliban's output through without re-rendering it.
+//! This is the opposite job — the pick store has to be read into a value,
+//! changed, and written back — so it is a second reader with a different
+//! shape rather than a replacement for the first. Folding the two together is
+//! a follow-up with both in front of it, not something to guess at from one
+//! side.
 //!
 //! Hand rolled rather than pulled in, because the pure core's dependency
 //! allowlist is empty and `serde_json` would have to be admitted to it for the
@@ -48,13 +57,17 @@ pub fn parse(text: &str) -> Option<Value> {
 
 /// The escaped *body* of a JSON string, without the quotes around it.
 ///
+/// Private: the only thing that needs it is [`Value::write`]. The milestone
+/// branch's `json::string` is the same decision with the quotes on, and that
+/// is the seam the two readers should meet at when they are folded together.
+///
 /// ASCII out, always — non-ASCII leaves as `\uXXXX`, with a surrogate pair for
 /// anything outside the basic plane, which is what Python's `json.dump` writes.
 /// That is not tidiness: `bin/ayeaye` opens the shared store with the locale's
 /// encoding, and on a machine whose locale is not UTF-8 a raw accented byte is
 /// a `UnicodeDecodeError` — which `_recents_load` catches by throwing the whole
 /// history away. A file that is pure ASCII cannot be misread by any locale.
-pub fn escape(text: &str) -> String {
+fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {

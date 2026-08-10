@@ -85,8 +85,8 @@ async fn request(port: u16, path: &str, headers: &[(&str, &str)]) -> Answer {
 
 /// The one row the page would draw, read out of the body.
 fn rows(body: &str) -> Vec<HashMap<String, String>> {
-    let read = ayeaye_core::json::parse(body).expect("the page parses this");
-    let ayeaye_core::json::Value::Array(projects) =
+    let read = ayeaye_core::projects::json::parse(body).expect("the page parses this");
+    let ayeaye_core::projects::json::Value::Array(projects) =
         read.get("projects").expect("a projects array").clone()
     else {
         panic!("projects is not an array: {body}");
@@ -94,14 +94,14 @@ fn rows(body: &str) -> Vec<HashMap<String, String>> {
     projects
         .iter()
         .map(|project| {
-            let ayeaye_core::json::Value::Object(fields) = project else {
+            let ayeaye_core::projects::json::Value::Object(fields) = project else {
                 panic!("a row is not an object: {body}");
             };
             fields
                 .iter()
                 .map(|(name, value)| {
                     let rendered = match value {
-                        ayeaye_core::json::Value::String(text) => text.clone(),
+                        ayeaye_core::projects::json::Value::String(text) => text.clone(),
                         other => other.render(),
                     };
                     (name.clone(), rendered)

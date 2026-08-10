@@ -46,6 +46,9 @@ pub struct Bounds {
     pub ttl: Duration,
 }
 
+/// How many finished searches are remembered at once. The daemon's own number.
+const CACHE_MAX: usize = 64;
+
 /// The searches this server is running.
 pub struct Searches {
     lister: Arc<dyn Lister + 'static>,
@@ -68,6 +71,14 @@ impl State {
     fn prune(&mut self, now: Instant, ttl: Duration) {
         self.cache
             .retain(|_, (at, _)| now.duration_since(*at) < ttl);
+        // And a hard cap, as the daemon has. The TTL alone bounds this by
+        // "distinct completed walks per minute", which is small in practice
+        // and is not a bound. Cleared wholesale rather than evicted: refilling
+        // costs one bounded walk, and an eviction policy is more code than the
+        // thing it serves.
+        if self.cache.len() > CACHE_MAX {
+            self.cache.clear();
+        }
     }
 }
 
@@ -110,6 +121,29 @@ impl Registry {
         }
         search.finish();
     }
+}
+
+/// However a walk ends, the registry is told.
+struct Ending {
+    registry: Registry,
+    search: Arc<Search>,
+    stopped: Mutex<Stopped>,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        let stopped = self
+            .stopped
+            .lock()
+            .map(|stopped| *stopped)
+            .unwrap_or(Stopped::Cancel);
+        self.registry.finished(&self.search, stopped);
+    }
+}
+
+/// The roots that are there right now.
+fn existing(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots.iter().filter(|root| root.is_dir()).cloned().collect()
 }
 
 struct Search {
@@ -237,7 +271,9 @@ impl Searches {
             }
             tokio::select! {
                 changed = phase.changed() => {
-                    // The sender is gone, which can only mean the walk is over.
+                    // Unreachable while this caller holds the `Arc` the sender
+                    // lives in. Answered rather than ignored, because the
+                    // alternative is a loop spinning on a closed channel.
                     if changed.is_err() {
                         break Phase::Finished;
                     }
@@ -268,17 +304,35 @@ impl Searches {
         let bounds = self.bounds.clone();
         let registry = self.handle();
         tokio::task::spawn_blocking(move || {
+            // The Python wraps its walk in `try/finally` so `done` is set
+            // however the walk ends. Without the same guarantee a panicking
+            // walk would leave this search `Running` for ever, and every later
+            // caller asking the same question would join a dead search, wait
+            // the whole budget and get its partial rows — never re-walked and
+            // never cached. This guard is that `finally`.
+            let ending = Ending {
+                registry,
+                search: Arc::clone(&search),
+                // Unless the walk says otherwise it did not finish, so nothing
+                // is cached.
+                stopped: Mutex::new(Stopped::Cancel),
+            };
             let stop = stopper(Instant::now() + bounds.budget, Arc::clone(&search.cancel));
             let stopped = walk(
                 lister.as_ref(),
-                &bounds.roots,
+                // Re-checked here rather than once at construction, as the
+                // daemon re-checks them: a root created after this server
+                // started is still a root.
+                &existing(&bounds.roots),
                 bounds.depth,
                 search.cap,
                 &search.query,
                 &stop,
                 &mut |candidate| search.push(candidate),
             );
-            registry.finished(&search, stopped);
+            if let Ok(mut ended) = ending.stopped.lock() {
+                *ended = stopped;
+            }
         });
     }
 

@@ -1,7 +1,7 @@
 //! Which candidates the picker shows, and in what order.
 
 use super::recents::Recents;
-use crate::json::Value;
+use crate::projects::json::Value;
 
 /// A directory the walk found, or a pick the walk could not reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +174,7 @@ fn names_it(path: &str, query: &str) -> bool {
 }
 
 /// The last component of a path, with any trailing slashes ignored.
-pub fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         // Every slash: the root, which has no component to be named after.
@@ -495,7 +495,10 @@ mod tests {
         }];
         let rendered = body(&rows);
         assert!(rendered.contains(r#""dir":"/home/a/od\"d""#), "{rendered}");
-        assert!(crate::json::parse(&rendered).is_some(), "{rendered}");
+        assert!(
+            crate::projects::json::parse(&rendered).is_some(),
+            "{rendered}"
+        );
     }
 
     // AYEAYE-50 — "an in-flight search is superseded cleanly": the page reads
@@ -506,14 +509,14 @@ mod tests {
     #[test]
     fn a_superseded_search_is_not_an_empty_answer() {
         assert_ne!(SUPERSEDED, body(&[]));
-        let read = crate::json::parse(SUPERSEDED).expect("the page parses this");
+        let read = crate::projects::json::parse(SUPERSEDED).expect("the page parses this");
         assert_eq!(
             read.get("superseded"),
-            Some(&crate::json::Value::Bool(true))
+            Some(&crate::projects::json::Value::Bool(true))
         );
         assert_eq!(
             read.get("projects"),
-            Some(&crate::json::Value::Array(Vec::new()))
+            Some(&crate::projects::json::Value::Array(Vec::new()))
         );
     }
 }
