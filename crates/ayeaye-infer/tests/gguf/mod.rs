@@ -14,8 +14,6 @@
 //! other correctly, and exactly the right thing to point the degradation tests
 //! at.
 
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
@@ -24,9 +22,9 @@ use candle_core::{Device, Tensor};
 /// The width of the model. A multiple of 32 because that is the block size
 /// every `Q8_0` row is quantized in, and `QTensor::quantize` refuses a row that
 /// is not a whole number of blocks.
-pub const EMBEDDING: usize = 32;
+const EMBEDDING: usize = 32;
 /// How many tokens the toy vocabulary holds, specials included.
-pub const VOCAB: usize = 64;
+const VOCAB: usize = 64;
 /// The feed-forward width. Also a multiple of the block size.
 const FEED_FORWARD: usize = 64;
 /// Attention heads, and key/value heads: no grouped-query trickery to test.
@@ -70,7 +68,7 @@ const WORDS: [&str; 20] = [
 ];
 
 /// The id a special token is written at.
-pub fn special_id(token: &str) -> u32 {
+fn special_id(token: &str) -> u32 {
     let index = SPECIALS
         .iter()
         .position(|t| *t == token)
