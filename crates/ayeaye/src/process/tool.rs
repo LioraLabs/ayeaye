@@ -81,11 +81,22 @@ impl Tool for Subprocess {
         // holds the pipe open. Waiting for the child would return promptly and
         // then wait forever for an end-of-file nobody is going to send.
         //
-        // The reader is left to itself when that happens. It is blocked on a
-        // pipe whose only writer is a process this is about to kill, and it
-        // ends when the process does.
+        // The reader is left to itself when that happens, and in the very case
+        // this exists for it outlives the kill: the grandchild is a writer too,
+        // so the pipe does not reach end-of-file until that grandchild ends.
+        // One idle thread per timed-out tool, and no way in the standard
+        // library to cancel a blocking read — which is a real cost and a much
+        // smaller one than a request handler that never returns.
         let said = done.recv_timeout(self.patience);
-        // The only process this ever signals is one it started itself.
+        // Killed rather than waited for, and on the way out of a successful
+        // call too: the wait above is on the pipe, so a tool that closes its
+        // output and then keeps working is one this stops. `ps` and `lsof` do
+        // not, and a tool that outlives its own answer is not one to keep
+        // waiting for.
+        //
+        // The only process this ever signals is one it started itself, and the
+        // pid cannot have been recycled underneath it because nothing has
+        // reaped it yet.
         let _ = child.kill();
         let _ = child.wait();
 
@@ -175,6 +186,77 @@ mod tests {
             "it waited {:?} for a pipe the exited child's own child still held",
             started.elapsed()
         );
+    }
+
+    // AYEAYE-44 — giving up on a tool has to stop it as well. A server that
+    // leaves one behind per timeout accumulates exactly the thing the deadline
+    // exists to protect it from, and a `Child` that is only dropped is neither
+    // stopped nor reaped.
+    #[test]
+    fn a_tool_given_up_on_is_stopped_and_not_left_behind() {
+        let marker = std::env::temp_dir().join(format!("ayeaye-tool-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let impatient = Subprocess {
+            patience: Duration::from_millis(100),
+        };
+
+        let said = impatient.run(&argv(&[
+            "sh",
+            "-c",
+            &format!("sleep 1; : > {}", marker.display()),
+        ]));
+        assert_eq!(said, None, "the deadline passed");
+
+        // Long enough that a tool still running would have got there.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "it was still running after being given up on"
+        );
+        assert!(
+            !left_behind(),
+            "it was stopped but never reaped, so it is still a process"
+        );
+    }
+
+    /// Whether this process has any child it has stopped and not collected.
+    ///
+    /// Polled rather than sampled, and only on the platform that publishes the
+    /// answer: other tests in this file are starting and stopping tools of
+    /// their own on other threads, and one of those between its exit and its
+    /// reaping is an ordinary sight rather than a leak. A leak never clears.
+    #[cfg(target_os = "linux")]
+    fn left_behind() -> bool {
+        let ours = std::process::id();
+        for _ in 0..20 {
+            let mut any = false;
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                        continue;
+                    };
+                    let Some((_, after_name)) = stat.rsplit_once(')') else {
+                        continue;
+                    };
+                    let mut fields = after_name.split_whitespace();
+                    let state = fields.next();
+                    let parent: Option<u32> = fields.next().and_then(|pid| pid.parse().ok());
+                    if state == Some("Z") && parent == Some(ours) {
+                        any = true;
+                    }
+                }
+            }
+            if !any {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn left_behind() -> bool {
+        false
     }
 
     // AYEAYE-44 — `ps -axww` on a busy Mac is tens of kilobytes against a pipe
