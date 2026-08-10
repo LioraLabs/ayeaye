@@ -15,6 +15,7 @@ pub mod board;
 pub mod chat;
 pub mod cleanup;
 pub mod fit;
+pub mod health;
 pub mod http;
 pub mod identity;
 pub mod json;
