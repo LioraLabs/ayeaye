@@ -19,6 +19,8 @@
 //! request handler, and a pane whose agent cannot be identified is an ordinary
 //! state of the world.
 
+pub mod lsof;
+pub mod procfs;
 pub mod ps;
 mod walk;
 

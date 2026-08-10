@@ -62,6 +62,31 @@ impl Source for Tree {
     }
 }
 
+/// The address a process was reached from, out of what `ps -ww -E` printed.
+///
+/// `-E` appends the environment to the command column, space separated — so
+/// unlike Linux's NUL-separated block, a value with a space in it cannot be
+/// recovered whole here. That is why this answers one narrow question rather
+/// than offering a general environment: the field wanted is an address, an
+/// address has no spaces, and both platforms can therefore return exactly the
+/// same answer. A general reader would have had to truncate a value on one
+/// platform and not the other, quietly.
+///
+/// The name is anchored to a token boundary, so neither `OLD_SSH_CONNECTION`
+/// nor `SSH_CLIENT` answers for it, and the value stops at the first space, so
+/// an `SSH_CONNECTION` that is set but empty does not hand back the variable
+/// after it as an address — which the caller would go on to dial.
+pub fn ssh_peer_in_command(text: &str) -> Option<String> {
+    const NAME: &str = "SSH_CONNECTION=";
+    let value = text
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(NAME))?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// The first whitespace-separated word, and everything after it.
 ///
 /// `None` only when there is no word left at all, so a row `ps` printed with
@@ -92,7 +117,7 @@ fn name_of(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::Tree;
+    use super::{Tree, ssh_peer_in_command};
     use crate::machine::fixture;
 
     fn codex_tree() -> Tree {
@@ -171,5 +196,47 @@ mod tests {
         let tree = Tree::parse(&raw);
         assert_eq!(tree.comm(702), Some("codex"));
         assert_eq!(tree.comm(902), Some("vim"));
+    }
+
+    // AYEAYE-44 — the same answer Linux gives, out of the block `ps -E`
+    // appends to the command column.
+    #[test]
+    fn the_peer_comes_out_of_the_process_environment() {
+        assert_eq!(
+            ssh_peer_in_command(fixture!("ps/darwin-ssh-environ")).as_deref(),
+            Some("100.101.102.103")
+        );
+    }
+
+    // AYEAYE-44 — a client sitting at the machine.
+    #[test]
+    fn a_local_client_has_no_peer() {
+        assert_eq!(
+            ssh_peer_in_command(fixture!("ps/darwin-local-environ")),
+            None
+        );
+        assert_eq!(ssh_peer_in_command(""), None);
+    }
+
+    // AYEAYE-44 — the fixture carries an OLD_SSH_CONNECTION with a different
+    // address ahead of the real one, and a loose match returns the wrong one.
+    // SSH_CLIENT is there for the same reason.
+    #[test]
+    fn a_variable_whose_name_merely_ends_in_it_is_not_it() {
+        let text = fixture!("ps/darwin-ssh-environ");
+        assert!(text.contains("OLD_SSH_CONNECTION=10.0.0.1"));
+        assert_eq!(
+            ssh_peer_in_command(text).as_deref(),
+            Some("100.101.102.103"),
+            "10.0.0.1 is OLD_SSH_CONNECTION's, and dialling it is the bug"
+        );
+    }
+
+    // AYEAYE-44 — this block is space separated, so an SSH_CONNECTION with
+    // nothing in it is followed immediately by the next variable; a hungrier
+    // read hands back SSH_TTY's value as an address.
+    #[test]
+    fn an_ssh_connection_with_no_value_is_not_the_next_variable() {
+        assert_eq!(ssh_peer_in_command(fixture!("ps/darwin-ssh-empty")), None);
     }
 }
