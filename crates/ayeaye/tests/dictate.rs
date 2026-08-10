@@ -406,6 +406,7 @@ async fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
         settings(Some("openai/whisper-small.en"), None),
         Policy::default(),
         converter.to_string(),
+        ayeaye_infer::backend::select(),
     )
     .probe()
     .await;
@@ -417,6 +418,7 @@ async fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
         settings(Some("openai/whisper-tiny.en"), None),
         Policy::default(),
         converter.to_string(),
+        ayeaye_infer::backend::select(),
     )
     .probe()
     .await;
@@ -437,11 +439,61 @@ async fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
         settings(Some("openai/whisper-small.en"), None),
         Policy::default(),
         "ayeaye-58-no-such-converter".to_string(),
+        ayeaye_infer::backend::select(),
     )
     .probe()
     .await;
     assert!(!no_converter.converter);
     assert!(!no_converter.ok());
+}
+
+// AYEAYE-73
+//
+// The process makes the device decision once and hands the same one to every
+// slot: a voice built on a selection that fell back shows that selection's own
+// words from both slots, before any model has loaded. That is what makes the
+// startup banner and the resident models unable to disagree — they are
+// readings of one value, not two probes that happened to answer alike. The
+// selection is built by asking for cuda and opening the processor, which is a
+// fallback by definition on every build row, no card involved.
+#[tokio::test]
+async fn one_selection_reaches_both_slots_and_each_reports_its_fallback() {
+    use ayeaye_infer::backend::{self, Backend};
+
+    let selection = backend::choose(Backend::Cuda, |_| backend::open(Backend::Cpu));
+    let why = selection
+        .fallback()
+        .expect("a cpu opened for a cuda ask is a fallback")
+        .to_string();
+
+    let store = Store::named("one-selection");
+    let voice = dictate::Voice::new(
+        store.0.clone(),
+        settings(None, None),
+        Policy::default(),
+        "ayeaye-73-no-such-converter".to_string(),
+        selection,
+    );
+
+    let (speech_why, cleanup_why) = voice
+        .with_both(|speech, cleanup| {
+            (
+                speech.fallback().map(str::to_string),
+                cleanup.fallback().map(str::to_string),
+            )
+        })
+        .await;
+
+    assert_eq!(
+        speech_why.as_deref(),
+        Some(why.as_str()),
+        "the speech slot holds the process's decision"
+    );
+    assert_eq!(
+        cleanup_why.as_deref(),
+        Some(why.as_str()),
+        "and the language slot holds the same one"
+    );
 }
 
 // AYEAYE-58
@@ -457,6 +509,7 @@ async fn a_machine_with_no_speech_model_refuses_before_decoding_anything() {
         settings(None, None),
         Policy::default(),
         "ayeaye-58-no-such-converter".to_string(),
+        ayeaye_infer::backend::select(),
     );
 
     let outcome = voice.dictate(&stereo_44100(0.2), "wav", "").await;
@@ -875,6 +928,10 @@ impl ayeaye::models::Slot for StubSpeech {
         self.releases += usize::from(self.resident);
         std::mem::take(&mut self.resident)
     }
+
+    fn fallback(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl Speech for StubSpeech {
@@ -896,6 +953,10 @@ impl ayeaye::models::Slot for NoWeights {
 
     fn unload(&mut self) -> bool {
         false
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -923,6 +984,10 @@ impl ayeaye::models::Slot for StubCleanup {
     fn unload(&mut self) -> bool {
         self.releases += usize::from(self.resident);
         std::mem::take(&mut self.resident)
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        None
     }
 }
 

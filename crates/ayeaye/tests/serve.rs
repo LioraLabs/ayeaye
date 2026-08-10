@@ -271,6 +271,7 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
         // No path, for the reason `fits` has none: a test must never write
         // into the pick history of whoever is running the suite. The case
@@ -2925,6 +2926,7 @@ fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictat
             .expect("a readable configuration"),
         ayeaye_core::cleanup::Policy::default(),
         converter.to_string(),
+        ayeaye_infer::backend::select(),
     )
 }
 

@@ -190,6 +190,7 @@ fn settings(tmux: ayeaye::tmux::Tmux, agents: Agents) -> ayeaye::config::Setting
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-45-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
     )
     .expect("settings a test can drive");

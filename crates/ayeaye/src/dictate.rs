@@ -22,6 +22,7 @@ use ayeaye_core::cleanup::{Cleaned, Policy, settle};
 use ayeaye_core::dictation::{self, Capability, Outcome, State, is_hallucination};
 use ayeaye_core::model::residency::Policy as Residency;
 use ayeaye_core::model::settings::ModelSettings;
+use ayeaye_infer::backend::Selection;
 use ayeaye_infer::{LanguageSlot, SpeechSlot};
 
 use crate::audio;
@@ -162,7 +163,7 @@ struct Resident<S: Slot, L: Slot> {
 }
 
 impl Voice {
-    /// A voice on this machine.
+    /// A voice on this machine, its models bound to one device decision.
     ///
     /// `policy` arrives resolved rather than being assembled here, for the same
     /// reason the token and cliban do on [`crate::config::Settings`]: it is read
@@ -172,19 +173,27 @@ impl Voice {
     /// default prompt's echo phrases, which `Policy::resolve` exists to prevent,
     /// and leaves `CLEANUP_TEMPLATE` and `CLEANUP_MAX_TOKENS` reading nothing at
     /// all.
+    ///
+    /// `selection` arrives made rather than being probed here, and that is
+    /// AYEAYE-73's criterion in a signature: the process decides once, in
+    /// `main`, and the same value feeds the banner it prints and both slots
+    /// here — so the acceleration the daemon reports and the acceleration its
+    /// models run on are readings of one value, not two calls that happened to
+    /// agree.
     pub fn new(
         store: PathBuf,
         settings: ModelSettings,
         policy: Policy,
         converter: String,
+        selection: Selection,
     ) -> Voice {
         Voice::with_slots(
             store,
             settings,
             policy,
             converter,
-            SpeechSlot::empty(),
-            LanguageSlot::empty(),
+            SpeechSlot::on(selection.clone()),
+            LanguageSlot::on(selection),
         )
     }
 }
@@ -307,15 +316,36 @@ where
         };
 
         let mut resident = self.resident.lock().await;
-        if let Err(why) = resident.speech.ensure(Some(&speech)) {
-            return Outcome::Unavailable(format!("{speech} would not load: {why}"));
+        match resident.speech.ensure(Some(&speech)) {
+            Err(why) => return Outcome::Unavailable(format!("{speech} would not load: {why}")),
+            // A degradation is said at each load, not only at startup — the
+            // model an idle sweep let go of reloads an hour later, and whoever
+            // is reading the log then was not reading it at startup. Only at a
+            // load, though: a resident model kept is not news, and per-dictation
+            // repetition is the spam a real fallback line drowns in. Read off
+            // the slot rather than the process's own `Selection`, so the line
+            // names the device the resident model is actually on.
+            Ok(loaded_now) => {
+                if loaded_now {
+                    if let Some(why) = resident.speech.slot().fallback() {
+                        eprintln!("ayeaye: {why}");
+                    }
+                }
+            }
         }
         // Loaded on the same demand, and released the same way. A cleanup model
         // nobody configured is not an error: it is a machine that dictates the
         // words the speaker said.
         let cleanup = self.settings.cleanup.clone();
         let loaded = match resident.language.ensure(cleanup.as_ref()) {
-            Ok(()) => cleanup.is_some(),
+            Ok(loaded_now) => {
+                if loaded_now {
+                    if let Some(why) = resident.language.slot().fallback() {
+                        eprintln!("ayeaye: {why}");
+                    }
+                }
+                cleanup.is_some()
+            }
             Err(why) => {
                 // Said out loud and stepped over. Losing the rewrite is a worse
                 // dictation; losing the dictation is no dictation.

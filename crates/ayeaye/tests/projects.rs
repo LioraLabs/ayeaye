@@ -166,6 +166,7 @@ async fn the_picker_answers_over_a_socket() {
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
         // This test never spawns, and a `None` store is the same guarantee
         // the `fits: None` above makes: nothing here writes into the state

@@ -78,9 +78,10 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
 /// capability report that goes on claiming `cuda` after finding no card is the
 /// silent degradation the ticket exists to refuse.
 ///
-/// This reports the selection *this call* made. Making it the same one the
-/// resident models are on — one decision per process, handed to the slots — is
-/// AYEAYE-73, because the daemon's slot construction is not in this tree.
+/// The serve path hands the selection it prints here to the daemon's slots as
+/// well — one decision per process, so the banner and the resident models are
+/// readings of one value and cannot disagree (AYEAYE-73). `report()` makes its
+/// own, which in that process is the only one there is.
 fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
     ayeaye_core::Identity {
         version: ayeaye_core::VERSION,
@@ -146,11 +147,17 @@ fn serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The process's one device decision, made before the daemon takes shape:
+    // the same value feeds the slots here and the banner below, which is what
+    // makes the acceleration the daemon reports provably the acceleration its
+    // models are running on.
+    let selection = ayeaye_infer::backend::select();
     let voice = Arc::new(ayeaye::dictate::Voice::new(
         store,
         models,
         policy,
         ayeaye::audio::CONVERTER.to_string(),
+        selection.clone(),
     ));
     let settings = match Settings::resolve(
         args,
@@ -189,8 +196,8 @@ fn serve(args: &[String]) -> ExitCode {
         // The acceleration line first and on its own: it is a fact about the
         // machine rather than about the address, and folding it into the
         // startup line would bury the one sentence somebody needs when their
-        // card is not being used.
-        let selection = ayeaye_infer::backend::select();
+        // card is not being used. The selection is the one the slots hold —
+        // made above, before the daemon took shape.
         if let Some(why) = selection.fallback() {
             eprintln!("ayeaye: {why}");
         }
@@ -386,6 +393,9 @@ fn dictate_verb(args: &[String]) -> ExitCode {
             models,
             policy,
             ayeaye::audio::CONVERTER.to_string(),
+            // This process's one device decision — a toggle is short-lived,
+            // so its one decision is simply made here.
+            ayeaye_infer::backend::select(),
         );
         let state = store.join(ayeaye::dictate::STATE_FILE);
         let toggle = ayeaye::dictate::Toggle {
