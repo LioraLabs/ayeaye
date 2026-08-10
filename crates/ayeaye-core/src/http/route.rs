@@ -115,10 +115,17 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
 /// The method is half of the answer, not a detail. The daemon serves pages to
 /// anyone who can reach it, but `do_POST` gates *every* POST before it looks
 /// at the path at all — a POST acts on a pane, and no path is exempt from
-/// that. So anything that is not a GET is gated whatever it names, and the
-/// route table only decides the GET case.
+/// that. So anything that could write is gated whatever it names, and the
+/// route table only decides the reading case.
+///
+/// HEAD reads what GET reads and returns no body, so it is gated exactly where
+/// GET is. That is a decision rather than an oversight: the server answers
+/// HEAD out of the GET handler, and gating it would 401 the link previewers
+/// and PWA install checks that HEAD an icon nobody needs a token to fetch.
+/// The daemon refuses HEAD outright today (501, no `do_HEAD`), so this is a
+/// deliberate widening, and it exposes nothing a GET does not already.
 pub fn gate(method: &str, route: Route) -> Gate {
-    if method != "GET" {
+    if !matches!(method, "GET" | "HEAD") {
         return Gate::Token;
     }
     match route {
@@ -266,12 +273,12 @@ mod tests {
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at
-    // the path: a POST acts on a pane, and no path is exempt. Anything that is
-    // not a GET is therefore gated whatever it names, or serving the pages
+    // the path: a POST acts on a pane, and no path is exempt. Anything that
+    // could write is therefore gated whatever it names, or serving the pages
     // openly would open a hole the moment the first endpoint lands.
     #[test]
-    fn nothing_but_a_get_is_ever_open() {
-        for method in ["POST", "PUT", "DELETE", "HEAD", "OPTIONS", "get"] {
+    fn nothing_that_could_write_is_ever_open() {
+        for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "get"] {
             for path in ["/", "/board", "/login", "/nope", "/api/send"] {
                 assert_eq!(
                     gate(method, resolve(path, false)),
@@ -280,5 +287,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    // AYEAYE-42 — HEAD reads what GET reads and returns no body, so it is
+    // gated exactly where GET is. Deliberate: the server answers HEAD from the
+    // GET handler, and refusing it would 401 the link previewers and PWA
+    // install checks that HEAD an icon nobody needs a token to fetch.
+    #[test]
+    fn head_is_gated_exactly_where_get_is() {
+        for path in ["/", "/board", "/favicon.ico", "/manifest.webmanifest"] {
+            assert_eq!(
+                gate("HEAD", resolve(path, false)),
+                Gate::Open,
+                "HEAD {path} must be as open as GET"
+            );
+        }
+        assert_eq!(gate("HEAD", resolve("/api/panes", false)), Gate::Token);
     }
 }
