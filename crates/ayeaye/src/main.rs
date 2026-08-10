@@ -6,11 +6,13 @@
 
 mod service;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ayeaye::config::{self, Settings};
+use ayeaye::models;
 use ayeaye::server;
 use ayeaye_core::service::{DEFAULT_LAUNCHD_PREFIX, Definition, Layout, Manager, Session};
 use service::{Runner, Services, Subprocess};
@@ -20,6 +22,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("service") => service_verb(args.get(1).map(String::as_str)),
+        Some("model") => model_verb(&args[1..]),
         None => {
             println!("{}", banner());
             ExitCode::SUCCESS
@@ -42,17 +45,26 @@ fn main() -> ExitCode {
 const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
+       ayeaye model <ls|pull ID|use ID|rm ID>
 
   serve      run the HTTP server
   service    manage the service this binary installs for itself
+  model      fetch and choose the models this binary runs
   --version  print the version and what this build can do
   --help     this
+
+a model ID is owner/name, as in openai/whisper-small.en, optionally
+@revision. ayeaye ships the inference, not the weights.
 
 environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_BIND           address to bind (default 127.0.0.1)
   AYEAYE_DEV_PORT       port to bind (default 8912)
   AYEAYE_ALLOWED_HOSTS  comma-separated extra Host values to answer to
-  AYEAYE_TOKEN          the shared secret; otherwise read from the state file";
+  AYEAYE_TOKEN          the shared secret; otherwise read from the state file
+  AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use` writes it
+  AYEAYE_CLEANUP_PROMPT what the cleanup model is told it is for
+  AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
+  AYEAYE_MODEL_HUB      where models are fetched from";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {
@@ -110,6 +122,118 @@ fn serve(args: &[String]) -> ExitCode {
         }
         ExitCode::SUCCESS
     })
+}
+
+/// `ayeaye model <verb>` — the models this binary runs.
+///
+/// ayeaye ships the inference and not the weights, so this is how weights get
+/// onto a machine: a repository id in, a directory under the state directory
+/// out, with the architecture checked before anything large is fetched.
+fn model_verb(args: &[String]) -> ExitCode {
+    let Some(store) = config::state_dir() else {
+        return complain(
+            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let config_file = PathBuf::from(layout(from_environment).env_file);
+
+    // Resolved before the verb runs, so a configuration file with a typo in it
+    // is one error rather than a different one per subcommand.
+    let settings = match models::settings(&config_file) {
+        Ok(settings) => settings,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+
+    let id = |given: Option<&String>| match given {
+        Some(given) => ayeaye_core::model::ModelId::parse(given).map_err(|why| why.to_string()),
+        None => Err("which model? give it as owner/name".to_string()),
+    };
+
+    match args.first().map(String::as_str) {
+        Some("ls") => {
+            let installed = models::installed(&store);
+            if installed.is_empty() {
+                println!("no models yet — `ayeaye model pull openai/whisper-small.en` gets one");
+                return ExitCode::SUCCESS;
+            }
+            let chosen = settings.speech.as_ref().map(ToString::to_string);
+            for model in installed {
+                // The chosen one is marked rather than listed separately: the
+                // question somebody runs this to answer is usually "is the one
+                // I configured actually here".
+                let mark = if chosen.as_deref() == Some(&model.to_string()) {
+                    " (in use)"
+                } else {
+                    ""
+                };
+                println!("{model}{mark}");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("pull") => match id(args.get(1)) {
+            Err(why) => complain(&format!("ayeaye: {why}")),
+            Ok(id) => {
+                eprintln!("fetching {id} from {}", settings.hub);
+                match models::pull(&models::Curl, &store, &settings.hub, &id) {
+                    Ok(pulled) => {
+                        println!(
+                            "{} is in {} ({}, {})",
+                            pulled.id,
+                            pulled.dir.display(),
+                            pulled.architecture.hf_name(),
+                            human(pulled.bytes)
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(why) => complain(&format!("ayeaye: {why}")),
+                }
+            }
+        },
+        Some("use") => match id(args.get(1)) {
+            Err(why) => complain(&format!("ayeaye: {why}")),
+            Ok(id) => {
+                let key = ayeaye_core::model::settings::SPEECH_MODEL;
+                if let Err(why) = models::choose(&config_file, key, &id.to_string()) {
+                    return complain(&format!("ayeaye: {why}"));
+                }
+                println!("{} is the model to transcribe with", id);
+                println!("  written to {}", config_file.display());
+                // Said rather than refused: choosing a model before fetching it
+                // is a reasonable order to do things in, and refusing it would
+                // make the two commands care about each other for no reason.
+                if !models::installed(&store).contains(&id) {
+                    println!("  it is not on this machine yet — `ayeaye model pull {id}`");
+                }
+                ExitCode::SUCCESS
+            }
+        },
+        Some("rm") => match id(args.get(1)) {
+            Err(why) => complain(&format!("ayeaye: {why}")),
+            Ok(id) => match models::remove(&store, &id) {
+                Ok(true) => {
+                    println!("removed {id}");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!("there was no {id} to remove");
+                    ExitCode::SUCCESS
+                }
+                Err(why) => complain(&format!("ayeaye: {why}")),
+            },
+        },
+        _ => complain("usage: ayeaye model <ls|pull ID|use ID|rm ID>"),
+    }
+}
+
+/// A byte count somebody can read at a glance.
+fn human(bytes: u64) -> String {
+    const STEP: u64 = 1024;
+    for (limit, unit) in [(STEP.pow(3), "GB"), (STEP.pow(2), "MB"), (STEP, "kB")] {
+        if bytes >= limit {
+            return format!("{:.1} {unit}", bytes as f64 / limit as f64);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 /// `ayeaye service <verb>` — the service this binary installs for itself.
