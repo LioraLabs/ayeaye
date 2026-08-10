@@ -1041,3 +1041,62 @@ async fn none_of_the_board_endpoints_answer_without_a_token() {
         asked("gated-answers")
     );
 }
+
+// AYEAYE-45 — the endpoint the panel names a pane's session with. `kind` is
+// always there and is null when the pane is not an agent, so the page can tell
+// "not an agent" from "something went wrong" without reading a status code.
+#[tokio::test]
+async fn the_session_endpoint_answers_for_a_pane_that_is_not_an_agent() {
+    let server = Server::started().await;
+    let answer = server
+        .request("GET", "/api/session", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body_text(), r#"{"kind":null}"#);
+}
+
+// AYEAYE-45 — **membership, not syntax.** A pane id that is not in the list
+// this process just read never reaches tmux as a target, and the answer is the
+// ordinary "not an agent" rather than a refusal: the panel asks about whatever
+// is selected, and a pane that has just closed is a race rather than a caller
+// doing something wrong.
+#[tokio::test]
+async fn a_pane_nobody_offered_is_never_a_target() {
+    let server = Server::started().await;
+    for pane in [
+        "desktop/%99",
+        "desktop/%0",
+        // Shaped like a target and not one. The list is what refuses these,
+        // and a pattern over the id would not be a substitute.
+        "desktop/work:0.0",
+        "desktop/-X",
+        "%0",
+        "../../etc/passwd",
+    ] {
+        let answer = server
+            .request(
+                "GET",
+                &format!("/api/session?pane={}", urlencode(pane)),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{pane}");
+        assert_eq!(answer.body_text(), r#"{"kind":null}"#, "{pane}");
+    }
+}
+
+// AYEAYE-45 — it is an `/api/` path, so it is gated like every other one. This
+// is what an endpoint mounted on the router with `.route(…)` would skip, and
+// nothing else in the suite would notice.
+#[tokio::test]
+async fn the_session_endpoint_is_gated_like_the_rest_of_the_api() {
+    let server = Server::started().await;
+    let anonymous = server.get("/api/session?pane=desktop/%250").await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
+}
+
+/// Percent-encode the characters a pane id can carry that a query cannot.
+fn urlencode(text: &str) -> String {
+    form_urlencoded::byte_serialize(text.as_bytes()).collect()
+}
