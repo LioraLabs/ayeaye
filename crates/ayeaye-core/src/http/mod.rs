@@ -8,4 +8,5 @@
 pub mod auth;
 pub mod hosts;
 pub mod login;
+pub mod origin;
 pub mod route;
