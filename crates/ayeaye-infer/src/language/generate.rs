@@ -55,7 +55,7 @@ impl LanguageModel {
         let mut index = 0usize;
 
         while written.len() < budget && index + fed.len() < window {
-            let input = Tensor::new(fed.as_slice(), &self.device)
+            let input = Tensor::new(fed.as_slice(), &self.selection.device)
                 .map_err(LanguageError::inference)?
                 .unsqueeze(0)
                 .map_err(LanguageError::inference)?;

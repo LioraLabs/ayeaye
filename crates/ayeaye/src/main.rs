@@ -23,14 +23,8 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[1..]),
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
-        None => {
-            println!("{}", banner());
-            ExitCode::SUCCESS
-        }
-        Some("--version" | "-V") => {
-            println!("{}", banner());
-            ExitCode::SUCCESS
-        }
+        None => report(),
+        Some("--version" | "-V") => report(),
         Some("--help" | "-h") => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -68,14 +62,32 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
   AYEAYE_MODEL_HUB      where models are fetched from";
 
-/// One line naming the version and the capabilities compiled in.
-fn banner() -> String {
-    let backend = ayeaye_infer::backend::selected();
+/// One line naming the version and what this build can do *here*.
+///
+/// `got()` and not `selected()`, which is the whole of AYEAYE-57 in one line: a
+/// build with cuda compiled into it that found no card is a processor build for
+/// the rest of its life, and a capability report that goes on claiming `cuda` is
+/// the silent degradation the ticket exists to refuse.
+fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
     ayeaye_core::Identity {
         version: ayeaye_core::VERSION,
-        capabilities: &[backend.label()],
+        capabilities: &[selection.got().label()],
     }
     .banner()
+}
+
+/// Say what this build is, and — when it is not what it was compiled to be —
+/// why.
+///
+/// Kept out of [`banner`] because the banner is one line and is also used as
+/// the first half of the startup line; the reason is a sentence of its own.
+fn report() -> ExitCode {
+    let selection = ayeaye_infer::backend::select();
+    println!("{}", banner(&selection));
+    if let Some(why) = &selection.fallback {
+        println!("ayeaye: {why}");
+    }
+    ExitCode::SUCCESS
 }
 
 fn serve(args: &[String]) -> ExitCode {
@@ -118,9 +130,17 @@ fn serve(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // The acceleration line first and on its own: it is a fact about the
+        // machine rather than about the address, and folding it into the
+        // startup line would bury the one sentence somebody needs when their
+        // card is not being used.
+        let selection = ayeaye_infer::backend::select();
+        if let Some(why) = &selection.fallback {
+            eprintln!("ayeaye: {why}");
+        }
         eprintln!(
             "{} on {} · token auth on, browsers log in once via /?token=<token>",
-            banner(),
+            banner(&selection),
             settings.address()
         );
         // Before the first request, and only here: a window a previous process

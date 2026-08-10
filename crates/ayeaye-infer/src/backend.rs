@@ -86,7 +86,10 @@ pub struct Selection {
     /// The device to build tensors on.
     pub device: candle_core::Device,
     /// Why the device is not the one asked for, in words a user can act on.
-    /// `None` exactly when nothing was given up.
+    ///
+    /// `None` exactly when [`Selection::got`] is [`Selection::asked`], and that
+    /// is arranged in [`choose`] rather than trusted: it is computed from the
+    /// device, so the two cannot say different things.
     pub fallback: Option<String>,
 }
 
@@ -112,28 +115,39 @@ pub fn choose<F>(asked: Backend, open: F) -> Selection
 where
     F: FnOnce(Backend) -> candle_core::Result<candle_core::Device>,
 {
-    match open(asked) {
-        Ok(device) => Selection {
-            asked,
-            device,
-            fallback: None,
-        },
-        // A processor that will not open is not a fallback, it is a machine
-        // with no arithmetic on it. There is nowhere below this to go, so the
-        // reason is stated and the CPU device — which candle builds without
-        // asking anything of the system — is used regardless.
-        Err(why) => Selection {
-            asked,
-            device: candle_core::Device::Cpu,
-            fallback: (asked != Backend::Cpu).then(|| {
-                format!(
-                    "this build has {} compiled in, but no {} device would open ({why}); \
-                     running on the processor instead",
-                    asked.label(),
-                    asked.label(),
-                )
-            }),
-        },
+    // A device that will not open leaves the processor, which candle builds
+    // without asking anything of the system and so cannot itself fail.
+    let (device, refusal) = match open(asked) {
+        Ok(device) => (device, None),
+        Err(why) => (candle_core::Device::Cpu, Some(why)),
+    };
+
+    // The reason is derived from the device rather than from which arm was
+    // taken. That is what makes "`fallback` is `None` exactly when nothing was
+    // given up" a fact about this function instead of a promise about every
+    // opener ever passed to it — an opener that returns a device other than the
+    // one it was asked for is reported, not believed.
+    let got = Backend::of(&device);
+    let fallback = (got != asked).then(|| match refusal {
+        Some(why) => format!(
+            "this build has {} compiled in, but no {} device would open ({why}); \
+             running on the {} instead",
+            asked.label(),
+            asked.label(),
+            got.label(),
+        ),
+        None => format!(
+            "this build has {} compiled in, but the device that opened is a {}; \
+             running on that instead",
+            asked.label(),
+            got.label(),
+        ),
+    });
+
+    Selection {
+        asked,
+        device,
+        fallback,
     }
 }
 
@@ -218,19 +232,34 @@ mod tests {
 
     // AYEAYE-57 — the other half, and the one that stops the rule above being
     // satisfied by a `choose` that always falls back.
-    //
-    // The opener hands back a CPU device while claiming to have opened a Metal
-    // one, which is a lie no real opener can tell. That is deliberate and it is
-    // the shape of the design: `got()` is read off the device, so a fake cannot
-    // forge it, and what is left to assert here is the only thing `choose`
-    // decides on its own — whether there is anything to explain. A `choose`
-    // that reported a fallback for a device that opened would fail here.
     #[test]
-    fn a_device_that_opens_leaves_nothing_to_explain() {
+    fn a_device_that_opens_as_asked_leaves_nothing_to_explain() {
+        let selection = choose(Backend::Cpu, |_| Ok(Device::Cpu));
+
+        assert_eq!(selection.asked, Backend::Cpu);
+        assert_eq!(selection.got(), Backend::Cpu);
+        assert_eq!(selection.fallback, None, "nothing happened worth reporting");
+    }
+
+    // AYEAYE-57 — the reason is derived from the device, not from whether the
+    // opener returned an error. An opener that answers a Metal request with a
+    // CPU device is a lie no real opener can tell, and the point of the test is
+    // that `choose` reports it anyway rather than believing the request: this
+    // is what makes "`fallback` is `None` exactly when nothing was given up"
+    // true of the function rather than of its callers. The wording is asserted
+    // because it is what separates this from the refusal case — a `choose` that
+    // ignored the device and read the error arm would say "would not open".
+    #[test]
+    fn a_device_that_opens_as_something_else_is_still_a_fallback() {
         let selection = choose(Backend::Metal, |_| Ok(Device::Cpu));
 
-        assert_eq!(selection.asked, Backend::Metal);
-        assert_eq!(selection.fallback, None, "nothing happened worth reporting");
+        assert_eq!(selection.got(), Backend::Cpu);
+        let why = selection.fallback.expect("a device that is not the one asked for");
+        assert!(why.contains("metal"), "{why}");
+        assert!(
+            why.contains("the device that opened is a cpu"),
+            "it opened, it was simply not the one asked for: {why}"
+        );
     }
 
     // AYEAYE-57 — a CPU build has nowhere below it to go. Reporting a fallback

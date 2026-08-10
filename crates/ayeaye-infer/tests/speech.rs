@@ -129,8 +129,7 @@ fn a_clip_shorter_than_the_window_transcribes_in_one_segment() {
 // it says "nothing was compiled in and nothing was reported"; on the NVIDIA
 // artifact, a `backend()` that returned the build's constant would keep
 // claiming `cuda` while `fallback()` explained why it was not — and this is
-// what fails. It cannot be watched fail on a machine with no card, so the
-// mutation run against it is a `backend()` that ignores `self`.
+// what fails.
 #[test]
 fn a_loaded_model_reports_the_device_it_got_and_says_when_that_is_not_the_build() {
     let dir = tiny_model("reports-its-device", &tiny_config(vec![]));
@@ -145,6 +144,45 @@ fn a_loaded_model_reports_the_device_it_got_and_says_when_that_is_not_the_build(
         ayeaye_infer::backend::selected(),
         model.fallback(),
     );
+}
+
+// AYEAYE-57
+//
+// The test above is `true == true` on a machine with no card, which is every
+// machine anyone develops on — so this is the one that actually holds the
+// wiring down. `load_with` lets the selection be named rather than probed, so
+// the state a GPU artifact reaches after a dead card can be reached here: a
+// build that asked for cuda, a processor to run on, and a sentence saying so.
+//
+// What it pins is that the reason survives the load and comes back out. A
+// `fallback()` returning `None`, or a `backend()` that answered `asked` rather
+// than the device, each fail this on any machine.
+#[test]
+fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
+    let dir = tiny_model("carries-the-reason", &tiny_config(vec![]));
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cuda, |_| {
+        Err(candle_core::Error::Msg(
+            "no CUDA-capable device is detected".to_string(),
+        ))
+    });
+
+    let model = SpeechModel::load_with(dir.path(), selection.clone())
+        .expect("a model should load on the device it fell back to");
+
+    assert_eq!(
+        model.backend(),
+        selection.got(),
+        "the model reports the selection it was loaded with, not the build"
+    );
+    assert_eq!(
+        model.backend(),
+        ayeaye_infer::Backend::Cpu,
+        "it is on the processor, whatever the build asked for"
+    );
+    let why = model.fallback().expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback.as_deref());
+    assert!(why.contains("cuda"), "{why}");
+    assert!(why.contains("no CUDA-capable device is detected"), "{why}");
 }
 
 // AYEAYE-54

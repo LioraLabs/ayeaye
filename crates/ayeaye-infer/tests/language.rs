@@ -247,6 +247,30 @@ fn a_complete_quantized_model_loads_from_the_directory_it_was_pointed_at() {
     assert!(described.contains("cpu"), "{described}");
 }
 
+// AYEAYE-57
+//
+// The language model got the same wiring as the speech model and needs the same
+// hold-down: `load_with` names a selection this machine cannot produce, so the
+// state a GPU artifact reaches after a dead card is reachable here. See the
+// twin in `tests/speech.rs` for the argument.
+#[test]
+fn a_model_loaded_after_a_fallback_carries_the_reason_out_with_it() {
+    let dir = tiny_model("carries-the-reason");
+    let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Metal, |_| {
+        Err(candle_core::Error::Msg("no Metal device is present".to_string()))
+    });
+
+    let model = LanguageModel::load_with(dir.path(), selection.clone())
+        .expect("a model should load on the device it fell back to");
+
+    assert_eq!(model.backend(), selection.got());
+    assert_eq!(model.backend(), ayeaye_infer::Backend::Cpu);
+    let why = model.fallback().expect("the reason should survive the load");
+    assert_eq!(Some(why), selection.fallback.as_deref());
+    assert!(why.contains("metal"), "{why}");
+    assert!(why.contains("no Metal device is present"), "{why}");
+}
+
 // -------------------------------------------------------------- generation
 
 // AYEAYE-55

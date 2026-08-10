@@ -41,6 +41,39 @@ fn the_bare_binary_prints_the_banner_and_succeeds() {
     assert_eq!(versioned, out, "--version should be the same banner");
 }
 
+// AYEAYE-57 — the capability report names what this run actually got, and says
+// why when that is not what the build asked for.
+//
+// The shape is asserted against a selection made in the test rather than
+// against the literal `cpu`, so it holds on every row of the release matrix.
+// The second line cannot be produced on a machine with no card — a build with
+// no acceleration in it has nothing to fall back from — so what runs here is
+// the negative half: exactly one line, and it names the backend in use.
+#[test]
+fn the_banner_reports_the_acceleration_this_run_actually_got() {
+    let selection = ayeaye_infer::backend::select();
+
+    let (code, out, _) = ayeaye(&["--version"]);
+
+    assert_eq!(code, 0);
+    assert!(
+        out.contains(&format!("({})", selection.got().label())),
+        "the banner should name the backend in use ({}): {out:?}",
+        selection.got().label()
+    );
+    match &selection.fallback {
+        None => assert_eq!(
+            out.lines().count(),
+            1,
+            "nothing was given up, so there is nothing to explain: {out:?}"
+        ),
+        Some(why) => assert!(
+            out.contains(why.as_str()),
+            "the reason has to reach the person reading it: {out:?}"
+        ),
+    }
+}
+
 // AYEAYE-42 — an unrecognised command fails rather than starting something.
 // A service unit with a typo in it should stop, not silently serve.
 #[test]

@@ -3,12 +3,12 @@
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use candle_transformers::models::{quantized_llama, quantized_qwen2};
 use tokenizers::Tokenizer;
 
 use super::error::LanguageError;
-use crate::backend::{self, Backend};
+use crate::backend::{self, Backend, Selection};
 
 /// The weights, quantized, in the format llama.cpp publishes.
 ///
@@ -94,10 +94,12 @@ impl Weights {
 pub struct LanguageModel {
     pub(crate) weights: Weights,
     pub(crate) tokenizer: Tokenizer,
-    pub(crate) device: Device,
-    /// Why the device is not the backend this build was compiled for. `None`
-    /// when nothing was given up; see [`crate::backend::choose`].
-    pub(crate) fallback: Option<String>,
+    /// The device, and how it came to be that one.
+    ///
+    /// The whole answer is kept rather than the device alone, so that
+    /// [`Self::backend`] and [`Self::fallback`] are two readings of one fact
+    /// instead of two fields that can drift.
+    pub(crate) selection: Selection,
     pub(crate) architecture: String,
     /// How many positions this model's rotary table was built for.
     pub(crate) window: usize,
@@ -112,7 +114,14 @@ impl LanguageModel {
     /// The directory is the caller's to choose and ayeaye's to read: acquiring
     /// what goes in it is AYEAYE-56's, and shipping weights is nobody's.
     pub fn load(dir: &Path) -> Result<Self, LanguageError> {
-        let selection = backend::select();
+        Self::load_with(dir, backend::select())
+    }
+
+    /// Load the model in `dir` onto a device already chosen.
+    ///
+    /// See [`super::super::speech::SpeechModel::load_with`] for why the device
+    /// decision is the process's rather than the model's.
+    pub fn load_with(dir: &Path, selection: Selection) -> Result<Self, LanguageError> {
         let device = selection.device.clone();
 
         let weights_path = dir.join(WEIGHTS_FILE);
@@ -171,8 +180,7 @@ impl LanguageModel {
         Ok(Self {
             weights,
             tokenizer,
-            device,
-            fallback: selection.fallback,
+            selection,
             architecture,
             window,
             eos,
@@ -185,7 +193,7 @@ impl LanguageModel {
     /// with acceleration compiled in these differ exactly when [`Self::fallback`]
     /// has something to say.
     pub fn backend(&self) -> Backend {
-        Backend::of(&self.device)
+        self.selection.got()
     }
 
     /// Why this model is not on the backend the build was compiled for.
@@ -193,7 +201,7 @@ impl LanguageModel {
     /// `None` when it is — which is every CPU build, where there was nothing
     /// to give up.
     pub fn fallback(&self) -> Option<&str> {
-        self.fallback.as_deref()
+        self.selection.fallback.as_deref()
     }
 
     /// What the file called itself.
