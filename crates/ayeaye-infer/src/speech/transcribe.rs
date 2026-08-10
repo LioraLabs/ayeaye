@@ -8,6 +8,9 @@ use super::error::SpeechError;
 use super::model::SpeechModel;
 use super::transcript::{Segment, Transcript};
 
+/// The sample rate, as the float the segment timings are computed in.
+const SAMPLE_RATE_F32: f32 = ayeaye_core::audio::SAMPLE_RATE_HZ as f32;
+
 impl SpeechModel {
     /// Transcribe 16 kHz mono audio, in this process.
     ///
@@ -162,6 +165,3 @@ impl SpeechModel {
         best
     }
 }
-
-/// The sample rate, as the float the timings are computed in.
-const SAMPLE_RATE_F32: f32 = ayeaye_core::audio::SAMPLE_RATE_HZ as f32;

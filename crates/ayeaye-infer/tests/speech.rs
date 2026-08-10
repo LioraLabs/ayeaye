@@ -249,3 +249,26 @@ fn a_thirty_second_window_is_the_shape_a_real_whisper_asks_for() {
         .collect();
     assert_eq!(spans, vec![(0.0, 30.0), (30.0, 31.0)]);
 }
+
+// AYEAYE-54
+//
+// Loading releases the resident model before it reads the new one, so a load
+// that fails leaves the slot empty rather than holding the old model. That is
+// a deliberate trade and worth pinning: it is what stops a reconfiguration
+// from briefly holding two models, and the price is that a bad path costs you
+// the working one. AYEAYE-56's policy needs to know which of the two it gets.
+#[test]
+fn a_failed_load_leaves_the_slot_empty_rather_than_holding_the_old_model() {
+    let dir = tiny_model("failed-reload", &tiny_config(vec![]));
+    let mut slot = ayeaye_infer::SpeechSlot::empty();
+    slot.load(dir.path()).expect("the toy model should load");
+    assert!(slot.is_loaded());
+
+    let error = slot
+        .load(std::path::Path::new("/nowhere/no-such-model"))
+        .expect_err("there is no model there");
+
+    assert!(matches!(error, SpeechError::Missing { .. }));
+    assert!(!slot.is_loaded(), "the old model was released, not retained");
+    assert!(slot.transcribe(&support::tone(1.0)).is_err());
+}

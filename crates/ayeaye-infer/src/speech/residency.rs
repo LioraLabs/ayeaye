@@ -54,11 +54,6 @@ impl SpeechSlot {
         self.model.is_some()
     }
 
-    /// The resident model, for asking it about itself.
-    pub fn model(&self) -> Option<&SpeechModel> {
-        self.model.as_ref()
-    }
-
     /// Transcribe with the resident model.
     ///
     /// [`SpeechError::NotLoaded`] when the slot is empty. It does not load one.

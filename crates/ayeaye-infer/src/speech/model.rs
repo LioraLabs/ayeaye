@@ -99,11 +99,6 @@ impl SpeechModel {
         })
     }
 
-    /// The directory layout a model is expected in, for error messages and docs.
-    pub fn expected_files() -> [&'static str; 3] {
-        [CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE]
-    }
-
     /// Where this model is running.
     pub fn backend(&self) -> Backend {
         backend::selected()
