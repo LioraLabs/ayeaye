@@ -230,6 +230,13 @@ async fn tail(
 
     let mut idle = 0;
     while stop_after.is_none_or(|limit| idle < limit) {
+        // The sends below are what usually notice a hung-up client — but an
+        // agent sitting on a dangling partial line is new bytes every poll
+        // and no event and no ping, so nothing would ever send. Asked
+        // outright, or that one case leaks this task until a line completes.
+        if sender.is_closed() {
+            return;
+        }
         let Ok(grown) = tokio::fs::metadata(&path).await else {
             // The file went away: a cleared session, a deleted project. The
             // stream ends and the client's reconnect finds out what is true.
@@ -450,6 +457,35 @@ mod tests {
         assert_eq!(next(&mut stream, "the first ping").await, PING);
         assert_eq!(next(&mut stream, "the second ping").await, PING);
         assert_eq!(stream.next().await, None, "two idle polls were the limit");
+    }
+
+    // AYEAYE-46 — the disconnect story: a client that goes away drops the
+    // receiver, the next send fails, and the tail *ends* — it does not poll a
+    // dead socket forever. Driven through `tail` itself so the task's end is
+    // observable as its JoinHandle resolving; `frames` is the same spawn with
+    // the handle detached.
+    #[tokio::test]
+    async fn a_client_that_hangs_up_ends_the_tail() {
+        let file = File::holding("hangup", &format!("{}\n", user_line("one")));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(super::IN_FLIGHT);
+        let task = tokio::spawn(super::tail(
+            Kind::Claude,
+            "0123abcd".to_string(),
+            file.path().to_string(),
+            200,
+            Duration::from_millis(10),
+            None,
+            sender,
+        ));
+        assert!(
+            receiver.recv().await.is_some(),
+            "the stream opened: the client got its init frame"
+        );
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the tail must end when the client hangs up, not poll forever")
+            .expect("and end by returning, not by panicking");
     }
 
     // AYEAYE-46 — a transcript that is not there is a stream that ends rather

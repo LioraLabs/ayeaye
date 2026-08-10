@@ -602,14 +602,24 @@ async fn stream(settings: &Settings, query: &Query) -> Response {
     let Some(found) = found else {
         return json(StatusCode::NOT_FOUND, r#"{"kind":null}"#);
     };
-    let frames = crate::transcript::frames(
+    streaming(crate::transcript::frames(
         found.kind,
         found.id,
         found.path,
         crate::transcript::backlog_limit(|name| std::env::var(name).ok()),
         crate::transcript::POLL,
         None,
-    );
+    ))
+}
+
+/// The event-stream response around an already-running tail.
+///
+/// Split from [`stream`] so the response's shape — the content type, the
+/// unbuffered-proxy header, and above all the *absence* of a Content-Length —
+/// is a fact a test can hold without a session to stream. The body's length
+/// is unknown by construction, which is what keeps hyper from ever writing
+/// one: the stream ends when the connection does.
+fn streaming(frames: crate::transcript::Frames) -> Response {
     build(
         StatusCode::OK,
         "text/event-stream",
@@ -1058,5 +1068,59 @@ impl Query {
             }
         }
         query
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streaming;
+    use axum::http::header;
+    use std::time::Duration;
+
+    // AYEAYE-46 — the spec's "no content length", held as a fact about the
+    // response rather than hoped about the wire: the body is a stream whose
+    // size is unknown by construction, so no Content-Length is ever set and
+    // hyper has nothing to write one from. The content type and the
+    // unbuffered-proxy header are the rest of what an event stream needs to
+    // arrive as events rather than as a download.
+    #[tokio::test]
+    async fn the_stream_response_is_an_event_stream_with_no_length() {
+        let frames = crate::transcript::frames(
+            ayeaye_core::session::Kind::Claude,
+            "0123abcd".to_string(),
+            "/nonexistent/transcript.jsonl".to_string(),
+            200,
+            Duration::from_millis(10),
+            None,
+        );
+        let response = streaming(frames);
+        assert_eq!(response.status(), super::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("a content type"),
+            "text/event-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-accel-buffering")
+                .expect("the proxy must not buffer a stream"),
+            "no"
+        );
+        assert!(
+            response.headers().get(header::CONTENT_LENGTH).is_none(),
+            "an event stream has no length; the connection is the lifetime"
+        );
+        // The other half of "no content length": an exact size hint is what
+        // hyper would turn into one at write time. The trait lives in
+        // `http_body`, which axum depends on and this crate does not name, so
+        // it is borrowed for the one assertion.
+        use axum::body::HttpBody as _;
+        assert!(
+            response.body().size_hint().exact().is_none(),
+            "an exact size hint is what hyper would turn into a Content-Length"
+        );
     }
 }
