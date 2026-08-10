@@ -17,11 +17,21 @@ use axum::response::Response;
 use ayeaye_core::http::origin::{Origin, Site};
 use ayeaye_core::http::route::{Asset, Gate, Route};
 use ayeaye_core::http::{auth, login, origin, route};
+use ayeaye_core::json;
+use ayeaye_core::prompt;
+use ayeaye_core::tmux::Pane;
 
 /// The header a browser labels a request's provenance with. `http` has no
 /// constant for it: it is a fetch-metadata header, newer than the crate's
 /// table.
 const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
+/// The most body a write endpoint will read.
+///
+/// `bin/ayeaye`'s `MAX_BODY`, and the same one megabyte. These bodies carry a
+/// pane id and a line of dictated text; the limit is what stops a client that
+/// announced a gigabyte from being given a gigabyte of this process's memory.
+pub const MAX_BODY: usize = 1 << 20;
 
 use crate::assets;
 use crate::config::Settings;
@@ -61,6 +71,12 @@ async fn handle(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    // The body, **unread**. `Bytes` here would have axum buffer it before
+    // this function is entered, which would put the reading of an attacker's
+    // body above the Host and CSRF gates rather than below them. Taking the
+    // stream and draining it at the one place that wants it keeps the order
+    // the daemon refuses in, and keeps a refused write costing nothing.
+    body: Body,
 ) -> Response {
     // The Host gate comes first and applies to everything, pages included:
     // it is what stops a page on an attacker's origin, resolving their name to
@@ -106,12 +122,22 @@ async fn handle(
             serve_asset(asset)
         }
         Route::Panes if method == Method::GET || method == Method::HEAD => panes(&settings).await,
+        Route::Prompt if method == Method::GET || method == Method::HEAD => {
+            asked(&settings, query.pane.as_deref().unwrap_or("")).await
+        }
+        Route::Answer if method == Method::POST => answer(&settings, body).await,
+        Route::Send if method == Method::POST => send(&settings, body).await,
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
-        Route::Panes | Route::Api | Route::NotFound | Route::Login | Route::Asset(_) => {
-            json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
-        }
+        Route::Panes
+        | Route::Prompt
+        | Route::Answer
+        | Route::Send
+        | Route::Api
+        | Route::NotFound
+        | Route::Login
+        | Route::Asset(_) => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
     }
 }
 
@@ -169,6 +195,171 @@ async fn panes(settings: &Settings) -> Response {
         Body::from(body),
         |response| response,
     )
+}
+
+/// The question one pane is stopped on, or a null prompt.
+///
+/// One `capture-pane` and nothing else: cheap enough for the transcript view to
+/// poll, so a permission prompt is answerable from there without paying for a
+/// full overview scan.
+async fn asked(settings: &Settings, qualified: &str) -> Response {
+    let pane = match pane_of(settings, qualified).await {
+        Ok(pane) => pane,
+        Err(refusal) => return refusal,
+    };
+    match settings.tmux.capture(&pane).await {
+        Ok(screen) => body_of(StatusCode::OK, prompt::body(prompt::read(&screen).as_ref())),
+        // Not a null prompt. "There is no question here" and "I could not look"
+        // are opposite answers, and answering the second as the first is the
+        // failure this whole endpoint exists to prevent: the card would read
+        // `working` while the pane sat stopped, which is what happened for half
+        // an hour and is why these fixtures exist.
+        Err(trouble) => refused(StatusCode::INTERNAL_SERVER_ERROR, &trouble.to_string()),
+    }
+}
+
+/// Press one key in one pane.
+///
+/// A digit is sent on its own and never with Enter: claude's multi-select uses
+/// digits to toggle checkboxes and Enter to submit, so pairing them toggled and
+/// submitted in a single tap. Confirming is always a second act — which is also
+/// what you want from a remote that can approve `git restore`.
+async fn answer(settings: &Settings, body: Body) -> Response {
+    let asked = match read_body(body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return refusal,
+    };
+    let pane = match pane_of(
+        settings,
+        asked.get("pane").and_then(json::Value::text).unwrap_or(""),
+    )
+    .await
+    {
+        Ok(pane) => pane,
+        Err(refusal) => return refusal,
+    };
+    // Only a string. The daemon writes `str(req.get("key", ""))`, so `{"key": 1}`
+    // answers a prompt there and is a bad key here — a divergence, and the safe
+    // direction of one: `share/app.html` sends `opt.key`, which is the string it
+    // read out of this server's own answer.
+    let named = asked.get("key").and_then(json::Value::text).unwrap_or("");
+    let Some(key) = prompt::press(named) else {
+        return refused(StatusCode::BAD_REQUEST, "bad key");
+    };
+    match settings.tmux.press(&pane, key).await {
+        Ok(()) => body_of(
+            StatusCode::OK,
+            format!(r#"{{"ok":true,"sent":{}}}"#, json::string(named)),
+        ),
+        Err(trouble) => refused(StatusCode::INTERNAL_SERVER_ERROR, &trouble.to_string()),
+    }
+}
+
+/// Type some text into one pane, and submit it only if asked to.
+async fn send(settings: &Settings, body: Body) -> Response {
+    let asked = match read_body(body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return refusal,
+    };
+    let named = asked.get("pane").and_then(json::Value::text).unwrap_or("");
+    let text = asked.get("text").and_then(json::Value::text).unwrap_or("");
+    if named.trim().is_empty() || text.is_empty() {
+        return refused(StatusCode::BAD_REQUEST, "pane and text required");
+    }
+    let pane = match pane_of(settings, named).await {
+        Ok(pane) => pane,
+        Err(refusal) => return refusal,
+    };
+    // The newline check is the acceptance criterion, not a hardening: typing
+    // sends text *without* submitting it, and a newline in the text is a submit
+    // the caller did not ask for and the user never saw.
+    let Some(text) = prompt::typed(text) else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "text cannot carry control characters",
+        );
+    };
+    if let Err(trouble) = settings.tmux.type_text(&pane, text).await {
+        return refused(StatusCode::INTERNAL_SERVER_ERROR, &trouble.to_string());
+    }
+    if asked.get("enter").is_some_and(json::Value::truthy)
+        && let Err(trouble) = settings.tmux.submit(&pane).await
+    {
+        return refused(StatusCode::INTERNAL_SERVER_ERROR, &trouble.to_string());
+    }
+    body_of(StatusCode::OK, r#"{"ok":true}"#.to_string())
+}
+
+/// The live pane this id names, or the refusal to send.
+///
+/// **Membership, not syntax.** The id is compared against the list tmux has just
+/// reported, and nothing about its shape is trusted to stand in for that: a
+/// well-formed id for a pane that is not there is exactly what a forged one
+/// looks like. Every caller below sends keys to somebody's terminal, so this is
+/// the one check between a request and that terminal.
+///
+/// It is also what refuses another machine's pane, without a second rule: the
+/// only list this can read is this machine's, and an id qualified with a
+/// different host is not in it. When there is a transport to read another
+/// machine's list over, this function grows the route and its callers do not
+/// change — which is the whole reason ids are qualified.
+async fn pane_of(settings: &Settings, qualified: &str) -> Result<Pane, Response> {
+    if qualified.trim().is_empty() {
+        return Err(refused(StatusCode::BAD_REQUEST, "no pane"));
+    }
+    let here = settings.peers.here().name();
+    let panes = match settings.tmux.panes(here).await {
+        Ok(panes) => panes,
+        // Refused rather than treated as "not a pane". A tmux that could not be
+        // asked knows nothing about whether this pane exists, and answering "no
+        // such pane" would be this server stating something it does not know.
+        Err(trouble) => {
+            eprintln!("ayeaye: {trouble}");
+            return Err(refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &trouble.to_string(),
+            ));
+        }
+    };
+    panes
+        .into_iter()
+        // Compared as issued, byte for byte. Not trimmed, not normalised: this
+        // server wrote the id the client is handing back, so an id that differs
+        // from one of ours by so much as a trailing tab is one somebody else
+        // wrote, and every rule that "tidies" it before comparing is a rule that
+        // has to agree with tmux's own target parsing to be safe.
+        .find(|pane| pane.id.qualified() == qualified)
+        // Deliberately the same answer for a forged id, a stale one, and one
+        // naming another machine. Saying which it was would tell whoever is
+        // guessing how to guess better, and there is nothing the panel does
+        // differently between the three.
+        .ok_or_else(|| refused(StatusCode::BAD_REQUEST, "no such pane"))
+}
+
+/// The request body, read at last and parsed.
+///
+/// Below every gate, so a cross-site write is refused without a byte of its
+/// body being read, and bounded, so a client that announced a gigabyte is not
+/// given one.
+async fn read_body(body: Body) -> Result<json::Value, Response> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|_| refused(StatusCode::BAD_REQUEST, "bad body"))?;
+    let text =
+        core::str::from_utf8(&bytes).map_err(|_| refused(StatusCode::BAD_REQUEST, "bad json"))?;
+    json::parse(text).map_err(|_| refused(StatusCode::BAD_REQUEST, "bad json"))
+}
+
+/// One refusal, in the shape every `/api/` error takes: `{"error": "…"}`.
+fn refused(status: StatusCode, why: &str) -> Response {
+    body_of(status, format!(r#"{{"error":{}}}"#, json::string(why)))
+}
+
+/// A JSON answer that had to be built rather than written out.
+fn body_of(status: StatusCode, text: String) -> Response {
+    build(status, "application/json", Body::from(text), |response| {
+        response
+    })
 }
 
 /// A file compiled into the binary.
@@ -232,7 +423,7 @@ fn presented_origin(headers: &HeaderMap) -> Origin<'_> {
     }
 }
 
-/// The two query parameters this server reads.
+/// The query parameters this server reads.
 ///
 /// Percent-decoded, and `+` read as a space, because that is what the daemon's
 /// `parse_qs` does — and a `next` compared before decoding is a check looking
@@ -242,12 +433,14 @@ fn presented_origin(headers: &HeaderMap) -> Origin<'_> {
 struct Query {
     token: Option<String>,
     next: Option<String>,
+    pane: Option<String>,
 }
 
 impl Query {
     fn of(raw: Option<&str>) -> Query {
         let mut token = None;
         let mut next = None;
+        let mut pane = None;
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             if value.is_empty() {
                 continue;
@@ -256,9 +449,10 @@ impl Query {
             match key.as_ref() {
                 "token" if token.is_none() => token = Some(value.into_owned()),
                 "next" if next.is_none() => next = Some(value.into_owned()),
+                "pane" if pane.is_none() => pane = Some(value.into_owned()),
                 _ => {}
             }
         }
-        Query { token, next }
+        Query { token, next, pane }
     }
 }
