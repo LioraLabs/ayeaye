@@ -1,0 +1,96 @@
+//! The constitution, run against the workspace it governs.
+//!
+//! The rules themselves are unit-tested against planted violations beside
+//! their implementations; these are the same rules pointed at the real tree.
+//! Both halves are needed: a rule with no mutation test may be blind, and a
+//! rule that is never run against the tree is decoration.
+
+use constitution::corpus::{Corpus, workspace_root};
+use constitution::{deps, effect_budget, finding::report, strata};
+
+/// The floor the corpus walk has to clear.
+///
+/// It exists to catch a walk that found nothing — a mistyped directory, a
+/// wrong root, a member list that stopped matching the tree. Raise it as the
+/// crates fill up; a walk that returns two files where it used to return forty
+/// is the failure this number is here to make loud.
+const NON_TRIVIAL: usize = 8;
+
+fn corpus() -> Corpus {
+    Corpus::walk(&workspace_root()).expect("the workspace should be readable")
+}
+
+// AYEAYE-41
+#[test]
+fn the_walk_finds_a_non_trivial_corpus() {
+    let corpus = corpus();
+    assert!(
+        corpus.file_count() >= NON_TRIVIAL,
+        "the walk found {} source files, which is fewer than the {NON_TRIVIAL} a real \
+         workspace has — the walk is looking in the wrong place",
+        corpus.file_count()
+    );
+}
+
+// AYEAYE-41
+#[test]
+fn every_crate_the_strata_place_is_a_crate_the_walk_found() {
+    let corpus = corpus();
+    for (name, _) in strata::STRATA {
+        let member = corpus.member(name).unwrap_or_else(|| {
+            panic!("{name} is in the stratum table but the walk did not find it")
+        });
+        assert!(
+            !member.sources.is_empty(),
+            "{name} contributed no source files, so nothing about it was actually read"
+        );
+    }
+}
+
+// AYEAYE-41
+#[test]
+fn the_pure_core_stays_within_its_effect_budget() {
+    let corpus = corpus();
+    let core = corpus
+        .member(deps::GOVERNED)
+        .expect("the pure core should be a workspace member");
+    let findings: Vec<_> = core
+        .sources
+        .iter()
+        .flat_map(|source| effect_budget::scan(&source.path, &source.text))
+        .collect();
+    assert!(
+        findings.is_empty(),
+        "{} reaches outside the effect budget:\n{}",
+        deps::GOVERNED,
+        report(&findings)
+    );
+}
+
+// AYEAYE-41
+#[test]
+fn the_pure_core_declares_only_allowlisted_dependencies() {
+    let corpus = corpus();
+    let core = corpus
+        .member(deps::GOVERNED)
+        .expect("the pure core should be a workspace member");
+    let findings = deps::check(&core.name, &core.dependencies);
+    assert!(
+        findings.is_empty(),
+        "{} declares dependencies that are not on its allowlist:\n{}",
+        deps::GOVERNED,
+        report(&findings)
+    );
+}
+
+// AYEAYE-41
+#[test]
+fn no_crate_depends_upwards_or_sideways() {
+    let corpus = corpus();
+    let findings = strata::check(&corpus.nodes(), strata::STRATA);
+    assert!(
+        findings.is_empty(),
+        "the strata are broken:\n{}",
+        report(&findings)
+    );
+}
