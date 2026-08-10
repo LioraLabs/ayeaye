@@ -21,7 +21,7 @@ pub fn rows(stdout: &str) -> Vec<&str> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && crate::json::is_value(line))
+        .filter(|line| crate::json::is_value(line))
         .collect()
 }
 
@@ -74,6 +74,12 @@ pub fn failure(message: &str) -> String {
 /// nothing else from cliban and the board is a couple of hundred kilobytes. A
 /// row with no `key` is skipped rather than refused: the answer is a list of
 /// what can be linkified, and one unusable row does not make the rest unusable.
+///
+/// The keys are escaped but not shape-checked, which is the daemon's
+/// `[p["key"] for p in projs if p.get("key")]` and is on purpose: cliban names
+/// its own projects, and unlike [`is_issue_key`] nothing here reaches an argv.
+/// Escaping is not optional though — the page reads this with `.json()`, and a
+/// body that does not parse is no links at all rather than one link fewer.
 pub fn project_keys(rows: &[&str]) -> String {
     let keys: Vec<String> = rows
         .iter()
@@ -124,6 +130,10 @@ mod tests {
         "\n",
         r#"{"key":"CLI","name":"Cliban","updated_at":"2026-08-10T01:41:44Z"}"#,
         "\n",
+        // A row whose first member is a number, which is what a project with a
+        // retention setting really looks like.
+        r#"{"auto_archive_done_after_days":7,"key":"COOK","name":"Cook"}"#,
+        "\n",
     );
 
     /// One line of `cliban issue ls --json`, nested `relations` and all: the
@@ -141,6 +151,7 @@ mod tests {
             vec![
                 r#"{"key":"AYEAYE","name":"AyeAye","updated_at":"2026-08-10T05:53:47Z"}"#,
                 r#"{"key":"CLI","name":"Cliban","updated_at":"2026-08-10T01:41:44Z"}"#,
+                r#"{"auto_archive_done_after_days":7,"key":"COOK","name":"Cook"}"#,
             ]
         );
         assert!(rows("").is_empty());
@@ -180,6 +191,13 @@ mod tests {
                 ISSUE
             )
         );
+        // Every payload parses, populated or not: the page reads all of them
+        // with `.json()`, and one that does not is a blank board with no error.
+        assert!(is_value(&payload(
+            &[r#"{"key":"AYEAYE"}"#],
+            &[r#"{"name":"One binary"}"#],
+            &[ISSUE]
+        )));
         // An empty board is still a board, and still has to parse.
         assert_eq!(
             payload(&[], &[], &[]),
@@ -211,7 +229,7 @@ mod tests {
     fn the_project_keys_are_the_keys_and_the_rest_is_skipped() {
         assert_eq!(
             project_keys(&rows(PROJECTS)),
-            r#"{"keys":["AYEAYE","CLI"]}"#
+            r#"{"keys":["AYEAYE","CLI","COOK"]}"#
         );
         assert_eq!(project_keys(&[]), r#"{"keys":[]}"#);
         assert_eq!(
@@ -226,6 +244,16 @@ mod tests {
             project_keys(&[r#"{"key":""}"#, r#"{"key":"CLI"}"#]),
             r#"{"keys":["CLI"]}"#
         );
+        // The key is escaped on the way out, not interpolated. cliban names its
+        // own projects so nothing here is hostile, but app.html reads this with
+        // `.json()` and swallows the failure into a silent catch: a key that
+        // ended its own string would cost every ticket link on the page, with
+        // nothing anywhere saying why.
+        let awkward = project_keys(&[r#"{"key":"a\"b\nc"}"#]);
+        assert_eq!(awkward, r#"{"keys":["a\"b\nc"]}"#);
+        assert!(is_value(&awkward));
+        assert!(is_value(&project_keys(&rows(PROJECTS))));
+        assert!(is_value(&project_keys(&[])));
     }
 
     // AYEAYE-53 — the key goes into a subprocess argv, so this is the check

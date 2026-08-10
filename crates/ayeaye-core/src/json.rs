@@ -13,6 +13,8 @@
 
 /// How deep a value may nest before it is refused.
 ///
+/// Levels, not the index of the deepest: 128 nest, 129 is refused.
+///
 /// A recursive scanner with no bound is a stack overflow waiting for the first
 /// oddly-shaped input, and an overflow is not a `false` — it takes the process
 /// with it. cliban's rows nest two or three deep; anything near this is not a
@@ -41,7 +43,7 @@ fn skip_space(bytes: &[u8], mut at: usize) -> usize {
 
 /// Scan one value, returning the index just past it.
 fn scan_value(bytes: &[u8], at: usize, depth: usize) -> Option<usize> {
-    if depth > MAX_DEPTH {
+    if depth >= MAX_DEPTH {
         return None;
     }
     match *bytes.get(at)? {
@@ -164,8 +166,9 @@ fn digits(bytes: &[u8], mut at: usize) -> usize {
 /// `out` decides whether the characters are kept: validating a whole board
 /// would otherwise allocate a `String` for every string in it, and the only one
 /// ever wanted is the single value [`string_member`] was asked for. Scanning
-/// bytes is safe on UTF-8 text because every byte this looks at is ASCII, and a
-/// continuation byte can never be one of them.
+/// Scanning bytes is safe on UTF-8 text because every byte this *decides* on is
+/// ASCII, and a continuation byte can never be one of those; the walk below
+/// steps over the continuations so that what is kept is whole characters.
 fn read_string(bytes: &[u8], at: usize, mut out: Option<&mut String>) -> Option<usize> {
     if bytes.get(at) != Some(&b'"') {
         return None;
@@ -276,7 +279,15 @@ pub fn string_member(text: &str, name: &str) -> Option<String> {
 /// The raw bytes answer it for every name cliban has ever emitted; only a name
 /// carrying a backslash costs a decode, and `{"key":…}` is still `key`.
 fn named(bytes: &[u8], start: usize, end: usize, name: &str) -> bool {
-    let raw = &bytes[start + 1..end - 1];
+    // Indexed through `get` rather than sliced: the caller's guarantee that
+    // this span is a whole `"…"` lives in a doc comment, and a doc comment is
+    // not a reason for the one place in this module that could panic.
+    let Some(raw) = end
+        .checked_sub(1)
+        .and_then(|last| bytes.get(start + 1..last))
+    else {
+        return false;
+    };
     if !raw.contains(&b'\\') {
         return raw == name.as_bytes();
     }
@@ -336,7 +347,7 @@ mod tests {
             "true",
             "false",
             "null",
-            "  \n\t {\"a\": [1, {\"b\": null}]}  \n",
+            "  \n\t {\"a\": [1, {\"b\": null}]}  \r\n",
             r#"{"description":"a \"quoted\" word\nand a line break"}"#,
             r#"{"emoji":"😀 and é"}"#,
         ] {
@@ -375,6 +386,15 @@ mod tests {
     fn nesting_past_the_cap_is_refused_rather_than_recursed() {
         let shallow = format!("{}{}", "[".repeat(64), "]".repeat(64));
         assert!(is_value(&shallow));
+        // The cap is levels, not the index of the deepest: 128 nest, 129 does
+        // not, and a constant that means one and says the other is a trap for
+        // whoever next reads it as a budget.
+        assert!(is_value(&format!("{}{}", "[".repeat(128), "]".repeat(128))));
+        assert!(!is_value(&format!(
+            "{}{}",
+            "[".repeat(129),
+            "]".repeat(129)
+        )));
         let deep = format!("{}{}", "[".repeat(5_000), "]".repeat(5_000));
         assert!(!is_value(&deep));
     }
@@ -406,8 +426,17 @@ mod tests {
         );
         // Junk after the object is not an object with a member; a reader that
         // stopped at the first match would answer a question about text that
-        // never parsed.
+        // never parsed. Nor is junk *before* it: the leading brace is what
+        // makes this an object rather than a member found in loose text.
         assert_eq!(string_member(r#"{"key":"A"} and then junk"#, "key"), None);
+        assert_eq!(string_member(r#"?"key":"A"}"#, "key"), None);
+        // A name that merely starts with the one asked for is a different
+        // member. `keys` and `keyboard` are both real cliban member names.
+        assert_eq!(string_member(r#"{"keyboard":"X"}"#, "key"), None);
+        assert_eq!(
+            string_member(r#"{"keys":["A"],"key":"B"}"#, "key").as_deref(),
+            Some("B")
+        );
     }
 
     // AYEAYE-53 — cliban writes UTF-8 straight out, and a project name or a
