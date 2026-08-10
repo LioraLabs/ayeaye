@@ -6,11 +6,14 @@
 use std::process::Command;
 
 fn ayeaye(args: &[&str]) -> (i32, String, String) {
+    // A token is supplied rather than removed. `serve` loads the token before
+    // it parses arguments, so on a machine with no token file every `serve`
+    // assertion below would otherwise be answered by the "no token" branch and
+    // prove nothing about argument handling — passing for the wrong reason on
+    // one machine and the right one on another.
     let output = Command::new(env!("CARGO_BIN_EXE_ayeaye"))
         .args(args)
-        // A stray AYEAYE_* in the developer's shell must not change what these
-        // assertions see.
-        .env_remove("AYEAYE_TOKEN")
+        .env("AYEAYE_TOKEN", "test-token-not-a-real-secret")
         .env_remove("VOICE_REMOTE_TOKEN")
         .output()
         .expect("the binary should be runnable");
@@ -54,10 +57,8 @@ fn an_unknown_command_fails_and_says_so() {
 fn a_bad_serve_argument_is_refused_before_binding() {
     let (code, _, err) = ayeaye(&["serve", "--prot", "9000"]);
     assert_eq!(code, 1);
-    assert!(
-        err.contains("--prot") || err.contains("no token"),
-        "stderr was {err:?}"
-    );
+    assert!(err.contains("--prot"), "stderr was {err:?}");
+    assert!(err.contains("usage:"), "stderr was {err:?}");
     assert!(
         !err.contains("panicked"),
         "a bad flag must not panic: {err:?}"

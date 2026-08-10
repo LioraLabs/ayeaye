@@ -34,10 +34,12 @@ pub fn safe_next(next: &str) -> &str {
 
 /// Characters no URL path may carry into a header.
 ///
-/// C0, DEL and space. A space is legal in neither a request target nor a
-/// header value, and percent-decoding a `next` can produce one.
+/// `is_control` is Unicode `Cc`, so it already covers C0, DEL and C1 — there
+/// is nothing to add for DEL. Space is separate: it is legal in neither a
+/// request target nor a header value, and percent-decoding a `next` can
+/// produce one.
 fn is_forbidden(character: char) -> bool {
-    character.is_control() || character == ' ' || character == '\u{7f}'
+    character.is_control() || character == ' '
 }
 
 /// The `Set-Cookie` value the handshake returns.

@@ -120,8 +120,11 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
 ///
 /// HEAD reads what GET reads and returns no body, so it is gated exactly where
 /// GET is. That is a decision rather than an oversight: the server answers
-/// HEAD out of the GET handler, and gating it would 401 the link previewers
-/// and PWA install checks that HEAD an icon nobody needs a token to fetch.
+/// HEAD for the assets, and gating it would 401 the link previewers and PWA
+/// install checks that HEAD an icon nobody needs a token to fetch. It is only
+/// the *gate* that treats HEAD as a GET: the server still answers 404 to a
+/// HEAD of the login handshake, so a previewer cannot burn a one-time token
+/// on the user's behalf.
 /// The daemon refuses HEAD outright today (501, no `do_HEAD`), so this is a
 /// deliberate widening, and it exposes nothing a GET does not already.
 pub fn gate(method: &str, route: Route) -> Gate {
