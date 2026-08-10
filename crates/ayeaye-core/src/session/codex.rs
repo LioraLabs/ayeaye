@@ -24,7 +24,7 @@
 //! nobody.
 
 use crate::json;
-use crate::session::file_name;
+use crate::paths::file_name;
 
 /// What a rollout file is called, at both ends.
 const ROLLOUT: &str = "rollout-";

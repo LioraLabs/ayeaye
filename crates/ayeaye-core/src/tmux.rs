@@ -135,9 +135,78 @@ pub fn no_server_running(stderr: &str) -> bool {
 /// socket that was never there, and a server that has since gone.
 const NO_SERVER: &[&str] = &["no server running", "server exited unexpectedly"];
 
+/// The `list-sessions -F` format the live-session set is read out of.
+///
+/// One field, and it lives beside its parser for the same reason
+/// [`PANE_FORMAT`] does.
+pub const SESSION_FORMAT: &str = "#{session_name}";
+
+/// The `.tmux.yaml` key a project names its own session with.
+const DECLARED: &str = "session_name:";
+
+/// What a session is called when the path names nothing — `/`, or nothing.
+const ROOT: &str = "root";
+
+/// Every session name `list-sessions -F SESSION_FORMAT` printed.
+///
+/// Read as **lines**, where the daemon splits on whitespace. That is a
+/// deliberate divergence and a small one: tmux refuses `.` and `:` in a session
+/// name and allows a space, so the daemon reads one session called `my work` as
+/// two called `my` and `work` — and then reports the project that owns it as
+/// having no session, which is the one thing this answer is used for.
+pub fn session_names(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// What the session for a project at `path` is called.
+///
+/// The ftz/ftn convention: the last component of the path, or whatever the
+/// project's own `.tmux.yaml` calls itself, with dots replaced — tmux treats a
+/// dot in a session name as the separator in `session.window`, so a session
+/// named after `github.com` could not be addressed at all.
+///
+/// `tmux_yaml` is the text of that file, or `None` where the project has none.
+/// It is an argument because reading it is the shell's, and because the two
+/// callers that want this — spawning an agent, and telling the picker which
+/// projects are already open — must agree on the answer.
+pub fn session_name(path: &str, tmux_yaml: Option<&str>) -> String {
+    let named = crate::paths::file_name(path.trim_end_matches('/'));
+    let named = if named.is_empty() { ROOT } else { named };
+    // A project that names itself wins, and a `session_name:` with nothing
+    // after it names nothing: the fallback is the path, not the empty string.
+    let declared = tmux_yaml.and_then(declared_name);
+    declared
+        .unwrap_or_else(|| named.to_string())
+        .replace('.', "_")
+}
+
+/// The first `session_name:` a `.tmux.yaml` declares, if it declares one.
+///
+/// Read line by line rather than parsed. This is one key out of a file another
+/// tool owns, and a YAML parser would be a dependency, a wider surface, and a
+/// new way to disagree with the shell script that has been reading it this way
+/// for years.
+fn declared_name(tmux_yaml: &str) -> Option<String> {
+    // The *first* such line, and then no further looking, which is where the
+    // daemon stops. A second one is a file that contradicts itself, and the two
+    // readers must not resolve that differently.
+    let value = tmux_yaml
+        .lines()
+        .find_map(|line| line.strip_prefix(DECLARED))?
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PANE_FORMAT, no_server_running, panes, panes_body};
+    use super::{
+        PANE_FORMAT, SESSION_FORMAT, no_server_running, panes, panes_body, session_name,
+        session_names,
+    };
     use crate::peer::HostName;
 
     /// Real output, captured from a private `tmux -L` server carrying a
@@ -321,6 +390,118 @@ this is not a pane
         assert_eq!(
             panes_body(&host(), &[], Some("tmux: No such file or directory")),
             r#"{"host":"desktop","panes":[],"error":"tmux: No such file or directory"}"#
+        );
+    }
+
+    // AYEAYE-45 — the format lives beside its parser, and one field is the
+    // whole of it: this answer is only ever asked "is this project open".
+    #[test]
+    fn the_session_format_asks_for_the_name_and_nothing_else() {
+        assert_eq!(SESSION_FORMAT, "#{session_name}");
+    }
+
+    // AYEAYE-45 — what `list-sessions -F` prints, one session to a line.
+    #[test]
+    fn every_line_of_the_session_list_is_a_session() {
+        assert_eq!(
+            session_names("work\nayeaye\ncliban\n"),
+            ["work", "ayeaye", "cliban"]
+        );
+        assert_eq!(session_names(""), Vec::<String>::new());
+        assert_eq!(session_names("\n\n"), Vec::<String>::new());
+    }
+
+    // AYEAYE-45 — read as lines rather than split on whitespace, which is what
+    // the daemon does. tmux refuses `.` and `:` in a session name and allows a
+    // space, so splitting reads one session called `my work` as two — and then
+    // reports the project that owns it as having no session, which is the only
+    // thing this answer is used for.
+    #[test]
+    fn a_session_name_with_a_space_in_it_is_one_session() {
+        assert_eq!(session_names("my work\nother\n"), ["my work", "other"]);
+    }
+
+    // AYEAYE-45 — the ftz convention: the project directory's own name.
+    #[test]
+    fn a_session_is_named_after_the_project_directory() {
+        assert_eq!(session_name("/home/someone/dev/ayeaye", None), "ayeaye");
+        assert_eq!(
+            session_name("/home/someone/dev/ayeaye/", None),
+            "ayeaye",
+            "a trailing separator names the same project"
+        );
+        assert_eq!(session_name("ayeaye", None), "ayeaye");
+    }
+
+    // AYEAYE-45 — tmux reads a dot in a session name as the separator in
+    // `session.window`, so a session named after `github.com` could not be
+    // addressed at all.
+    #[test]
+    fn a_dot_cannot_survive_in_a_session_name() {
+        assert_eq!(
+            session_name("/home/someone/dev/github.com", None),
+            "github_com"
+        );
+        assert_eq!(
+            session_name(
+                "/home/someone/dev/thing",
+                Some("session_name: my.project\n")
+            ),
+            "my_project",
+            "a declared name is no more addressable than a derived one"
+        );
+    }
+
+    // AYEAYE-45 — there is always a name, including for the paths that name
+    // nothing. A session called "" cannot be created, let alone found again.
+    #[test]
+    fn a_path_that_names_nothing_still_has_a_session_name() {
+        assert_eq!(session_name("/", None), "root");
+        assert_eq!(session_name("", None), "root");
+        assert_eq!(session_name("///", None), "root");
+    }
+
+    // AYEAYE-45 — a project that names itself wins, and this is read line by
+    // line rather than parsed: one key out of a file another tool owns is not
+    // worth a YAML dependency, a wider surface, and a new way to disagree with
+    // the shell script that has read it this way for years.
+    #[test]
+    fn a_project_that_names_its_own_session_is_obeyed() {
+        let yaml = "windows:\n  - editor\nsession_name: ftz\nroot: .\n";
+        assert_eq!(session_name("/home/someone/dev/ayeaye", Some(yaml)), "ftz");
+        assert_eq!(
+            session_name("/home/someone/dev/ayeaye", Some("session_name:   ftz  \n")),
+            "ftz",
+            "the value is trimmed"
+        );
+    }
+
+    // AYEAYE-45 — the fallback is the path, not the empty string, and the first
+    // such line is where the daemon stops looking. A file that contradicts
+    // itself must not be resolved differently by the two readers of it.
+    #[test]
+    fn a_yaml_that_declares_nothing_usable_falls_back_to_the_path() {
+        for yaml in [
+            "",
+            "windows:\n  - editor\n",
+            "session_name:\n",
+            "session_name:   \n",
+            "  session_name: indented\n",
+            "not_session_name: other\n",
+        ] {
+            assert_eq!(
+                session_name("/home/someone/dev/ayeaye", Some(yaml)),
+                "ayeaye",
+                "declared a session out of {yaml:?}"
+            );
+        }
+        assert_eq!(
+            session_name(
+                "/home/someone/dev/ayeaye",
+                Some("session_name:\nsession_name: second\n")
+            ),
+            "ayeaye",
+            "the first line is where the daemon stops, empty or not"
         );
     }
 }

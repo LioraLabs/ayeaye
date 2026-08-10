@@ -18,6 +18,7 @@ pub mod json;
 pub mod logits;
 pub mod machine;
 pub mod mel;
+pub mod paths;
 pub mod peer;
 pub mod process;
 pub mod service;
