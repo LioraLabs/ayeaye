@@ -71,8 +71,14 @@ probe scripts
 #
 # `share/*` too: the web UI is compiled in with `include_bytes!`, so those
 # files are inputs to the suite that live outside crates/. Mutation-verified.
+#
+# And not only the .rs: a fixture reaches a pure crate through `include_str!`,
+# so the expected values of a test can live in a .txt that no glob over source
+# would notice. Editing one changes what the suite asserts while leaving every
+# sealed path untouched - a cached pass over assertions that have moved, which
+# is the same stale green the benches/ omission produced.
 probe rust
-    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "share/*" }
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" "share/*" "crates/**/tests/fixtures/*" }
 
 # The compiler is a determinant of what the suite says: a lint that fires on
 # one toolchain and not the next is exactly the drift `-D warnings` exists to

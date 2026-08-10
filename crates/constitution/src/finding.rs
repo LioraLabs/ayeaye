@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-/// The rules this crate enforces. Tier 1 — the three that hold the pure core
-/// pure and the strata apart.
+/// The rules this crate enforces. Tier 1 — the four that hold the pure core
+/// pure, the strata apart, and a C toolchain out of the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// `ayeaye-core` may not reach outside itself.
@@ -12,6 +12,8 @@ pub enum Rule {
     DependencyAllowlist,
     /// A crate may depend only on a strictly lower stratum.
     Stratum,
+    /// Nothing in the dependency graph may need a C or C++ compiler.
+    PureRustGraph,
 }
 
 impl Rule {
@@ -21,6 +23,7 @@ impl Rule {
             Rule::EffectBudget => "effect-budget",
             Rule::DependencyAllowlist => "dependency-allowlist",
             Rule::Stratum => "stratum",
+            Rule::PureRustGraph => "pure-rust-graph",
         }
     }
 }

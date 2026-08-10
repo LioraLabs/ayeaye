@@ -10,11 +10,15 @@
 //! fails the build. The rules, and how to amend one, are in
 //! `crates/constitution/README.md`.
 
+pub mod audio;
 pub mod http;
 pub mod identity;
+pub mod logits;
 pub mod machine;
+pub mod mel;
 pub mod service;
 
+pub use audio::Pcm16kMono;
 pub use identity::Identity;
 pub use machine::Machine;
 

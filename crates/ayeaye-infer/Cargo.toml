@@ -11,7 +11,45 @@ repository.workspace = true
 default = []
 # Acceleration is a compile-time choice, not a runtime one: both of these pull
 # a toolchain the portable build deliberately does not have.
-cuda = []
-metal = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [dependencies]
+ayeaye-core.workspace = true
+
+# candle, and not bindings to the ggml/llama.cpp lineage. It is pure Rust and
+# cross-compiles cleanly, and that property is the milestone rather than a
+# detail of it: whisper-rs would need CMake, a C++ toolchain, and a libstdc++
+# built against musl, which `cargo-zigbuild` cannot produce. See "One binary".
+#
+# **Held at 0.9 deliberately, and this is load-bearing.** candle-core 0.10
+# added a non-optional dependency, on every target that is not wasm32:
+#
+#     [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
+#     version = "0.22.0"
+#     features = ["onig"]
+#
+# `onig` is oniguruma — a C library whose build script compiles C — and there
+# is no feature that turns it off, because candle-core asks for it by name.
+# Taking candle 0.10 or 0.11 therefore puts a C compiler back in the build of
+# every native target, which is most of what candle was chosen to avoid.
+# 0.9.2 has no tokenizers dependency at all, and the whisper API is identical:
+# same `Config` fields, same `Whisper::load`, same `pcm_to_mel`.
+#
+# Upgrading is not a routine bump. Before moving off 0.9, check whether
+# candle-core still names tokenizers/onig, and if it does, say out loud that
+# the build is gaining a C toolchain rather than discovering it later.
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+
+# The same trap one level down, and here it *is* a feature we control.
+# `tokenizers` defaults to `onig` too, so default features are off and the
+# pure-Rust `fancy-regex` engine is named instead. `esaxx-rs` comes along
+# regardless, but it only compiles C++ under its `cpp` feature, which nothing
+# in this graph enables.
+tokenizers = { version = "0.23", default-features = false, features = [
+    "fancy-regex",
+] }
+
+serde_json = "1"
