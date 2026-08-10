@@ -90,3 +90,96 @@ fn a_model_loads_from_the_directory_it_was_pointed_at() {
 
     assert_eq!(model.mel_bins(), support::MEL_BINS);
 }
+
+// AYEAYE-54
+//
+// The acceptance criterion, end to end: audio in, text out, in this process.
+// Nothing here starts a subprocess or opens a socket — the proof that CPU
+// inference works with no external speech runtime is that this test passes on
+// a machine with none installed.
+#[test]
+fn a_clip_shorter_than_the_window_transcribes_in_one_segment() {
+    let dir = tiny_model("one-window", &tiny_config(vec![]));
+    let mut model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    let transcript = model
+        .transcribe(&support::tone(1.0))
+        .expect("a second of audio should transcribe");
+
+    assert_eq!(transcript.segments.len(), 1);
+    assert_eq!(transcript.segments[0].start_secs, 0.0);
+    assert_eq!(transcript.segments[0].end_secs, 1.0);
+    assert_eq!(model.backend(), ayeaye_infer::Backend::Cpu);
+    // Not an assertion about *what* it heard — these weights are noise — but
+    // that it heard something. It is what makes the suppression test below
+    // mean anything.
+    assert!(
+        !transcript.segments[0].text.is_empty(),
+        "the model should have decoded something"
+    );
+}
+
+// AYEAYE-54
+//
+// The window is one second in this toy model, so 2.5 seconds is three windows
+// and the last one is short. Truncating at the window and returning anyway is
+// the failure this guards: it is indistinguishable from a successful
+// transcription of a shorter recording.
+#[test]
+fn audio_longer_than_the_window_is_decoded_window_by_window() {
+    let dir = tiny_model("three-windows", &tiny_config(vec![]));
+    let mut model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    let transcript = model
+        .transcribe(&support::tone(2.5))
+        .expect("two and a half seconds should transcribe");
+
+    let spans: Vec<(f32, f32)> = transcript
+        .segments
+        .iter()
+        .map(|s| (s.start_secs, s.end_secs))
+        .collect();
+    assert_eq!(spans, vec![(0.0, 1.0), (1.0, 2.0), (2.0, 2.5)]);
+}
+
+// AYEAYE-54
+//
+// A clip nobody spoke into is an empty transcript, and the model is never run:
+// thirty seconds of zero-padding through an encoder to be told nothing was
+// said is a cost with no answer attached.
+#[test]
+fn an_empty_clip_is_an_empty_transcript() {
+    let dir = tiny_model("empty", &tiny_config(vec![]));
+    let mut model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    let transcript = model
+        .transcribe(&ayeaye_core::Pcm16kMono::new(vec![]))
+        .expect("an empty clip is legal input");
+
+    assert!(transcript.segments.is_empty());
+    assert!(transcript.is_empty());
+}
+
+// AYEAYE-54
+//
+// `suppress_tokens` is the model's own list of things it must never say, and
+// Whisper ships one. Suppressing everything except the end token is the
+// version of that claim a toy model can be held to: whatever the weights would
+// have produced, the only move left is to stop, so every segment comes back
+// empty. A no-op suppression fails this, because the unsuppressed run of the
+// same model on the same audio produces text — which the test above asserts.
+#[test]
+fn a_suppressed_token_is_never_decoded() {
+    let end = support::special_id("<|endoftext|>");
+    let everything_else: Vec<u32> = (0..support::VOCAB as u32).filter(|id| *id != end).collect();
+    let dir = tiny_model("suppressed", &tiny_config(everything_else));
+    let mut model = SpeechModel::load(dir.path()).expect("the toy model should load");
+
+    let transcript = model
+        .transcribe(&support::tone(1.0))
+        .expect("a second of audio should transcribe");
+
+    assert_eq!(transcript.segments.len(), 1);
+    assert_eq!(transcript.segments[0].text, "");
+    assert!(transcript.is_empty());
+}

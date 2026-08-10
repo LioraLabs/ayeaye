@@ -29,9 +29,6 @@ pub const MEL_BINS: usize = 80;
 /// without computing anything.
 pub const WINDOW_POSITIONS: usize = 50;
 
-/// One second, in samples, at the sample rate everything here uses.
-pub const WINDOW_SAMPLES: usize = WINDOW_POSITIONS * 2 * 160;
-
 /// How many tokens the vocabulary holds, specials included.
 pub const VOCAB: usize = 64;
 
@@ -113,8 +110,9 @@ impl Drop for ModelDir {
 
 /// Build a complete, loadable model directory.
 ///
-/// The weights are whatever the initialisers produce, which is why the seed is
-/// fixed: a test that asserts on a decode has to get the same decode twice.
+/// The weights are made deterministic after the shapes are discovered — see
+/// [`fill_deterministically`] — so a test that asserts on a decode gets the
+/// same decode twice.
 pub fn tiny_model(label: &str, config: &Config) -> ModelDir {
     let path = std::env::temp_dir().join(format!(
         "ayeaye-54-{label}-{}-{}",
@@ -245,4 +243,21 @@ fn tokenizer_json() -> String {
         },
     })
     .to_string()
+}
+
+/// A tone, as 16 kHz mono audio.
+///
+/// Not silence: a model fed nothing but zeros is being asked a question with a
+/// degenerate answer, and the mel of pure silence is a constant. A tone
+/// exercises the filterbank the way speech would.
+pub fn tone(secs: f32) -> ayeaye_core::Pcm16kMono {
+    let samples = (secs * 16_000.0) as usize;
+    ayeaye_core::Pcm16kMono::new(
+        (0..samples)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+            })
+            .collect(),
+    )
 }
