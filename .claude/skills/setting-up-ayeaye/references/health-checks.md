@@ -82,8 +82,9 @@ second direction proves anything: a gate accepting every name passes the
 first half perfectly. `FAILED`'s detail says which broke. A stranger being
 answered is the classic sign of a daemon started before
 `AYEAYE_ALLOWED_HOSTS` was written — restart (`ayeaye service stop`,
-`start`). A named host refused means the file and the name the proxy serves
-disagree — make them match. `skipped`: no hosts configured, nothing claimed.
+`start`). A named host refused is the same staleness from the other side: the
+daemon's gate has not read that name yet — restart it too. `skipped`: no
+hosts configured, nothing claimed.
 
 **https** — *the address the phone opens answers.*
 A 401/403 refusal counts as `ok` — it proves the address reaches ayeaye,
@@ -100,7 +101,8 @@ up`, run by the user (it changes their network membership). `skipped`: not
 installed, and not a fault; a mesh is one placement among several.
 
 **board** — *the ticket board on the phone.*
-`FAILED`: the app answered and its answer held no projects — the daemon may
+`FAILED`: the app answered with something that is not a projects answer at
+all — the daemon may
 predate cliban's arrival (restart it), or `AYEAYE_CLIBAN` points somewhere
 stale. `unknown`: the request could not be made at all — no key here, or the
 daemon is down; fix **local** and **authorised** first and this resolves.
