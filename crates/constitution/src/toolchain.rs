@@ -120,9 +120,10 @@ pub fn gated(subject: &str, manifest: &str, gated: &[Gated]) -> Vec<Finding> {
             subject: subject.to_string(),
             what: entry.feature.to_string(),
             why: format!(
-                "{how}, and it needs {}. The portable build may not pay that: keep it \
-                 behind a feature nobody turns on by default, or amend GATED and say out \
-                 loud that {} is no longer the only artifact that is not static",
+                "{how}. Building it needs {}. That cost is why {} is the one release \
+                 artifact that is not a static portable binary, and the portable build may \
+                 not pay it: leave the feature off by default, or amend GATED and say out \
+                 loud which artifact stops being static",
                 entry.cost, entry.artifact
             ),
             line: None,

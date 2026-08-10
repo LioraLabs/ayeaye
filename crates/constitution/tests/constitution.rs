@@ -173,3 +173,44 @@ fn nothing_in_the_dependency_graph_needs_a_c_compiler() {
         report(&findings)
     );
 }
+
+// AYEAYE-57
+//
+// Rule 4's second half, against the real manifests. The first half proves the
+// graph compiles no C; this proves the cost that `cc` cannot see — nvcc, driven
+// by candle-kernels' build script — stays out of the build nobody asks for.
+#[test]
+fn no_default_build_turns_on_a_feature_that_needs_a_toolchain() {
+    let corpus = corpus();
+
+    // A rule that finds nothing in manifests it is not really reading would
+    // pass this vacuously, and unlike the lockfile there is nothing to plant:
+    // the real tree has no violation. So the proof runs the other way round —
+    // hand it a table naming `metal`, which `ayeaye-infer` really does turn on
+    // for Apple builds through a target table, and it has to say so.
+    let probe = &[toolchain::Gated {
+        feature: "metal",
+        cost: "nothing at all, which is why it is not really gated",
+        artifact: "no artifact",
+    }];
+    let infer = corpus
+        .member("ayeaye-infer")
+        .expect("ayeaye-infer should be a workspace member");
+    assert!(
+        !toolchain::gated(&infer.dir, &infer.manifest, probe).is_empty(),
+        "the rule found nothing in a manifest that turns metal on for macOS; \
+         it is not reading the manifests"
+    );
+
+    let findings: Vec<_> = corpus
+        .members
+        .iter()
+        .flat_map(|member| toolchain::gated(&member.dir, &member.manifest, toolchain::GATED))
+        .collect();
+
+    assert!(
+        findings.is_empty(),
+        "a default build would need a toolchain:\n{}",
+        report(&findings)
+    );
+}

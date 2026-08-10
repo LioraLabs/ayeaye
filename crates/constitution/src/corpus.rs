@@ -40,6 +40,13 @@ pub struct Member {
     pub dependencies: Vec<String>,
     /// Every `.rs` file under its `src/` and `tests/`.
     pub sources: Vec<Source>,
+    /// The manifest's own text.
+    ///
+    /// Kept because a manifest says two different kinds of thing and the rules
+    /// need both: which crates are depended on (rule 2, already parsed out of
+    /// it) and which features a build turns on (rule 4's second half, which
+    /// takes the text so it can be handed a planted one instead).
+    pub manifest: String,
 }
 
 /// The workspace as the constitution sees it.
@@ -110,7 +117,9 @@ impl Corpus {
 /// Read one member: its name, its declared dependencies, and its sources.
 fn read_member(root: &Path, dir: &str) -> Result<Member, String> {
     let manifest_path = root.join(dir).join("Cargo.toml");
-    let manifest = parse(&manifest_path)?;
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let manifest = parse_text(&manifest_text, &manifest_path)?;
 
     let name = manifest
         .get("package")
@@ -145,6 +154,7 @@ fn read_member(root: &Path, dir: &str) -> Result<Member, String> {
         dir: dir.to_string(),
         dependencies,
         sources,
+        manifest: manifest_text,
     })
 }
 
@@ -204,6 +214,11 @@ fn read_source(root: &Path, path: &Path, out: &mut Vec<Source>) -> Result<(), St
 
 fn parse(path: &Path) -> Result<toml::Value, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_text(&text, path)
+}
+
+/// The same, for a manifest whose text the caller already has and keeps.
+fn parse_text(text: &str, path: &Path) -> Result<toml::Value, String> {
     // Parsed as a document rather than as a value: a manifest is a table, and
     // `Value`'s own FromStr wants a single TOML value.
     let table = text
