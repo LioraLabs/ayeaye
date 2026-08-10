@@ -14,8 +14,14 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 
+use ayeaye_core::http::origin::{Origin, Site};
 use ayeaye_core::http::route::{Asset, Gate, Route};
-use ayeaye_core::http::{auth, login, route};
+use ayeaye_core::http::{auth, login, origin, route};
+
+/// The header a browser labels a request's provenance with. `http` has no
+/// constant for it: it is a fetch-metadata header, newer than the crate's
+/// table.
+const SEC_FETCH_SITE: &str = "sec-fetch-site";
 
 use crate::assets;
 use crate::config::Settings;
@@ -61,6 +67,20 @@ async fn handle(
     // this address, from talking to this server at all.
     let host = header_str(&headers, header::HOST.as_str()).unwrap_or("");
     if !settings.allowed_hosts.allows(host) {
+        return json(StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#);
+    }
+
+    // Then the CSRF gate, and before the token: the daemon's `do_POST` refuses
+    // a bad Host and a bad Origin together, in one `_forbidden`, so a write
+    // from another site is refused whatever token it carries and cannot be
+    // told from a refused Host by its answer.
+    if origin::gate(
+        method.as_str(),
+        header_str(&headers, SEC_FETCH_SITE),
+        presented_origin(&headers),
+        &settings.allowed_hosts,
+    ) == Site::Cross
+    {
         return json(StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#);
     }
 
@@ -160,6 +180,20 @@ fn build(
 
 fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The `Origin:` header, told apart from a request that carries none.
+///
+/// Not `header_str`: for `Origin`, "not there" is the branch that *allows* —
+/// a non-browser client sends no Origin and is judged by its token instead —
+/// so a header that arrived with bytes `to_str` cannot render must not come
+/// back as `None`. `Origin::Unreadable` is what carries that difference into
+/// the gate, which refuses it.
+fn presented_origin(headers: &HeaderMap) -> Origin<'_> {
+    match headers.get(header::ORIGIN) {
+        None => Origin::Absent,
+        Some(value) => value.to_str().map_or(Origin::Unreadable, Origin::Value),
+    }
 }
 
 /// The two query parameters this server reads.

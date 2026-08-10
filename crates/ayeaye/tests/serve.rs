@@ -68,25 +68,42 @@ impl Server {
     /// "read to EOF" is the whole body and no `Content-Length` parsing is
     /// needed to know where to stop.
     async fn request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Answer {
+        let raw: Vec<(&str, &[u8])> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        self.request_raw(method, path, &raw).await
+    }
+
+    /// The same, with header *values* as bytes rather than text.
+    ///
+    /// A header value is bytes on the wire and only sometimes text, and the
+    /// difference is load-bearing for the origin gate: a value a Rust `String`
+    /// cannot hold is exactly the one that must not read as "no header sent".
+    /// A test that could only send `&str` could never send that request.
+    async fn request_raw(&self, method: &str, path: &str, headers: &[(&str, &[u8])]) -> Answer {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port))
             .await
             .expect("the server should be listening");
 
-        let mut request = format!("{method} {path} HTTP/1.1\r\n");
+        let mut request = format!("{method} {path} HTTP/1.1\r\n").into_bytes();
         let mut has_host = false;
         for (name, value) in headers {
             if name.eq_ignore_ascii_case("host") {
                 has_host = true;
             }
-            request.push_str(&format!("{name}: {value}\r\n"));
+            request.extend_from_slice(name.as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value);
+            request.extend_from_slice(b"\r\n");
         }
         if !has_host {
-            request.push_str(&format!("Host: 127.0.0.1:{}\r\n", self.port));
+            request.extend_from_slice(format!("Host: 127.0.0.1:{}\r\n", self.port).as_bytes());
         }
-        request.push_str("Connection: close\r\n\r\n");
+        request.extend_from_slice(b"Connection: close\r\n\r\n");
 
         stream
-            .write_all(request.as_bytes())
+            .write_all(&request)
             .await
             .expect("the request should be writable");
         let mut raw = Vec::new();
@@ -300,6 +317,123 @@ async fn a_post_needs_a_token_even_for_a_page() {
         let answer = server.request("POST", path, &[]).await;
         assert_eq!(answer.status, 401, "POST {path} must need a token");
     }
+}
+
+// AYEAYE-69 — the CSRF gate, over the wire. A browser labels a request from
+// somebody else's page `Sec-Fetch-Site: cross-site`, and that is refused at
+// every path — before the token is looked at, so a stolen or guessed token
+// buys nothing, and with the same 403 the Host gate gives so a refused write
+// cannot be told apart from a refused host.
+#[tokio::test]
+async fn a_cross_site_write_is_refused_before_the_token_is_looked_at() {
+    let server = Server::started().await;
+    for path in ["/", "/board", "/api/answer", "/nope"] {
+        for headers in [
+            vec![("Sec-Fetch-Site", "cross-site")],
+            // With the right token, which must not buy past this gate.
+            vec![("Sec-Fetch-Site", "cross-site"), ("X-Voice-Token", TOKEN)],
+        ] {
+            let answer = server.request("POST", path, &headers).await;
+            assert_eq!(answer.status, 403, "POST {path} with {headers:?}");
+            assert_eq!(answer.body_text(), r#"{"error":"forbidden"}"#);
+        }
+    }
+}
+
+// AYEAYE-69 — the other half of the label: an `Origin` naming a host this
+// daemon does not answer to, and the opaque `null` a sandboxed frame sends.
+// The same request from this server's own origin has to reach the token gate,
+// or the test above would pass on a server that refused every write.
+#[tokio::test]
+async fn a_write_from_a_foreign_origin_is_refused_and_one_from_here_is_not() {
+    let server = Server::started().await;
+    let ours = format!("http://127.0.0.1:{}", server.port);
+
+    for origin in [
+        "https://evil.example",
+        "null",
+        "http://127.0.0.1.evil.example",
+    ] {
+        let answer = server
+            .request("POST", "/api/answer", &[("Origin", origin)])
+            .await;
+        assert_eq!(answer.status, 403, "POST from {origin}");
+        assert_eq!(answer.body_text(), r#"{"error":"forbidden"}"#);
+    }
+
+    // 401, not 403: this origin passed the CSRF gate and was stopped by the
+    // token gate behind it, which is the order the daemon refuses in.
+    let anonymous = server
+        .request("POST", "/api/answer", &[("Origin", ours.as_str())])
+        .await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
+
+    // And with the token it is a 404, because nothing writes here yet: both
+    // gates let it through.
+    let authorized = server
+        .request(
+            "POST",
+            "/api/answer",
+            &[("Origin", ours.as_str()), ("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(authorized.status, 404);
+}
+
+// AYEAYE-69 — a read is exempt, which is not a detail: a page on any origin
+// may link to this one, and a link preview or a PWA install check fetches an
+// icon with `Sec-Fetch-Site: cross-site` on it. Gating reads would break that
+// for no gain, since a read changes nothing.
+#[tokio::test]
+async fn a_cross_site_read_is_still_answered() {
+    let server = Server::started().await;
+    let labelled: &[(&str, &str)] = &[
+        ("Sec-Fetch-Site", "cross-site"),
+        ("Origin", "https://evil.example"),
+    ];
+
+    for path in ["/", "/favicon.ico", "/manifest.webmanifest"] {
+        assert_eq!(
+            server.request("GET", path, labelled).await.status,
+            200,
+            "a cross-site GET of {path} is a read"
+        );
+    }
+    assert_eq!(
+        server
+            .request("HEAD", "/favicon.ico", labelled)
+            .await
+            .status,
+        200
+    );
+}
+
+// AYEAYE-69 — an `Origin` whose bytes are not text. This is the bypass the
+// three-state `Origin` type exists to prevent: `to_str().ok()` would turn
+// these bytes into `None`, `None` is what a non-browser client sends, and a
+// non-browser client is *allowed*. So one byte of rubbish in the header this
+// gate judges would have opened every write on the server.
+#[tokio::test]
+async fn an_origin_whose_bytes_are_not_text_is_refused() {
+    let server = Server::started().await;
+    // 0xFF is legal in a header value (RFC 9110 obs-text) and is not UTF-8.
+    let hostile: &[u8] = b"https://\xff\xfe.example";
+
+    let write = server
+        .request_raw("POST", "/api/answer", &[("Origin", hostile)])
+        .await;
+    assert_eq!(
+        write.status, 403,
+        "an Origin the server cannot read must not read as no Origin at all"
+    );
+    assert_eq!(write.body_text(), r#"{"error":"forbidden"}"#);
+
+    // A read is still a read, and the server is still answering afterwards.
+    let read = server
+        .request_raw("GET", "/favicon.ico", &[("Origin", hostile)])
+        .await;
+    assert_eq!(read.status, 200);
 }
 
 // AYEAYE-42 — the handshake a phone does once: a token in the query comes back
