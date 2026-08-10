@@ -141,9 +141,24 @@ impl Drop for Ending {
     }
 }
 
-/// The roots that are there right now.
+/// The roots that are there right now, absolute.
+///
+/// `walk_projects` does `abspath(r)` and then `isdir(r)`, and both halves
+/// matter: a relative root yields relative candidate paths, which match no key
+/// in the pick history and shorten to nothing when the picker draws them.
 fn existing(roots: &[PathBuf]) -> Vec<PathBuf> {
-    roots.iter().filter(|root| root.is_dir()).cloned().collect()
+    let here = std::env::current_dir().unwrap_or_default();
+    roots
+        .iter()
+        .map(|root| {
+            if root.is_absolute() {
+                root.clone()
+            } else {
+                here.join(root)
+            }
+        })
+        .filter(|root| root.is_dir())
+        .collect()
 }
 
 struct Search {

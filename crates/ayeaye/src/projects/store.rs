@@ -56,12 +56,20 @@ pub fn note_pick(at: &Path, path: &str, now: f64) {
 /// The store's key for a directory somebody names.
 ///
 /// The daemon's `_recents_key` is `abspath(expanduser(path)).rstrip("/")`, and
-/// all three parts are load-bearing while the two share one file: a pick
+/// every part of it is load-bearing while the two share one file: a pick
 /// written under `~/src/thing` or under a relative path is a key the Python
 /// daemon will never produce, so the history quietly splits in a file both are
 /// writing. `recents::key` is the `rstrip` — pure, and the core's. Expanding a
 /// `~` needs a home and resolving a relative path needs a working directory,
 /// and both of those are here.
+///
+/// **What is not here.** `abspath` is `normpath(join(cwd, path))`, and the
+/// `normpath` half is not implemented: `~/src/../other` and `./src` key
+/// differently from the daemon. Nor is `expanduser` of *another* user's home,
+/// which needs the password database — `~root/x` lands under the working
+/// directory here, as it does in Python when the name cannot be looked up.
+/// Both are bounded to a path somebody typed: the picker's own candidates
+/// arrive absolute and already normal, straight from the walk.
 pub fn key_for(path: &str) -> String {
     let expanded = match path.strip_prefix('~') {
         Some("") => home(),
@@ -76,8 +84,13 @@ pub fn key_for(path: &str) -> String {
     recents::key(&absolute.to_string_lossy())
 }
 
-/// The home directory, or nothing — in which case a `~` stays a `~` and the
-/// key is at least stable rather than silently rooted somewhere else.
+/// The home directory, or the empty string when there is none.
+///
+/// With no `HOME` there is no right answer: `~` keys as the working directory
+/// and `~/x` as `/x`. Neither is the daemon's answer either — `expanduser`
+/// falls back to the password database, which this does not read — and a
+/// daemon running without a `HOME` has worse problems than its picker's
+/// history.
 fn home() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
@@ -141,6 +154,17 @@ mod tests {
         let relative = super::key_for("src/thing");
         assert!(relative.starts_with('/'), "{relative}");
         assert!(relative.ends_with("/src/thing"), "{relative}");
+
+        // And the two halves of `abspath` that are *not* implemented, pinned
+        // as divergences rather than left to be discovered: `normpath` is not
+        // here, so a path somebody typed with a `..` in it keys differently
+        // from the daemon. Bounded to typed paths — the walk's own candidates
+        // arrive absolute and already normal.
+        assert_eq!(
+            super::key_for("~/src/../other"),
+            "/home/tester/src/../other",
+            "the daemon would say /home/tester/other"
+        );
 
         // And the key that lands in the file is the resolved one.
         note_pick(&at, "~/src/thing", 5.0);
