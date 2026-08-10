@@ -16,6 +16,7 @@ use std::process::Command;
 
 use ayeaye_core::service::{
     Definition, Install, Layout, Manager, Operation, Session, Unavailable, plan_install,
+    unrepresentable_in_systemd,
 };
 
 /// What running a command came to.
@@ -73,6 +74,10 @@ pub enum Failed {
     Unavailable(Unavailable),
     /// A file could not be read, written, copied or removed.
     Disk(String),
+    /// systemd cannot name this path in a unit at all, and no escaping exists
+    /// for it. Not a disk problem and not the manager refusing: a fact about
+    /// where somebody put their files.
+    Unrepresentable(String),
     /// The service manager ran and refused.
     Command {
         /// What was run.
@@ -93,8 +98,26 @@ impl std::fmt::Display for Failed {
         match self {
             Failed::Unavailable(why) => write!(f, "{why}"),
             Failed::Disk(what) => f.write_str(what),
+            Failed::Unrepresentable(path) => write!(
+                f,
+                "systemd cannot name a path holding a quote, a backslash or a line break \
+                 in a unit, and this one does: {path}"
+            ),
             Failed::Command { argv, output } => {
-                write!(f, "{} failed: {}", argv.join(" "), output.trim())
+                // Quoted where a word holds a space, because argv was chosen
+                // precisely so a plist path with a space in it stays one
+                // argument, and a message that joins on spaces gives that back.
+                let said: Vec<String> = argv
+                    .iter()
+                    .map(|word| {
+                        if word.contains(' ') {
+                            format!("'{word}'")
+                        } else {
+                            word.clone()
+                        }
+                    })
+                    .collect();
+                write!(f, "{} failed: {}", said.join(" "), output.trim())
             }
         }
     }
@@ -113,14 +136,23 @@ pub struct Installed {
     pub backup: Option<PathBuf>,
 }
 
+/// What taking a service off the machine did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    /// The definition that is no longer there.
+    pub path: PathBuf,
+    /// Where a copy of it was kept.
+    pub backup: PathBuf,
+}
+
 /// What bringing a service up to date did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repaired {
     /// What happened to the file.
     pub installed: Installed,
-    /// Whether the service was already up when this started. Asked before the
-    /// file is replaced, because afterwards there is no way to tell "it was
-    /// already running" from "we just wrote this".
+    /// Whether the service was already up when this started, asked before
+    /// anything is written so that the answer describes the machine as it was
+    /// found.
     pub was_running: bool,
     /// Whether it was restarted onto the new definition.
     pub restarted: bool,
@@ -156,11 +188,31 @@ impl<R: Runner> Services<R> {
         );
         let rendered = self.session.render(definition, &self.layout)?;
 
-        // Read and compared in memory before anything is created. Telling a
-        // name this layer does not have from a directory it cannot write is the
-        // difference between two problems, and only one of them is about disk.
-        let existing = fs::read_to_string(&path).ok();
-        let action = plan_install(existing.as_deref(), &rendered);
+        // systemd unquotes the executable word and then refuses the unit if
+        // what comes out holds a quote, a backslash or a control character.
+        // There is no escaping for that, so the only honest answers are to name
+        // the path or to install a unit that can never start.
+        if self.session.manager == Manager::Systemd {
+            let mut paths: Vec<&str> = definition.argv.iter().map(String::as_str).collect();
+            paths.push(&self.layout.env_file);
+            if let Some(refused) = unrepresentable_in_systemd(&paths) {
+                return Err(Failed::Unrepresentable(refused.to_string()));
+            }
+        }
+
+        // Whether a copy is kept turns on whether something is *there*, and
+        // reading it only decides whether it needs replacing. Collapsing the two
+        // - `read_to_string(&path).ok()` - answers "nothing is there" for a unit
+        // that is there and unreadable, and then the rename below destroys it
+        // with no copy taken. Bytes that are not text, and a file somebody has
+        // made unreadable, are both that case.
+        let action = match fs::read_to_string(&path) {
+            Ok(text) => plan_install(Some(&text), &rendered),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                plan_install(None, &rendered)
+            }
+            Err(_) => Install::Replace,
+        };
         if action == Install::Unchanged {
             return Ok(Installed {
                 path,
@@ -172,6 +224,15 @@ impl<R: Runner> Services<R> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(dir).map_err(|e| Failed::Disk(format!("{}: {e}", dir.display())))?;
 
+        // The agent names the files it writes, and launchd refuses to start a
+        // job whose StandardOutPath cannot be opened. Created rather than hoped
+        // for: this is the difference between an agent that runs and one that is
+        // installed, reported as installed, and never starts.
+        if self.session.manager == Manager::Launchd {
+            fs::create_dir_all(&self.layout.log_dir)
+                .map_err(|e| Failed::Disk(format!("{}: {e}", self.layout.log_dir)))?;
+        }
+
         // Written first, so that a directory that cannot be written leaves the
         // definition already there untouched rather than backed up and lost.
         // Appended rather than `with_extension`, which would turn
@@ -179,7 +240,10 @@ impl<R: Runner> Services<R> {
         let temporary = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
         fs::write(&temporary, &rendered)
             .map_err(|e| Failed::Disk(format!("{}: {e}", temporary.display())))?;
-        set_readable(&temporary)?;
+        if let Err(why) = set_readable(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(why);
+        }
 
         // A definition that is there and different is somebody's — an older
         // version of this program wrote it, or a person edited it. This run is
@@ -279,17 +343,14 @@ impl<R: Runner> Services<R> {
     }
 
     /// What the service manager says about it, in its own words.
-    pub fn status(&self, name: &str) -> Result<String, Failed> {
+    ///
+    /// The outcome is handed back whole rather than turned into an error,
+    /// because a non-zero exit here is an *answer*: `systemctl status` exits 3
+    /// for a unit that is simply stopped. Wrapping that in "the command failed"
+    /// would hide a perfectly good report behind a complaint about it.
+    pub fn status(&self, name: &str) -> Result<Outcome, Failed> {
         let argv = self.session.command(name, Operation::Status, None)?;
-        let outcome = self.runner.run(&argv);
-        if outcome.ok {
-            Ok(outcome.output)
-        } else {
-            Err(Failed::Command {
-                argv,
-                output: outcome.output,
-            })
-        }
+        Ok(self.runner.run(&argv))
     }
 
     /// Whether the service manager says the service is up — or, on launchd,
@@ -320,22 +381,40 @@ impl<R: Runner> Services<R> {
         }
     }
 
-    /// Take the service off this machine: unregister it, then delete its
-    /// definition.
+    /// Take the service off this machine: unregister it, keep a copy of its
+    /// definition, and delete it.
     ///
-    /// Unregistering a service that is not registered is not a failure — that
-    /// is the state being asked for.
-    pub fn remove(&self, name: &str) -> Result<Option<PathBuf>, Failed> {
-        self.unregister(name);
+    /// The disable is unconditional. Doing it only when the service is *running*
+    /// leaves an enabled-but-stopped unit deleted with its `default.target.wants`
+    /// symlink still pointing at nothing, which is a service manager complaining
+    /// at every login about a unit nobody can find. Disabling something already
+    /// disabled is the state being asked for, not a failure.
+    ///
+    /// A copy is kept for the same reason installing over one keeps a copy: this
+    /// may be a definition somebody wrote by hand, and deleting it is cheap to
+    /// regret.
+    pub fn remove(&self, name: &str, stamp: &str) -> Result<Option<Removed>, Failed> {
+        let _ = self.disable(name);
         let path = PathBuf::from(self.session.definition_path(name, &self.layout)?);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let kept = free_backup_path(&path, stamp);
+        fs::copy(&path, &kept).map_err(|error| {
+            Failed::Disk(format!(
+                "could not keep a copy of {} at {}: {error}",
+                path.display(),
+                kept.display()
+            ))
+        })?;
         match fs::remove_file(&path) {
-            Ok(()) => Ok(Some(path)),
+            Ok(()) => Ok(Some(Removed { path, backup: kept })),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Failed::Disk(format!("{}: {error}", path.display()))),
         }
     }
 
-    /// Disable it if it is registered, and say nothing either way.
+    /// Boot a launchd job out if it is registered, and say nothing either way.
     fn unregister(&self, name: &str) {
         if self.is_running(name) {
             let _ = self.disable(name);
@@ -367,7 +446,7 @@ fn free_backup_path(path: &Path, stamp: &str) -> PathBuf {
     if !first.exists() {
         return first;
     }
-    for n in 2.. {
+    for n in 2u32.. {
         let candidate = PathBuf::from(format!("{base}-{n}"));
         if !candidate.exists() {
             return candidate;
@@ -509,6 +588,16 @@ mod tests {
             layout: scratch.layout(),
             runner,
         }
+    }
+
+    /// Where this session would install ayeaye's definition.
+    fn unit_path(services: &Services<Fake>) -> PathBuf {
+        PathBuf::from(
+            services
+                .session
+                .definition_path("ayeaye", &services.layout)
+                .expect("a path"),
+        )
     }
 
     /// Every file in a directory, sorted.
@@ -714,7 +803,7 @@ mod tests {
         services.enable("ayeaye").expect("enable");
         services.start("ayeaye").expect("start");
         services.stop("ayeaye").expect("stop");
-        services.status("ayeaye").expect("status");
+        services.status("ayeaye").expect("a status");
         services.disable("ayeaye").expect("disable");
 
         assert!(
@@ -862,14 +951,47 @@ mod tests {
             .install(&definition(), "stamp")
             .expect("an install");
 
-        let removed = services.remove("ayeaye").expect("a removal");
+        let removed = services
+            .remove("ayeaye", "stamp")
+            .expect("a removal")
+            .expect("a definition");
 
-        assert_eq!(removed, Some(installed.path.clone()));
+        assert_eq!(removed.path, installed.path);
         assert!(!installed.path.exists());
         assert!(
             services
                 .runner
                 .ran("systemctl --user disable --now ayeaye.service")
+        );
+        assert_eq!(
+            fs::read_to_string(&removed.backup).expect("the copy"),
+            services
+                .session
+                .render(&definition(), &services.layout)
+                .expect("a definition"),
+            "a definition somebody may have written by hand is cheap to keep"
+        );
+    }
+
+    // AYEAYE-61 — disabling only when the service is *running* leaves an
+    // enabled-but-stopped unit deleted with its default.target.wants symlink
+    // still pointing at nothing, which the service manager complains about at
+    // every login.
+    #[test]
+    fn remove_disables_a_service_that_is_installed_but_not_running() {
+        let scratch = Scratch::new("remove-stopped");
+        let services = systemd(&scratch, Fake::default());
+        services
+            .install(&definition(), "stamp")
+            .expect("an install");
+
+        services.remove("ayeaye", "stamp").expect("a removal");
+
+        assert!(
+            services
+                .runner
+                .ran("systemctl --user disable --now ayeaye.service"),
+            "a stopped unit may still be enabled"
         );
     }
 
@@ -879,7 +1001,181 @@ mod tests {
     fn removing_a_service_that_is_not_installed_is_not_a_failure() {
         let scratch = Scratch::new("remove-absent");
         let services = systemd(&scratch, Fake::default());
-        assert_eq!(services.remove("ayeaye").expect("a removal"), None);
+        assert_eq!(services.remove("ayeaye", "stamp").expect("a removal"), None);
+    }
+
+    // AYEAYE-61 — the case that loses somebody's unit. Deciding whether a copy
+    // is needed by whether the file could be *read* answers "nothing is there"
+    // for a definition that is there and unreadable, and the rename then
+    // destroys it with no copy taken.
+    #[test]
+    fn a_definition_that_is_there_but_not_text_is_still_replaced_with_a_copy_kept() {
+        let scratch = Scratch::new("not-text");
+        let services = systemd(&scratch, Fake::default());
+        let path = unit_path(&services);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("the unit directory");
+        let bytes: &[u8] = &[b'[', b'U', 0xff, 0xfe, b']', b'\n'];
+        fs::write(&path, bytes).expect("a unit that is not UTF-8");
+
+        let installed = services
+            .install(&definition(), "stamp")
+            .expect("an install");
+
+        assert_eq!(installed.action, Install::Replace);
+        let backup = installed.backup.expect("a copy of what was there");
+        assert_eq!(fs::read(&backup).expect("the copy"), bytes);
+    }
+
+    // AYEAYE-61 — and when the copy cannot be taken at all, the definition
+    // already there is left alone rather than replaced blind.
+    #[cfg(unix)]
+    #[test]
+    fn a_definition_whose_copy_cannot_be_taken_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("unreadable");
+        let services = systemd(&scratch, Fake::default());
+        let path = unit_path(&services);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("the unit directory");
+        fs::write(&path, "somebody's unit\n").expect("a unit");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("unreadable");
+
+        let refused = services.install(&definition(), "stamp");
+
+        // Running as root defeats the permission bit, and a test that quietly
+        // passes because it could read the file after all is worse than none.
+        if fs::read_to_string(&path).is_ok() {
+            return;
+        }
+        assert!(matches!(refused, Err(Failed::Disk(_))), "{refused:?}");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("readable again");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the unit"),
+            "somebody's unit\n",
+            "the definition that was there must survive a refusal"
+        );
+    }
+
+    // AYEAYE-61 — launchd refuses to start a job whose StandardOutPath cannot
+    // be opened, so an agent installed into a home with no log directory is
+    // installed, reported as installed, and never starts.
+    #[test]
+    fn installing_an_agent_creates_the_directory_it_writes_its_log_into() {
+        let scratch = Scratch::new("logs");
+        let services = launchd(&scratch, Fake::default());
+        let installed = services
+            .install(&definition(), "stamp")
+            .expect("an install");
+
+        assert!(
+            Path::new(&services.layout.log_dir).is_dir(),
+            "the agent names {}/ayeaye.log and nothing created it",
+            services.layout.log_dir
+        );
+        assert!(
+            fs::read_to_string(&installed.path)
+                .expect("the agent")
+                .contains(&format!(
+                    "<string>{}/ayeaye.log</string>",
+                    services.layout.log_dir
+                ))
+        );
+    }
+
+    // AYEAYE-61 — the launchd half of "migrated rather than duplicated". It is
+    // where the risk actually lives: the label and the filename are one string,
+    // and a definition installed under one name beside another under a second
+    // is two agents where somebody has one.
+    #[test]
+    fn an_agent_from_a_previous_install_is_replaced_not_duplicated() {
+        let scratch = Scratch::new("migrate-agent");
+        let services = launchd(&scratch, Fake::default());
+        let path = unit_path(&services);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("the agents directory");
+        fs::write(&path, "<plist>an older agent</plist>\n").expect("the previous install");
+
+        let installed = services
+            .install(&definition(), "stamp")
+            .expect("an install");
+
+        assert_eq!(installed.action, Install::Replace);
+        assert_eq!(installed.path, path);
+        assert_eq!(
+            listing(path.parent().expect("a directory"))
+                .into_iter()
+                .filter(|name| name.ends_with(".plist"))
+                .collect::<Vec<String>>(),
+            vec!["dev.ayeaye.plist"],
+            "one agent, not two"
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .expect("the agent")
+                .contains("<string>dev.ayeaye</string>"),
+            "the label is the stem of the file it is installed as"
+        );
+    }
+
+    // AYEAYE-61 — systemd has no escaping for a quote, a backslash or a line
+    // break in an executable path: it rejects the unit outright with
+    // "Executable path contains special characters". Naming the path beats
+    // installing something that can never start.
+    #[test]
+    fn a_path_systemd_cannot_express_is_named_rather_than_installed() {
+        let scratch = Scratch::new("unrepresentable");
+        let services = systemd(&scratch, Fake::default());
+        let awkward = Definition::ayeaye("/opt/o\"d/bin/ayeaye");
+
+        match services.install(&awkward, "stamp") {
+            Err(Failed::Unrepresentable(path)) => assert_eq!(path, "/opt/o\"d/bin/ayeaye"),
+            other => panic!("expected the path to be named, got {other:?}"),
+        }
+        assert!(listing(Path::new(&services.layout.unit_dir)).is_empty());
+        // launchd has no such limit — XML says what it means about any of
+        // these — so the refusal is systemd's rule and not this program's.
+        launchd(&scratch, Fake::default())
+            .install(&awkward, "stamp")
+            .expect("an agent");
+    }
+
+    // AYEAYE-61 — `systemctl status` exits 3 for a unit that is simply
+    // stopped. That is an answer, and turning it into "the command failed"
+    // hides a perfectly good report behind a complaint about it.
+    #[test]
+    fn status_reports_a_stopped_service_rather_than_failing_to_ask() {
+        let scratch = Scratch::new("status");
+        let stopped = systemd(&scratch, Fake::default());
+        assert!(
+            !stopped.status("ayeaye").expect("an answer").ok,
+            "a stopped unit is not a successful exit, and is still an answer"
+        );
+        assert!(
+            systemd(&scratch, Fake::running())
+                .status("ayeaye")
+                .expect("an answer")
+                .ok
+        );
+    }
+
+    // AYEAYE-61 — the stamp is what keeps yesterday's copy from being
+    // overwritten by today's.
+    #[test]
+    fn a_kept_copy_is_named_after_the_stamp_it_was_given() {
+        let scratch = Scratch::new("stamped");
+        let services = systemd(&scratch, Fake::default());
+        let path = unit_path(&services);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("the unit directory");
+        fs::write(&path, "an older unit\n").expect("a unit");
+
+        let installed = services
+            .install(&definition(), "20260810-120000")
+            .expect("an install");
+
+        let backup = installed.backup.expect("a copy");
+        assert!(
+            backup.to_string_lossy().contains("20260810-120000"),
+            "the copy is at {}",
+            backup.display()
+        );
     }
 
     // AYEAYE-61 — at the moment something fails, the service manager's own

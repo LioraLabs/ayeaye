@@ -70,11 +70,31 @@ fn service_verb(verb: Option<&str>) -> ExitCode {
             .map(|()| format!("{name} will not start again")),
         Some("start") => services.start(&name).map(|()| format!("{name} started")),
         Some("stop") => services.stop(&name).map(|()| format!("{name} stopped")),
-        Some("status") => services.status(&name),
-        Some("remove") => services.remove(&name).map(|path| match path {
-            Some(path) => format!("removed {}", path.display()),
-            None => format!("there was no {name} definition to remove"),
-        }),
+        // Reported as the manager reported it, exit code included: `systemctl
+        // status` exits 3 for a unit that is simply stopped, and answering
+        // "the command failed" to a question about a stopped service is not an
+        // answer at all.
+        Some("status") => match services.status(&name) {
+            Ok(outcome) => {
+                println!("{}", outcome.output.trim_end());
+                return if outcome.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            Err(why) => Err(why),
+        },
+        Some("remove") => services
+            .remove(&name, &stamp())
+            .map(|removed| match removed {
+                Some(removed) => format!(
+                    "removed {}\nkept a copy at {}",
+                    removed.path.display(),
+                    removed.backup.display()
+                ),
+                None => format!("there was no {name} definition to remove"),
+            }),
         _ => {
             return complain(
                 "usage: ayeaye service <install|repair|enable|disable|start|stop|status|remove>",

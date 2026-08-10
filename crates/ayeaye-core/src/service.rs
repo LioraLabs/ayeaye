@@ -21,8 +21,11 @@
 /// The user-session service manager a machine has.
 ///
 /// Which one this machine has is not decided here — detection is the shell's,
-/// and it arrives as a value. "Neither" is spelled `Option<Manager>` by the
-/// caller rather than as a variant, so that every function below is total.
+/// and it arrives as a value. There is deliberately no "neither" variant: every
+/// function below would have to answer for it, and the honest place for that
+/// answer is above, where a machine with no user service manager is told so
+/// rather than handed a command it cannot run. AYEAYE-60 is what will supply
+/// it; until then the binary assumes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
     /// systemd's *user* session. Never the system manager: this project
@@ -240,6 +243,14 @@ impl Session {
     pub fn unit_name(&self, name: &str) -> Result<String, Unavailable> {
         if name.is_empty() {
             return Err(Unavailable::Caller("a service with no name"));
+        }
+        // A name is a name, not a path. `definition_path` joins it onto a
+        // directory, so a separator in it is a definition written outside the
+        // one place this program installs into.
+        if name.contains('/') || name.contains(std::path::MAIN_SEPARATOR) {
+            return Err(Unavailable::Caller(
+                "a service name may not contain a path separator",
+            ));
         }
         Ok(match self.manager {
             Manager::Systemd => {

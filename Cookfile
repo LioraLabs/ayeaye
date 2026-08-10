@@ -108,7 +108,6 @@ recipe suite
 # The ingredient is the workspace manifest - a source, which is what makes this
 # cacheable at all. The sources themselves are the sealed probe above: cargo
 # consumes them, but it does not take them as arguments.
-
 #
 # `fixtures` is sealed here as well as on the bash suite: the Rust tests read
 # the captured unit fixtures through `include_str!`, so a golden file is an
@@ -125,11 +124,14 @@ recipe rust-suite
 # Separate from the suite so a lint failure and a test failure are two
 # different red units rather than one. `-D warnings` is the gate the milestone
 # asked for; without it clippy is advice nobody reads.
+# `fixtures` for the same reason as above: --all-targets compiles the tests, and
+# the tests `include_str!` the captured units.
 recipe rust-lint
     ingredients "Cargo.toml"
     seal rust
     seal rust:toolchain
     seal rust:tools
+    seal fixtures
     test { cargo clippy --workspace --all-targets --locked -- -D warnings }
 
 # --- release gates ------------------------------------------------------
