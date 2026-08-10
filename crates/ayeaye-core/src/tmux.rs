@@ -4,6 +4,7 @@
 //! which is what lets the parse be held to output really captured from a tmux
 //! server rather than to output somebody imagined.
 
+use crate::json;
 use crate::peer::{HostName, PaneId};
 
 /// The `list-panes -F` format the pane list is read out of.
@@ -73,6 +74,42 @@ pub fn panes(host: &HostName, text: &str) -> Vec<Pane> {
     panes
 }
 
+/// The body `/api/panes` answers with.
+///
+/// The daemon's shape — the host this list came from, then the panes — with the
+/// six fields `share/app.html` reads off each card. The id is qualified, and
+/// the client carries it opaquely: nothing in the page splits it, which is what
+/// lets a federated id and a local one be the same string to everything above
+/// this line.
+///
+/// `failed` is what to say when tmux could not be asked at all. It is a field
+/// rather than a status code because the panel must keep rendering; an empty
+/// list with no explanation is the specific lie this app exists to prevent,
+/// since "no agents need you" and "I could not look" are opposite answers.
+pub fn panes_body(host: &HostName, panes: &[Pane], failed: Option<&str>) -> String {
+    let mut body = format!("{{\"host\":{},\"panes\":[", json::string(host.as_str()));
+    for (index, pane) in panes.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            "{{\"id\":{},\"session\":{},\"window\":{},\"name\":{},\"cmd\":{},\"active\":{}}}",
+            json::string(&pane.id.qualified()),
+            json::string(&pane.session),
+            json::string(&pane.window),
+            json::string(&pane.name),
+            json::string(&pane.cmd),
+            pane.active,
+        ));
+    }
+    body.push(']');
+    if let Some(failed) = failed {
+        body.push_str(&format!(",\"error\":{}", json::string(failed)));
+    }
+    body.push('}');
+    body
+}
+
 /// Whether what tmux printed on stderr means "there is no server here".
 ///
 /// A machine with no sessions is not a broken daemon, and the difference is
@@ -97,7 +134,7 @@ const NO_SERVER: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{PANE_FORMAT, no_server_running, panes};
+    use super::{PANE_FORMAT, no_server_running, panes, panes_body};
     use crate::peer::HostName;
 
     /// Real output, captured from a private `tmux -L` server carrying a
@@ -139,7 +176,11 @@ mod tests {
             "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\
              \t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
         );
-        assert_eq!(MIXED.lines().count(), 5, "the fixture is that format's output");
+        assert_eq!(
+            MIXED.lines().count(),
+            5,
+            "the fixture is that format's output"
+        );
     }
 
     // AYEAYE-43 — a machine with no tmux server has no panes, which is not the
@@ -186,5 +227,53 @@ this is not a pane
             .collect();
         assert_eq!(ids, ["desktop/%0", "desktop/%2"]);
         assert!(panes(&host(), "").is_empty());
+    }
+
+    // AYEAYE-43 — the body the panel reads: the host it came from, and a card
+    // per pane carrying the six fields `share/app.html` renders. Written out in
+    // full rather than field by field, because the shape is the contract.
+    #[test]
+    fn the_body_carries_the_host_and_a_card_per_pane() {
+        let body = panes_body(&host(), &panes(&host(), MIXED), None);
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"host":"desktop","panes":["#,
+                r#"{"id":"desktop/%0","session":"work","window":"0","name":"editor","cmd":"sh","active":true},"#,
+                r#"{"id":"desktop/%1","session":"work","window":"0","name":"editor","cmd":"sh","active":false},"#,
+                r#"{"id":"desktop/%2","session":"work","window":"1","name":"cook","cmd":"sh","active":true}"#,
+                r#"]}"#,
+            )
+        );
+        assert_eq!(
+            panes_body(&host(), &[], None),
+            r#"{"host":"desktop","panes":[]}"#
+        );
+    }
+
+    // AYEAYE-43 — a window name is whatever somebody typed. A quote in it must
+    // not end the string that carries it, or one badly-named window empties the
+    // panel for every pane — the same failure the spec names about decoding.
+    #[test]
+    fn a_window_name_cannot_break_the_body() {
+        let awkward = "%0\twork\t0\tsay \"hi\"\tsh\t1\t0\n";
+        assert_eq!(
+            panes_body(&host(), &panes(&host(), awkward), None),
+            concat!(
+                r#"{"host":"desktop","panes":[{"id":"desktop/%0","session":"work",""#,
+                r#"window":"0","name":"say \"hi\"","cmd":"sh","active":true}]}"#,
+            )
+        );
+    }
+
+    // AYEAYE-43 — tmux that could not be asked is said out loud. An empty list
+    // with no reason reads as "nothing needs you", which is the one thing this
+    // app must never say when it does not know.
+    #[test]
+    fn a_failure_is_stated_rather_than_served_as_an_empty_list() {
+        assert_eq!(
+            panes_body(&host(), &[], Some("tmux: No such file or directory")),
+            r#"{"host":"desktop","panes":[],"error":"tmux: No such file or directory"}"#
+        );
     }
 }

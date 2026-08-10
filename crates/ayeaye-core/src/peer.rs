@@ -370,7 +370,10 @@ mod tests {
     fn the_local_machine_is_a_peer_with_a_null_transport() {
         let registry = Registry::new(vec![
             Peer::here(host("desktop")),
-            Peer::over(host("gpu-box"), Transport::Ssh("alex@gpu-box.lan".to_string())),
+            Peer::over(
+                host("gpu-box"),
+                Transport::Ssh("alex@gpu-box.lan".to_string()),
+            ),
         ])
         .expect("two differently-named peers, one of them here");
 
@@ -378,7 +381,9 @@ mod tests {
         assert_eq!(registry.here().transport(), None);
         assert!(registry.here().is_here());
 
-        let gpu = registry.get("gpu-box").expect("the peer that was registered");
+        let gpu = registry
+            .get("gpu-box")
+            .expect("the peer that was registered");
         assert!(!gpu.is_here());
         assert_eq!(
             gpu.transport(),
@@ -425,7 +430,10 @@ mod tests {
     fn a_qualified_id_routes_to_the_peer_it_names() {
         let registry = Registry::new(vec![
             Peer::here(host("desktop")),
-            Peer::over(host("gpu-box"), Transport::Ssh("alex@gpu-box.lan".to_string())),
+            Peer::over(
+                host("gpu-box"),
+                Transport::Ssh("alex@gpu-box.lan".to_string()),
+            ),
         ])
         .expect("a deployment");
 
