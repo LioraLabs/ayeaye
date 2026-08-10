@@ -111,6 +111,10 @@ const EFFECTFUL_METHODS: &[&str] = &[
     "read_to_string",
     "read_to_end",
     "write_all",
+    "write",
+    "flush",
+    "open",
+    "create",
     "canonicalize",
     "create_dir_all",
     "remove_file",
@@ -126,56 +130,66 @@ pub fn scan(path: &str, source: &str) -> Vec<Finding> {
     let mut findings: Vec<Finding> = Vec::new();
 
     // `use` items first, because they are the only place a reach is written as
-    // a tree rather than as a path. They are then blanked out, so the path
-    // scan below cannot read `use std::time::{Duration, Instant}` as a bare
-    // reach to `std::time` and convict the Duration along with the clock.
-    for (start, end) in use_items(&code) {
-        let line = line_of(&code, start);
-        for reach in expand_use(&code[start + "use".len()..end]) {
+    // a tree rather than as a path.
+    let items = use_items(&code);
+    for (start, end) in &items {
+        let line = line_of(&code, *start);
+        for reach in expand_use(&code[start + "use".len()..*end]) {
             if let Some(budget) = judge(&reach) {
-                push(&mut findings, path, &reach, budget, line);
+                push(&mut findings, path, &reach, budget.why, line);
             }
         }
-        blank(&mut code, start, end);
+    }
+
+    // Then blanked out, so the path scan below cannot read
+    // `use std::time::{Duration, Instant}` as a bare reach to `std::time` and
+    // convict the Duration along with the clock. Backwards, because blanking
+    // replaces every character with one byte and so shortens the text wherever
+    // it held a multi-byte one: going forwards invalidates every range still
+    // to come, which is a scanner that goes silently blind on legal Rust.
+    for (start, end) in items.iter().rev() {
+        blank(&mut code, *start, *end);
     }
 
     for (offset, chain) in chains(&code) {
         if let Some(budget) = judge(&chain) {
-            push(&mut findings, path, &chain, budget, line_of(&code, offset));
+            push(
+                &mut findings,
+                path,
+                &chain,
+                budget.why,
+                line_of(&code, offset),
+            );
         }
     }
 
     for (offset, name) in calls(&code, b'!') {
         if EFFECTFUL_MACROS.contains(&name.as_str()) {
-            let budget = &Budget {
-                reach: "",
-                mode: Match::Exact,
-                why: "writing to a stream is the shell's; return the string instead",
-            };
             let what = format!("{name}!");
-            push(&mut findings, path, &what, budget, line_of(&code, offset));
+            let why = "writing to a stream is the shell's; return the string instead";
+            push(&mut findings, path, &what, why, line_of(&code, offset));
         }
     }
 
     for (offset, name) in calls(&code, b'(') {
         if EFFECTFUL_METHODS.contains(&name.as_str()) {
-            let budget = &Budget {
-                reach: "",
-                mode: Match::Exact,
-                why: "the call is effectful whatever the receiver is; do it above the core",
-            };
             let what = format!(".{name}()");
-            push(&mut findings, path, &what, budget, line_of(&code, offset));
+            let why = "the call is effectful whatever the receiver is; do it above the core";
+            push(&mut findings, path, &what, why, line_of(&code, offset));
         }
     }
 
     findings
 }
 
-/// Identifiers immediately followed by `terminator`, and preceded by nothing
-/// that would make them part of a longer path. `!` finds macro invocations;
-/// `(` finds calls, which are only interesting here when the call is a method
-/// on something — hence the leading `.`.
+/// Identifiers followed by `terminator`, and preceded by nothing that would
+/// make them part of a longer path. `!` finds macro invocations; `(` finds
+/// calls, which are only interesting here when the call is a method on
+/// something — hence the leading `.`.
+///
+/// Whitespace either side is skipped: `println !("x")` is a call to `println!`,
+/// and a rule that only sees the tidy spelling is a rule that depends on the
+/// formatter having run first.
 fn calls(code: &str, terminator: u8) -> Vec<(usize, String)> {
     let bytes = code.as_bytes();
     let wants_dot = terminator == b'(';
@@ -187,13 +201,32 @@ fn calls(code: &str, terminator: u8) -> Vec<(usize, String)> {
             continue;
         }
         let end = ident_end(bytes, i);
-        let preceded_by_dot = i > 0 && bytes[i - 1] == b'.';
-        if end < bytes.len() && bytes[end] == terminator && (!wants_dot || preceded_by_dot) {
+        let after = skip_space(bytes, end);
+        let preceded_by_dot = last_non_space(bytes, i) == Some(b'.');
+        if after < bytes.len() && bytes[after] == terminator && (!wants_dot || preceded_by_dot) {
             found.push((i, code[i..end].to_string()));
         }
         i = end.max(i + 1);
     }
     found
+}
+
+/// The first index at or after `from` that is not whitespace.
+fn skip_space(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// The last non-whitespace byte before `before`, if there is one.
+fn last_non_space(bytes: &[u8], before: usize) -> Option<u8> {
+    bytes[..before]
+        .iter()
+        .rev()
+        .find(|b| !b.is_ascii_whitespace())
+        .copied()
 }
 
 /// The `use` items in the text, as `(start, end)` byte ranges covering
@@ -245,22 +278,21 @@ fn walk_use(prefix: &str, item: &str, out: &mut Vec<String>) {
         let Some(close) = matching_brace(item, open) else {
             return;
         };
-        let head = item[..open].trim().trim_end_matches("::");
+        let head = squeeze(&item[..open]);
         let inner = &item[open + 1..close];
-        let nested = join(prefix, head);
+        let nested = join(prefix, head.trim_end_matches("::"));
         for part in split_top_level(inner) {
             walk_use(&nested, part, out);
         }
         return;
     }
-    let leaf = item
-        .split(" as ")
-        .next()
-        .unwrap_or(item)
-        .trim()
-        .trim_end_matches('*')
-        .trim_end_matches("::")
-        .trim();
+    // An alias is dropped before the whitespace is: `fs as f` and `fs\nas\nf`
+    // both name `fs`, and squeezing first would turn either into `fsasf`.
+    let named: String = item
+        .split_whitespace()
+        .take_while(|word| *word != "as")
+        .collect();
+    let leaf = named.trim_end_matches('*').trim_end_matches("::");
     let reach = if leaf.is_empty() || leaf == "self" {
         prefix.to_string()
     } else {
@@ -269,6 +301,11 @@ fn walk_use(prefix: &str, item: &str, out: &mut Vec<String>) {
     if !reach.is_empty() {
         out.push(reach);
     }
+}
+
+/// A path with every space taken out of it. `std :: time ::` is `std::time::`.
+fn squeeze(path: &str) -> String {
+    path.split_whitespace().collect()
 }
 
 fn join(prefix: &str, leaf: &str) -> String {
@@ -340,12 +377,12 @@ fn judge(reach: &str) -> Option<&'static Budget> {
 
 /// Record a finding, unless the same violation is already recorded. One reach
 /// written twice in a file is one thing to fix.
-fn push(findings: &mut Vec<Finding>, path: &str, what: &str, budget: &Budget, line: usize) {
+fn push(findings: &mut Vec<Finding>, path: &str, what: &str, why: &str, line: usize) {
     let finding = Finding {
         rule: Rule::EffectBudget,
         subject: path.to_string(),
         what: what.to_string(),
-        why: budget.why.to_string(),
+        why: why.to_string(),
         line: Some(line),
     };
     if findings.iter().any(|seen| seen.key() == finding.key()) {
@@ -355,6 +392,11 @@ fn push(findings: &mut Vec<Finding>, path: &str, what: &str, budget: &Budget, li
 }
 
 /// Every `a::b::c` chain in the text, with the offset it starts at.
+///
+/// The chain is returned normalised — whatever whitespace or blanked-out
+/// comment sat between the segments, `std :: fs :: read` comes back as
+/// `std::fs::read`. Comparing the raw spelling is how a scanner ends up
+/// depending on the formatter to be correct.
 fn chains(code: &str) -> Vec<(usize, String)> {
     let bytes = code.as_bytes();
     let mut found = Vec::new();
@@ -365,23 +407,26 @@ fn chains(code: &str) -> Vec<(usize, String)> {
             continue;
         }
         let start = i;
-        let mut end = i;
-        let mut segments = 0;
+        let mut end = ident_end(bytes, i);
+        let mut chain = code[start..end].to_string();
+        let mut segments = 1;
         loop {
-            let seg_end = ident_end(bytes, end);
-            if seg_end == end {
+            let separator = skip_space(bytes, end);
+            if !bytes[separator..].starts_with(b"::") {
                 break;
             }
+            let next = skip_space(bytes, separator + 2);
+            let next_end = ident_end(bytes, next);
+            if next_end == next {
+                break;
+            }
+            chain.push_str("::");
+            chain.push_str(&code[next..next_end]);
             segments += 1;
-            end = seg_end;
-            if bytes[end..].starts_with(b"::") && ident_end(bytes, end + 2) > end + 2 {
-                end += 2;
-            } else {
-                break;
-            }
+            end = next_end;
         }
         if segments > 1 {
-            found.push((start, code[start..end].to_string()));
+            found.push((start, chain));
         }
         i = end.max(start + 1);
     }
@@ -486,6 +531,48 @@ mod tests {
     fn a_lifetime_does_not_swallow_the_code_after_it() {
         let source = "fn f<'a>(x: &'a str) { std::fs::write(x); }\n";
         assert_eq!(what(&scan("planted.rs", source)), vec!["std::fs::write"]);
+    }
+
+    // AYEAYE-41 — non-ASCII identifiers are legal Rust. An earlier version
+    // blanked each use item as it walked the list it had already collected,
+    // so one multi-byte character in an earlier import shifted every later
+    // range and the import after it vanished without a finding.
+    #[test]
+    fn a_multi_byte_identifier_earlier_in_the_file_hides_nothing_later() {
+        let source = "use crate::中;\nuse std::process::Command;\n";
+        assert_eq!(
+            what(&scan("planted.rs", source)),
+            vec!["std::process::Command"]
+        );
+    }
+
+    // AYEAYE-41 — a reach is a reach however it is spaced. Leaning on
+    // `cargo fmt` to normalise this first would make one gate's correctness
+    // depend on another gate having run.
+    #[test]
+    fn whitespace_between_the_segments_does_not_hide_a_reach() {
+        let spaced = scan("a.rs", "fn f() { std :: fs :: read(p); }\n");
+        let wrapped = scan("a.rs", "fn f() {\n    std::\n        fs::read(p);\n}\n");
+        let commented = scan("a.rs", "fn f() { std::/* why */fs::read(p); }\n");
+        assert_eq!(what(&spaced), vec!["std::fs::read"]);
+        assert_eq!(what(&wrapped), vec!["std::fs::read"]);
+        assert_eq!(what(&commented), vec!["std::fs::read"]);
+    }
+
+    // AYEAYE-41
+    #[test]
+    fn whitespace_in_a_use_item_does_not_hide_a_reach() {
+        assert_eq!(what(&scan("a.rs", "use std :: fs;\n")), vec!["std::fs"]);
+        assert_eq!(what(&scan("a.rs", "use std::\n    fs;\n")), vec!["std::fs"]);
+    }
+
+    // AYEAYE-41
+    #[test]
+    fn whitespace_before_the_bang_does_not_hide_a_macro() {
+        assert_eq!(
+            what(&scan("a.rs", "fn f() { println !(\"x\"); }\n")),
+            vec!["println!"]
+        );
     }
 
     fn what(findings: &[crate::Finding]) -> Vec<&str> {

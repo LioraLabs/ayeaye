@@ -8,13 +8,20 @@
 use constitution::corpus::{Corpus, workspace_root};
 use constitution::{deps, effect_budget, finding::report, strata};
 
-/// The floor the corpus walk has to clear.
+/// The floor the whole corpus walk has to clear.
 ///
 /// It exists to catch a walk that found nothing — a mistyped directory, a
 /// wrong root, a member list that stopped matching the tree. Raise it as the
 /// crates fill up; a walk that returns two files where it used to return forty
 /// is the failure this number is here to make loud.
 const NON_TRIVIAL: usize = 8;
+
+/// The floor for the crates that are actually shipped.
+///
+/// The constitution is most of the workspace's source today, so a total on its
+/// own would still pass if the walk found nothing but the constitution. This
+/// is the number that says the governed crates were really read.
+const NON_TRIVIAL_SHIPPED: usize = 5;
 
 fn corpus() -> Corpus {
     Corpus::walk(&workspace_root()).expect("the workspace should be readable")
@@ -29,6 +36,18 @@ fn the_walk_finds_a_non_trivial_corpus() {
         "the walk found {} source files, which is fewer than the {NON_TRIVIAL} a real \
          workspace has — the walk is looking in the wrong place",
         corpus.file_count()
+    );
+
+    let shipped: usize = corpus
+        .members
+        .iter()
+        .filter(|member| member.name != "constitution")
+        .map(|member| member.sources.len())
+        .sum();
+    assert!(
+        shipped >= NON_TRIVIAL_SHIPPED,
+        "the walk found {shipped} source files outside the constitution itself, fewer than \
+         the {NON_TRIVIAL_SHIPPED} the shipped crates have — the rules are judging almost nothing"
     );
 }
 
@@ -74,7 +93,7 @@ fn the_pure_core_declares_only_allowlisted_dependencies() {
     let core = corpus
         .member(deps::GOVERNED)
         .expect("the pure core should be a workspace member");
-    let findings = deps::check(&core.name, &core.dependencies);
+    let findings = deps::check(&core.name, &core.dependencies, deps::ALLOWED);
     assert!(
         findings.is_empty(),
         "{} declares dependencies that are not on its allowlist:\n{}",

@@ -78,3 +78,57 @@ pub fn report(findings: &[Finding]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Finding, Rule, report};
+
+    fn finding(line: Option<usize>) -> Finding {
+        Finding {
+            rule: Rule::EffectBudget,
+            subject: "crates/ayeaye-core/src/lib.rs".to_string(),
+            what: "std::fs".to_string(),
+            why: "the filesystem is the shell's".to_string(),
+            line,
+        }
+    }
+
+    // AYEAYE-41 — the key is what a waiver list will hang on, so an edit that
+    // moves a known violation down the file must not rename it.
+    #[test]
+    fn the_key_does_not_move_when_the_line_does() {
+        assert_eq!(finding(Some(4)).key(), finding(Some(400)).key());
+        assert_eq!(
+            finding(None).key(),
+            "effect-budget/crates/ayeaye-core/src/lib.rs/std::fs"
+        );
+    }
+
+    // AYEAYE-41
+    #[test]
+    fn two_different_violations_have_two_different_keys() {
+        let mut other = finding(Some(4));
+        other.what = "std::net".to_string();
+        assert_ne!(finding(Some(4)).key(), other.key());
+    }
+
+    // AYEAYE-41 — the failure message is the product: a reader has to be able
+    // to find the violation and know what to do about it.
+    #[test]
+    fn a_report_names_the_file_the_line_the_reach_and_the_remedy() {
+        let rendered = report(&[finding(Some(12))]);
+        assert_eq!(
+            rendered,
+            "  crates/ayeaye-core/src/lib.rs:12: std::fs — the filesystem is the shell's\n"
+        );
+    }
+
+    // AYEAYE-41 — a rule with nothing to point at still has to read.
+    #[test]
+    fn a_finding_with_no_line_leaves_the_colon_out() {
+        assert_eq!(
+            finding(None).to_string(),
+            "crates/ayeaye-core/src/lib.rs: std::fs — the filesystem is the shell's"
+        );
+    }
+}
