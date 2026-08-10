@@ -1134,6 +1134,23 @@ async fn killing_a_pane_removes_it_from_the_list_the_panel_reads() {
         "{doomed} is still listed: {after:?}"
     );
     assert_eq!(after.len(), 1, "only the one pane went: {after:?}");
+
+    // And the host half is matched the way the registry matches it. `route`
+    // folds case because DNS does — AYEAYE-43 has a test insisting on it — so a
+    // membership check that compared whole ids would route `DESKTOP/%1` to this
+    // machine and then answer "no such pane" about it, with the two layers
+    // disagreeing about how many machines there are.
+    let (survivor, _) = after.first().expect("one pane left").clone();
+    let shouted = survivor.replace("desktop/", "DESKTOP/");
+    assert_ne!(
+        shouted, survivor,
+        "this asserts nothing unless the case moved"
+    );
+    let answer = server
+        .post_as_us("/api/kill", &format!(r#"{{"pane":"{shouted}"}}"#))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body_text());
+    assert!(listed_panes(&server).await.is_empty());
 }
 
 // AYEAYE-51 — the membership check, and the reason it is membership rather than

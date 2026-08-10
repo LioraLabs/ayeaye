@@ -76,9 +76,8 @@ pub fn within_limit(prompt: &str) -> &str {
 /// What the tmux session for a project is called.
 ///
 /// The `ftz`/`ftn` convention `bin/ayeaye` mirrors: the last path component,
-/// unless the project names itself in `.tmux.yaml`, with dots folded to
-/// underscores because a dot in a session name is a target tmux reads as a
-/// window separator.
+/// unless the project names itself in `.tmux.yaml`, with the two characters
+/// tmux reads as target separators folded to underscores.
 ///
 /// The file's *text* is the argument rather than the path, so this stays a
 /// decision. Reading it is the shell's, and a project without one passes
@@ -94,13 +93,29 @@ pub fn session_name(dir: &str, tmux_yaml: Option<&str>) -> String {
         "" => "root",
         last => last,
     };
-    // A dot is a window separator to tmux — `work.1` is window 1 of `work` —
-    // so it cannot survive into a session name whichever half named it.
     tmux_yaml
         .and_then(declared_name)
         .unwrap_or(from_dir)
-        .replace('.', "_")
+        .replace(SEPARATORS, "_")
 }
+
+/// The characters tmux reads as target separators, which a session name may not
+/// carry.
+///
+/// A tmux target is `session:window.pane`, so both of these turn a name into a
+/// *different* name plus a coordinate. `bin/ayeaye:1403` folds only the dot,
+/// and the colon is the one that does real damage: tmux accepts a session
+/// literally called `work:9`, and `new-window -t "=work:9"` then opens window 9
+/// of the session `work` — someone else's project gaining a window nobody asked
+/// for, which is exactly what the `=` is there to prevent. The `=` forces an
+/// exact match on the *session* half and cannot help once the colon has ended
+/// it.
+///
+/// A deliberate departure from the daemon, in the same direction as
+/// `Tmux::sessions` splitting on lines: a project directory can be called
+/// anything, and this is the only place that can stop what it is called from
+/// naming somebody else's session.
+const SEPARATORS: &[char] = &[':', '.'];
 
 /// The `session_name:` a project declares, if it declares one.
 ///
@@ -306,6 +321,26 @@ pub mod refused {
         format!("tmux would not create the {}", created.as_str())
     }
 
+    /// The pane was made and the agent could not be started in it.
+    ///
+    /// The daemon has no counterpart because it never checks: it types and
+    /// moves on. This one names the pane on purpose. By the time it can happen
+    /// the pane really exists, so a refusal that said only "it did not work"
+    /// would leave a pane running on somebody's machine that nothing had told
+    /// them about — and the panel's next poll would show it with no explanation
+    /// of where it came from.
+    pub fn started_but_could_not_type(
+        created: super::Created,
+        pane: &crate::peer::PaneId,
+        why: &str,
+    ) -> String {
+        format!(
+            "started the {} as {} but could not type into it: {why}",
+            created.as_str(),
+            pane.qualified()
+        )
+    }
+
     /// tmux refused the kill, quoting what it said. `bin/ayeaye:1939` for a
     /// tmux that could not be run at all, `:1941` for the empty-stderr
     /// fallback, `:1942` for a tmux that ran and said no.
@@ -381,7 +416,7 @@ mod tests {
         // Trailing slashes are stripped first, however many there are.
         assert_eq!(session_name("/home/alex/dev/ayeaye/", None), "ayeaye");
         assert_eq!(session_name("/home/alex/dev/ayeaye///", None), "ayeaye");
-        // A dot is a window separator to tmux, so it cannot be in the name.
+        // A dot is a pane separator to tmux, so it cannot be in the name.
         assert_eq!(session_name("/home/alex/.config/nvim.d", None), "nvim_d");
         // The root directory has no last component, and a session still needs
         // a name.
@@ -389,6 +424,28 @@ mod tests {
         assert_eq!(session_name("", None), "root");
         // A relative path is still a path.
         assert_eq!(session_name("ayeaye", None), "ayeaye");
+    }
+
+    // AYEAYE-51 — found at the final gate, and the reason `create`'s `=` is not
+    // enough on its own. A tmux target is `session:window.pane`, and tmux will
+    // happily hold a session called `work:9` — so a project directory of that
+    // name produces `new-window -t "=work:9"`, which opens **window 9 of the
+    // session `work`**. Verified against a real tmux on a private socket: the
+    // window lands in `work`, and the reply would name a session it is not in.
+    //
+    // `bin/ayeaye:1403` folds only the dot and has this hole. Folding both is a
+    // departure from it, and the safe direction: a project can be called
+    // anything, and this is the only place that can stop what it is called from
+    // naming somebody else's session.
+    #[test]
+    fn a_name_cannot_carry_a_character_tmux_reads_as_a_target_separator() {
+        assert_eq!(session_name("/dev/work:9", None), "work_9");
+        assert_eq!(session_name("/dev/a:b.c", None), "a_b_c");
+        assert_eq!(
+            session_name("/dev/proj", Some("session_name: work:9\n")),
+            "work_9",
+            "a project that names itself does not get to skip this"
+        );
     }
 
     // AYEAYE-51 — a project that names itself wins over its directory, which is
@@ -589,6 +646,18 @@ mod tests {
         assert_eq!(
             refused::could_not_kill("  \n"),
             "could not kill pane: tmux refused the request"
+        );
+        // And the one refusal that has to name the pane: by the time it can
+        // happen the pane exists, so a refusal that did not say which one would
+        // leave a pane running that nothing had told anybody about.
+        assert_eq!(
+            refused::started_but_could_not_type(
+                Created::Window,
+                &pane("desktop", "%7"),
+                "tmux: gave up after 5s"
+            ),
+            "started the window as desktop/%7 but could not type into it: \
+             tmux: gave up after 5s"
         );
     }
 

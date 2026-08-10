@@ -99,13 +99,10 @@ pub async fn spawn(settings: &Settings, body: &[u8]) -> Answered {
     };
 
     if let Err(trouble) = type_into(settings, pane.pane(), &command_line).await {
-        // The pane exists at this point, and saying it does not would leave one
-        // nobody knows about. So this reports the pane *and* what went wrong
-        // with the typing, which is the only answer that is not a lie.
-        return Answered::refused(format!(
-            "started the {} but could not type into {}: {trouble}",
-            made.created().as_str(),
-            pane.qualified()
+        return Answered::refused(refused::started_but_could_not_type(
+            made.created(),
+            &pane,
+            &trouble.to_string(),
         ));
     }
 
@@ -150,7 +147,13 @@ pub async fn kill(settings: &Settings, body: &[u8]) -> Answered {
         Ok(listed) => listed,
         Err(trouble) => return Answered::refused(trouble.to_string()),
     };
-    if !listed.iter().any(|pane| pane.id == id) {
+    // Compared on the pane half. The host half has already been answered, and
+    // answered better: `route` folds case the way DNS does, so `DESKTOP/%1` and
+    // `desktop/%1` reach the same peer — while these listed ids all carry that
+    // peer's name as the registry spells it. Comparing whole ids would refuse
+    // the shouted one as "no such pane" and make this layer disagree with the
+    // routing layer about how many machines there are.
+    if !listed.iter().any(|pane| pane.id.pane() == id.pane()) {
         return Answered::refused(refused::NO_SUCH_PANE);
     }
 

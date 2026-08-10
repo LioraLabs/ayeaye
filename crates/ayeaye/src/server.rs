@@ -64,6 +64,15 @@ async fn handle(
     // Last, because axum takes the body-consuming extractor last. Every route
     // is handled here, so this is read for a GET of an icon too — it is the
     // bytes that were sent, which for a GET is none.
+    //
+    // It is therefore buffered *before* the three gates below run, which is
+    // worth knowing rather than worth restructuring: axum bounds it at 2 MiB
+    // by default, so what an unauthenticated caller can make this server hold
+    // is one small body per connection. A body past that limit is answered by
+    // axum itself with a 413 — the one response here that does not come out of
+    // `build()`, so it carries no `no-store` and is not the `{"error":…}` the
+    // panel expects. Nothing sends bodies near that size; if anything ever
+    // does, that is the reason to take the body per-route instead.
     body: axum::body::Bytes,
 ) -> Response {
     // The Host gate comes first and applies to everything, pages included:
