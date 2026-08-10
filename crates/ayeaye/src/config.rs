@@ -172,11 +172,7 @@ impl Settings {
         // need not show a real hostname; then what the machine calls itself;
         // then a name it can at least be routed by, because every pane id on
         // this machine is qualified with this and there is no "unnamed".
-        let named = env("NAME")
-            .or(nodename)
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_NAME.to_string());
-        let here = HostName::new(&named).map_err(ConfigError::BadName)?;
+        let here = HostName::new(&machine_name(&env, nodename)).map_err(ConfigError::BadName)?;
         Ok(Settings {
             allowed_hosts: AllowedHosts::new(&bind, port, &extra),
             bind,
@@ -195,6 +191,26 @@ impl Settings {
     pub fn address(&self) -> String {
         format!("{}:{}", self.bind, self.port)
     }
+}
+
+/// What this machine calls itself.
+///
+/// The daemon's own order: the configured name first, so a screenshot need not
+/// show a real hostname; then what the machine calls itself; then a name it can
+/// at least be routed by, because every pane id on this machine is qualified
+/// with this and there is no "unnamed".
+///
+/// **Public, and shared, because two programs have to agree about it.** The
+/// daemon qualifies every pane id it issues with this name, and `ayeaye dictate`
+/// compares the id in its state file against the pane list under the same name —
+/// so a second spelling of this rule anywhere is a toggle that cannot find the
+/// panes the daemon named. It was written out twice once; this is that mistake
+/// removed rather than commented on.
+pub fn machine_name(env: impl Fn(&str) -> Option<String>, nodename: Option<String>) -> String {
+    env("NAME")
+        .or(nodename)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NAME.to_string())
 }
 
 /// Where the `cliban` the board endpoints run lives.
@@ -655,6 +671,39 @@ mod tests {
         )
         .expect("a blank nodename is no nodename");
         assert_eq!(blank.peers.here().name().as_str(), "localhost");
+    }
+
+    // AYEAYE-58 — the daemon qualifies every pane id it issues with this name,
+    // and `ayeaye dictate` compares the ids in its state file against the pane
+    // list under the same name. Two spellings of this rule is a toggle that
+    // cannot find any pane the daemon named, and the symptom is a dictation that
+    // records, transcribes, runs the cleanup model and then throws the words
+    // away — so it is one function, and this is the test that says so.
+    #[test]
+    fn the_daemon_and_the_toggle_name_this_machine_the_same_way() {
+        let configured = |name: &str| (name == "NAME").then(|| "desktop".to_string());
+
+        // The configured name first, so a screenshot need not show a hostname.
+        assert_eq!(
+            super::machine_name(configured, Some("box".to_string())),
+            "desktop"
+        );
+        // Then what the machine calls itself.
+        assert_eq!(super::machine_name(no_env, Some("box".to_string())), "box");
+        // Then something a pane id can at least be routed by.
+        assert_eq!(super::machine_name(no_env, None), super::DEFAULT_NAME);
+        assert_eq!(
+            super::machine_name(no_env, Some("   ".to_string())),
+            super::DEFAULT_NAME
+        );
+
+        // And the settings really are built from it, rather than from a second
+        // copy of the same three lines.
+        let settings = resolve(&[], configured).expect("a named machine");
+        assert_eq!(
+            settings.peers.here().name().as_str(),
+            super::machine_name(configured, Some("box".to_string()))
+        );
     }
 
     // AYEAYE-43 — a name a pane id cannot carry stops the server rather than

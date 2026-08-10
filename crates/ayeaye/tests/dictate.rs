@@ -476,17 +476,36 @@ async fn a_machine_with_no_speech_model_refuses_before_decoding_anything() {
 #[tokio::test]
 async fn sweeping_a_voice_that_has_never_been_used_lets_go_of_nothing() {
     let store = Store::named("sweep");
-    let voice = dictate::Voice::new(
+    let voice = dictate::Voice::with_slots(
         store.0.clone(),
-        settings(Some("openai/whisper-small.en"), None),
+        ModelSettings::resolve(
+            |_| None,
+            "AYEAYE_SPEECH_MODEL=openai/whisper-small.en\n\
+             AYEAYE_CLEANUP_MODEL=Qwen/Qwen2.5-7B-Instruct-GGUF\n\
+             AYEAYE_MODEL_IDLE=1s\n",
+        )
+        .expect("a readable configuration"),
         Policy::default(),
         "true".to_string(),
+        StubSpeech::default(),
+        StubCleanup::default(),
     );
 
-    assert!(!voice.sweep(std::time::Instant::now()).await);
+    // Long past any idle time, on a machine where nobody has dictated yet.
     assert!(
-        !voice.probe().await.speech_ready,
-        "nothing was loaded to sweep"
+        !voice
+            .sweep(std::time::Instant::now() + std::time::Duration::from_secs(3_600))
+            .await
+    );
+    // The part worth asserting, and the part the slots are the only witness to:
+    // the sweep did not *load* anything in order to discover there was nothing
+    // to release. Reading the store instead would be true whatever it did.
+    assert_eq!(
+        voice
+            .with_both(|speech, cleanup| (speech.resident, cleanup.resident))
+            .await,
+        (false, false),
+        "a sweep of a voice nobody has dictated through loaded a model"
     );
 }
 
@@ -510,7 +529,8 @@ struct Agent {
 }
 
 impl Agent {
-    async fn started(healthy: bool, clip: &'static [u8]) -> Agent {
+    async fn started(healthy: bool, clip: impl Into<Arc<[u8]>>) -> Agent {
+        let clip: Arc<[u8]> = clip.into();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("a port");
@@ -518,12 +538,14 @@ impl Agent {
         let stops = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&stops);
 
+        let clip = Arc::clone(&clip);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let counted = Arc::clone(&counted);
+                let clip = Arc::clone(&clip);
                 tokio::spawn(async move {
                     let mut raw = vec![0u8; 4096];
                     let read = stream.read(&mut raw).await.unwrap_or(0);
@@ -555,7 +577,7 @@ impl Agent {
                             clip.len()
                         )
                         .into_bytes();
-                        out.extend_from_slice(clip);
+                        out.extend_from_slice(&clip);
                         out
                     };
                     let _ = stream.write_all(&answer).await;
@@ -620,7 +642,7 @@ async fn a_second_press_types_the_words_into_the_pane_and_never_submits_them() {
     let Some(server) = common::Private::named("toggle") else {
         return;
     };
-    let agent = Agent::started(true, b"pretend this is ogg").await;
+    let agent = Agent::started(true, b"pretend this is ogg".to_vec()).await;
     let voice = Says::heard("run the tests");
     let state = state_path("typed");
     let tmux = server.layer();
@@ -686,7 +708,7 @@ async fn a_recorder_that_refuses_the_token_leaves_no_recording_behind() {
     let Some(server) = common::Private::named("toggle-token") else {
         return;
     };
-    let agent = Agent::started(true, b"never reached").await;
+    let agent = Agent::started(true, b"never reached".to_vec()).await;
     let voice = Says::heard("never reached");
     let state = state_path("token");
     let tmux = server.layer();
@@ -1063,7 +1085,7 @@ async fn a_pane_on_another_machine_is_never_typed_into() {
     let Some(server) = common::Private::named("toggle-elsewhere") else {
         return;
     };
-    let agent = Agent::started(true, b"pretend this is ogg").await;
+    let agent = Agent::started(true, b"pretend this is ogg".to_vec()).await;
     let voice = Says::heard("this must not be typed anywhere");
     let state = state_path("elsewhere");
     let tmux = server.layer();
@@ -1134,9 +1156,7 @@ async fn a_pane_on_another_machine_is_never_typed_into() {
 // worse than one that failed, because nobody knows to say it again.
 #[tokio::test]
 async fn an_agent_sending_more_than_a_dictation_is_refused_rather_than_truncated() {
-    let huge = vec![0u8; ayeaye::recorder::MAX_CLIP + 1];
-    let clip: &'static [u8] = Box::leak(huge.into_boxed_slice());
-    let agent = Agent::started(true, clip).await;
+    let agent = Agent::started(true, vec![0u8; ayeaye::recorder::MAX_CLIP + 1]).await;
     let recorder = ayeaye::recorder::Recorder::at("127.0.0.1", agent.port, "right-token");
 
     let refused = recorder.stop().await.expect_err("that is not a dictation");
@@ -1149,7 +1169,7 @@ async fn an_agent_sending_more_than_a_dictation_is_refused_rather_than_truncated
 
     // And a clip inside the cap still comes back whole, so the guard is a cap
     // rather than a ceiling everything bumps into.
-    let small = Agent::started(true, b"a real recording").await;
+    let small = Agent::started(true, b"a real recording".to_vec()).await;
     let recorder = ayeaye::recorder::Recorder::at("127.0.0.1", small.port, "right-token");
     let reply = recorder.stop().await.expect("a recording of a sane size");
     assert_eq!(reply.body, b"a real recording");
@@ -1169,7 +1189,7 @@ async fn an_agent_with_no_microphone_is_told_from_one_with_a_microphone() {
     let Some(server) = common::Private::named("toggle-backend") else {
         return;
     };
-    let agent = Agent::started(false, b"never recorded").await;
+    let agent = Agent::started(false, b"never recorded".to_vec()).await;
     let voice = Says::heard("never reached");
     let state = state_path("backend");
     let tmux = server.layer();
@@ -1286,5 +1306,105 @@ fn the_microphone_is_the_one_belonging_to_the_client_that_pressed_the_key() {
     assert_eq!(
         ayeaye::dictate::recording_peer(&machines, Some("not-a-pid"), &[200]),
         Some("100.101.102.103".to_string())
+    );
+}
+
+// AYEAYE-58
+//
+// "I could not ask tmux" and "that pane is gone" are opposite answers, and this
+// is the most expensive possible place to confuse them: `type_into` runs after
+// the recording, the transcription and the cleanup model. A wedged tmux reported
+// as a vanished pane sends somebody looking at their window layout for a problem
+// that will have fixed itself by the time they get there.
+#[tokio::test]
+async fn a_tmux_that_would_not_answer_is_told_from_a_pane_that_has_gone() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-wedged") else {
+        return;
+    };
+    let agent = Agent::started(true, b"pretend this is ogg".to_vec()).await;
+    let voice = Says::heard("run the tests");
+    let state = state_path("wedged");
+
+    // A tmux that answers, and a pane it does not have: that pane has gone.
+    let live = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &live,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+    let said = toggle.press("desktop/%99", None).await;
+    assert!(
+        said.contains("is not a pane on this machine"),
+        "a tmux that answered should say the pane has gone: {said:?}"
+    );
+
+    // A tmux nobody can ask: not the same sentence, and not a claim about the
+    // pane at all.
+    let unreachable = ayeaye::tmux::Tmux::spelled(
+        &["ayeaye-58-no-such-tmux"],
+        std::time::Duration::from_secs(5),
+    );
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &unreachable,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+    let said = toggle.press("desktop/%0", None).await;
+    assert!(
+        said.contains("could not ask tmux"),
+        "a tmux that could not be asked must not be reported as a missing pane: {said:?}"
+    );
+    assert!(
+        !state.exists(),
+        "nothing was recorded, so nothing is remembered"
+    );
+}
+
+// AYEAYE-58
+//
+// The target is judged on the way *in*. Finding out at the second press costs
+// the recording, the transcription and the cleanup model as well as the words,
+// and the microphone was turned on for nothing.
+#[tokio::test]
+async fn a_target_this_machine_does_not_have_is_refused_before_the_microphone() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-early") else {
+        return;
+    };
+    let agent = Agent::started(true, b"never recorded".to_vec()).await;
+    let voice = Says::heard("never reached");
+    let state = state_path("early");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        here: ayeaye_core::peer::HostName::new("desktop").expect("a host name"),
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+
+    let said = toggle.press("desktop/%99", None).await;
+
+    assert!(said.contains("is not a pane on this machine"), "{said}");
+    assert!(
+        !state.exists(),
+        "a recording that was refused must not be remembered"
+    );
+    assert_eq!(
+        agent.stops.load(Ordering::Relaxed),
+        0,
+        "the microphone was turned on for a pane that does not exist"
     );
 }

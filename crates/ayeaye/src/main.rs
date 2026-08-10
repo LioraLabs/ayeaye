@@ -286,9 +286,18 @@ fn model_verb(args: &[String]) -> ExitCode {
 /// and nothing on stdout: `run-shell -b` discards both streams, so a message
 /// written here would be a key that silently did nothing.
 ///
-/// The pane id is qualified — `host/%3` — like every id in this app. A tmux
-/// binding spells it `#{host}/#{pane_id}`, or passes the bare `#{pane_id}` when
-/// this machine's name is the default.
+/// **The pane id must be qualified** — `desktop/%3`, like every id in this app —
+/// and the host half has to be the name this machine goes by, because the pane
+/// is looked up in the list under that name. A bare `#{pane_id}` is refused:
+/// `PaneId::parse` has nothing to split, so there is no host to compare.
+///
+/// A tmux binding therefore spells it `#{host}/#{pane_id}`, and that only agrees
+/// with this binary while nobody has set `AYEAYE_NAME` — tmux's `#{host}` is
+/// `gethostname()`, and `AYEAYE_NAME` overrides it. A machine that sets it has
+/// to write the same name into the binding, or every dictation is refused with
+/// "is not a pane on this machine". `ayeaye::config::machine_name` is the one
+/// rule; there is nothing that can reconcile it with a string in somebody's
+/// `tmux.conf`, so it is said here instead.
 fn dictate_verb(args: &[String]) -> ExitCode {
     let Some(pane) = args.first() else {
         return complain("usage: ayeaye dictate <pane> [client-pid]");
@@ -320,10 +329,10 @@ fn dictate_verb(args: &[String]) -> ExitCode {
     // What this machine calls itself, in the same order `Settings::resolve`
     // reads it — the two have to agree, or a pane id written by the daemon is
     // one this toggle cannot find in its own pane list.
-    let named = config::env_var("NAME")
-        .or_else(|| nodename(&Subprocess))
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| ayeaye::config::DEFAULT_NAME.to_string());
+    // The same function the daemon names itself with, not a second spelling of
+    // the same rule: the ids in the state file were qualified by the daemon, and
+    // a toggle that disagreed about this name could not find any of them.
+    let named = ayeaye::config::machine_name(config::env_var, nodename(&Subprocess));
     let here = match ayeaye_core::peer::HostName::new(&named) {
         Ok(here) => here,
         Err(why) => {

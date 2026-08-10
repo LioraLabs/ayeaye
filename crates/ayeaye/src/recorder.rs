@@ -156,10 +156,10 @@ impl Recorder {
         // can carry one today — the address comes from the process table and the
         // secret from a file — but a hand-rolled client that argues it is safe
         // to hand-roll has to be the thing that checks.
-        if speakable(&self.token) {
+        if carries_control(&self.token) {
             return Err(Unreachable::Unspeakable("token"));
         }
-        if speakable(&self.host) {
+        if carries_control(&self.host) {
             return Err(Unreachable::Unspeakable("address"));
         }
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
@@ -201,7 +201,11 @@ impl Recorder {
 }
 
 /// Whether text would break out of the request line it is interpolated into.
-fn speakable(text: &str) -> bool {
+///
+/// Named for what it answers rather than for what the caller wants: `speakable`
+/// returning true for text that cannot be spoken is the kind of predicate a
+/// later reader inverts by accident.
+fn carries_control(text: &str) -> bool {
     text.chars().any(|c| c.is_control())
 }
 

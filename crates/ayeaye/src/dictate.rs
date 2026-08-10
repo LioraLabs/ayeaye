@@ -509,6 +509,18 @@ impl<D: Dictates> Toggle<'_, D> {
 
     /// Begin.
     async fn start(&self, pane: &str, peer: Option<&str>) -> String {
+        // Before the microphone is touched. A target this machine does not have
+        // is knowable now, and finding out at the *second* press costs somebody
+        // the recording, the transcription and the cleanup model as well as the
+        // words.
+        if let Err(why) = self.pane_of(pane).await {
+            return match why {
+                NoPane::NotThere => format!("voice: {pane} is not a pane on this machine"),
+                NoPane::CouldNotLook(why) => {
+                    format!("voice: could not ask tmux about {pane}: {why}")
+                }
+            };
+        }
         let (host, label) = dictation::recording_device(peer);
         let recorder = Recorder::at(&host, self.port, &self.token);
 
@@ -605,16 +617,29 @@ impl<D: Dictates> Toggle<'_, D> {
     /// `%0`. That matters more here than it looks: the id `type_into` uses is
     /// read back out of a **state file on disk**, which outlives the process
     /// that wrote it and the pane it named.
-    async fn pane_of(&self, qualified: &str) -> Option<ayeaye_core::tmux::Pane> {
-        let panes = self.tmux.panes(&self.here).await.ok()?;
+    async fn pane_of(&self, qualified: &str) -> Result<ayeaye_core::tmux::Pane, NoPane> {
+        // Not `.ok()?`. `Tmux::panes` is careful to tell a tmux that could not be
+        // asked from a machine with no panes, and collapsing the two here would
+        // report a wedged tmux as "that pane is gone" — after the recording, the
+        // transcription and the cleanup model have all run, which is the most
+        // expensive possible moment to be told the wrong thing.
+        let panes = self
+            .tmux
+            .panes(&self.here)
+            .await
+            .map_err(|why| NoPane::CouldNotLook(why.to_string()))?;
         panes
             .into_iter()
             .find(|pane| pane.id.qualified() == qualified)
+            .ok_or(NoPane::NotThere)
     }
 
     /// The identifiers on the pane being dictated into.
+    ///
+    /// Every way of failing is the same answer — no names — because the hint is
+    /// an improvement to the spelling and losing it must not cost the dictation.
     async fn vocabulary(&self, pane: &str) -> String {
-        let Some(pane) = self.pane_of(pane).await else {
+        let Ok(pane) = self.pane_of(pane).await else {
             return String::new();
         };
         let captured = self
@@ -639,8 +664,17 @@ impl<D: Dictates> Toggle<'_, D> {
     /// sent, ever: the point of the whole feature is that a person reads what a
     /// model wrote before an agent acts on it.
     async fn type_into(&self, pane: &str, text: &str) -> String {
-        let Some(target) = self.pane_of(pane).await else {
-            return format!("voice: {pane} is not a pane on this machine any more");
+        let target = match self.pane_of(pane).await {
+            Ok(target) => target,
+            // Told apart, because they are opposite instructions to whoever
+            // reads them: one is a pane that has gone, the other is a tmux that
+            // would not answer and will answer again in a moment.
+            Err(NoPane::NotThere) => {
+                return format!("voice: {pane} is not a pane on this machine any more");
+            }
+            Err(NoPane::CouldNotLook(why)) => {
+                return format!("voice: could not ask tmux about {pane}: {why}");
+            }
         };
         let Some(typed) = prompt::typed(text) else {
             return "voice: the rewrite carried something that cannot be typed".to_string();
@@ -704,6 +738,19 @@ pub fn recording_peer(
     clients.iter().find_map(|pid| processes.ssh_peer(*pid))
 }
 
+/// Why there is no pane to dictate into.
+///
+/// Two cases and not one, because they are opposite instructions to whoever
+/// reads the status line: a pane that has gone is somebody's own doing, and a
+/// tmux that would not answer will answer again in a moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoPane {
+    /// The id is not in the list tmux just gave us.
+    NotThere,
+    /// tmux could not be asked at all.
+    CouldNotLook(String),
+}
+
 /// The recording in progress, or `None`.
 pub fn read_state(path: &Path) -> Option<State> {
     State::decode(&std::fs::read_to_string(path).ok()?)
@@ -729,8 +776,12 @@ pub fn write_state(path: &Path, state: &State) -> Result<(), String> {
     // reach the disk before the bytes do, which is the one ordering that turns a
     // power loss into a state file that exists, is named correctly, and is
     // empty — the case the temporary name was supposed to make impossible.
-    write_and_sync(&temporary, state.encode().as_bytes())
-        .map_err(|why| format!("{}: {why}", temporary.display()))?;
+    if let Err(why) = write_and_sync(&temporary, state.encode().as_bytes()) {
+        // Not left behind for somebody to find later and wonder about, whichever
+        // of the write, the flush or the create was the one that failed.
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("{}: {why}", temporary.display()));
+    }
     std::fs::rename(&temporary, path).map_err(|why| {
         // Not left behind for somebody to find later and wonder about.
         let _ = std::fs::remove_file(&temporary);
