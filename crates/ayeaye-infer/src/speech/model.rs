@@ -251,16 +251,11 @@ fn check_shape(
 
 /// The device this build's backend runs on.
 ///
-/// A one-line mapping today because a CPU build has one answer. AYEAYE-57 owns
-/// turning this into a real selection — asking whether the device is actually
-/// there and falling back to the CPU with a stated reason — and this is the
-/// function it replaces.
+/// The mapping itself moved to [`backend::device`] when a second model started
+/// needing it; this is the error type it wears here. AYEAYE-57 owns turning the
+/// mapping into a real selection.
 fn device_for(backend: Backend) -> Result<Device, SpeechError> {
-    match backend {
-        Backend::Cpu => Ok(Device::Cpu),
-        Backend::Cuda => Device::new_cuda(0).map_err(SpeechError::inference),
-        Backend::Metal => Device::new_metal(0).map_err(SpeechError::inference),
-    }
+    backend::device(backend).map_err(SpeechError::inference)
 }
 
 #[cfg(test)]
