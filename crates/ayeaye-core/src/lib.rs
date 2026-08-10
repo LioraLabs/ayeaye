@@ -13,6 +13,7 @@
 pub mod http;
 pub mod identity;
 pub mod machine;
+pub mod process;
 pub mod service;
 
 pub use identity::Identity;

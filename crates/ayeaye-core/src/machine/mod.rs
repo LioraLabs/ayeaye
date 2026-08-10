@@ -31,8 +31,8 @@ pub use tier::{Cause, Tier, Usability, Verdict};
 /// only way it may: at compile time.
 ///
 /// Defined once, here, so every module's corpus is the same corpus. The relative
-/// path resolves against this file, and every module that uses it sits in this
-/// same directory.
+/// path resolves against the file the macro is expanded in, and every module
+/// that uses it sits at this same depth — one directory below `src/`.
 #[cfg(test)]
 macro_rules! fixture {
     ($path:literal) => {
