@@ -82,6 +82,8 @@ impl Reply {
 pub enum Unreachable {
     /// The address or the secret carries something a request line cannot.
     Unspeakable(&'static str),
+    /// It sent more than a recording could reasonably be.
+    TooMuch(usize),
     /// Nothing answered on that address.
     NoAnswer(String),
     /// It answered with something that is not an HTTP response.
@@ -96,6 +98,11 @@ impl fmt::Display for Unreachable {
             Unreachable::Unspeakable(what) => {
                 write!(out, "the {what} carries a character a request cannot")
             }
+            Unreachable::TooMuch(cap) => write!(
+                out,
+                "it sent more than {} MB of audio, which is more than a dictation is",
+                cap >> 20
+            ),
             Unreachable::NoAnswer(why) => write!(out, "{why}"),
             Unreachable::Garbled(why) => write!(out, "it answered with {why}"),
             Unreachable::TimedOut(limit) => write!(out, "it did not answer within {limit:?}"),
@@ -172,16 +179,23 @@ impl Recorder {
             .map_err(|why| Unreachable::NoAnswer(why.to_string()))?;
 
         // Bounded. `read_to_end` on a socket is bounded only by the deadline,
-        // and one megabyte per millisecond is a plausible tailnet. A clip larger
-        // than the cap is truncated rather than refused, and the decode below
-        // says so: a truncated container is not audio, which is the honest
-        // answer and the one `BadWav` already spells.
+        // and one megabyte per millisecond is a plausible tailnet.
+        //
+        // One byte past the cap is read on purpose, so that hitting it is
+        // *observable*. Stopping exactly at the cap and decoding what arrived
+        // would hand the converter a truncated container — which it will
+        // usually decode, cheerfully, into a recording that stops mid-sentence.
+        // A dictation silently missing its ending is worse than one that failed,
+        // because nobody knows to say it again.
         let mut raw = Vec::new();
         (&mut stream)
-            .take(MAX_CLIP as u64)
+            .take(MAX_CLIP as u64 + 1)
             .read_to_end(&mut raw)
             .await
             .map_err(|why| Unreachable::NoAnswer(why.to_string()))?;
+        if raw.len() > MAX_CLIP {
+            return Err(Unreachable::TooMuch(MAX_CLIP));
+        }
         parse(&raw)
     }
 }

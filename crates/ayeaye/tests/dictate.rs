@@ -1126,6 +1126,37 @@ async fn a_pane_on_another_machine_is_never_typed_into() {
 
 // AYEAYE-58
 //
+// An agent sending more than a dictation could be is refused, not truncated.
+// The cap has to exist — `read_to_end` on a socket is bounded only by the
+// deadline — but stopping silently at it and decoding what arrived would hand
+// the converter a truncated container, which it will usually decode into a
+// recording that stops mid-sentence. A dictation quietly missing its ending is
+// worse than one that failed, because nobody knows to say it again.
+#[tokio::test]
+async fn an_agent_sending_more_than_a_dictation_is_refused_rather_than_truncated() {
+    let huge = vec![0u8; ayeaye::recorder::MAX_CLIP + 1];
+    let clip: &'static [u8] = Box::leak(huge.into_boxed_slice());
+    let agent = Agent::started(true, clip).await;
+    let recorder = ayeaye::recorder::Recorder::at("127.0.0.1", agent.port, "right-token");
+
+    let refused = recorder.stop().await.expect_err("that is not a dictation");
+
+    assert_eq!(
+        refused,
+        ayeaye::recorder::Unreachable::TooMuch(ayeaye::recorder::MAX_CLIP)
+    );
+    assert!(refused.to_string().contains("32 MB"), "{refused}");
+
+    // And a clip inside the cap still comes back whole, so the guard is a cap
+    // rather than a ceiling everything bumps into.
+    let small = Agent::started(true, b"a real recording").await;
+    let recorder = ayeaye::recorder::Recorder::at("127.0.0.1", small.port, "right-token");
+    let reply = recorder.stop().await.expect("a recording of a sane size");
+    assert_eq!(reply.body, b"a real recording");
+}
+
+// AYEAYE-58
+//
 // A recording agent that is running on a machine with no microphone it knows
 // how to use answers 200 and says `{"ok": false}`. Reading the status alone
 // would start a recording on a device that cannot record, and the person would
