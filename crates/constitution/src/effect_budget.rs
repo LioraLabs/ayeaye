@@ -107,11 +107,14 @@ const EFFECTFUL_MACROS: &[&str] = &["print", "println", "eprint", "eprintln", "d
 /// Belt to the reach scan's braces — the import that made the receiver is
 /// normally caught first, and this catches the receiver that arrived as an
 /// argument.
+///
+/// `read` and `write` are deliberately absent: they are `RwLock`'s, and a pure
+/// crate may hold a lock. A name that a pure receiver also answers to belongs
+/// in the reach scan, not here.
 const EFFECTFUL_METHODS: &[&str] = &[
     "read_to_string",
     "read_to_end",
     "write_all",
-    "write",
     "flush",
     "open",
     "create",
@@ -127,9 +130,25 @@ const EFFECTFUL_METHODS: &[&str] = &[
 /// literal in a test rather than a fixture on disk.
 pub fn scan(path: &str, source: &str) -> Vec<Finding> {
     let mut code = crate::strip::code_only(source);
+    unraw(&mut code);
     let mut findings: Vec<Finding> = Vec::new();
 
-    // `use` items first, because they are the only place a reach is written as
+    // `extern crate x as y;` names a crate without being a `use` item at all,
+    // and aliasing it there is the one spelling the crate-alias entry in the
+    // budget would otherwise miss.
+    for (offset, name) in extern_crates(&code) {
+        if let Some(budget) = judge(&name) {
+            push(
+                &mut findings,
+                path,
+                &name,
+                budget.why,
+                line_of(&code, offset),
+            );
+        }
+    }
+
+    // `use` items next, because they are the only place a reach is written as
     // a tree rather than as a path.
     let items = use_items(&code);
     for (start, end) in &items {
@@ -202,11 +221,62 @@ fn calls(code: &str, terminator: u8) -> Vec<(usize, String)> {
         }
         let end = ident_end(bytes, i);
         let after = skip_space(bytes, end);
-        let preceded_by_dot = last_non_space(bytes, i) == Some(b'.');
+        let preceded_by_dot = is_method_dot(bytes, i);
         if after < bytes.len() && bytes[after] == terminator && (!wants_dot || preceded_by_dot) {
             found.push((i, code[i..end].to_string()));
         }
         i = end.max(i + 1);
+    }
+    found
+}
+
+/// Blank out the `r#` that turns an identifier into a raw one.
+///
+/// `r#std::fs` and `std::fs` are the same reach, and a scanner that answers
+/// differently for the two spellings is worse than one that answers wrongly
+/// for both. Two bytes become two spaces, so every offset survives.
+///
+/// Raw *strings* are already gone by the time this runs — the stripper took
+/// them — so the only `r#` left in the text opens an identifier.
+fn unraw(code: &mut String) {
+    let bytes = code.as_bytes();
+    let mut at = Vec::new();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b'r'
+            && bytes[i + 1] == b'#'
+            && is_ident_start(bytes[i + 2])
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+        {
+            at.push(i);
+        }
+    }
+    for i in at {
+        code.replace_range(i..i + 2, "  ");
+    }
+}
+
+/// Every `extern crate <name>` in the text, with the offset the name is at.
+fn extern_crates(code: &str) -> Vec<(usize, String)> {
+    let bytes = code.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_boundary = i == 0 || !is_ident_byte(bytes[i - 1]);
+        if !(is_boundary && bytes[i..].starts_with(b"extern")) {
+            i += 1;
+            continue;
+        }
+        let after_extern = skip_space(bytes, i + "extern".len());
+        if !bytes[after_extern..].starts_with(b"crate") {
+            i += 1;
+            continue;
+        }
+        let name_at = skip_space(bytes, after_extern + "crate".len());
+        let name_end = ident_end(bytes, name_at);
+        if name_end > name_at {
+            found.push((name_at, code[name_at..name_end].to_string()));
+        }
+        i = name_end.max(i + 1);
     }
     found
 }
@@ -220,13 +290,15 @@ fn skip_space(bytes: &[u8], from: usize) -> usize {
     i
 }
 
-/// The last non-whitespace byte before `before`, if there is one.
-fn last_non_space(bytes: &[u8], before: usize) -> Option<u8> {
-    bytes[..before]
-        .iter()
-        .rev()
-        .find(|b| !b.is_ascii_whitespace())
-        .copied()
+/// Whether the identifier at `at` is the method half of a `receiver.method`.
+///
+/// One dot is a method call; two are a range, and `a..flush(b)` calls a free
+/// function on a range bound rather than flushing anything.
+fn is_method_dot(bytes: &[u8], at: usize) -> bool {
+    let Some(dot) = bytes[..at].iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    bytes[dot] == b'.' && (dot == 0 || bytes[dot - 1] != b'.')
 }
 
 /// The `use` items in the text, as `(start, end)` byte ranges covering
@@ -572,6 +644,55 @@ mod tests {
         assert_eq!(
             what(&scan("a.rs", "fn f() { println !(\"x\"); }\n")),
             vec!["println!"]
+        );
+    }
+
+    // AYEAYE-41 — `use std as s` is caught by the budget's own crate-alias
+    // entry; `extern crate std as s` is the same aliasing written the one way
+    // that is not a use item at all.
+    #[test]
+    fn a_crate_aliased_by_extern_crate_is_found() {
+        let source = "extern crate std as s;\nfn f() { s::fs::read(p); }\n";
+        assert_eq!(what(&scan("planted.rs", source)), vec!["std"]);
+    }
+
+    // AYEAYE-41 — a raw identifier is the same identifier. Without this the
+    // two spellings of one reach disagree with each other, which is worse
+    // than either answer.
+    #[test]
+    fn a_raw_identifier_names_the_same_reach_as_the_plain_one() {
+        assert_eq!(what(&scan("a.rs", "use r#std::fs;\n")), vec!["std::fs"]);
+        assert_eq!(
+            what(&scan("a.rs", "fn f() { r#std::fs::read(p); }\n")),
+            vec!["std::fs::read"]
+        );
+    }
+
+    // AYEAYE-41 — `a..write(b)` is a range, not a method call, and the dot
+    // that ends a range is not the dot that starts one.
+    #[test]
+    fn a_range_is_not_a_method_call() {
+        assert!(
+            scan("a.rs", "fn f() { let r = a..flush(b); }\n").is_empty(),
+            "{:?}",
+            scan("a.rs", "fn f() { let r = a..flush(b); }\n")
+        );
+        assert_eq!(
+            what(&scan("a.rs", "fn f() { a.flush(); }\n")),
+            vec![".flush()"]
+        );
+    }
+
+    // AYEAYE-41 — a pure crate may legitimately hold a lock, and locking is
+    // not an effect the budget is about.
+    #[test]
+    fn taking_a_write_lock_is_not_an_effect() {
+        assert!(
+            scan(
+                "a.rs",
+                "fn f(l: &RwLock<u8>) { *l.write().unwrap() = 1; }\n"
+            )
+            .is_empty()
         );
     }
 

@@ -323,9 +323,16 @@ mod tests {
         assert!(error.contains("glob"), "{error}");
     }
 
-    // AYEAYE-41
+    // AYEAYE-41 — a crate manifest one directory too high would also be a
+    // Cargo.toml, and would read as a root with no members at all.
     #[test]
-    fn the_workspace_root_is_the_directory_holding_the_root_manifest() {
-        assert!(workspace_root().join("Cargo.toml").is_file());
+    fn the_workspace_root_is_the_directory_holding_the_workspace_manifest() {
+        let manifest = workspace_root().join("Cargo.toml");
+        let text = fs::read_to_string(&manifest).expect("the root manifest");
+        assert!(
+            text.contains("[workspace]"),
+            "{} is not the workspace manifest",
+            manifest.display()
+        );
     }
 }

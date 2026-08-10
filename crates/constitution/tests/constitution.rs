@@ -20,8 +20,10 @@ const NON_TRIVIAL: usize = 8;
 ///
 /// The constitution is most of the workspace's source today, so a total on its
 /// own would still pass if the walk found nothing but the constitution. This
-/// is the number that says the governed crates were really read.
-const NON_TRIVIAL_SHIPPED: usize = 5;
+/// is the number that says the governed crates were really read. It sits below
+/// today's count on purpose: it is a floor against a walk that found nothing,
+/// not a ratchet against anybody merging two modules into one.
+const NON_TRIVIAL_SHIPPED: usize = 3;
 
 fn corpus() -> Corpus {
     Corpus::walk(&workspace_root()).expect("the workspace should be readable")
