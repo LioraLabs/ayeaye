@@ -5,6 +5,8 @@
 //! called, which subcommand makes the pane, and what gets typed into it — and
 //! the shell above turns the answers into subprocesses.
 
+use crate::shell;
+
 /// The programs that may be started, and the command each one is.
 ///
 /// An allowlist rather than a name interpolated out of the request. This
@@ -108,9 +110,36 @@ pub fn create(session: &str, dir: &str, session_exists: bool) -> Create {
     Create { argv, created }
 }
 
+/// The line typed into the pane's shell to start the agent.
+///
+/// Both agents take an opening prompt as an argument, which is what sidesteps
+/// guessing how long a TUI takes to boot before anything can be pasted into
+/// it. The prompt is collapsed to one line first — the daemon's
+/// `" ".join(prompt.split())` — because this is a *command line*, and then
+/// quoted, which is where a prompt that cannot be typed is refused.
+pub fn command_line(agent_command: &str, prompt: &str) -> Result<String, shell::Unquotable> {
+    let collapsed = one_line(prompt);
+    if collapsed.is_empty() {
+        return Ok(agent_command.to_string());
+    }
+    Ok(format!("{agent_command} {}", shell::quote(&collapsed)?))
+}
+
+/// Every run of whitespace becomes one space, and the ends lose theirs.
+///
+/// `bin/ayeaye`'s `" ".join(prompt.split())`, with one difference worth naming:
+/// Python counts the C0 separators `\x1c`–`\x1f` as whitespace and Rust does
+/// not, so those survive this and are refused by the quoting instead. That is
+/// the safe direction — a byte nobody typed on purpose is refused rather than
+/// silently becoming a space.
+fn one_line(prompt: &str) -> String {
+    prompt.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_command, create, session_name};
+    use super::{agent_command, command_line, create, session_name};
+    use crate::shell::Unquotable;
 
     fn argv(session: &str, dir: &str, exists: bool) -> Vec<String> {
         create(session, dir, exists).argv
@@ -217,5 +246,50 @@ mod tests {
             ]
         );
         assert_eq!(create("ayeaye", "/home/alex/dev/ayeaye", true).created, "window");
+    }
+
+    // AYEAYE-51 — "spawn takes a project path, an agent, and an **optional**
+    // prompt". No prompt is the agent on its own; a prompt is one argument
+    // after it, whatever the prompt happens to contain.
+    #[test]
+    fn a_prompt_becomes_one_argument_and_no_prompt_becomes_none() {
+        assert_eq!(command_line("claude", "").unwrap(), "claude");
+        assert_eq!(command_line("claude", "   \n  ").unwrap(), "claude");
+        assert_eq!(
+            command_line("claude", "fix the tests").unwrap(),
+            "claude 'fix the tests'"
+        );
+        assert_eq!(
+            command_line("codex", "run $(id) && rm -rf ~; echo 'done'").unwrap(),
+            r"codex 'run $(id) && rm -rf ~; echo '\''done'\'''"
+        );
+    }
+
+    // AYEAYE-51 — a prompt arrives from a phone keyboard, so it arrives with
+    // line breaks in it. This is a command line: the collapse is what stops the
+    // first newline submitting half a prompt, and it happens before the quoting
+    // rather than after, or the quoting would be refusing text the user never
+    // meant as separate lines.
+    #[test]
+    fn a_prompt_written_over_several_lines_is_collapsed_into_one() {
+        assert_eq!(
+            command_line("claude", "  fix\n  the\ttests \r\n please  ").unwrap(),
+            "claude 'fix the tests please'"
+        );
+    }
+
+    // AYEAYE-51 — and what the collapse does not reach is refused rather than
+    // typed. An escape byte is not whitespace, so it survives into the quoting,
+    // and there it has no spelling that a terminal reads as text.
+    #[test]
+    fn a_prompt_that_cannot_be_typed_is_refused_with_its_reason() {
+        assert_eq!(
+            command_line("claude", "fix \u{1b}[31mthe\u{1b}[0m tests").unwrap_err(),
+            Unquotable::Control('\u{1b}')
+        );
+        assert_eq!(
+            command_line("claude", r"escape the \n in the regex").unwrap_err(),
+            Unquotable::Backslash
+        );
     }
 }
