@@ -321,9 +321,10 @@ async fn a_post_needs_a_token_even_for_a_page() {
 
 // AYEAYE-69 — the CSRF gate, over the wire. A browser labels a request from
 // somebody else's page `Sec-Fetch-Site: cross-site`, and that is refused at
-// every path — before the token is looked at, so a stolen or guessed token
-// buys nothing, and with the same 403 the Host gate gives so a refused write
-// cannot be told apart from a refused host.
+// every path and by every method that is not a read — before the token is
+// looked at, so a stolen or guessed token buys nothing, and with the same 403
+// the Host gate gives so a refused write cannot be told apart from a refused
+// host.
 #[tokio::test]
 async fn a_cross_site_write_is_refused_before_the_token_is_looked_at() {
     let server = Server::started().await;
@@ -337,6 +338,14 @@ async fn a_cross_site_write_is_refused_before_the_token_is_looked_at() {
             assert_eq!(answer.status, 403, "POST {path} with {headers:?}");
             assert_eq!(answer.body_text(), r#"{"error":"forbidden"}"#);
         }
+    }
+    // Not only POST: the router sends every method to the one handler, so the
+    // gate covers a verb nobody has mounted an endpoint on yet.
+    for method in ["PUT", "PATCH", "DELETE", "OPTIONS"] {
+        let answer = server
+            .request(method, "/api/answer", &[("Sec-Fetch-Site", "cross-site")])
+            .await;
+        assert_eq!(answer.status, 403, "{method} /api/answer");
     }
 }
 
@@ -409,11 +418,15 @@ async fn a_cross_site_read_is_still_answered() {
     );
 }
 
-// AYEAYE-69 — an `Origin` whose bytes are not text. This is the bypass the
-// three-state `Origin` type exists to prevent: `to_str().ok()` would turn
-// these bytes into `None`, `None` is what a non-browser client sends, and a
-// non-browser client is *allowed*. So one byte of rubbish in the header this
-// gate judges would have opened every write on the server.
+// AYEAYE-69 — an `Origin` whose bytes are not text, sent as bytes. `to_str()`
+// cannot render these, and `to_str().ok()` would call them `None` — the same
+// answer as a client that sent no `Origin`, which is allowed. Nobody is kept
+// out by refusing them who could not simply omit the header instead; what this
+// pins is that the server can still tell the two apart, which is the property
+// the next caller of this gate will need.
+//
+// It is also the only test here that can send a request a Rust `String` cannot
+// hold, which is why the harness grew `request_raw`.
 #[tokio::test]
 async fn an_origin_whose_bytes_are_not_text_is_refused() {
     let server = Server::started().await;

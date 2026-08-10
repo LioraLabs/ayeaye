@@ -58,6 +58,11 @@ pub enum Site {
 /// the caller choose out loud: there is no conversion from `Option<&str>`, so
 /// a `to_str().ok()` cannot quietly turn a malformed header into an allowed
 /// request.
+///
+/// The honest size of that: nobody is kept out by it who was not already. Only
+/// a non-browser client can send bytes that are not text, and the same client
+/// can send no `Origin` at all, which is allowed. The type is for the next
+/// caller of this gate, not for today's attacker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin<'a> {
     /// No `Origin` header at all.
@@ -93,6 +98,12 @@ const OPAQUE: &str = "null";
 /// be the ASCII label this looks for, in this implementation or in CPython's,
 /// so dropping an unreadable one loses nothing. An unreadable `Origin` loses a
 /// refusal, which is why it has a name of its own.
+///
+/// **The exemption is by method, and it assumes what a method means.** A GET
+/// is exempt because a GET reads. The day something that writes is mounted on
+/// a GET — `GET /api/kill?pane=…` — this gate stops covering it, and nothing
+/// here can tell. That invariant belongs to whoever adds the endpoint:
+/// anything that acts on a pane is a POST, as every one of the daemon's is.
 pub fn gate(
     method: &str,
     sec_fetch_site: Option<&str>,
@@ -349,13 +360,17 @@ mod tests {
         );
     }
 
-    // AYEAYE-69 — an `Origin` the server could not read is refused, and this
-    // is the one place where getting it wrong is a bypass rather than a
-    // curiosity: "absent" allows, so an unreadable header that collapsed into
-    // absent would hand every write to anything that could put one byte of
-    // rubbish in the header it is judged by. The daemon has no such hole — it
-    // reads headers as latin-1, so those bytes become a netloc no ASCII
-    // allow-list holds — and neither does this.
+    // AYEAYE-69 — an `Origin` the server could not read is refused rather than
+    // read as absent, which is the allowing branch.
+    //
+    // Not because it is reachable: only a non-browser client can put those
+    // bytes in the header, and a non-browser client can equally send no
+    // `Origin` at all, which is allowed by design and judged by the token. It
+    // is refused for parity — the daemon reads headers as latin-1, so those
+    // bytes become a netloc no ASCII allow-list holds — and because "the
+    // server could not read it" and "the client did not send one" are
+    // different facts, and the day something else asks this question the type
+    // is what stops the two being confused.
     #[test]
     fn an_origin_the_server_could_not_read_is_refused_rather_than_ignored() {
         assert_eq!(
