@@ -12,5 +12,6 @@
 pub mod assets;
 pub mod command;
 pub mod config;
+pub mod fit;
 pub mod server;
 pub mod tmux;

@@ -7,6 +7,10 @@
 //! its own server, on its own socket, with `-f /dev/null` so none of the
 //! machine's configuration reaches it, and kills that server on the way out
 //! whether its assertions passed or not.
+//!
+//! Each test binary compiles this file for itself and uses the part of it that
+//! binary needs, so what one leaves unused is not dead — it is in use next door.
+#![allow(dead_code)]
 
 use std::process::Command;
 use std::time::Duration;
