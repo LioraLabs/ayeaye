@@ -224,6 +224,11 @@ async fn handle(
             json_body(settings.voice.probe().await.body())
         }
         Route::Send if method == Method::POST => send(&settings, body).await,
+        // GET only, no HEAD: every other read answers HEAD from its GET
+        // handler, but this body never ends, so a HEAD would hold the
+        // connection open promising bytes that are defined never to come.
+        // The daemon refuses HEAD outright, so 404 diverges from nothing.
+        Route::Stream if method == Method::GET => stream(&settings, &query).await,
         // A write, and a POST — which is not incidental. The CSRF gate above
         // exempts GET and HEAD, so it is safe only while every write is a POST;
         // mounting this on a GET would put it outside that gate with no test
@@ -574,6 +579,42 @@ fn json_body(text: String) -> Response {
         "application/json",
         Body::from(text),
         |response| response,
+    )
+}
+
+/// One pane's transcript as server-sent events: backlog, then live rows.
+///
+/// A pane with no session behind it — including no pane named at all — is the
+/// daemon's 404 `{"kind":null}`, so the panel can tell "not an agent" from a
+/// broken server without parsing an error string.
+///
+/// The success response is the one body in this server that never ends: no
+/// Content-Length, the frames written as they happen, and the connection is
+/// the lifetime. `X-Accel-Buffering: no` is for the proxy in front — a
+/// buffered event stream is a transcript that arrives when the conversation
+/// is over. The daemon sends `Cache-Control: no-cache` here; this server
+/// keeps its blanket `no-store`, which refuses strictly more caching.
+async fn stream(settings: &Settings, query: &Query) -> Response {
+    let found = match query.pane.as_deref() {
+        Some(pane) => crate::session::resolve(settings, pane).await,
+        None => None,
+    };
+    let Some(found) = found else {
+        return json(StatusCode::NOT_FOUND, r#"{"kind":null}"#);
+    };
+    let frames = crate::transcript::frames(
+        found.kind,
+        found.id,
+        found.path,
+        crate::transcript::backlog_limit(|name| std::env::var(name).ok()),
+        crate::transcript::POLL,
+        None,
+    );
+    build(
+        StatusCode::OK,
+        "text/event-stream",
+        Body::from_stream(frames),
+        |response| response.header("x-accel-buffering", "no"),
     )
 }
 

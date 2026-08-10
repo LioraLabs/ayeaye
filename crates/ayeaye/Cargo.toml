@@ -40,6 +40,11 @@ tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "net", 
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.
 form_urlencoded = "1"
+# The `Stream` trait and nothing else, for the transcript event stream:
+# `Body::from_stream` needs the trait named, axum does not re-export it, and
+# the adapter over a tokio channel is ten lines. Trait-only on purpose — the
+# full `futures` stack would be a lot of surface for one `poll_recv`.
+futures-core = { version = "0.3", default-features = false }
 # `SC_CLK_TCK` is the unit /proc counts a process's start in, and no file on
 # the machine says what it is. One sysconf call, in the one crate allowed to
 # make it; the constitution refuses libc inside ayeaye-core.
