@@ -97,6 +97,7 @@ dependencies = [
  "ayeaye-core",
  "ayeaye-infer",
  "form_urlencoded",
+ "futures-core",
  "libc",
  "serde_json",
  "sysinfo",

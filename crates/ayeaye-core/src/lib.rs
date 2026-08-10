@@ -38,6 +38,7 @@ pub mod session;
 pub mod setup;
 pub mod sha1;
 pub mod tmux;
+pub mod transcript;
 pub mod vocab;
 
 pub use audio::Pcm16kMono;

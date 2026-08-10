@@ -224,6 +224,11 @@ async fn handle(
             json_body(settings.voice.probe().await.body())
         }
         Route::Send if method == Method::POST => send(&settings, body).await,
+        // GET only, no HEAD: every other read answers HEAD from its GET
+        // handler, but this body never ends, so a HEAD would hold the
+        // connection open promising bytes that are defined never to come.
+        // The daemon refuses HEAD outright, so 404 diverges from nothing.
+        Route::Stream if method == Method::GET => stream(&settings, &query).await,
         // A write, and a POST — which is not incidental. The CSRF gate above
         // exempts GET and HEAD, so it is safe only while every write is a POST;
         // mounting this on a GET would put it outside that gate with no test
@@ -271,6 +276,7 @@ async fn handle(
         | Route::Voice
         | Route::FilesResolve
         | Route::FilesPreview
+        | Route::Stream
         | Route::Api
         | Route::NotFound
         | Route::Login
@@ -289,7 +295,10 @@ async fn api(settings: &Settings, uri: &Uri) -> Option<(StatusCode, String)> {
     if let Some(answered) = board::answer(settings, uri.path(), uri.query()).await {
         return Some(answered);
     }
-    session::answer(settings, uri.path(), uri.query()).await
+    if let Some(answered) = session::answer(settings, uri.path(), uri.query()).await {
+        return Some(answered);
+    }
+    crate::transcript::answer(settings, uri.path(), uri.query()).await
 }
 
 /// An answer one of the write endpoints decided on.
@@ -589,6 +598,52 @@ fn json_body(text: String) -> Response {
         "application/json",
         Body::from(text),
         |response| response,
+    )
+}
+
+/// One pane's transcript as server-sent events: backlog, then live rows.
+///
+/// A pane with no session behind it — including no pane named at all — is the
+/// daemon's 404 `{"kind":null}`, so the panel can tell "not an agent" from a
+/// broken server without parsing an error string.
+///
+/// The success response is the one body in this server that never ends: no
+/// Content-Length, the frames written as they happen, and the connection is
+/// the lifetime. `X-Accel-Buffering: no` is for the proxy in front — a
+/// buffered event stream is a transcript that arrives when the conversation
+/// is over. The daemon sends `Cache-Control: no-cache` here; this server
+/// keeps its blanket `no-store`, which refuses strictly more caching.
+async fn stream(settings: &Settings, query: &Query) -> Response {
+    let found = match query.pane.as_deref() {
+        Some(pane) => crate::session::resolve(settings, pane).await,
+        None => None,
+    };
+    let Some(found) = found else {
+        return json(StatusCode::NOT_FOUND, r#"{"kind":null}"#);
+    };
+    streaming(crate::transcript::frames(
+        found.kind,
+        found.id,
+        found.path,
+        crate::transcript::backlog_limit(|name| std::env::var(name).ok()),
+        crate::transcript::POLL,
+        None,
+    ))
+}
+
+/// The event-stream response around an already-running tail.
+///
+/// Split from [`stream`] so the response's shape — the content type, the
+/// unbuffered-proxy header, and above all the *absence* of a Content-Length —
+/// is a fact a test can hold without a session to stream. The body's length
+/// is unknown by construction, which is what keeps hyper from ever writing
+/// one: the stream ends when the connection does.
+fn streaming(frames: crate::transcript::Frames) -> Response {
+    build(
+        StatusCode::OK,
+        "text/event-stream",
+        Body::from_stream(frames),
+        |response| response.header("x-accel-buffering", "no"),
     )
 }
 
@@ -1077,5 +1132,59 @@ impl Query {
             }
         }
         query
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streaming;
+    use axum::http::header;
+    use std::time::Duration;
+
+    // AYEAYE-46 — the spec's "no content length", held as a fact about the
+    // response rather than hoped about the wire: the body is a stream whose
+    // size is unknown by construction, so no Content-Length is ever set and
+    // hyper has nothing to write one from. The content type and the
+    // unbuffered-proxy header are the rest of what an event stream needs to
+    // arrive as events rather than as a download.
+    #[tokio::test]
+    async fn the_stream_response_is_an_event_stream_with_no_length() {
+        let frames = crate::transcript::frames(
+            ayeaye_core::session::Kind::Claude,
+            "0123abcd".to_string(),
+            "/nonexistent/transcript.jsonl".to_string(),
+            200,
+            Duration::from_millis(10),
+            None,
+        );
+        let response = streaming(frames);
+        assert_eq!(response.status(), super::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("a content type"),
+            "text/event-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-accel-buffering")
+                .expect("the proxy must not buffer a stream"),
+            "no"
+        );
+        assert!(
+            response.headers().get(header::CONTENT_LENGTH).is_none(),
+            "an event stream has no length; the connection is the lifetime"
+        );
+        // The other half of "no content length": an exact size hint is what
+        // hyper would turn into one at write time. The trait lives in
+        // `http_body`, which axum depends on and this crate does not name, so
+        // it is borrowed for the one assertion.
+        use axum::body::HttpBody as _;
+        assert!(
+            response.body().size_hint().exact().is_none(),
+            "an exact size hint is what hyper would turn into a Content-Length"
+        );
     }
 }

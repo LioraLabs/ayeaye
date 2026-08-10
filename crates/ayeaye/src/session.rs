@@ -371,13 +371,21 @@ async fn session(settings: &Settings, query: Option<&str>) -> (StatusCode, Strin
         // was never going to match anything.
         return (StatusCode::OK, session_body(None));
     };
+    let found = resolve(settings, &asked).await;
+    (StatusCode::OK, session_body(found.as_ref()))
+}
+
+/// The session behind one qualified pane id, or `None`.
+///
+/// The membership check and the resolution in one place, because three
+/// endpoints make exactly this move: `/api/session` to name the session,
+/// `/api/message` to open its transcript at a line, and `/api/stream` to tail
+/// it. One spelling means one rule about what a client-supplied id may reach.
+pub async fn resolve(settings: &Settings, qualified: &str) -> Option<Session> {
     let here = settings.peers.here().name();
     let panes = settings.tmux.panes(here).await.unwrap_or_default();
-    let Some(pane) = panes.iter().find(|pane| pane.id.qualified() == asked) else {
-        return (StatusCode::OK, session_body(None));
-    };
-    let found = settings.agents.behind(&settings.tmux, pane).await;
-    (StatusCode::OK, session_body(found.as_ref()))
+    let pane = panes.iter().find(|pane| pane.id.qualified() == qualified)?;
+    settings.agents.behind(&settings.tmux, pane).await
 }
 
 /// The first non-empty value of a query parameter.
