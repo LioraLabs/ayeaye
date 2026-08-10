@@ -1,0 +1,12 @@
+[package]
+name = "ayeaye-core"
+description = "The pure core: text and structs in, text and structs out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Every name here has to earn a place on the constitution's allowlist first.
+# See crates/constitution/README.md.
+[dependencies]

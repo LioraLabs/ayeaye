@@ -9,3 +9,7 @@ assets/*.png
 dist/
 .worktrees/
 .cook
+
+# Cargo's build directory. Cargo.lock is tracked: this workspace produces a
+# binary, and a release has to be reproducible from the commit it was cut at.
+/target/

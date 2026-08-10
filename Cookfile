@@ -6,9 +6,13 @@
 #   cook stamp     write the artifact's checksum into install.sh
 #   cook publish   tag and upload it  (refuses a dirty tree)
 #
-# The version lives in exactly one place - AYEAYE_VERSION at the top of
-# install.sh - and `release-version` fails if this file or anything else has
-# drifted from it.
+# The version lives in AYEAYE_VERSION at the top of install.sh, and
+# `release-version` fails if this file or the README has drifted from it.
+#
+# It is no longer the only place the tree claims a version: the Cargo
+# workspace carries one too, and neither `bump` nor `release-version` knows
+# about it yet. Teaching them is AYEAYE-59's, and until then a bump leaves the
+# crate manifest behind without anything saying so.
 #
 # Cutting a release is two commits, in this order:
 #
@@ -53,6 +57,34 @@ probe commit
 probe scripts
     files { "scripts/*.sh" }
 
+# Every input to `cargo test --workspace`. cargo iterates the workspace, not a
+# file list, so none of this appears on the command line and nothing else would
+# tell cook the answer had changed. The lockfile is in here because the suite
+# runs `--locked`: a moved dependency is a different answer.
+#
+# Every `.rs` under crates/, not a list of the directories anyone thought of.
+# The first version of this named src/ and tests/ and build.rs, and so went
+# green on a planted violation in benches/ that `cargo test` had already gone
+# red on - a stale pass on the release gate, from a probe that had quietly
+# stopped describing its own recipe. `constitution` asserts the other half of
+# this: that every workspace member really does live under crates/.
+probe rust
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" }
+
+# The compiler is a determinant of what the suite says: a lint that fires on
+# one toolchain and not the next is exactly the drift `-D warnings` exists to
+# catch, and a cached green from the old one would hide it.
+#
+# It is the compiler's *version* that is folded, not the binary's bytes. Under
+# rustup, `cargo`, `rustc` and `cargo-clippy` are all the same shim - one hash
+# for all three, unmoved by the update that replaces the toolchain behind it -
+# so `tools { }` alone reports agreement it has not checked.
+probe rust:toolchain
+    { rustc --version --verbose && cargo clippy --version }
+
+probe rust:tools
+    tools { cargo rustc cargo-clippy }
+
 # --- the suite ----------------------------------------------------------
 # One unit per case file, so editing one test re-runs one test. The whole
 # suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
@@ -67,6 +99,33 @@ recipe suite
     seal scripts
     test { bash tests/run.sh $<in.stem> }
 
+# The Rust workspace is one unit, not one per crate: cargo already builds the
+# whole graph to test any part of it, so fanning out would compile the same
+# crates several times over and cache none of it better. It is its own unit
+# rather than a step inside the bash suite so that an edit to a shell test does
+# not recompile Rust, and an edit to Rust does not re-run 69 shell files.
+#
+# The ingredient is the workspace manifest - a source, which is what makes this
+# cacheable at all. The sources themselves are the sealed probe above: cargo
+# consumes them, but it does not take them as arguments.
+
+recipe rust-suite
+    ingredients "Cargo.toml"
+    seal rust
+    seal rust:toolchain
+    seal rust:tools
+    test { cargo test --workspace --locked }
+
+# Separate from the suite so a lint failure and a test failure are two
+# different red units rather than one. `-D warnings` is the gate the milestone
+# asked for; without it clippy is advice nobody reads.
+recipe rust-lint
+    ingredients "Cargo.toml"
+    seal rust
+    seal rust:toolchain
+    seal rust:tools
+    test { cargo clippy --workspace --all-targets --locked -- -D warnings }
+
 # --- release gates ------------------------------------------------------
 
 recipe release-version
@@ -80,7 +139,7 @@ recipe release-version
 # Sealed on the sources because `git archive` names none of them, so nothing
 # else would tell cook the artifact is stale.
 
-recipe dist: suite release-version
+recipe dist: suite release-version rust-suite rust-lint
     seal commit
     seal scripts
     cook "dist/ayeaye-v0.2.2.tar.gz" { bash scripts/release-archive.sh $<out> }
@@ -105,7 +164,7 @@ chore stamp: dist
 # still stand in the way of a red tree. The dirty-tree refusal lives in the
 # script, which can tell an uncommitted stamp from ordinary dirt and say
 # "commit it and go" rather than only "no".
-chore publish version="v0.2.2": suite release-version
+chore publish version="v0.2.2": suite release-version rust-suite rust-lint
     bash scripts/release-publish.sh $<version>
 
 chore bump version

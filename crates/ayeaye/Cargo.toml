@@ -1,0 +1,17 @@
+[package]
+name = "ayeaye"
+description = "The ayeaye daemon: one portable binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+cuda = ["ayeaye-infer/cuda"]
+metal = ["ayeaye-infer/metal"]
+
+[dependencies]
+ayeaye-core.workspace = true
+ayeaye-infer.workspace = true
