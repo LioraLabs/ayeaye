@@ -183,3 +183,45 @@ fn a_suppressed_token_is_never_decoded() {
     assert_eq!(transcript.segments[0].text, "");
     assert!(transcript.is_empty());
 }
+
+// AYEAYE-54
+//
+// Residency is the daemon's, not the slot's. Transcribing into an empty slot
+// is the moment an implicit design would quietly load a model, so this is the
+// test that says it must not: an error, and still empty afterwards.
+#[test]
+fn transcribing_an_empty_slot_is_an_error_and_loads_nothing() {
+    let mut slot = ayeaye_infer::SpeechSlot::empty();
+
+    let error = slot
+        .transcribe(&support::tone(1.0))
+        .expect_err("an empty slot has nothing to transcribe with");
+
+    assert!(matches!(error, SpeechError::NotLoaded));
+    assert!(!slot.is_loaded(), "it must not have loaded one to find out");
+}
+
+// AYEAYE-54
+//
+// Load and unload are both explicit, both repeatable, and unload really lets
+// go — the sequence AYEAYE-56's residency policy will drive, from a place that
+// cannot know which state it is in.
+#[test]
+fn a_model_can_be_loaded_unloaded_and_loaded_again() {
+    let dir = tiny_model("residency", &tiny_config(vec![]));
+    let mut slot = ayeaye_infer::SpeechSlot::empty();
+    assert!(!slot.is_loaded());
+
+    slot.load(dir.path()).expect("the toy model should load");
+    assert!(slot.is_loaded());
+    assert!(!slot.transcribe(&support::tone(1.0)).unwrap().is_empty());
+
+    assert!(slot.unload(), "unload should say it released something");
+    assert!(!slot.is_loaded());
+    assert!(!slot.unload(), "unloading nothing releases nothing");
+    assert!(slot.transcribe(&support::tone(1.0)).is_err());
+
+    slot.load(dir.path()).expect("it should load a second time");
+    assert!(slot.is_loaded());
+    assert!(!slot.transcribe(&support::tone(1.0)).unwrap().is_empty());
+}
