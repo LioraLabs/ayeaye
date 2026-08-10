@@ -24,13 +24,18 @@ default = []
 # lockfile rule, which is why rule 4 grew a second half. See `GATED` in
 # `crates/constitution/src/toolchain.rs`.
 #
-# **metal costs no toolchain.** `candle-metal-kernels` 0.9.2 declares
-# `build = false`, and neither `metal` 0.29 nor `ug-metal` 0.5 carries a build
-# script; the kernels are compiled by the Metal runtime from source held in the
-# binary. It is not that the macOS graph has *no* build script — `objc2` has one
-# — but that every script in it is pure Rust with no build-dependencies, so
-# nothing compiles C and there is nothing here rule 4 would refuse. That is the
-# claim, and it is narrower than "no build scripts".
+# **metal costs no toolchain**, measured against the resolved Apple graph rather
+# than the lockfile — the lockfile also lists `metal` 0.29 and `ug-metal`, and
+# neither is in it, because `candle-ug` is optional and off.
+# `cargo tree -e normal --target aarch64-apple-darwin` adds exactly
+# `candle-metal-kernels` and the `objc2` family, and
+# `cargo tree -e build --target aarch64-apple-darwin` returns the root alone:
+# **no build-dependency edges at all.** `candle-metal-kernels` declares
+# `build = false`; the kernels are Metal source held in the binary and compiled
+# by the Metal runtime. `objc2` does carry a `build.rs`, but a pure-Rust one
+# with no build-dependencies. So nothing in an Apple build compiles C, and there
+# is nothing here rule 4 would refuse — a narrower claim than "no build
+# scripts", and the true one.
 #
 # That asymmetry is why `metal` is not only a feature: the target table below
 # turns it on for every Apple build, because a feature nobody passes is off and

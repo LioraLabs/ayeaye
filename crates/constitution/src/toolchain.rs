@@ -62,10 +62,17 @@ pub struct Gated {
     /// Other feature names that turn the same cost on.
     ///
     /// A gated feature is rarely reachable only under its own name: candle
-    /// defines `cudnn = ["cuda", …]` and `nccl = ["cuda", …]`, so
-    /// `default = ["candle-core/cudnn"]` pays for nvcc while naming nothing
-    /// called `cuda`. Every spelling that reaches the cost has to be here, or
-    /// the rule is a keyword filter rather than a rule.
+    /// defines `cudnn`, `nccl` and `flash-attn`, each listing `cuda` among its
+    /// own, so `default = ["candle-core/cudnn"]` pays for nvcc while naming
+    /// nothing called `cuda`.
+    ///
+    /// **This list is a courtesy, not the guarantee.** It cannot be complete:
+    /// it describes an upstream's feature names, which the upstream may add to
+    /// in any release, and a crate of ours can forward any of them under a name
+    /// of its own. [`in_default_build`] is the half that actually holds — it
+    /// reads what cargo resolved and does not care what anything is called.
+    /// What this buys is a finding that names the feature and the manifest,
+    /// which is what somebody needs in order to fix it.
     pub also: &'static [&'static str],
     /// What building it needs that a default build does not.
     pub cost: &'static str,
@@ -85,11 +92,68 @@ pub const GATED: &[Gated] = &[Gated {
     feature: "cuda",
     // candle-core, candle-nn and candle-transformers all define these, and
     // both of them list "cuda" among their own implied features.
-    also: &["cudnn", "nccl"],
+    also: &["cudnn", "nccl", "flash-attn"],
     cost: "nvcc and a host C++ compiler at build time (candle-kernels' build \
            script compiles .cu sources with nvcc and links stdc++ and cudart)",
-    artifact: "the x86_64 Linux NVIDIA build, which is glibc-dynamic rather than static musl",
+    artifact: "the x86_64 Linux NVIDIA build (glibc-dynamic rather than static musl)",
 }];
+
+/// Packages that exist only to build acceleration, and what each one costs.
+///
+/// This is the *exact* half of the feature question, and it is a table of
+/// **packages** rather than of feature names on purpose. [`gated`] has to guess
+/// how an upstream spells the features that reach a toolchain — candle alone
+/// offers `cuda`, `cudnn`, `nccl` and `flash-attn`, and a crate of ours can
+/// forward any of them under a name of its own — and every version of that
+/// guess has been incomplete. A package cannot be spelled two ways. If any of
+/// these is in the default build's resolved graph, something turned
+/// acceleration on, whatever it called it.
+pub const ACCELERATED: &[(&str, &str)] = &[
+    (
+        "candle-kernels",
+        "candle's CUDA kernels; its build script runs nvcc over every .cu file",
+    ),
+    (
+        "bindgen_cuda",
+        "drives nvcc from a build script, which is why no `cc` ever appears",
+    ),
+    (
+        "candle-flash-attn",
+        "flash-attention CUDA kernels, compiled by nvcc at build time",
+    ),
+    (
+        "candle-flash-attn-build",
+        "the build script that compiles them",
+    ),
+    ("cudarc", "links the CUDA driver and runtime libraries"),
+    ("ug-cuda", "CUDA code generation"),
+];
+
+/// Rule 4, the exact half: no acceleration package in the default build.
+///
+/// `packages` is what cargo resolved, from
+/// [`crate::corpus::default_build_packages`] — feature resolution is cargo's,
+/// and this rule reads the answer rather than restating the question. That is
+/// what makes it immune to the spelling of a feature, to a feature forwarded
+/// across crates, and to a crate cargo treats as a member that our own walk
+/// never listed.
+pub fn in_default_build(packages: &[String], accelerated: &[(&str, &str)]) -> Vec<Finding> {
+    accelerated
+        .iter()
+        .filter(|(name, _)| packages.iter().any(|p| p == name))
+        .map(|(name, why)| Finding {
+            rule: Rule::PureRustGraph,
+            subject: "the default build".to_string(),
+            what: (*name).to_string(),
+            why: format!(
+                "{why}. A default build of this workspace resolves to it, so the \
+                 portable binary needs a CUDA toolchain — whatever feature turned it \
+                 on, and whichever manifest named it"
+            ),
+            line: None,
+        })
+        .collect()
+}
 
 /// The dependency tables a feature can be forced on from.
 const DEPENDENCY_TABLES: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
@@ -370,7 +434,7 @@ mod gated_tests {
 
     const CUDA: &[Gated] = &[Gated {
         feature: "cuda",
-        also: &["cudnn", "nccl"],
+        also: &["cudnn", "nccl", "flash-attn"],
         cost: "nvcc and a host C++ compiler",
         artifact: "the x86_64 Linux NVIDIA build",
     }];

@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::strata::CrateNode;
 
@@ -236,6 +237,55 @@ fn parse_text(text: &str, path: &Path) -> Result<toml::Value, String> {
         .parse::<toml::Table>()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(toml::Value::Table(table))
+}
+
+/// Every package a default build of the whole workspace resolves to.
+///
+/// This is the one question about features that cannot be answered by reading
+/// files, and the reason it is worth a subprocess: feature resolution is
+/// cargo's, and every attempt to restate it has been wrong. Rule 4's manifest
+/// half has to know that `cudnn`, `nccl` and `flash-attn` all imply `cuda`, and
+/// that a feature can be forwarded across crates; cargo simply knows.
+///
+/// `--locked`, so this can never rewrite the lockfile as a side effect of
+/// asking a question. A lockfile that no longer matches the manifests fails
+/// here rather than being silently regenerated — which is the same thing
+/// `cargo test --locked` says, one gate earlier.
+pub fn default_build_packages(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "--workspace",
+            "--edges",
+            "normal",
+            "--locked",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("running cargo tree in {}: {e}", root.display()))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "cargo tree failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut packages: Vec<String> = listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        // `(*)` marks a subtree cargo already printed, and a bare `[dev-dependencies]`
+        // style heading is not a package.
+        .filter(|name| !name.starts_with('[') && *name != "(*)")
+        .map(str::to_string)
+        .collect();
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
 }
 
 /// The root of the workspace this crate is compiled inside.

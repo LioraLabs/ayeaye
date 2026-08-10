@@ -138,9 +138,12 @@ without this the way past the rule is to not be in it.
 
 > Nothing the portable build needs may require a C, C++ or CUDA compiler.
 
-Two halves, because one input cannot answer it. `toolchain::check` reads
-`Cargo.lock` and proves the *graph* compiles no C; `toolchain::gated` reads the
-*manifests* and proves the cost `cc` cannot see stays out of the default build.
+Three checks, because no single input answers it. `toolchain::check` reads
+`Cargo.lock` and proves the graph carries no crate that vendors C for a C
+compiler to build. `toolchain::gated` reads the *manifests* and names the
+feature and the file when one turns a toolchain on. `toolchain::in_default_build`
+reads what **cargo** resolved and is the one that actually holds, because it
+refuses packages rather than feature spellings.
 
 `toolchain::check(lockfile, forbidden)` reads the text of `Cargo.lock` and
 refuses the package names in `FORBIDDEN`:
@@ -237,15 +240,49 @@ is where this workspace keeps candle, and therefore the most likely place a
 future acceleration edit lands. A rule over "every member's manifest" would skip
 exactly that file.
 
-Both halves are `Rule::PureRustGraph`, because they are one rule. The second
-half's mutation tests plant a `default` naming a gated feature, a `default` that
-reaches one through another of our own features, a `default` naming an implying
-spelling, a target table forcing one on, and a `[workspace.dependencies]` edge
-forcing one on — and assert that the same target table forcing `metal` on is
-clean. Against the real tree the proof runs the other way round again: there is
-no violation to leave planted, so the test hands the rule a table naming
-`metal`, which `ayeaye-infer` really does turn on for Apple builds, and fails if
-it finds nothing.
+The second half's mutation tests plant a `default` naming a gated feature, a
+`default` that reaches one through another of our own features, a `default`
+naming an implying spelling, a target table forcing one on, and a
+`[workspace.dependencies]` edge forcing one on — and assert that the same target
+table forcing `metal` on is clean. Against the real tree the proof runs the
+other way round again: there is no violation to leave planted, so the test hands
+the rule a table naming `metal`, which `ayeaye-infer` really does turn on for
+Apple builds, and fails if it finds nothing.
+
+### The third half, which is the one that actually holds
+
+**`gated` cannot be complete, and pretending otherwise cost three bypasses.**
+Each was found by planting it, and each was the same shape — a rule that
+restates cargo's feature resolution will keep being one release behind it:
+
+1. `candle-transformers/flash-attn` also implies `cuda`, and was not on the
+   alias list. Nor were `cudnn` and `nccl` until a gate found them.
+2. `gpu = ["cuda"]` in `ayeaye-infer` with `default = ["ayeaye-infer/gpu"]` in
+   `ayeaye`. Neither manifest reads badly on its own, and `gated`'s closure
+   stops at the crate boundary.
+3. A crate under `crates/` that is not in `[workspace] members`. Cargo treats a
+   path dependency inside the workspace as a member anyway; the corpus walk
+   reads the list, so **no** rule applied to it at all.
+
+So the question is asked of cargo instead. `corpus::default_build_packages`
+runs `cargo tree --workspace --edges normal --locked` and
+`toolchain::in_default_build(packages, ACCELERATED)` refuses the **packages**
+that exist only to build acceleration — `candle-kernels`, `bindgen_cuda`,
+`candle-flash-attn`, `candle-flash-attn-build`, `cudarc`, `ug-cuda`.
+
+A feature can be spelled four ways and forwarded through three crates; a
+package cannot. All three bypasses above fail this check, and it needs to know
+nothing about what any of them was called. `--locked`, so asking the question
+can never rewrite the lockfile as a side effect.
+
+This is the one rule that runs a subprocess, and it is worth it for exactly the
+reason the three bypasses give: feature resolution belongs to cargo, and every
+attempt to restate it here has been wrong. `gated` stays because a finding that
+names the feature and the manifest is what somebody needs in order to *fix* it —
+it is the diagnosis, and this is the proof.
+
+Both halves — all three checks — are `Rule::PureRustGraph`, because they are one
+rule.
 
 
 ---
@@ -258,8 +295,9 @@ cook rust-suite                     # the same, as the build system's cached uni
 ```
 
 `crates/constitution/tests/constitution.rs` runs all four rules over the real
-workspace, rule 4 in both halves — the lockfile against `FORBIDDEN`, and every
-member's manifest against `GATED`. It also asserts the corpus walk found a
+workspace, rule 4 in all three of its checks — the lockfile against
+`FORBIDDEN`, every manifest (the root's included) against `GATED`, and cargo's
+own resolution of the default build against `ACCELERATED`. It also asserts the corpus walk found a
 non-trivial number of files, and that every crate the strata place contributed
 at least one — a walk that
 finds nothing passes every rule it feeds, silently, which is the failure those
