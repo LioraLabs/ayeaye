@@ -10,6 +10,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ayeaye_core::http::hosts::AllowedHosts;
+use ayeaye_core::peer::{BadName, HostName, Peer, Registry};
+
+use crate::tmux::Tmux;
 
 /// The port the Rust daemon listens on until the cutover.
 ///
@@ -23,6 +26,13 @@ pub const DEFAULT_DEV_PORT: u16 = 8912;
 /// The address to bind when nothing says otherwise.
 pub const DEFAULT_BIND: &str = "127.0.0.1";
 
+/// What this machine is called when nothing else says.
+///
+/// There is no unnamed machine: every pane id carries a host, so a machine that
+/// will not say what it is called still needs something an id can be built from
+/// and split back apart by.
+pub const DEFAULT_NAME: &str = "localhost";
+
 /// Everything the server needs to answer a request.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -34,6 +44,14 @@ pub struct Settings {
     pub allowed_hosts: AllowedHosts,
     /// The shared secret every gated request has to present.
     pub token: String,
+    /// The machines this deployment can see. Today that is this one, as a peer
+    /// with no transport — which is the point: the local machine being a peer
+    /// like any other is what a second machine slots into later.
+    pub peers: Registry,
+    /// The tmux the panes are read from. A field rather than a constant so the
+    /// suite can point a whole server at its own private tmux server instead of
+    /// at the one holding somebody's work.
+    pub tmux: Tmux,
 }
 
 /// Why a configuration could not be resolved.
@@ -48,6 +66,11 @@ pub enum ConfigError {
     UnknownArgument(String),
     /// No token in the environment and none on disk.
     NoToken(String),
+    /// This machine's name is not one a pane id could carry. Refused at startup
+    /// rather than served: a name with the separator in it produces ids that
+    /// split back into a different machine, and a deployment that cannot route
+    /// its own ids should say so before it answers anything.
+    BadName(BadName),
 }
 
 impl fmt::Display for ConfigError {
@@ -57,6 +80,18 @@ impl fmt::Display for ConfigError {
             ConfigError::NotAPort(value) => write!(out, "{value:?} is not a port number"),
             ConfigError::UnknownArgument(arg) => write!(out, "unknown argument {arg:?}"),
             ConfigError::NoToken(why) => write!(out, "{why}"),
+            ConfigError::BadName(BadName::Empty) => {
+                write!(out, "this machine's name is empty")
+            }
+            ConfigError::BadName(BadName::HasSeparator(name)) => write!(
+                out,
+                "{name:?} cannot be this machine's name: pane ids are host/pane, \
+                 so a name carrying '/' makes ids nothing can route"
+            ),
+            ConfigError::BadName(BadName::HasControl(name)) => write!(
+                out,
+                "{name:?} cannot be this machine's name: it carries a control character"
+            ),
         }
     }
 }
@@ -77,6 +112,7 @@ impl Settings {
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
         token: String,
+        nodename: Option<String>,
     ) -> Result<Settings, ConfigError> {
         let mut bind = env("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let mut port = match env("DEV_PORT") {
@@ -104,11 +140,22 @@ impl Settings {
         }
 
         let extra = env("ALLOWED_HOSTS").unwrap_or_default();
+        // The daemon's own order: the configured name first, so a screenshot
+        // need not show a real hostname; then what the machine calls itself;
+        // then a name it can at least be routed by, because every pane id on
+        // this machine is qualified with this and there is no "unnamed".
+        let named = env("NAME")
+            .or(nodename)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_NAME.to_string());
+        let here = HostName::new(&named).map_err(ConfigError::BadName)?;
         Ok(Settings {
             allowed_hosts: AllowedHosts::new(&bind, port, &extra),
             bind,
             port,
             token,
+            peers: Registry::new(vec![Peer::here(here)]).expect("one peer, and it is this machine"),
+            tmux: Tmux::new(),
         })
     }
 
@@ -231,7 +278,12 @@ mod tests {
         list: &[&str],
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Settings, ConfigError> {
-        Settings::resolve(&args(list), env, "s3cret".to_string())
+        Settings::resolve(
+            &args(list),
+            env,
+            "s3cret".to_string(),
+            Some("box".to_string()),
+        )
     }
 
     // AYEAYE-42 — the newer name wins, and the legacy one is only used when it
@@ -338,6 +390,67 @@ mod tests {
         let settings = resolve(&["--port", "9202"], no_env).expect("arguments should resolve");
         assert!(settings.allowed_hosts.allows("127.0.0.1:9202"));
         assert!(!settings.allowed_hosts.allows("evil.example:9202"));
+    }
+
+    // AYEAYE-43 — what this machine calls itself, in the daemon's own order:
+    // the configured name first, so a screenshot need not show a real hostname,
+    // then what `uname -n` said, and only then a default. The name is a peer's
+    // name now rather than a header label, so it is also what every pane id on
+    // this machine is qualified with.
+    #[test]
+    fn the_configured_name_wins_over_the_nodename_and_something_always_answers() {
+        let named = |name: &str| match name {
+            "NAME" => Some("desktop".to_string()),
+            _ => None,
+        };
+        let configured =
+            Settings::resolve(&[], named, "s3cret".to_string(), Some("box".to_string()))
+                .expect("a named machine");
+        assert_eq!(configured.peers.here().name().as_str(), "desktop");
+        assert!(
+            configured.peers.here().is_here(),
+            "this machine has no transport"
+        );
+
+        let from_uname =
+            Settings::resolve(&[], no_env, "s3cret".to_string(), Some("box".to_string()))
+                .expect("an unnamed machine still has a nodename");
+        assert_eq!(from_uname.peers.here().name().as_str(), "box");
+
+        // And a machine that will not say: a name it can be routed by beats no
+        // name at all, since every pane id on it needs one.
+        let anonymous =
+            Settings::resolve(&[], no_env, "s3cret".to_string(), None).expect("a nameless machine");
+        assert_eq!(anonymous.peers.here().name().as_str(), "localhost");
+        let blank = Settings::resolve(&[], no_env, "s3cret".to_string(), Some("  ".to_string()))
+            .expect("a blank nodename is no nodename");
+        assert_eq!(blank.peers.here().name().as_str(), "localhost");
+    }
+
+    // AYEAYE-43 — a name a pane id cannot carry stops the server rather than
+    // being escaped or quietly replaced. Ids built from it split back into a
+    // different machine, and a deployment that cannot route its own ids should
+    // say so before it answers anything.
+    #[test]
+    fn a_name_no_pane_id_could_carry_refuses_to_start() {
+        let slashed = |name: &str| match name {
+            "NAME" => Some("gpu/box".to_string()),
+            _ => None,
+        };
+        let refused = Settings::resolve(&[], slashed, "s3cret".to_string(), None).unwrap_err();
+        assert_eq!(
+            refused,
+            ConfigError::BadName(ayeaye_core::peer::BadName::HasSeparator(
+                "gpu/box".to_string()
+            ))
+        );
+        // And it says which name and why, because the fix is to change that
+        // value and nothing else here can say which one it was.
+        let said = refused.to_string();
+        assert!(
+            said.contains("gpu/box") && said.contains("host/pane"),
+            "{said}"
+        );
     }
 
     // AYEAYE-42 — a typo has to be refused rather than absorbed: `--prot 9000`

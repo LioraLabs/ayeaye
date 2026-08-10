@@ -13,10 +13,13 @@
 pub mod audio;
 pub mod http;
 pub mod identity;
+pub mod json;
 pub mod logits;
 pub mod machine;
 pub mod mel;
+pub mod peer;
 pub mod service;
+pub mod tmux;
 
 pub use audio::Pcm16kMono;
 pub use identity::Identity;

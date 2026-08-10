@@ -10,5 +10,7 @@
 //! process and hoping.
 
 pub mod assets;
+pub mod command;
 pub mod config;
 pub mod server;
+pub mod tmux;

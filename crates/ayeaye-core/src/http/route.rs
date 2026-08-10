@@ -19,6 +19,8 @@ pub struct Asset {
 pub enum Route {
     /// The login handshake: a token in the query becomes a cookie.
     Login,
+    /// The pane list: every live pane on this machine, qualified.
+    Panes,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -43,6 +45,11 @@ const PNG: &str = "image/png";
 /// Everything below this is the API. The trailing slash matters: `/apifake` is
 /// not the API, and must not be gated as though it were.
 const API_PREFIX: &str = "/api/";
+
+/// The pane list. Every endpoint that grows a handler earns a line like this;
+/// the catch-all above stays, so a path nobody has written yet is still gated
+/// rather than being open by omission.
+const PANES: &str = "/api/panes";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -102,7 +109,10 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
     // is gated whether or not an endpoint answers on it, so an unauthenticated
     // caller cannot map the API by watching which paths come back 404.
     if path.starts_with(API_PREFIX) {
-        return Route::Api;
+        return match path {
+            PANES => Route::Panes,
+            _ => Route::Api,
+        };
     }
     if let Some((_, asset)) = ASSET_ROUTES.iter().find(|(route, _)| *route == path) {
         return Route::Asset(*asset);
@@ -132,7 +142,7 @@ pub fn gate(method: &str, route: Route) -> Gate {
         return Gate::Token;
     }
     match route {
-        Route::Api => Gate::Token,
+        Route::Api | Route::Panes => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -246,10 +256,10 @@ mod tests {
     // because they carry no data and every call they go on to make is gated.
     #[test]
     fn a_get_is_gated_under_api_and_open_on_the_pages() {
-        assert_eq!(resolve("/api/panes", false), Route::Api);
+        assert_eq!(resolve("/api/overview", false), Route::Api);
         assert_eq!(resolve("/api/", false), Route::Api);
         // A token in the query does not make an API path a login.
-        assert_eq!(resolve("/api/panes", true), Route::Api);
+        assert_eq!(resolve("/api/overview", true), Route::Api);
         assert_eq!(gate("GET", Route::Api), Gate::Token);
         for path in [
             "/",
@@ -273,6 +283,28 @@ mod tests {
         assert_eq!(gate("GET", Route::NotFound), Gate::Open);
         // A path that merely starts with the letters is not the API.
         assert_eq!(resolve("/apifake", false), Route::NotFound);
+    }
+
+    // AYEAYE-43 — the pane list is a route of its own rather than one more
+    // unknown path under `/api/`, and it is gated exactly as the rest of the
+    // API is. Naming it here is what keeps "which paths exist" a table a test
+    // can read rather than a chain of string comparisons in the handler.
+    #[test]
+    fn the_pane_list_is_a_route_and_is_gated_like_the_rest_of_the_api() {
+        assert_eq!(resolve("/api/panes", false), Route::Panes);
+        // A token in the query does not turn it into a login.
+        assert_eq!(resolve("/api/panes", true), Route::Panes);
+        for method in ["GET", "HEAD", "POST", "DELETE"] {
+            assert_eq!(
+                gate(method, Route::Panes),
+                Gate::Token,
+                "{method} /api/panes must need a token"
+            );
+        }
+        // Only that path. Anything under it is still the API's catch-all, so a
+        // new endpoint cannot arrive by accident.
+        assert_eq!(resolve("/api/panes/extra", false), Route::Api);
+        assert_eq!(resolve("/api/panes2", false), Route::Api);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at
@@ -305,6 +337,6 @@ mod tests {
                 "HEAD {path} must be as open as GET"
             );
         }
-        assert_eq!(gate("HEAD", resolve("/api/panes", false)), Gate::Token);
+        assert_eq!(gate("HEAD", resolve("/api/overview", false)), Gate::Token);
     }
 }
