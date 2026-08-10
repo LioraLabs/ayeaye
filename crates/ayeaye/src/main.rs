@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ayeaye::config::{self, Settings};
-use ayeaye::process::Processes;
 use ayeaye::models;
 use ayeaye::server;
 use ayeaye_core::service::{DEFAULT_LAUNCHD_PREFIX, Definition, Layout, Manager, Session};
@@ -352,6 +351,9 @@ async fn recording_peer(
     passed: Option<&str>,
 ) -> Option<String> {
 
+    // The methods below belong to `ayeaye::process::Processes`, and the trait is
+    // not imported: `here()` hands back a `dyn Processes`, whose methods are
+    // callable without it.
     let processes = ayeaye::process::here();
     let local = ayeaye_core::peer::PaneId::parse(pane)
         .map(|id| id.pane().to_string())
