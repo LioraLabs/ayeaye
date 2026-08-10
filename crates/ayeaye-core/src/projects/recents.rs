@@ -9,6 +9,8 @@
 //! The file is shared with the Python daemon for as long as both run, so the
 //! shape here is its shape, down to the version field.
 
+use std::collections::HashMap;
+
 use crate::json::{Value, parse};
 
 /// How long a pick takes to count for half.
@@ -61,15 +63,20 @@ impl Recents {
         let Some(members) = document.get("picks").and_then(Value::as_object) else {
             return Recents::default();
         };
+        // A key written twice is one directory: Python's dict keeps the first
+        // position and the last value, and so does this. The index is what
+        // keeps it linear — a scan of what has been seen, per member, is the
+        // quadratic this module went out of its way to remove from the parser.
         let mut picks: Vec<(String, Pick)> = Vec::with_capacity(members.len());
+        let mut seen: HashMap<&str, usize> = HashMap::with_capacity(members.len());
         for (path, row) in members {
             let Some(pick) = pick_of(row) else { continue };
-            // A key written twice is one directory, and the last one written
-            // is the one Python's decoder keeps. Two rows for one path would
-            // otherwise be scored off the first and both written back.
-            match picks.iter_mut().find(|(known, _)| known == path) {
-                Some((_, seen)) => *seen = pick,
-                None => picks.push((path.clone(), pick)),
+            match seen.get(path.as_str()) {
+                Some(&at) => picks[at].1 = pick,
+                None => {
+                    seen.insert(path.as_str(), picks.len());
+                    picks.push((path.clone(), pick));
+                }
             }
         }
         Recents { picks }
@@ -117,6 +124,11 @@ impl Recents {
         ranked.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1)));
         ranked
             .into_iter()
+            // A directory whose count was hand-edited to zero or below is not
+            // a signal, and this is what the ranker folds back in as a
+            // candidate: offering one would put a directory nobody has picked
+            // ahead of the directories they have.
+            .filter(|(score, _)| *score > 0.0)
             .take(how_many)
             .map(|(_, path)| path)
             .collect()
@@ -238,11 +250,24 @@ fn pick_of(row: &Value) -> Option<Pick> {
 }
 
 /// What Python's `int()` would make of this value, if it would make anything.
+///
+/// Known and deliberate departures, all of them in the refusing direction and
+/// none of them producible by the daemon itself: Python takes `int("1_0")` and
+/// non-ASCII digits, and its integers have no width, so a count of `10**30`
+/// saturates here rather than surviving. A saturated count is still a row; a
+/// refused one would be deleted from the shared file.
 fn as_int(value: &Value) -> Option<i64> {
     let number = match value {
         Value::Number(number) => *number,
-        // `int("3")` is 3; `int("3.5")` raises, and so does this.
-        Value::String(text) => return text.trim().parse().ok(),
+        // `int(True)` is 1. Absurd in a store, and absurd is what a
+        // hand-edited file is made of.
+        Value::Bool(flag) => return Some(i64::from(*flag)),
+        // `int("3")` is 3; `int("3.5")` raises, and so does this. A run of
+        // digits too long for an `i64` saturates rather than being refused.
+        Value::String(text) => {
+            let text = text.trim();
+            return text.parse().ok().or_else(|| saturated(text));
+        }
         _ => return None,
     };
     if !number.is_finite() {
@@ -252,13 +277,31 @@ fn as_int(value: &Value) -> Option<i64> {
     Some(number.trunc() as i64)
 }
 
+/// An integer literal too long for an `i64`, clamped to the end it ran off.
+fn saturated(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(if text.starts_with('-') {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
 /// What Python's `float()` would make of this value, if it would make anything.
 fn as_float(value: &Value) -> Option<f64> {
     let number = match value {
         Value::Number(number) => *number,
+        // `float(True)` is 1.0, for the same reason as above.
+        Value::Bool(flag) => return Some(if *flag { 1.0 } else { 0.0 }),
         Value::String(text) => text.trim().parse().ok()?,
         _ => return None,
     };
+    // The one place this refuses to follow Python: a `NaN` timestamp would
+    // poison the total order the picker repaints itself from, so it reads as
+    // the epoch — ancient, ranked last, and still a row in the file.
     Some(if number.is_finite() { number } else { 0.0 })
 }
 
@@ -342,6 +385,58 @@ mod tests {
             Recents::parse("{\"picks\":{\"/x\":{\"n\":\"3.5\",\"t\":5}}}").len(),
             0
         );
+    }
+
+    // AYEAYE-50 — the rest of what `int()` and `float()` take, and the one
+    // place this deliberately does not follow them. Every case here is a row
+    // the daemon keeps, so every case here is a row this must not delete.
+    #[test]
+    fn the_odd_corners_of_int_and_float_still_leave_a_row_behind() {
+        // `int(True)` is 1 and `float(True)` is 1.0. Absurd in a store, and
+        // absurd is what a hand-edited file is made of.
+        let flags =
+            Recents::parse("{\"picks\":{\"/a\":{\"n\":true,\"t\":5},\"/b\":{\"n\":1,\"t\":true}}}");
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags.get("/a").map(|pick| pick.count), Some(1));
+        assert_eq!(flags.get("/b").map(|pick| pick.at), Some(1.0));
+
+        // Python's integers have no width. A count too big for an `i64`
+        // saturates rather than being refused, because a saturated row is
+        // still a row and a refused one is deleted.
+        let huge = Recents::parse("{\"picks\":{\"/a\":{\"n\":\"99999999999999999999\",\"t\":5}}}");
+        assert_eq!(huge.get("/a").map(|pick| pick.count), Some(i64::MAX));
+
+        // `json.load` reads the three literals its own encoder writes, so a
+        // store carrying one must not be refused *whole* — that would rewrite
+        // the file with nothing in it. The timestamp reads as the epoch:
+        // ancient, ranked last, and still there.
+        let poisoned =
+            Recents::parse("{\"picks\":{\"/a\":{\"n\":1,\"t\":NaN},\"/b\":{\"n\":1,\"t\":5}}}");
+        assert_eq!(
+            poisoned.len(),
+            2,
+            "one bad timestamp must not empty the store"
+        );
+        assert_eq!(poisoned.get("/a").map(|pick| pick.at), Some(0.0));
+        assert!(poisoned.render().is_ascii());
+    }
+
+    // AYEAYE-50 — a count hand-edited to zero or below is not a signal, and
+    // `strongest` is what the ranker folds back in as candidates: offering one
+    // would put a directory nobody has picked ahead of the ones they have.
+    #[test]
+    fn a_directory_with_no_signal_left_is_not_offered_as_a_candidate() {
+        let store = Recents::parse(concat!(
+            "{\"picks\":{",
+            "\"/negative\":{\"n\":-3,\"t\":5},",
+            "\"/zero\":{\"n\":0,\"t\":5},",
+            "\"/real\":{\"n\":1,\"t\":5}",
+            "}}"
+        ));
+        assert_eq!(store.strongest(5.0, 10), vec!["/real"]);
+        // They are still *in* the store, because deleting them would delete
+        // them from the file the Python daemon reads.
+        assert_eq!(store.len(), 3);
     }
 
     // AYEAYE-50 — a key written twice is one directory, and Python's decoder
@@ -513,6 +608,26 @@ mod tests {
             "}}"
         ));
         assert_eq!(store.strongest(5.0, 3), vec!["/a", "/b", "/c"]);
+    }
+
+    // AYEAYE-50 — and the same tie-break where it decides what is *dropped*.
+    // `strongest` has this pinned; `trim` sorts on its own, and a stable sort
+    // with no tie-break would silently keep whichever the file happened to
+    // list first — so the row that must go is deliberately the one that was
+    // recorded *earliest*, where insertion order and the path disagree.
+    #[test]
+    fn two_equal_scores_are_broken_by_the_path_when_one_has_to_go() {
+        let now = 1_000.0;
+        let mut store = Recents::default();
+        store.record("/zzz-earliest", now);
+        for index in 0..super::MAX {
+            store.record(&format!("/keep{index:04}"), now);
+        }
+        assert_eq!(store.len(), super::MAX, "the last one displaced somebody");
+        assert!(
+            store.get("/zzz-earliest").is_none(),
+            "a tie goes to the lower path, and every /keep is lower than /zzz"
+        );
     }
 
     // AYEAYE-50 — the store is keyed by path, and two spellings of one

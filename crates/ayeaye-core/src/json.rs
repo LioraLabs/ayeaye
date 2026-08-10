@@ -86,10 +86,16 @@ impl Value {
     }
 
     /// The member under `key`, if this is an object that has one.
+    ///
+    /// The *last* one written, which is what Python's decoder keeps. A
+    /// document with a key twice is a hand-edited one, and disagreeing with
+    /// the daemon about which half is real would have this binary rewrite the
+    /// shared store with a value the daemon never used.
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Object(members) => members
                 .iter()
+                .rev()
                 .find(|(name, _)| name == key)
                 .map(|(_, value)| value),
             _ => None,
@@ -100,14 +106,6 @@ impl Value {
     pub fn as_object(&self) -> Option<&[(String, Value)]> {
         match self {
             Value::Object(members) => Some(members),
-            _ => None,
-        }
-    }
-
-    /// The number, if this is one.
-    pub fn as_number(&self) -> Option<f64> {
-        match self {
-            Value::Number(number) => Some(*number),
             _ => None,
         }
     }
@@ -166,6 +164,15 @@ fn read_value(bytes: &[u8], at: &mut usize, depth: usize) -> Option<Value> {
         b't' => literal(bytes, at, b"true", Value::Bool(true)),
         b'f' => literal(bytes, at, b"false", Value::Bool(false)),
         b'n' => literal(bytes, at, b"null", Value::Null),
+        // Not JSON, and read anyway: Python's encoder writes these three and
+        // its decoder takes them back. Refusing one refuses the whole
+        // document, and a whole-document refusal of the shared store means
+        // this binary rewrites it with nothing at all in it.
+        b'N' => literal(bytes, at, b"NaN", Value::Number(f64::NAN)),
+        b'I' => literal(bytes, at, b"Infinity", Value::Number(f64::INFINITY)),
+        b'-' if bytes[*at..].starts_with(b"-Infinity") => {
+            literal(bytes, at, b"-Infinity", Value::Number(f64::NEG_INFINITY))
+        }
         _ => read_number(bytes, at),
     }
 }
@@ -290,6 +297,17 @@ fn read_string(bytes: &[u8], at: &mut usize) -> Option<String> {
 /// and UTF-8 does not, which is what Python's `surrogateescape` puts in a path
 /// — and it becomes the replacement character rather than refusing the file:
 /// one unreadable path must not cost every other pick in the store.
+///
+/// **What that costs, said plainly.** A Rust `String` cannot hold a lone
+/// surrogate, so this is a rename rather than a reading: a key Python wrote as
+/// `/a/` plus an undecodable byte comes back with the replacement character in
+/// its place, and the next time this binary rewrites the store that is the key
+/// the file carries. The Python daemon will never produce that key again, so
+/// that directory's history is orphaned — and two paths differing only in
+/// their undecodable bytes collapse into one, which costs the weaker of the
+/// two its row. The alternative is refusing the document, which costs every
+/// row instead. Neither is good; this one is bounded to the paths UTF-8 cannot
+/// spell.
 fn read_escaped_char(bytes: &[u8], at: &mut usize) -> Option<char> {
     let first = read_hex4(bytes, at)?;
     if !(0xd800..0xdc00).contains(&first) {
@@ -422,6 +440,10 @@ mod tests {
         assert_eq!(escape("caf\u{e9}"), r"caf\u00e9");
         assert_eq!(escape("\u{1f600}"), r"\ud83d\ude00");
         assert!(escape("naïve/日本/😀").is_ascii());
+        // A four-byte character followed by a two-byte one: an over-wide
+        // width here ends the slice mid-character and refuses a valid
+        // document, which is a parser that goes blind on legal input.
+        assert_eq!(string("\"😀é日\""), "😀é日");
         // And what it writes, it reads back.
         assert_eq!(
             string(&format!("\"{}\"", escape("naïve/日本/😀"))),
@@ -444,15 +466,24 @@ mod tests {
         assert_eq!(parse(r#"[1,]"#), None);
         assert_eq!(parse(r#"{"a":}"#), None);
         assert_eq!(parse(""), None);
-        // What Python's own encoder writes for a non-finite number, and what
-        // no other reader accepts. Refused here, and rendered as null.
-        assert_eq!(parse("NaN"), None);
-        assert_eq!(parse("Infinity"), None);
+        // Not JSON, and read anyway, because Python's encoder writes these
+        // and its decoder reads them: refusing one would refuse the whole
+        // shared store rather than the one row that carried it. Rendered back
+        // as null, which every reader understands.
+        assert!(matches!(parse("NaN"), Some(Value::Number(number)) if number.is_nan()));
+        assert_eq!(parse("Infinity"), Some(Value::Number(f64::INFINITY)));
+        assert_eq!(parse("-Infinity"), Some(Value::Number(f64::NEG_INFINITY)));
+        assert_eq!(parse("Nan"), None, "and only these three spellings");
+        assert_eq!(parse("-Inf"), None);
+        assert_eq!(Value::Number(f64::NAN).render(), "null");
+
+        // A key written twice is the last one, as Python's decoder has it.
+        let twice = parse(r#"{"a":1,"a":2}"#).expect("a repeated key parses");
+        assert_eq!(twice.get("a"), Some(&Value::Number(2.0)));
         // A raw control character inside a string: refused, or a file
         // truncated mid-line reads as a longer one that happens to close.
         assert_eq!(parse("\"a\nb\""), None);
         assert_eq!(parse("\"a\u{0}b\""), None);
-        assert_eq!(Value::Number(f64::NAN).render(), "null");
 
         // Python's `repr` of a float is free to use an exponent, and the
         // timestamps in the store are floats it wrote.
