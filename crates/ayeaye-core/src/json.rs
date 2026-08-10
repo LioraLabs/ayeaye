@@ -48,9 +48,12 @@ pub fn parse(text: &str) -> Option<Value> {
 
 /// The escaped *body* of a JSON string, without the quotes around it.
 ///
-/// Non-ASCII is left as itself. Python's `json.dump` escapes it instead, and
-/// both are valid — each reads the other's file, which is the property that
-/// matters while the two daemons share one store.
+/// ASCII out, always — non-ASCII leaves as `\uXXXX`, with a surrogate pair for
+/// anything outside the basic plane, which is what Python's `json.dump` writes.
+/// That is not tidiness: `bin/ayeaye` opens the shared store with the locale's
+/// encoding, and on a machine whose locale is not UTF-8 a raw accented byte is
+/// a `UnicodeDecodeError` — which `_recents_load` catches by throwing the whole
+/// history away. A file that is pure ASCII cannot be misread by any locale.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -62,8 +65,13 @@ pub fn escape(text: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            c => {
+                let mut buffer = [0u16; 2];
+                for unit in c.encode_utf16(&mut buffer) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
         }
     }
     out
@@ -100,14 +108,6 @@ impl Value {
     pub fn as_number(&self) -> Option<f64> {
         match self {
             Value::Number(number) => Some(*number),
-            _ => None,
-        }
-    }
-
-    /// The text, if this is a string.
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Value::String(text) => Some(text),
             _ => None,
         }
     }
@@ -262,13 +262,20 @@ fn read_string(bytes: &[u8], at: &mut usize) -> Option<String> {
             // A raw control character is not allowed inside a JSON string, and
             // accepting one would let a truncated file read as a longer one.
             byte if byte < 0x20 => return None,
+            // ASCII is a character on its own, and taking it directly is what
+            // keeps this linear: validating from here to the end of the
+            // document once per character made a 2000-key store cost 50ms on
+            // the request path.
+            byte if byte < 0x80 => {
+                out.push(byte as char);
+                *at += 1;
+            }
             _ => {
-                // Multi-byte characters arrive whole: the offset walks bytes,
-                // so the character is copied from the text rather than pushed
-                // one byte at a time.
-                let start = *at;
-                let text = core_str(bytes, start)?;
-                let ch = text.chars().next()?;
+                // A multi-byte character arrives whole. Only its own bytes are
+                // examined — four at the most — never the rest of the text.
+                let width = utf8_width(byte);
+                let end = (*at + width).min(bytes.len());
+                let ch = core_str(bytes, *at, end)?.chars().next()?;
                 out.push(ch);
                 *at += ch.len_utf8();
             }
@@ -312,12 +319,36 @@ fn read_hex4(bytes: &[u8], at: &mut usize) -> Option<u32> {
     Some(value)
 }
 
-/// The rest of the document as text, from a byte offset that must be a
-/// character boundary.
-fn core_str(bytes: &[u8], from: usize) -> Option<&str> {
-    std::str::from_utf8(&bytes[from..]).ok()
+/// A slice of the document as text.
+///
+/// Bounded on both sides rather than running to the end: validating from here
+/// to the end of the document once per character is how a linear parser
+/// becomes a quadratic one, and this is read on the request path.
+fn core_str(bytes: &[u8], from: usize, to: usize) -> Option<&str> {
+    std::str::from_utf8(bytes.get(from..to)?).ok()
 }
 
+/// How many bytes the character starting with this one occupies.
+///
+/// A byte that starts no character at all answers 1, so the slice handed to
+/// `from_utf8` is one invalid byte and the parse refuses it — rather than
+/// running off the end looking for a continuation that is not there.
+fn utf8_width(first: u8) -> usize {
+    match first {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+/// A number, read a little more loosely than JSON spells one.
+///
+/// A leading zero and a trailing `.` are accepted, and an exponent too large
+/// for an `f64` becomes infinity, which [`Value::write`] renders as `null`.
+/// Every one of those is in the accepting direction, which is the right
+/// direction for a reader of a file another program wrote — but it means a
+/// document this refuses is a strict subset of what JSON refuses.
 fn read_number(bytes: &[u8], at: &mut usize) -> Option<Value> {
     let start = *at;
     if bytes.get(*at) == Some(&b'-') {
@@ -345,10 +376,7 @@ fn read_number(bytes: &[u8], at: &mut usize) -> Option<Value> {
             *at += 1;
         }
     }
-    core_str(bytes, start)?[..*at - start]
-        .parse()
-        .ok()
-        .map(Value::Number)
+    core_str(bytes, start, *at)?.parse().ok().map(Value::Number)
 }
 
 fn skip_space(bytes: &[u8], at: &mut usize) {
@@ -389,8 +417,16 @@ mod tests {
 
         assert_eq!(escape("a\"b\\c\nd\te"), r#"a\"b\\c\nd\te"#);
         assert_eq!(escape("\u{08}\u{0c}\r\u{1}"), r#"\b\f\r\u0001"#);
-        // Left as itself: valid JSON, and Python's reader takes it.
-        assert_eq!(escape("café"), "café");
+        // ASCII out, always: a store this binary rewrote must be readable by
+        // the Python daemon whatever the machine's locale is.
+        assert_eq!(escape("caf\u{e9}"), r"caf\u00e9");
+        assert_eq!(escape("\u{1f600}"), r"\ud83d\ude00");
+        assert!(escape("naïve/日本/😀").is_ascii());
+        // And what it writes, it reads back.
+        assert_eq!(
+            string(&format!("\"{}\"", escape("naïve/日本/😀"))),
+            "naïve/日本/😀"
+        );
     }
 
     // AYEAYE-50 — the store is read on the request path and a malformed one
@@ -412,7 +448,17 @@ mod tests {
         // no other reader accepts. Refused here, and rendered as null.
         assert_eq!(parse("NaN"), None);
         assert_eq!(parse("Infinity"), None);
+        // A raw control character inside a string: refused, or a file
+        // truncated mid-line reads as a longer one that happens to close.
+        assert_eq!(parse("\"a\nb\""), None);
+        assert_eq!(parse("\"a\u{0}b\""), None);
         assert_eq!(Value::Number(f64::NAN).render(), "null");
+
+        // Python's `repr` of a float is free to use an exponent, and the
+        // timestamps in the store are floats it wrote.
+        assert_eq!(parse("1e3"), Some(Value::Number(1000.0)));
+        assert_eq!(parse("1E+3"), Some(Value::Number(1000.0)));
+        assert_eq!(parse("-2.5e-2"), Some(Value::Number(-0.025)));
         // A well-formed document with room around it is still well formed.
         assert_eq!(
             parse(" {\"a\" : 1 } \n"),
@@ -449,6 +495,14 @@ mod tests {
         let text = r#"{"version":1,"picks":{"/home/a/src":{"n":3,"t":1700000000.5}}}"#;
         let value = parse(text).expect("a well-formed document should parse");
         assert_eq!(value.render(), text);
+
+        // The rest of the vocabulary, which the picker's body uses even though
+        // the store does not.
+        let mixed = r#"{"a":[true,false,null,[],{}],"b":-2.5}"#;
+        assert_eq!(
+            parse(mixed).expect("arrays and literals parse").render(),
+            mixed
+        );
         assert_eq!(
             value,
             Value::Object(vec![

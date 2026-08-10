@@ -29,7 +29,13 @@ const SECONDS_PER_DAY: f64 = 86400.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pick {
     /// How many times an agent was started here.
-    pub count: u32,
+    ///
+    /// Signed, because the daemon's reader takes whatever `int()` takes and a
+    /// hand-edited `-1` is a row it keeps. Refusing it here would not merely
+    /// ignore that row: [`Recents::render`] rewrites the whole shared file, so
+    /// a row this reader drops is a row deleted out from under the Python
+    /// daemon. A negative count simply ranks below every real pick.
+    pub count: i64,
     /// When the last one was, in seconds since the epoch.
     pub at: f64,
 }
@@ -55,12 +61,18 @@ impl Recents {
         let Some(members) = document.get("picks").and_then(Value::as_object) else {
             return Recents::default();
         };
-        Recents {
-            picks: members
-                .iter()
-                .filter_map(|(path, row)| Some((path.clone(), pick_of(row)?)))
-                .collect(),
+        let mut picks: Vec<(String, Pick)> = Vec::with_capacity(members.len());
+        for (path, row) in members {
+            let Some(pick) = pick_of(row) else { continue };
+            // A key written twice is one directory, and the last one written
+            // is the one Python's decoder keeps. Two rows for one path would
+            // otherwise be scored off the first and both written back.
+            match picks.iter_mut().find(|(known, _)| known == path) {
+                Some((_, seen)) => *seen = pick,
+                None => picks.push((path.clone(), pick)),
+            }
         }
+        Recents { picks }
     }
 
     /// How strong a signal this directory is, now.
@@ -70,13 +82,7 @@ impl Recents {
     /// rather than checking first. `now` is an argument because the core has
     /// no clock.
     pub fn score(&self, path: &str, now: f64) -> f64 {
-        let Some(pick) = self.get(path) else {
-            return 0.0;
-        };
-        // A clock that went backwards, or a timestamp from the future, must
-        // not be worth more than the present.
-        let age_days = ((now - pick.at) / SECONDS_PER_DAY).max(0.0);
-        f64::from(pick.count) * 0.5f64.powf(age_days / HALF_LIFE_DAYS)
+        self.get(path).map_or(0.0, |pick| score_of(pick, now))
     }
 
     /// Record that an agent was started here.
@@ -99,18 +105,20 @@ impl Recents {
 
     /// The strongest directories, strongest first.
     pub fn strongest(&self, now: f64, how_many: usize) -> Vec<&str> {
-        let mut ranked: Vec<&(String, Pick)> = self.picks.iter().collect();
+        // Scored once each rather than inside the comparator, which would ask
+        // the same `powf` a few thousand times over for two hundred picks.
+        let mut ranked: Vec<(f64, &str)> = self
+            .picks
+            .iter()
+            .map(|(path, pick)| (score_of(*pick, now), path.as_str()))
+            .collect();
         // By score, and by path where two scores are equal, so the answer does
         // not depend on what order the file happened to be written in.
-        ranked.sort_by(|left, right| {
-            self.score(&right.0, now)
-                .total_cmp(&self.score(&left.0, now))
-                .then_with(|| left.0.cmp(&right.0))
-        });
+        ranked.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1)));
         ranked
             .into_iter()
             .take(how_many)
-            .map(|(path, _)| path.as_str())
+            .map(|(_, path)| path)
             .collect()
     }
 
@@ -132,12 +140,22 @@ impl Recents {
         if self.picks.len() <= MAX {
             return;
         }
-        let keep: Vec<String> = self
-            .strongest(now, MAX)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        self.picks.retain(|(path, _)| keep.contains(path));
+        let mut order: Vec<usize> = (0..self.picks.len()).collect();
+        let score = |index: usize| score_of(self.picks[index].1, now);
+        order.sort_by(|&left, &right| {
+            score(right)
+                .total_cmp(&score(left))
+                .then_with(|| self.picks[left].0.cmp(&self.picks[right].0))
+        });
+        let mut keep = vec![false; self.picks.len()];
+        for &index in order.iter().take(MAX) {
+            keep[index] = true;
+        }
+        let mut index = 0;
+        self.picks.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
     }
 
     /// This directory's history, if it has one.
@@ -161,7 +179,7 @@ impl Recents {
                             (
                                 path.clone(),
                                 Value::Object(vec![
-                                    ("n".to_string(), Value::Number(f64::from(pick.count))),
+                                    ("n".to_string(), Value::Number(pick.count as f64)),
                                     ("t".to_string(), Value::Number(pick.at)),
                                 ]),
                             )
@@ -189,21 +207,59 @@ pub fn key(path: &str) -> String {
     trimmed.to_string()
 }
 
+/// How strong a pick is, now.
+///
+/// Frecency: how often, discounted by how long ago.
+fn score_of(pick: Pick, now: f64) -> f64 {
+    // A clock that went backwards, or a timestamp from the future, must not be
+    // worth more than the present.
+    let age_days = ((now - pick.at) / SECONDS_PER_DAY).max(0.0);
+    pick.count as f64 * 0.5f64.powf(age_days / HALF_LIFE_DAYS)
+}
+
 /// One row of the store, or `None` if it is not one.
 ///
-/// A count that is negative or not whole is not a count. The daemon's reader
-/// takes whatever `int()` accepts; refusing the row here costs one directory's
-/// history and keeps a negative count from outranking every real pick.
+/// This is deliberately as permissive as `_recents_load`, and for a reason
+/// beyond ranking: [`Recents::render`] rewrites the *whole* shared file, so a
+/// row this reader refuses is a row **deleted** from the store the Python
+/// daemon is still reading. So `n` takes what `int()` takes — a float, which
+/// truncates, or a string of digits — and `t` takes what `float()` takes.
+/// What is left over is exactly what the daemon drops too, and the daemon's
+/// own `note_project_pick` deletes those on its next write for the same
+/// reason.
+///
+/// The one departure: a non-finite number becomes 0 rather than travelling on.
+/// Python would carry a `NaN` into its sort; here a `NaN` score would poison
+/// the total order the picker repaints itself from on every keystroke.
 fn pick_of(row: &Value) -> Option<Pick> {
-    let count = row.get("n")?.as_number()?;
-    let at = row.get("t")?.as_number()?;
-    if !count.is_finite() || count < 0.0 || count.fract() != 0.0 || !at.is_finite() {
-        return None;
+    let count = as_int(row.get("n")?)?;
+    let at = as_float(row.get("t")?)?;
+    Some(Pick { count, at })
+}
+
+/// What Python's `int()` would make of this value, if it would make anything.
+fn as_int(value: &Value) -> Option<i64> {
+    let number = match value {
+        Value::Number(number) => *number,
+        // `int("3")` is 3; `int("3.5")` raises, and so does this.
+        Value::String(text) => return text.trim().parse().ok(),
+        _ => return None,
+    };
+    if !number.is_finite() {
+        return Some(0);
     }
-    Some(Pick {
-        count: count.min(f64::from(u32::MAX)) as u32,
-        at,
-    })
+    // `int(3.7)` truncates towards zero rather than rounding.
+    Some(number.trunc() as i64)
+}
+
+/// What Python's `float()` would make of this value, if it would make anything.
+fn as_float(value: &Value) -> Option<f64> {
+    let number = match value {
+        Value::Number(number) => *number,
+        Value::String(text) => text.trim().parse().ok()?,
+        _ => return None,
+    };
+    Some(if number.is_finite() { number } else { 0.0 })
 }
 
 #[cfg(test)]
@@ -241,15 +297,14 @@ mod tests {
             empty,
             "picks that is not an object"
         );
-        // A row that is not a row is dropped; the rest of the store survives,
-        // because one hand-edited line must not cost every other pick.
+        // A row that is genuinely not a row is dropped; the rest of the store
+        // survives, because one hand-edited line must not cost every other
+        // pick.
         let mixed = Recents::parse(concat!(
             "{\"version\":1,\"picks\":{",
             "\"/a\":{\"n\":2},",
             "\"/b\":{\"t\":5},",
             "\"/c\":\"nonsense\",",
-            "\"/d\":{\"n\":-1,\"t\":5},",
-            "\"/e\":{\"n\":1.5,\"t\":5},",
             "\"/good\":{\"n\":4,\"t\":9}",
             "}}"
         ));
@@ -257,6 +312,74 @@ mod tests {
             mixed.render(),
             "{\"version\":1,\"picks\":{\"/good\":{\"n\":4,\"t\":9}}}"
         );
+    }
+
+    // AYEAYE-50 — render() rewrites the whole file, and that file is shared
+    // with the Python daemon for as long as both run. So a row this reader
+    // refuses is a row *deleted* out from under it, and the reader has to take
+    // everything `int(rec["n"])` and `float(rec["t"])` take: a float, which
+    // truncates, a string of digits, and a negative count.
+    #[test]
+    fn a_row_the_python_daemon_would_keep_is_not_deleted_from_the_shared_file() {
+        let store = Recents::parse(concat!(
+            "{\"version\": 1, \"picks\": {",
+            "\"/truncates\": {\"n\": 1.7, \"t\": 5},",
+            "\"/stringy\": {\"n\": \"3\", \"t\": \"5.5\"},",
+            "\"/negative\": {\"n\": -1, \"t\": 5}",
+            "}}"
+        ));
+        assert_eq!(store.len(), 3, "every one of these survives `int()`");
+        assert_eq!(store.get("/truncates").map(|pick| pick.count), Some(1));
+        assert_eq!(store.get("/stringy").map(|pick| pick.count), Some(3));
+        assert_eq!(store.get("/stringy").map(|pick| pick.at), Some(5.5));
+        assert_eq!(store.get("/negative").map(|pick| pick.count), Some(-1));
+        // And a negative count ranks below a directory nobody has picked at
+        // all, rather than above every real one.
+        assert!(store.score("/negative", 5.0) < store.score("/unknown", 5.0));
+        // A string `int()` would refuse is refused here too, which is the one
+        // direction where dropping the row matches the daemon dropping it.
+        assert_eq!(
+            Recents::parse("{\"picks\":{\"/x\":{\"n\":\"3.5\",\"t\":5}}}").len(),
+            0
+        );
+    }
+
+    // AYEAYE-50 — a key written twice is one directory, and Python's decoder
+    // keeps the last one. Two rows for one path would otherwise be scored off
+    // the first and both written back.
+    #[test]
+    fn a_repeated_key_is_the_last_one_written() {
+        let store =
+            Recents::parse("{\"picks\":{\"/a\":{\"n\":1,\"t\":1},\"/a\":{\"n\":9,\"t\":9}}}");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("/a").map(|pick| pick.count), Some(9));
+        assert_eq!(
+            store.render(),
+            "{\"version\":1,\"picks\":{\"/a\":{\"n\":9,\"t\":9}}}"
+        );
+    }
+
+    // AYEAYE-50 — what `json.dump` actually writes: spaces after the
+    // separators, and every non-ASCII character escaped. A reader that only
+    // took this module's own compact output would agree with itself and with
+    // nothing else.
+    #[test]
+    fn a_store_python_wrote_is_read_and_written_back_as_ascii() {
+        let store = Recents::parse(
+            "{\"version\": 1, \"picks\": {\"/home/a/caf\\u00e9\": {\"n\": 3, \"t\": 1699000000.0}}}",
+        );
+        assert_eq!(
+            store.get("/home/a/caf\u{e9}").map(|pick| pick.count),
+            Some(3)
+        );
+        let written = store.render();
+        assert!(written.is_ascii(), "{written}");
+        assert_eq!(
+            written,
+            "{\"version\":1,\"picks\":{\"/home/a/caf\\u00e9\":{\"n\":3,\"t\":1699000000}}}"
+        );
+        // And back again, unchanged: the two daemons agree about this file.
+        assert_eq!(Recents::parse(&written), store);
     }
 
     // AYEAYE-50 — frecency: how often, discounted by how long ago. Halving
@@ -350,6 +473,46 @@ mod tests {
             ],
             "strongest first"
         );
+    }
+
+    // AYEAYE-50 — "strongest", not "most recent". A directory picked fifty
+    // times a fortnight ago is a stronger signal than a directory opened once
+    // today, and a trim that kept the newest would drop exactly the one the
+    // picker exists to surface. This is the mutation the first version of the
+    // test above could not see, because there strength and recency agreed.
+    #[test]
+    fn a_well_used_directory_survives_a_flood_of_directories_seen_once() {
+        let now = 1_000_000_000.0;
+        let fortnight_ago = now - 14.0 * 86400.0;
+        let mut store = Recents::default();
+        for _ in 0..50 {
+            store.record("/home/a/the-one", fortnight_ago);
+        }
+        // 25 after halving, against a score of 1 each for the newcomers.
+        for index in 0..super::MAX {
+            store.record(&format!("/home/a/seen-once{index}"), now);
+        }
+        assert_eq!(store.len(), super::MAX);
+        assert!(
+            store.get("/home/a/the-one").is_some(),
+            "fifty picks a fortnight ago outrank one pick today"
+        );
+        assert_eq!(store.strongest(now, 1), vec!["/home/a/the-one"]);
+    }
+
+    // AYEAYE-50 — the picker repaints on every keystroke, so two equal scores
+    // have to come back in the same order every time. Insertion order would
+    // make the answer depend on what order the file happened to be written in.
+    #[test]
+    fn two_equal_scores_are_broken_by_the_path() {
+        let store = Recents::parse(concat!(
+            "{\"picks\":{",
+            "\"/b\":{\"n\":1,\"t\":5},",
+            "\"/a\":{\"n\":1,\"t\":5},",
+            "\"/c\":{\"n\":1,\"t\":5}",
+            "}}"
+        ));
+        assert_eq!(store.strongest(5.0, 3), vec!["/a", "/b", "/c"]);
     }
 
     // AYEAYE-50 — the store is keyed by path, and two spellings of one
