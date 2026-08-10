@@ -51,13 +51,21 @@ pub fn children(text: &str) -> Vec<u32> {
 /// contains three of them. Entries are matched whole, so `OLD_SSH_CONNECTION`
 /// does not answer for it. Bytes are decoded lossily: an environment nobody can
 /// decode is not a reason to fail a request.
+///
+/// An entry that is set but empty is skipped rather than ending the search, the
+/// same way [`super::ps::ssh_peer_in_command`] does — this is the one question
+/// the two platforms must answer identically, and two implementations of it
+/// answering differently is the failure the module they replace was extracted
+/// to stop.
 pub fn ssh_peer(environ: &[u8]) -> Option<String> {
     const NAME: &[u8] = b"SSH_CONNECTION=";
-    let entry = environ
+    environ
         .split(|byte| *byte == 0)
-        .find(|entry| entry.starts_with(NAME))?;
-    let value = String::from_utf8_lossy(&entry[NAME.len()..]);
-    Some(value.split_whitespace().next()?.to_string())
+        .filter(|entry| entry.starts_with(NAME))
+        .find_map(|entry| {
+            let value = String::from_utf8_lossy(&entry[NAME.len()..]);
+            Some(value.split_whitespace().next()?.to_string())
+        })
 }
 
 #[cfg(test)]
@@ -191,6 +199,27 @@ mod tests {
             "SSH_CONNECTION=100.101.102.103 54321 100.64.0.1 22",
         ]);
         assert_eq!(ssh_peer(&block).as_deref(), Some("100.101.102.103"));
+    }
+
+    // AYEAYE-44 — set but empty is not an address, and it is not the end of
+    // the search either: this is the one question both platforms must answer
+    // identically, and the module exists because two implementations of it is
+    // how they stopped doing so.
+    #[test]
+    fn an_empty_value_does_not_end_the_search() {
+        let block = environ(&[
+            "SSH_CONNECTION=",
+            "SSH_TTY=/dev/pts/4",
+            "SSH_CONNECTION=10.0.0.9 1 2 3",
+        ]);
+        assert_eq!(ssh_peer(&block).as_deref(), Some("10.0.0.9"));
+        assert_eq!(
+            ssh_peer(&block),
+            crate::process::ps::ssh_peer_in_command(
+                "SSH_CONNECTION= SSH_TTY=/dev/pts/4 SSH_CONNECTION=10.0.0.9 1 2 3"
+            ),
+            "the two platforms answer this question with one answer or not at all"
+        );
     }
 
     // AYEAYE-44 — set but empty is not an address.
