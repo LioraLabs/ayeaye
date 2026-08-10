@@ -10,5 +10,6 @@
 //! process and hoping.
 
 pub mod assets;
+pub mod cliban;
 pub mod config;
 pub mod server;

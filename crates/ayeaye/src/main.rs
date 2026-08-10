@@ -52,7 +52,9 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_BIND           address to bind (default 127.0.0.1)
   AYEAYE_DEV_PORT       port to bind (default 8912)
   AYEAYE_ALLOWED_HOSTS  comma-separated extra Host values to answer to
-  AYEAYE_TOKEN          the shared secret; otherwise read from the state file";
+  AYEAYE_TOKEN          the shared secret; otherwise read from the state file
+  AYEAYE_CLIBAN         the cliban the board tab reads (legacy VOICE_CLIBAN);
+                        otherwise the first on PATH, else ~/.cargo/bin/cliban";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {
@@ -72,7 +74,11 @@ fn serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let settings = match Settings::resolve(args, config::env_var, token) {
+    // Resolved before the arguments are parsed for the same reason the token
+    // is: both are the machine's answer rather than the caller's, and neither
+    // should depend on which flags were typed.
+    let cliban = ayeaye::cliban::Cliban::new(config::locate_cliban());
+    let settings = match Settings::resolve(args, config::env_var, token, cliban) {
         Ok(settings) => settings,
         Err(why) => {
             eprintln!("ayeaye: {why}\n\n{USAGE}");

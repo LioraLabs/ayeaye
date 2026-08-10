@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use ayeaye_core::http::hosts::AllowedHosts;
 
+use crate::cliban::Cliban;
+
 /// The port the Rust daemon listens on until the cutover.
 ///
 /// Deliberately not 8911. The Python daemon keeps the real port for the rest
@@ -34,6 +36,10 @@ pub struct Settings {
     pub allowed_hosts: AllowedHosts,
     /// The shared secret every gated request has to present.
     pub token: String,
+    /// The cliban the board endpoints ask. Resolved once, at startup, because
+    /// that is when the daemon resolves it and because a PATH search per
+    /// request is a directory walk per request.
+    pub cliban: Cliban,
 }
 
 /// Why a configuration could not be resolved.
@@ -67,6 +73,9 @@ impl Settings {
     /// Resolve the settings from arguments, the environment, and a token the
     /// caller has already found.
     ///
+    /// `token` and `cliban` arrive resolved, for the same reason: finding them
+    /// means reading a file and walking a PATH, and neither is a decision.
+    ///
     /// `env` is a lookup rather than `std::env` so this is a decision a test
     /// can drive. It is handed the *bare* name — `BIND`, `DEV_PORT` — and is
     /// expected to try `AYEAYE_<name>` before the legacy `VOICE_REMOTE_<name>`,
@@ -77,6 +86,7 @@ impl Settings {
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
         token: String,
+        cliban: Cliban,
     ) -> Result<Settings, ConfigError> {
         let mut bind = env("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let mut port = match env("DEV_PORT") {
@@ -109,6 +119,7 @@ impl Settings {
             bind,
             port,
             token,
+            cliban,
         })
     }
 
@@ -116,6 +127,60 @@ impl Settings {
     pub fn address(&self) -> String {
         format!("{}:{}", self.bind, self.port)
     }
+}
+
+/// Where the `cliban` the board endpoints run lives.
+///
+/// The daemon resolves this once at startup rather than per call, and the
+/// comment on its own line says why: the systemd user PATH does not include
+/// `~/.cargo/bin`, which is where cargo puts it. So a PATH search alone is not
+/// enough, and neither is the fallback alone.
+///
+/// `look_up` and `executable` are arguments so the order is testable without a
+/// process environment or a directory of stand-ins.
+pub fn choose_cliban(
+    look_up: impl Fn(&str) -> Option<String>,
+    executable: impl Fn(&Path) -> bool,
+) -> String {
+    // `AYEAYE_CLIBAN` first for the name this daemon will be configured under,
+    // then the one the Python daemon reads today. Not `VOICE_REMOTE_CLIBAN`:
+    // that prefix belongs to the server's own settings and nothing has ever
+    // set this under it.
+    for name in ["AYEAYE_CLIBAN", "VOICE_CLIBAN"] {
+        if let Some(named) = look_up(name).filter(|value| !value.trim().is_empty()) {
+            return named.trim().to_string();
+        }
+    }
+    if let Some(path) = look_up("PATH") {
+        for directory in path.split(':').filter(|entry| !entry.is_empty()) {
+            let candidate = Path::new(directory).join("cliban");
+            if executable(&candidate) {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Left as a literal `~` when there is no home to expand it against, which
+    // is what `os.path.expanduser` does: a name that cannot be spawned states
+    // its reason, where an empty one would spawn the current directory.
+    match look_up("HOME").filter(|home| !home.trim().is_empty()) {
+        Some(home) => format!("{}/.cargo/bin/cliban", home.trim_end_matches('/')),
+        None => "~/.cargo/bin/cliban".to_string(),
+    }
+}
+
+/// [`choose_cliban`], against the real environment and the real filesystem.
+///
+/// The one effectful wrapper, beside [`load_token`], and called once at startup
+/// rather than per request.
+pub fn locate_cliban() -> String {
+    choose_cliban(
+        |name| std::env::var(name).ok(),
+        |path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path)
+                .is_ok_and(|found| found.is_file() && found.permissions().mode() & 0o111 != 0)
+        },
+    )
 }
 
 fn parse_port(value: &str) -> Result<u16, ConfigError> {
@@ -231,7 +296,69 @@ mod tests {
         list: &[&str],
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Settings, ConfigError> {
-        Settings::resolve(&args(list), env, "s3cret".to_string())
+        Settings::resolve(
+            &args(list),
+            env,
+            "s3cret".to_string(),
+            super::Cliban::new("/nonexistent/cliban".to_string()),
+        )
+    }
+
+    // AYEAYE-53 — the daemon resolves cliban once at startup as
+    // `VOICE_CLIBAN or shutil.which("cliban") or ~/.cargo/bin/cliban`, and the
+    // third clause is the load-bearing one: the systemd user PATH does not
+    // include `~/.cargo/bin`, so a service that only searched PATH would find
+    // nothing on the very machine this runs on.
+    #[test]
+    fn cliban_is_found_where_the_daemon_looks_for_it() {
+        let env = |values: Vec<(&'static str, &'static str)>| {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let nothing_runs = |_: &Path| false;
+
+        // The variable wins outright, even over something on PATH.
+        assert_eq!(
+            super::choose_cliban(
+                env(vec![("VOICE_CLIBAN", "/opt/cliban"), ("PATH", "/bin")]),
+                |_| true
+            ),
+            "/opt/cliban"
+        );
+        // Then PATH, in order, taking the first entry that is executable.
+        assert_eq!(
+            super::choose_cliban(env(vec![("PATH", "/empty:/bin:/usr/bin")]), |path| path
+                == Path::new("/bin/cliban")
+                || path == Path::new("/usr/bin/cliban")),
+            "/bin/cliban"
+        );
+        // A PATH entry that holds the name but cannot be run is not the answer.
+        assert_eq!(
+            super::choose_cliban(
+                env(vec![("PATH", "/notexec:/bin"), ("HOME", "/home/tester")]),
+                |path| path == Path::new("/bin/cliban")
+            ),
+            "/bin/cliban"
+        );
+        // Nothing on PATH: the cargo directory, which is where it usually is
+        // and where the service manager's PATH will not look.
+        assert_eq!(
+            super::choose_cliban(
+                env(vec![("PATH", "/bin"), ("HOME", "/home/tester")]),
+                nothing_runs
+            ),
+            "/home/tester/.cargo/bin/cliban"
+        );
+        // No PATH and no HOME at all: still a name, so the failure is a stated
+        // reason from the spawn rather than an empty argv.
+        assert_eq!(
+            super::choose_cliban(env(vec![]), nothing_runs),
+            "~/.cargo/bin/cliban"
+        );
     }
 
     // AYEAYE-42 — the newer name wins, and the legacy one is only used when it

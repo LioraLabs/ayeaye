@@ -108,6 +108,7 @@ fn settings_on_port(port: u16) -> Settings {
         port,
         allowed_hosts: AllowedHosts::new("127.0.0.1", port, ""),
         token: TOKEN.to_string(),
+        cliban: ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
     }
 }
 

@@ -25,11 +25,14 @@ ayeaye-infer.workspace = true
 # here: ayeaye-core is synchronous, and the constitution's effect budget
 # refuses `tokio` inside it.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# `process` and `time` for the board endpoints: the standard library has no
+# wait-with-timeout, and a request that waits on a wedged cliban forever is
+# the broken panel AYEAYE-53 exists to avoid.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.
 form_urlencoded = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
