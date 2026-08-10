@@ -373,9 +373,10 @@ pub fn state_dir() -> Option<PathBuf> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        // Not `std::env::home_dir`: the workspace declares an MSRV of 1.85 and
-        // nothing here builds at it, so the un-deprecation is not worth
-        // depending on for a daemon that only runs on Unix anyway.
+        // Not `std::env::home_dir`: on Unix — the only place this daemon
+        // runs — it consults `$HOME` first anyway, so the un-deprecated
+        // function would add a platform-generality layer this read of the
+        // variable already matches.
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
