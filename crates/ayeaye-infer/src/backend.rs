@@ -45,6 +45,21 @@ pub const fn selected() -> Backend {
     }
 }
 
+/// The candle device a backend runs on.
+///
+/// One line per backend today, because a CPU build has one answer. AYEAYE-57
+/// owns turning this into a real selection — asking whether the device is
+/// actually there and falling back to the CPU with a stated reason — and this
+/// is the function it replaces. It lives here rather than beside either model
+/// so that there is one of it to replace.
+pub fn device(backend: Backend) -> candle_core::Result<candle_core::Device> {
+    match backend {
+        Backend::Cpu => Ok(candle_core::Device::Cpu),
+        Backend::Cuda => candle_core::Device::new_cuda(0),
+        Backend::Metal => candle_core::Device::new_metal(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Backend, selected};

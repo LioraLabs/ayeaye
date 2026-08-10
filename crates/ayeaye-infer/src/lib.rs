@@ -5,7 +5,9 @@
 //! discovers belongs in the core rather than here.
 
 pub mod backend;
+pub mod language;
 pub mod speech;
 
 pub use backend::Backend;
+pub use language::{LanguageError, LanguageModel};
 pub use speech::{Segment, SpeechError, SpeechModel, SpeechSlot, Transcript};
