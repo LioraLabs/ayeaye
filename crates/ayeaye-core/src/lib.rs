@@ -12,9 +12,11 @@
 
 pub mod http;
 pub mod identity;
+pub mod machine;
 pub mod service;
 
 pub use identity::Identity;
+pub use machine::Machine;
 
 /// The version this build claims to be.
 ///

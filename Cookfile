@@ -113,9 +113,12 @@ recipe suite
 # consumes them, but it does not take them as arguments.
 #
 # `fixtures` is sealed here as well as on the bash suite: the Rust tests read
-# the captured unit fixtures through `include_str!`, so a golden file is an
-# input to `cargo test` that the `rust` probe - a glob under crates/ - cannot
-# see. Without it, editing a fixture replays yesterday's green.
+# the captured unit and probe fixtures through `include_str!`, so a golden file
+# is an input to `cargo test` that appears on no command line and that the
+# `rust` probe - a glob under crates/ - cannot see. Without it, editing a
+# fixture leaves the release gate replaying a cached green over a corpus that
+# moved.
+
 recipe rust-suite
     ingredients "Cargo.toml"
     seal rust
