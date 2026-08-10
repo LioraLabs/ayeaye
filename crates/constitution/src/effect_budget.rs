@@ -76,10 +76,20 @@ const BUDGET: &[Budget] = &[
         mode: Match::Prefix,
         why: "channels imply threads, which the core does not have",
     },
+    // The bare-module entries below are what stop an alias laundering a reach:
+    // `use std::time as t` makes `t::Instant` unrecognisable to any scan, so
+    // the module import itself is refused and the item import is not.
+    // `ancestors_of_every_prefix_entry_are_covered` keeps this list honest —
+    // every new prefix entry needs its ancestors here or the test fails.
     Budget {
         reach: "std::time",
         mode: Match::Exact,
         why: "import the item, not the module: a module alias hides the clock",
+    },
+    Budget {
+        reach: "std::sync",
+        mode: Match::Exact,
+        why: "import the item, not the module: a module alias hides the channels",
     },
     Budget {
         reach: "std",
@@ -108,16 +118,17 @@ const EFFECTFUL_MACROS: &[&str] = &["print", "println", "eprint", "eprintln", "d
 /// normally caught first, and this catches the receiver that arrived as an
 /// argument.
 ///
-/// `read` and `write` are deliberately absent: they are `RwLock`'s, and a pure
-/// crate may hold a lock. A name that a pure receiver also answers to belongs
-/// in the reach scan, not here.
+/// The test for admission is that the name means the effect on its own. A name
+/// a pure receiver could plausibly answer to belongs in the reach scan, where
+/// the type it came from can be seen, and not here — so `read` and `write`
+/// (which are `RwLock`'s) are out, and so are `open`, `create` and `flush`,
+/// which are ordinary English and would convict the first pure type that used
+/// one. There is no per-violation waiver until AYEAYE-64, so a false positive
+/// here costs a rule edit.
 const EFFECTFUL_METHODS: &[&str] = &[
     "read_to_string",
     "read_to_end",
     "write_all",
-    "flush",
-    "open",
-    "create",
     "canonicalize",
     "create_dir_all",
     "remove_file",
@@ -672,21 +683,19 @@ mod tests {
     // that ends a range is not the dot that starts one.
     #[test]
     fn a_range_is_not_a_method_call() {
-        assert!(
-            scan("a.rs", "fn f() { let r = a..flush(b); }\n").is_empty(),
-            "{:?}",
-            scan("a.rs", "fn f() { let r = a..flush(b); }\n")
-        );
+        let range = "fn f() { let r = a..write_all(b); }\n";
+        assert!(scan("a.rs", range).is_empty(), "{:?}", scan("a.rs", range));
         assert_eq!(
-            what(&scan("a.rs", "fn f() { a.flush(); }\n")),
-            vec![".flush()"]
+            what(&scan("a.rs", "fn f() { a.write_all(b); }\n")),
+            vec![".write_all()"]
         );
     }
 
     // AYEAYE-41 — a pure crate may legitimately hold a lock, and locking is
-    // not an effect the budget is about.
+    // not an effect the budget is about. The same goes for any name that is
+    // ordinary English rather than the effect itself.
     #[test]
-    fn taking_a_write_lock_is_not_an_effect() {
+    fn a_method_name_a_pure_receiver_could_answer_to_is_not_an_effect() {
         assert!(
             scan(
                 "a.rs",
@@ -694,6 +703,39 @@ mod tests {
             )
             .is_empty()
         );
+        assert!(scan("a.rs", "fn f(d: &Dialog) { d.open(); }\n").is_empty());
+        assert!(scan("a.rs", "fn f(b: &Builder) { b.create(); }\n").is_empty());
+    }
+
+    // AYEAYE-41 — the property that makes "aliases do not launder a reach"
+    // true, rather than true of the entries somebody remembered. A prefix
+    // entry deeper than a top-level module can be reached through an alias of
+    // any module above it, so every one of those has to be refused too.
+    #[test]
+    fn ancestors_of_every_prefix_entry_are_covered() {
+        for entry in super::BUDGET {
+            let segments: Vec<&str> = entry.reach.split("::").collect();
+            for depth in 1..segments.len() {
+                let ancestor = segments[..depth].join("::");
+                assert!(
+                    super::judge(&ancestor).is_some(),
+                    "{} can be reached through an alias of {ancestor}, which nothing refuses \
+                     — add an exact entry for it",
+                    entry.reach
+                );
+            }
+        }
+    }
+
+    // AYEAYE-41 — the concrete case the invariant above was missing.
+    #[test]
+    fn a_module_alias_above_a_forbidden_reach_is_refused() {
+        assert_eq!(what(&scan("a.rs", "use std::sync;\n")), vec!["std::sync"]);
+        assert_eq!(
+            what(&scan("a.rs", "use std::sync as sy;\n")),
+            vec!["std::sync"]
+        );
+        assert!(scan("a.rs", "use std::sync::Arc;\n").is_empty());
     }
 
     fn what(findings: &[crate::Finding]) -> Vec<&str> {

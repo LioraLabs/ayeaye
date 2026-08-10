@@ -39,14 +39,19 @@ compared, brace groups and nesting and `self` and globs included, and the
   `dbg!` and their siblings. This is the shape that made an earlier version of
   this rule green and blind at the same time.
 - A short list of method names that are effectful whatever the receiver is
-  (`EFFECTFUL_METHODS`), for the receiver that arrived as an argument. `read`
-  and `write` are deliberately **not** on it: those are `RwLock`'s, and a pure
-  crate may hold a lock.
+  (`EFFECTFUL_METHODS`), for the receiver that arrived as an argument. A name
+  earns its place by meaning the effect on its own: `read`, `write`, `open`,
+  `create` and `flush` are all deliberately **absent**, because a pure type
+  could answer to any of them and there is no per-violation waiver to let one
+  off with.
 
 **Aliases do not launder a reach.** `use std as s`, `use std::time as t`,
 `extern crate std as s`, and `use r#std::fs` all resolve to the reach they
-really name. The budget refuses the bare `std` and bare `std::time` imports
-outright for this reason: import the item, not the module.
+really name. An alias is only opaque when the *module* is imported, so every
+module above a forbidden reach is refused outright — import the item, not the
+module. That is a property of the table rather than of the entries somebody
+remembered: a test walks every entry's ancestors and fails if one of them is
+unrefused, so a new deep entry cannot land without its cover.
 
 **Comments and literals are not code.** They are blanked before scanning, or
 this file and the budget table itself would convict the crate that holds them.
@@ -138,6 +143,13 @@ workspace. It also asserts the corpus walk found a non-trivial number of files,
 and that every crate the strata place contributed at least one — a walk that
 finds nothing passes every rule it feeds, silently, which is the failure those
 floors exist to make loud.
+
+It asserts one more thing, which is about the build system rather than about
+the code: **every workspace member lives under `crates/`.** The Cookfile's
+`rust` probe is a glob rooted there, and a member outside it would be read by
+this walk and invisible to that probe — a green release gate over source
+nothing rebuilt on. Move a member and the probe moves with it, in the same
+commit.
 
 ## Amending a rule
 

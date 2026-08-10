@@ -68,6 +68,22 @@ fn every_crate_the_strata_place_is_a_crate_the_walk_found() {
     }
 }
 
+// AYEAYE-41 — the build system's probe over the Rust sources is a glob under
+// `crates/`. A member outside it would be read by this walk and invisible to
+// that probe, which is a green release gate over source nothing rebuilt on.
+#[test]
+fn every_workspace_member_lives_under_crates() {
+    for member in &corpus().members {
+        assert!(
+            member.dir.starts_with("crates/"),
+            "{} sits at {}, outside the Cookfile's `rust` probe — move it under crates/, \
+             or widen the probe in the same commit",
+            member.name,
+            member.dir
+        );
+    }
+}
+
 // AYEAYE-41
 #[test]
 fn the_pure_core_stays_within_its_effect_budget() {

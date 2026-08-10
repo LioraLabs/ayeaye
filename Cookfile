@@ -6,9 +6,13 @@
 #   cook stamp     write the artifact's checksum into install.sh
 #   cook publish   tag and upload it  (refuses a dirty tree)
 #
-# The version lives in exactly one place - AYEAYE_VERSION at the top of
-# install.sh - and `release-version` fails if this file or anything else has
-# drifted from it.
+# The version lives in AYEAYE_VERSION at the top of install.sh, and
+# `release-version` fails if this file or the README has drifted from it.
+#
+# It is no longer the only place the tree claims a version: the Cargo
+# workspace carries one too, and neither `bump` nor `release-version` knows
+# about it yet. Teaching them is AYEAYE-59's, and until then a bump leaves the
+# crate manifest behind without anything saying so.
 #
 # Cutting a release is two commits, in this order:
 #
@@ -57,12 +61,27 @@ probe scripts
 # file list, so none of this appears on the command line and nothing else would
 # tell cook the answer had changed. The lockfile is in here because the suite
 # runs `--locked`: a moved dependency is a different answer.
+#
+# Every `.rs` under crates/, not a list of the directories anyone thought of.
+# The first version of this named src/ and tests/ and build.rs, and so went
+# green on a planted violation in benches/ that `cargo test` had already gone
+# red on - a stale pass on the release gate, from a probe that had quietly
+# stopped describing its own recipe. `constitution` asserts the other half of
+# this: that every workspace member really does live under crates/.
 probe rust
-    files { "Cargo.toml" "Cargo.lock" "crates/*/Cargo.toml" "crates/*/build.rs" "crates/*/src/*.rs" "crates/*/src/**/*.rs" "crates/*/tests/*.rs" "crates/*/tests/**/*.rs" }
+    files { "Cargo.toml" "Cargo.lock" "crates/*/*.rs" "crates/**/*.rs" "crates/*/Cargo.toml" }
 
 # The compiler is a determinant of what the suite says: a lint that fires on
 # one toolchain and not the next is exactly the drift `-D warnings` exists to
 # catch, and a cached green from the old one would hide it.
+#
+# It is the compiler's *version* that is folded, not the binary's bytes. Under
+# rustup, `cargo`, `rustc` and `cargo-clippy` are all the same shim - one hash
+# for all three, unmoved by the update that replaces the toolchain behind it -
+# so `tools { }` alone reports agreement it has not checked.
+probe rust:toolchain
+    { rustc --version --verbose && cargo clippy --version }
+
 probe rust:tools
     tools { cargo rustc cargo-clippy }
 
@@ -93,6 +112,7 @@ recipe suite
 recipe rust-suite
     ingredients "Cargo.toml"
     seal rust
+    seal rust:toolchain
     seal rust:tools
     test { cargo test --workspace --locked }
 
@@ -102,6 +122,7 @@ recipe rust-suite
 recipe rust-lint
     ingredients "Cargo.toml"
     seal rust
+    seal rust:toolchain
     seal rust:tools
     test { cargo clippy --workspace --all-targets --locked -- -D warnings }
 

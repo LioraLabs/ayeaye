@@ -9,6 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# Manifests are read as TOML because that is what they are. Nothing else here
-# needs a dependency: the corpus walk is twenty lines of std.
+# Manifests are read as TOML because that is what they are, and hand-rolling a
+# TOML parser to avoid a parser is not a trade worth making. It is not free:
+# this pulls a proc-macro tree into the release gate's build, and a cold
+# release machine now needs a registry it can reach. Nothing else here needs a
+# dependency - the corpus walk is std.
 toml = "0.9"
