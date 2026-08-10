@@ -16,7 +16,8 @@
 //! One list, so widening it widens both gates together and there is no second
 //! place to forget.
 //!
-//! Two deliberate departures from CPython, both stated rather than reproduced:
+//! Three deliberate departures from CPython, stated rather than reproduced —
+//! and a fourth on the netloc parse below:
 //!
 //! - `urlsplit` deletes ASCII tab and newline from anywhere in the URL before
 //!   parsing, so CPython reads `http://loc<TAB>alhost:8911` as `localhost:8911`
