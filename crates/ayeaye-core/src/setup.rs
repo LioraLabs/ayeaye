@@ -198,8 +198,7 @@ pub struct Existing {
 /// decision about entropy sources and belongs in the crate that is allowed to
 /// open `/dev/urandom`.
 pub fn urlsafe(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for group in bytes.chunks(3) {
         let mut packed = 0u32;

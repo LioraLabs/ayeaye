@@ -19,7 +19,7 @@
 //! It also does not install packages. It prints the command for this platform,
 //! from `machine::packages`, and stops.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use ayeaye_core::machine::Acceleration;
@@ -215,8 +215,7 @@ pub fn decide(
         // A file with nothing in it is not a key. `config::load_token` reads it
         // the same way, and disagreeing would mean setup keeps a key the daemon
         // then refuses to use.
-        key: std::fs::read_to_string(&places.token_file)
-            .is_ok_and(|held| !held.trim().is_empty()),
+        key: std::fs::read_to_string(&places.token_file).is_ok_and(|held| !held.trim().is_empty()),
         models: models::installed(&places.model_store),
     };
     let choices = Choices {
@@ -240,14 +239,23 @@ pub fn decide(
         let Some(consequence) = step.consequence() else {
             continue;
         };
-        let agreed = flags.yes || ask.confirm(&format!("{}. {}", step.describe(), consequence.question()), false);
+        let agreed = flags.yes
+            || ask.confirm(
+                &format!("{}. {}", step.describe(), consequence.question()),
+                false,
+            );
         match consequence {
             Consequence::Network => consent.network = agreed,
             Consequence::RunsAtLogin => consent.run_at_login = agreed,
         }
     }
 
-    plan(&machine, session.is_some(), &existing, &Choices { consent, ..choices })
+    plan(
+        &machine,
+        session.is_some(),
+        &existing,
+        &Choices { consent, ..choices },
+    )
 }
 
 /// Do it.
@@ -268,8 +276,10 @@ pub fn carry_out<R: Runner, F: Fetcher>(
         match step {
             Step::MintKey => {
                 let key = mint(&places.token_file)?;
-                did.lines
-                    .push(format!("generated the key at {}", places.token_file.display()));
+                did.lines.push(format!(
+                    "generated the key at {}",
+                    places.token_file.display()
+                ));
                 debug_assert!(!key.is_empty());
             }
             Step::WriteSettings => {
@@ -305,8 +315,10 @@ pub fn carry_out<R: Runner, F: Fetcher>(
                 did.lines
                     .push(format!("wrote {}", installed.path.display()));
                 if let Some(backup) = installed.backup {
-                    did.lines
-                        .push(format!("kept a copy of what was there at {}", backup.display()));
+                    did.lines.push(format!(
+                        "kept a copy of what was there at {}",
+                        backup.display()
+                    ));
                 }
             }
             Step::EnableService => {
@@ -327,23 +339,24 @@ pub fn carry_out<R: Runner, F: Fetcher>(
 
     for step in &plan.declined {
         if let Some(by_hand) = step.by_hand() {
-            did.declined
-                .push(format!("{} — `{by_hand}` when you want it", step.describe()));
+            did.declined.push(format!(
+                "{} — `{by_hand}` when you want it",
+                step.describe()
+            ));
         }
     }
 
     // The third answer, reached from here as well as from `ayeaye service`.
     if session.is_none() {
-        did.lines.extend(manual_instructions(
-            program,
-            &layout.env_file,
-        ));
+        did.lines
+            .extend(manual_instructions(program, &layout.env_file));
     }
 
     // Verified, never installed — and said whether or not anything else went
     // wrong, because it is the one thing without which none of the rest works.
     if !captured.has("tmux") {
-        did.lines.push("tmux is not installed, and ayeaye reads your agents through it.".to_string());
+        did.lines
+            .push("tmux is not installed, and ayeaye reads your agents through it.".to_string());
         did.lines.extend(captured.install_hint(&["tmux"]));
     }
 
@@ -357,17 +370,15 @@ pub fn carry_out<R: Runner, F: Fetcher>(
 /// between the two is a window in which the secret is world-readable.
 fn mint(path: &Path) -> Result<String, Failed> {
     let disk = |what: String| move |why: std::io::Error| Failed::Disk(format!("{what}: {why}"));
-    let bytes = std::fs::read(ENTROPY)
-        .map_err(disk(format!("read {ENTROPY}")))?
-        .into_iter()
-        .take(KEY_BYTES)
-        .collect::<Vec<u8>>();
-    if bytes.len() < KEY_BYTES {
-        return Err(Failed::Disk(format!(
-            "{ENTROPY} gave only {} bytes, which is not enough to make a key from",
-            bytes.len()
-        )));
-    }
+    // `read_exact` into a fixed buffer, and emphatically not `fs::read`:
+    // `/dev/urandom` is an endless stream with no EOF, so reading it to the end
+    // never returns. It hangs rather than failing, which is the worst shape a
+    // bug can have — `ayeaye setup` would simply stop, with the key half-made
+    // and nothing said.
+    let mut bytes = [0u8; KEY_BYTES];
+    std::fs::File::open(ENTROPY)
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(disk(format!("read {KEY_BYTES} bytes from {ENTROPY}")))?;
     let key = ayeaye_core::setup::urlsafe(&bytes);
 
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -419,7 +430,10 @@ fn write_settings(places: &Places, flags: &Flags) -> Result<String, Failed> {
         settings::upsert(&text, key, value)
     });
     if after == before && !before.is_empty() {
-        return Ok(format!("{} was already correct", places.config_file.display()));
+        return Ok(format!(
+            "{} was already correct",
+            places.config_file.display()
+        ));
     }
     std::fs::write(&places.config_file, after)
         .map_err(|why| Failed::Disk(format!("write {}: {why}", places.config_file.display())))?;
@@ -598,8 +612,17 @@ mod tests {
     // a misread option is a file written differently from what was asked.
     #[test]
     fn the_options_are_read_and_a_wrong_one_is_refused() {
-        let all = parse(&["--yes", "--no-service", "--bind", "0.0.0.0", "--port", "9000"]
-            .map(String::from))
+        let all = parse(
+            &[
+                "--yes",
+                "--no-service",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                "9000",
+            ]
+            .map(String::from),
+        )
         .expect("valid");
         assert!(all.yes && all.no_service);
         assert_eq!(all.bind.as_deref(), Some("0.0.0.0"));
@@ -616,8 +639,12 @@ mod tests {
         assert!(parse(&["--port".to_string(), "eight".to_string()]).is_err());
         assert!(parse(&["--model".to_string(), "not an id".to_string()]).is_err());
         assert!(
-            parse(&["--model".to_string(), "openai/whisper-tiny.en".to_string(), "--no-model".to_string()])
-                .is_err(),
+            parse(&[
+                "--model".to_string(),
+                "openai/whisper-tiny.en".to_string(),
+                "--no-model".to_string()
+            ])
+            .is_err(),
             "opposite things"
         );
     }
@@ -667,7 +694,9 @@ mod tests {
             runner.ran.borrow()
         );
         assert!(
-            did.declined.iter().any(|line| line.contains("ayeaye service enable")),
+            did.declined
+                .iter()
+                .any(|line| line.contains("ayeaye service enable")),
             "declining must never be a dead end: {:?}",
             did.declined
         );
@@ -688,7 +717,13 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
-        let decided = decide(&captured, &places(&root), Some(&session), &flags, &Assumed(false));
+        let decided = decide(
+            &captured,
+            &places(&root),
+            Some(&session),
+            &flags,
+            &Assumed(false),
+        );
         let runner = Recorder::default();
         let did = carry_out(
             &decided,
@@ -812,9 +847,15 @@ mod tests {
         .expect("written");
         let after = std::fs::read_to_string(&places.config_file).expect("readable");
         assert!(after.contains("AYEAYE_CLIBAN=/opt/cliban"), "{after}");
-        assert!(after.contains("# mine"), "a comment is somebody's note: {after}");
+        assert!(
+            after.contains("# mine"),
+            "a comment is somebody's note: {after}"
+        );
         assert!(after.contains("AYEAYE_BIND=127.0.0.1"), "{after}");
-        assert!(!after.contains("10.0.0.1"), "the old value is gone: {after}");
+        assert!(
+            !after.contains("10.0.0.1"),
+            "the old value is gone: {after}"
+        );
         assert!(after.contains("AYEAYE_DEV_PORT=9001"), "{after}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -850,7 +891,13 @@ mod tests {
             no_model: true,
             ..Flags::default()
         };
-        let agreed = decide(&captured, &places(&root), Some(&session), &flags, &Assumed(false));
+        let agreed = decide(
+            &captured,
+            &places(&root),
+            Some(&session),
+            &flags,
+            &Assumed(false),
+        );
         record_consent(&places(&root).state_dir, &agreed, "1000").expect("recorded");
 
         let declined = decide(
@@ -865,7 +912,8 @@ mod tests {
         );
         record_consent(&places(&root).state_dir, &declined, "2000").expect("recorded");
 
-        let held = std::fs::read_to_string(places(&root).state_dir.join("consent")).expect("a record");
+        let held =
+            std::fs::read_to_string(places(&root).state_dir.join("consent")).expect("a record");
         assert!(held.contains("1000 agreed start ayeaye now"), "{held}");
         assert!(
             held.contains("2000 declined start ayeaye now"),
@@ -903,7 +951,9 @@ mod tests {
         )
         .expect("a finished run");
         assert!(
-            did.lines.iter().any(|line| line.contains("run the server with: /opt/ayeaye")),
+            did.lines
+                .iter()
+                .any(|line| line.contains("run the server with: /opt/ayeaye")),
             "{:?}",
             did.lines
         );
@@ -937,12 +987,16 @@ mod tests {
         )
         .expect("a finished run");
         assert!(
-            did.lines.iter().any(|line| line.contains("tmux is not installed")),
+            did.lines
+                .iter()
+                .any(|line| line.contains("tmux is not installed")),
             "{:?}",
             did.lines
         );
         assert!(
-            did.lines.iter().any(|line| line.contains("packages needed: tmux")),
+            did.lines
+                .iter()
+                .any(|line| line.contains("packages needed: tmux")),
             "{:?}",
             did.lines
         );
@@ -968,7 +1022,15 @@ mod tests {
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         assert_eq!(build_acceleration(), Acceleration::Metal);
         // And whatever it is, it is one the core can compare against a machine.
-        assert_ne!(build_acceleration(), Acceleration::Rocm, "no ROCm backend exists");
-        assert_eq!(urlsafe(&[0, 0, 0]), "AAAA", "the core's encoder, not a second one");
+        assert_ne!(
+            build_acceleration(),
+            Acceleration::Rocm,
+            "no ROCm backend exists"
+        );
+        assert_eq!(
+            urlsafe(&[0, 0, 0]),
+            "AAAA",
+            "the core's encoder, not a second one"
+        );
     }
 }
