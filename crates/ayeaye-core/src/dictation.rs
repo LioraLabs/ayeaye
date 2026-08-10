@@ -229,9 +229,79 @@ pub fn on_sixteen_bit_scale(rms: f32) -> f32 {
     rms * 32_768.0
 }
 
+/// What tmux is holding while a recording is in progress.
+///
+/// The state lives in a file rather than in a process, and that is the whole
+/// design of the tmux path: there is deliberately no popup. A popup has to own
+/// the terminal to read a keystroke, and that fought everything — mouse
+/// reporting delivered escape sequences that read as "cancel", and toggling
+/// cbreak mode per keypress lost input entirely. Holding the state in a file and
+/// the indicator in a tmux option means there is nothing to close and no
+/// keyboard to capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct State {
+    /// The address the recorder is answering on.
+    pub host: String,
+    /// What to call that machine in a status-line message.
+    pub label: String,
+    /// The qualified id of the pane the words are going into.
+    pub pane: String,
+}
+
+impl State {
+    /// The file's contents.
+    pub fn encode(&self) -> String {
+        format!(
+            r#"{{"host":{},"label":{},"pane":{}}}"#,
+            json::string(&self.host),
+            json::string(&self.label),
+            json::string(&self.pane)
+        )
+    }
+
+    /// Read it back, or `None`.
+    ///
+    /// **`None` for anything that is not a whole state**, including a file torn
+    /// off half-written by a crash. That is a decision rather than leniency: the
+    /// alternative is a toggle that refuses forever, because the state that says
+    /// "you are recording" is also the state that has to be readable in order to
+    /// stop. Unreadable is treated as not recording, so the next keypress starts
+    /// one.
+    pub fn decode(text: &str) -> Option<State> {
+        let value = json::parse(text).ok()?;
+        let field = |name: &str| value.get(name).and_then(json::Value::text);
+        Some(State {
+            host: field("host")?.to_string(),
+            label: field("label")?.to_string(),
+            pane: field("pane")?.to_string(),
+        })
+    }
+}
+
+/// Which machine records, and what to call it.
+///
+/// **Where the person is, not where tmux is.** Recording happens on the device
+/// the tmux client is connected *from*, so an address means somebody is SSH'd in
+/// and the microphone is at the other end of it; no address means the client is
+/// on this machine and so is the microphone.
+pub fn recording_device(peer: Option<&str>) -> (String, String) {
+    match peer {
+        Some(address) => (address.to_string(), address.to_string()),
+        None => ("127.0.0.1".to_string(), "local".to_string()),
+    }
+}
+
+/// The status bar while a recording is in progress.
+pub const RECORDING: &str = "#[fg=#e46876,bold] ● REC #[default]";
+
+/// The status bar while the words are being worked out.
+pub const WORKING: &str = "#[fg=#98bb6c,bold] … #[default]";
+
 #[cfg(test)]
 mod tests {
-    use super::{Capability, Outcome, is_hallucination, on_sixteen_bit_scale};
+    use super::{
+        Capability, Outcome, State, is_hallucination, on_sixteen_bit_scale, recording_device,
+    };
     use crate::cleanup::{Kept, Policy, settle};
     use crate::model::ModelId;
 
@@ -430,6 +500,59 @@ mod tests {
             kept.why().contains(Kept::Unavailable.why()),
             "{}",
             kept.why()
+        );
+    }
+
+    // AYEAYE-58
+    //
+    // The recording state survives being written and read back, awkward labels
+    // included: a machine name is whatever tailscale or a person called it, and
+    // a quote in one must not end the string that carries it.
+    #[test]
+    fn the_recording_state_round_trips_through_the_file_it_lives_in() {
+        let state = State {
+            host: "100.101.102.103".to_string(),
+            label: "someone\'s \"phone\"".to_string(),
+            pane: "desktop/%3".to_string(),
+        };
+
+        assert_eq!(State::decode(&state.encode()), Some(state));
+    }
+
+    // AYEAYE-58
+    //
+    // A file torn off half-written by a crash is *not recording*, and that is
+    // the load-bearing half. The state that says "you are recording" is also the
+    // state that has to be readable in order to stop, so treating an unreadable
+    // one as recording would be a toggle that refuses forever — one keypress
+    // away from a person who can never dictate again.
+    #[test]
+    fn a_state_nothing_could_read_is_not_a_recording_in_progress() {
+        for torn in [
+            "",
+            "{",
+            r#"{"host":"1.2.3.4","label":"phone""#,
+            // Whole JSON, missing a field: half a state is not a state.
+            r#"{"host":"1.2.3.4","label":"phone"}"#,
+            r#"{"host":1,"label":"phone","pane":"desktop/%0"}"#,
+        ] {
+            assert_eq!(State::decode(torn), None, "{torn:?} is not a state");
+        }
+    }
+
+    // AYEAYE-58
+    //
+    // Recording happens where the person is, not where tmux is. An address means
+    // somebody is SSH\'d in and the microphone is at the other end of it.
+    #[test]
+    fn the_device_that_records_is_the_one_the_client_is_on() {
+        assert_eq!(
+            recording_device(Some("100.101.102.103")),
+            ("100.101.102.103".to_string(), "100.101.102.103".to_string())
+        );
+        assert_eq!(
+            recording_device(None),
+            ("127.0.0.1".to_string(), "local".to_string())
         );
     }
 }

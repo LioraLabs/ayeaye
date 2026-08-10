@@ -19,5 +19,6 @@ pub mod dictate;
 pub mod fit;
 pub mod models;
 pub mod process;
+pub mod recorder;
 pub mod server;
 pub mod tmux;

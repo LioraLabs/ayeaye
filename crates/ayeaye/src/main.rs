@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ayeaye::config::{self, Settings};
+use ayeaye::process::Processes;
 use ayeaye::models;
 use ayeaye::server;
 use ayeaye_core::service::{DEFAULT_LAUNCHD_PREFIX, Definition, Layout, Manager, Session};
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[1..]),
         Some("service") => service_verb(args.get(1).map(String::as_str)),
         Some("model") => model_verb(&args[1..]),
+        Some("dictate") => dictate_verb(&args[1..]),
         None => {
             println!("{}", banner());
             ExitCode::SUCCESS
@@ -46,10 +48,12 @@ const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
        ayeaye model <ls|pull ID|use ID|rm ID>
+       ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
   service    manage the service this binary installs for itself
   model      fetch and choose the models this binary runs
+  dictate    toggle dictation for one pane; bind it to a key in tmux
   --version  print the version and what this build can do
   --help     this
 
@@ -66,7 +70,8 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use` writes it
   AYEAYE_CLEANUP_PROMPT what the cleanup model is told it is for
   AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
-  AYEAYE_MODEL_HUB      where models are fetched from";
+  AYEAYE_MODEL_HUB      where models are fetched from
+  VOICE_PORT            the port the recording agent listens on (default 8787)";
 
 /// One line naming the version and the capabilities compiled in.
 fn banner() -> String {
@@ -256,6 +261,139 @@ fn model_verb(args: &[String]) -> ExitCode {
         },
         _ => complain("usage: ayeaye model <ls|pull ID|use ID|rm ID>"),
     }
+}
+
+/// `ayeaye dictate <pane> [client-pid]` — one press of the dictation key.
+///
+/// Bound to a key in tmux, which is why it says everything on the status line
+/// and nothing on stdout: `run-shell -b` discards both streams, so a message
+/// written here would be a key that silently did nothing.
+///
+/// The pane id is qualified — `host/%3` — like every id in this app. A tmux
+/// binding spells it `#{host}/#{pane_id}`, or passes the bare `#{pane_id}` when
+/// this machine's name is the default.
+fn dictate_verb(args: &[String]) -> ExitCode {
+    let Some(pane) = args.first() else {
+        return complain("usage: ayeaye dictate <pane> [client-pid]");
+    };
+    let Some(store) = config::state_dir() else {
+        return complain(
+            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
+        );
+    };
+    let token = match std::fs::read_to_string(agent_token_path()) {
+        Ok(token) => token.trim().to_string(),
+        Err(why) => {
+            return complain(&format!(
+                "no recorder token at {}: {why}",
+                agent_token_path().display()
+            ));
+        }
+    };
+    let models = match models::settings(&PathBuf::from(layout(from_environment).env_file)) {
+        Ok(models) => models,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(why) => return complain(&format!("ayeaye: could not start the async runtime: {why}")),
+    };
+    runtime.block_on(async move {
+        let tmux = ayeaye::tmux::Tmux::new();
+        let voice = ayeaye::dictate::Voice::new(
+            store.clone(),
+            models,
+            ayeaye::audio::CONVERTER.to_string(),
+        );
+        let state = store.join(ayeaye::dictate::STATE_FILE);
+        let toggle = ayeaye::dictate::Toggle {
+            tmux: &tmux,
+            voice: &voice,
+            state: &state,
+            token,
+            port: agent_port(),
+        };
+        // Only asked on the way *in*. The second press talks to the machine the
+        // first one recorded, which is what the state file is for: a client that
+        // has since detached must not send the audio somewhere else.
+        let peer = match ayeaye::dictate::read_state(&state) {
+            Some(_) => None,
+            None => recording_peer(&tmux, pane, args.get(1).map(String::as_str)).await,
+        };
+
+        let said = toggle.press(pane, peer.as_deref()).await;
+        if said.is_empty() {
+            return ExitCode::SUCCESS;
+        }
+        // The status line, because there is no window to use and nothing reads
+        // this process's streams.
+        let _ = tmux.ask(&["display-message", &said]).await;
+        eprintln!("{said}");
+        ExitCode::FAILURE
+    })
+}
+
+/// The address the tmux client is connected from, or `None` if it is local.
+///
+/// Prefer the pid tmux handed the binding; fall back to the pane's own session's
+/// clients, taking the first with an address. **A remote client is the
+/// interesting one**: it is the machine the person is sitting at, and therefore
+/// the machine with the microphone.
+///
+/// Both questions are asked of `crate::process`, not of `/proc`. That is a file
+/// tree which exists on exactly one of the two platforms this supports, and
+/// reading it directly on a Mac was not an error — it was an empty answer, which
+/// made every client look local and handed the microphone to whichever one tmux
+/// listed first.
+async fn recording_peer(
+    tmux: &ayeaye::tmux::Tmux,
+    pane: &str,
+    passed: Option<&str>,
+) -> Option<String> {
+
+    let processes = ayeaye::process::here();
+    let local = ayeaye_core::peer::PaneId::parse(pane)
+        .map(|id| id.pane().to_string())
+        .unwrap_or_else(|_| pane.to_string());
+
+    if let Some(pid) = passed.and_then(|pid| pid.parse::<u32>().ok())
+        && processes.exists(pid)
+    {
+        return processes.ssh_peer(pid);
+    }
+
+    let session = tmux
+        .ask(&["display-message", "-p", "-t", &local, "#{session_name}"])
+        .await
+        .unwrap_or_default();
+    let clients = tmux
+        .ask(&["list-clients", "-t", session.trim(), "-F", "#{client_pid}"])
+        .await
+        .unwrap_or_default();
+    clients
+        .split_whitespace()
+        .filter_map(|pid| pid.parse::<u32>().ok())
+        .find_map(|pid| processes.ssh_peer(pid))
+}
+
+/// Where the shared secret the recording agent checks lives.
+///
+/// `bin/voice-dictate`'s path, and deliberately the same file: the agent on the
+/// phone is the Python one and stays that way, so the secret has to be the one
+/// it was set up with.
+fn agent_token_path() -> PathBuf {
+    let base = from_environment("XDG_CONFIG_HOME")
+        .unwrap_or_else(|| format!("{}/.config", from_environment("HOME").unwrap_or_default()));
+    PathBuf::from(base).join("voice-dictate/token")
+}
+
+/// The port the recording agent listens on.
+fn agent_port() -> u16 {
+    from_environment("VOICE_PORT")
+        .or_else(|| config::env_var("VOICE_PORT"))
+        .and_then(|port| port.trim().parse().ok())
+        .unwrap_or(ayeaye::recorder::DEFAULT_PORT)
 }
 
 /// A byte count somebody can read at a glance.

@@ -475,3 +475,338 @@ async fn sweeping_a_voice_that_has_never_been_used_lets_go_of_nothing() {
     assert!(!voice.sweep(std::time::Instant::now()).await);
     assert!(!voice.probe().speech_ready, "nothing was loaded to sweep");
 }
+
+// ------------------------------------------------------------- the tmux path
+
+mod common;
+
+use ayeaye_core::dictation::State;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// A stand-in for `bin/voice-agent`, on a port the kernel picked.
+///
+/// A real socket speaking real HTTP/1.1, because the thing under test is a
+/// hand-rolled client and a substitute for the protocol would prove only that
+/// the substitute agrees with it.
+struct Agent {
+    port: u16,
+    stops: Arc<AtomicUsize>,
+}
+
+impl Agent {
+    async fn started(healthy: bool, clip: &'static [u8]) -> Agent {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("a bound address").port();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&stops);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let mut raw = vec![0u8; 4096];
+                    let read = stream.read(&mut raw).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&raw[..read]).into_owned();
+                    // Every route is gated, exactly as the agent gates them:
+                    // a peer on the tailnet without the secret must not be able
+                    // to turn somebody's microphone on.
+                    let authed = request.contains("X-Voice-Token: right-token");
+                    let answer: Vec<u8> = if !authed {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"error\":\"bad token\"}".to_vec()
+                    } else if request.starts_with("GET /health") {
+                        let body = if healthy {
+                            r#"{"ok":true,"recorder":"ffmpeg"}"#
+                        } else {
+                            r#"{"ok":false,"recorder":"none"}"#
+                        };
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .into_bytes()
+                    } else if request.starts_with("POST /start") {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
+                    } else {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             X-Audio-Ext: ogg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            clip.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(clip);
+                        out
+                    };
+                    let _ = stream.write_all(&answer).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        Agent { port, stops }
+    }
+}
+
+/// A dictation that answers with whatever it was told to, recording the clip.
+struct Says {
+    outcome: Outcome,
+    heard: std::sync::Mutex<Vec<(Vec<u8>, String, String)>>,
+}
+
+impl Says {
+    fn heard(text: &str) -> Says {
+        Says {
+            outcome: Outcome::Heard {
+                raw: text.to_string(),
+                cleaned: settle(&Policy::default(), text, None),
+            },
+            heard: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl dictate::Dictates for Says {
+    async fn dictate(&self, clip: &[u8], ext: &str, names: &str) -> Outcome {
+        self.heard.lock().expect("the lock").push((
+            clip.to_vec(),
+            ext.to_string(),
+            names.to_string(),
+        ));
+        self.outcome.clone()
+    }
+}
+
+fn state_path(what: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dictate-state-{what}"))
+        .join(ayeaye::dictate::STATE_FILE);
+    let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
+    path
+}
+
+// AYEAYE-58
+//
+// The whole tmux path in one case: the first press starts the recorder and puts
+// the indicator up, the second retrieves the audio, dictates it, and types the
+// words into the pane — **without submitting them**. That last assertion is the
+// point of the feature: a person reads what a model wrote before an agent acts
+// on it.
+#[tokio::test]
+async fn a_second_press_types_the_words_into_the_pane_and_never_submits_them() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle") else {
+        return;
+    };
+    let agent = Agent::started(true, b"pretend this is ogg").await;
+    let voice = Says::heard("run the tests");
+    let state = state_path("typed");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port: agent.port,
+    };
+
+    // The pane the words go into, named the way every id in this app is.
+    let pane = tmux
+        .ask(&["display-message", "-p", "-t", "work", "#{pane_id}"])
+        .await
+        .expect("tmux should name its own pane");
+    let qualified = format!("desktop/{}", pane.trim());
+
+    let said = toggle.press(&qualified, None).await;
+    assert_eq!(said, "", "starting a recording is not news: {said}");
+    assert!(state.exists(), "the recording has to be remembered");
+    assert_eq!(
+        ayeaye::dictate::read_state(&state).map(|s| s.pane),
+        Some(qualified.clone())
+    );
+
+    let said = toggle.press(&qualified, None).await;
+    assert_eq!(said, "", "a dictation that worked says nothing: {said}");
+    assert!(!state.exists(), "the recording is over");
+    assert_eq!(agent.stops.load(Ordering::Relaxed), 1);
+
+    // The audio really came from the agent, and the container it named is the
+    // one the dictation was told about.
+    let heard = voice.heard.lock().expect("the lock");
+    assert_eq!(heard.len(), 1);
+    assert_eq!(heard[0].0, b"pretend this is ogg");
+    assert_eq!(heard[0].1, "ogg");
+    drop(heard);
+
+    // And the pane holds the words, with no submission: `send-keys -l` writes
+    // the text and nothing else, so the shell has not run anything.
+    let screen = server.captured(pane.trim());
+    assert!(
+        screen.contains("run the tests"),
+        "the words are not in the pane: {screen:?}"
+    );
+    assert!(
+        !screen.contains("command not found") && !screen.contains("not found"),
+        "the text was submitted: {screen:?}"
+    );
+}
+
+// AYEAYE-58
+//
+// A recorder that will not take the token is a sentence naming the machine, not
+// a recording nobody started and a state file claiming otherwise.
+#[tokio::test]
+async fn a_recorder_that_refuses_the_token_leaves_no_recording_behind() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-token") else {
+        return;
+    };
+    let agent = Agent::started(true, b"never reached").await;
+    let voice = Says::heard("never reached");
+    let state = state_path("token");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        voice: &voice,
+        state: &state,
+        token: "wrong-token".to_string(),
+        port: agent.port,
+    };
+
+    let said = toggle.press("desktop/%0", None).await;
+
+    assert!(said.contains("rejected the token"), "{said}");
+    assert!(
+        !state.exists(),
+        "a recording that never started must not be remembered"
+    );
+}
+
+// AYEAYE-58
+//
+// No agent at all is the common case — a machine where nobody has installed the
+// recorder — and it has to name the device rather than fail oddly.
+#[tokio::test]
+async fn no_recorder_on_that_device_is_a_sentence_naming_it() {
+    if !common::have_tmux() {
+        return;
+    }
+    let Some(server) = common::Private::named("toggle-absent") else {
+        return;
+    };
+    // A port nothing is listening on: bound, then dropped.
+    let port = {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a port");
+        listener.local_addr().expect("an address").port()
+    };
+    let voice = Says::heard("never reached");
+    let state = state_path("absent");
+    let tmux = server.layer();
+    let toggle = ayeaye::dictate::Toggle {
+        tmux: &tmux,
+        voice: &voice,
+        state: &state,
+        token: "right-token".to_string(),
+        port,
+    };
+
+    let said = toggle.press("desktop/%0", Some("100.101.102.103")).await;
+
+    assert!(
+        said.starts_with("voice: no recorder on 100.101.102.103"),
+        "{said}"
+    );
+    assert!(!state.exists());
+}
+
+// AYEAYE-58
+//
+// The state is written to a temporary name and renamed over, so a crash leaves
+// either the old state or the new one. Asserted by watching the directory: the
+// real name never holds a partial file, and no temporary is left behind.
+#[test]
+fn the_recording_state_is_renamed_into_place_and_leaves_nothing_behind() {
+    let state = state_path("atomic");
+    let directory = state.parent().expect("a directory").to_path_buf();
+    let one = State {
+        host: "100.101.102.103".to_string(),
+        label: "phone".to_string(),
+        pane: "desktop/%0".to_string(),
+    };
+
+    ayeaye::dictate::write_state(&state, &one).expect("it should be writable");
+    let left: Vec<String> = std::fs::read_dir(&directory)
+        .expect("the directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        vec![ayeaye::dictate::STATE_FILE.to_string()],
+        "a temporary file was left beside the state"
+    );
+    assert_eq!(ayeaye::dictate::read_state(&state), Some(one));
+
+    // A file torn off half-written is not a recording in progress, so the next
+    // press starts one rather than refusing forever.
+    std::fs::write(&state, "{\"host\":\"1.2.3").expect("a torn file");
+    assert_eq!(ayeaye::dictate::read_state(&state), None);
+
+    ayeaye::dictate::clear_state(&state);
+    assert!(!state.exists());
+    // Clearing a state that is not there is not an error.
+    ayeaye::dictate::clear_state(&state);
+}
+
+// AYEAYE-58
+//
+// The half that says the write really is a rename rather than a write to the
+// real name. The temporary this process would use is occupied by a directory,
+// so the write cannot be made — and the recording that was there survives whole.
+//
+// A write straight to the real name would have succeeded instead, replacing it.
+// That is the failure this is here to catch, and it is why the test knows the
+// temporary's name: the name carrying this process's id *is* the contract, both
+// for atomicity and so two daemons cannot rename each other's half-written file
+// into place.
+#[test]
+fn a_write_that_cannot_be_staged_leaves_the_recording_that_was_there() {
+    let state = state_path("staging");
+    let before = State {
+        host: "100.101.102.103".to_string(),
+        label: "phone".to_string(),
+        pane: "desktop/%0".to_string(),
+    };
+    ayeaye::dictate::write_state(&state, &before).expect("the first one is writable");
+
+    let temporary = state.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::create_dir_all(&temporary).expect("something in the way of the temporary");
+
+    let refused = ayeaye::dictate::write_state(
+        &state,
+        &State {
+            host: "10.0.0.1".to_string(),
+            label: "laptop".to_string(),
+            pane: "desktop/%9".to_string(),
+        },
+    );
+
+    assert!(refused.is_err(), "the write could not have been staged");
+    assert_eq!(
+        ayeaye::dictate::read_state(&state),
+        Some(before),
+        "a write that could not be staged must leave the recording that was there"
+    );
+}
