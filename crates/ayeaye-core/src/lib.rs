@@ -10,6 +10,7 @@
 //! fails the build. The rules, and how to amend one, are in
 //! `crates/constitution/README.md`.
 
+pub mod agent;
 pub mod audio;
 pub mod http;
 pub mod identity;
