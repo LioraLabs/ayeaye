@@ -58,6 +58,25 @@ impl Private {
     pub fn layer(&self) -> Tmux {
         on_socket(&self.socket)
     }
+
+    /// What one of this server's panes says right now.
+    ///
+    /// The test's own capture rather than the layer's, and that is the point: a
+    /// test asserting that nothing reached a pane cannot ask the code under test
+    /// whether anything did. This path shares no line with it.
+    ///
+    /// `dead_code` is allowed because this module is compiled separately into
+    /// every test binary that declares it, so a helper only one of them wants is
+    /// unused in the others by construction.
+    #[allow(dead_code)]
+    pub fn captured(&self, pane: &str) -> String {
+        let ran = Command::new("tmux")
+            .args(["-f", "/dev/null", "-L", &self.socket])
+            .args(["capture-pane", "-p", "-t", pane])
+            .output()
+            .expect("the test's own tmux should run");
+        String::from_utf8_lossy(&ran.stdout).into_owned()
+    }
 }
 
 impl Drop for Private {

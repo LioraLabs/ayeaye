@@ -11,6 +11,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ayeaye::config::Settings;
 use ayeaye::fit::Fits;
@@ -18,6 +19,8 @@ use ayeaye_core::http::hosts::AllowedHosts;
 use ayeaye_core::peer::{HostName, Peer, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use common::Private;
 
 /// The token every test logs in with.
 const TOKEN: &str = "test-token-not-a-real-secret";
@@ -158,6 +161,83 @@ impl Server {
             .expect("the response should be readable");
         parse(&raw)
     }
+    /// A write, presented the way the panel presents one.
+    ///
+    /// The `Origin` is this server's own and the token is the test token,
+    /// because AYEAYE-69's CSRF gate judges every non-GET before anything reads
+    /// a body: a write test that sent neither would be refused at that gate and
+    /// would look exactly like the endpoint being broken.
+    async fn write(&self, path: &str, body: &str) -> Answer {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        let length = body.len().to_string();
+        self.request_with_body(
+            "POST",
+            path,
+            &[
+                ("Origin", origin.as_str()),
+                ("X-Voice-Token", TOKEN),
+                ("Content-Type", "application/json"),
+                ("Content-Length", length.as_str()),
+            ],
+            body,
+        )
+        .await
+    }
+
+    /// The same as [`Server::request`], with a body after the headers.
+    async fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Answer {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .expect("the server should be listening");
+
+        let mut request = format!("{method} {path} HTTP/1.1\r\n").into_bytes();
+        for (name, value) in headers {
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        request.extend_from_slice(format!("Host: 127.0.0.1:{}\r\n", self.port).as_bytes());
+        request.extend_from_slice(b"Connection: close\r\n\r\n");
+        request.extend_from_slice(body.as_bytes());
+
+        stream
+            .write_all(&request)
+            .await
+            .expect("the request should be writable");
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .await
+            .expect("the response should be readable");
+        parse(&raw)
+    }
+}
+
+/// One value, percent-encoded the way `encodeURIComponent` encodes it.
+///
+/// Every tmux pane id starts with `%`, so an id in a query string is always
+/// encoded on the way here — and a server that compared the raw text would be
+/// looking at different text than the panel sent.
+fn encoded(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// One JSON string literal, for building a body in a test.
+fn quoted(value: &str) -> String {
+    ayeaye_core::json::string(value)
 }
 
 fn settings_on_port(port: u16) -> Settings {
@@ -580,8 +660,10 @@ async fn a_write_from_a_foreign_origin_is_refused_and_one_from_here_is_not() {
     assert_eq!(anonymous.status, 401);
     assert_eq!(anonymous.body_text(), r#"{"error":"unauthorized"}"#);
 
-    // And with the token it is a 404, because nothing writes here yet: both
-    // gates let it through.
+    // And with the token both gates let it through and the endpoint itself
+    // answers. AYEAYE-48 gave this path a handler, so what a bodiless POST gets
+    // is that handler refusing an empty body — which is still the proof this
+    // test was written for: neither gate stopped it.
     let authorized = server
         .request(
             "POST",
@@ -589,7 +671,8 @@ async fn a_write_from_a_foreign_origin_is_refused_and_one_from_here_is_not() {
             &[("Origin", ours.as_str()), ("X-Voice-Token", TOKEN)],
         )
         .await;
-    assert_eq!(authorized.status, 404);
+    assert_eq!(authorized.status, 400);
+    assert_eq!(authorized.body_text(), r#"{"error":"bad json"}"#);
 }
 
 // AYEAYE-69 — a read is exempt, which is not a detail: a page on any origin
@@ -1501,4 +1584,473 @@ async fn window_is_manual(tmux: &ayeaye::tmux::Tmux, pane: &str) -> bool {
         .await
         .unwrap_or_default();
     ayeaye_core::fit::manual(&shown)
+}
+
+/// A server whose tmux is a private one of the test's own, and the pane it is
+/// pointed at.
+///
+/// **The safety check every case below leans on.** Nothing here may reach the
+/// tmux the person running the suite keeps their work in, and the very next
+/// thing these tests do is press keys. So the pane is taken out of the pane list
+/// the server itself answers with — over the socket, through the route under
+/// test — and that list is refused unless it is exactly the private server's.
+/// A `Tmux` whose `-L` had not taken effect would answer with somebody's real
+/// sessions here, and the test would stop rather than type into one.
+async fn server_on_its_own_tmux(what: &str, program: &str) -> Option<(Private, Server, String)> {
+    let server = Private::named(what)?;
+    server.tmux(&["new-window", "-t", "work", "-n", "answering", "-d", program]);
+
+    let mut settings = settings_on_port(0);
+    // Submitting immediately: the 400ms gap exists so a TUI does not read the
+    // Enter as part of the same burst, and `cat` is not a TUI.
+    settings.tmux = server.layer().submitting_after(Duration::from_millis(1));
+    let serving = Server::start(settings).await;
+
+    let listed = serving
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await
+        .body_text();
+    assert!(
+        listed.contains(r#""name":"answering""#) && listed.contains(r#""session":"work""#),
+        "this is not the suite's own tmux server: {listed}"
+    );
+    assert!(
+        !listed.contains(r#""session":"_"#),
+        "this is not the suite's own tmux server: {listed}"
+    );
+    let pane = id_of(&listed, "answering");
+    Some((server, serving, pane))
+}
+
+/// The qualified id of the pane with this window name, out of a `/api/panes`
+/// body. Read out of the answer rather than built, so what is targeted below is
+/// what the panel would have been given.
+fn id_of(body: &str, window: &str) -> String {
+    let card = body
+        .split("{\"id\":\"")
+        .find(|card| card.contains(&format!(r#""name":"{window}""#)))
+        .unwrap_or_else(|| panic!("no card for {window} in {body}"));
+    card.split('"')
+        .next()
+        .expect("the id ends at its closing quote")
+        .to_string()
+}
+
+/// What the pane says, once it says it — or what it last said, at the deadline.
+async fn settles(tmux: &Private, pane: &str, until: impl Fn(&str) -> bool) -> String {
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+    for _ in 0..100 {
+        let said = tmux.captured(&bare);
+        if until(&said) {
+            return said;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tmux.captured(&bare)
+}
+
+// AYEAYE-48 — the whole ticket, from the seam a phone reads: a real socket, a
+// real tmux, a real screen with a question drawn on it, and the options coming
+// back as JSON. The parser tests prove the reading and the tmux tests prove the
+// capture; only this proves they are wired to a route.
+#[tokio::test]
+async fn a_pane_at_a_prompt_shows_its_options_and_can_be_answered() {
+    let Some((tmux, server, pane)) = server_on_its_own_tmux("prompt", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1;
+    tmux.tmux(&[
+        "send-keys",
+        "-t",
+        bare,
+        "-l",
+        "--",
+        "Pick one?\n 1. First\n 2. Second\n Enter to select . Esc to cancel\n",
+    ]);
+    settles(&tmux, &pane, |said| said.contains("Esc to cancel")).await;
+
+    let asked = server
+        .request(
+            "GET",
+            &format!("/api/prompt?pane={}", encoded(&pane)),
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(asked.status, 200);
+    assert_eq!(asked.header("content-type"), Some("application/json"));
+    assert_eq!(asked.header("cache-control"), Some("no-store"));
+    let body = asked.body_text();
+    assert!(body.contains(r#""question":"Pick one?""#), "{body}");
+    assert!(body.contains(r#"{"key":"1","label":"First"}"#), "{body}");
+    assert!(body.contains(r#"{"key":"2","label":"Second"}"#), "{body}");
+
+    // And answering it presses that key in that pane, which the pane itself is
+    // the witness for.
+    let answered = server
+        .write("/api/answer", &format!(r#"{{"pane":"{pane}","key":"2"}}"#))
+        .await;
+    assert_eq!(answered.status, 200, "{}", answered.body_text());
+    assert_eq!(answered.body_text(), r#"{"ok":true,"sent":"2"}"#);
+    let screen = settles(&tmux, &pane, |said| said.contains("Esc to cancel\n2")).await;
+    assert!(
+        screen.contains("Esc to cancel\n2"),
+        "the key never reached the pane: {screen:?}"
+    );
+}
+
+// AYEAYE-48 — a pane with no question on it answers a null prompt, which is not
+// an error and is not silence. The page clears its card on a null and keeps the
+// last one on a failure, and those are opposite instructions.
+#[tokio::test]
+async fn a_pane_with_no_question_on_it_answers_a_null_prompt() {
+    let Some((_tmux, server, pane)) = server_on_its_own_tmux("quiet", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let asked = server
+        .request(
+            "GET",
+            &format!("/api/prompt?pane={}", encoded(&pane)),
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(asked.status, 200);
+    assert_eq!(asked.body_text(), r#"{"prompt":null}"#);
+}
+
+// AYEAYE-48 — a pane that is not there has no question on it, and that is an
+// answer rather than a refusal. `share/app.html`'s pollPrompt keeps its last
+// card on a failed request, so refusing here would leave a dead pane's question
+// on screen for as long as the transcript view stayed open. Naming no pane at
+// all is still a refusal, because that is a caller mistake and not a fact about
+// a pane — which is exactly the daemon's split too.
+#[tokio::test]
+async fn a_pane_that_is_not_there_has_no_question_on_it() {
+    let Some((_tmux, server, pane)) = server_on_its_own_tmux("gone", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+    for missing in [
+        "desktop/%9999".to_string(),
+        bare.clone(),
+        format!("gpu-box/{bare}"),
+        format!("desktop/{bare} ; kill-server"),
+    ] {
+        let asked = server
+            .request(
+                "GET",
+                &format!("/api/prompt?pane={}", encoded(&missing)),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(asked.status, 200, "for {missing:?}");
+        assert_eq!(asked.body_text(), r#"{"prompt":null}"#, "for {missing:?}");
+    }
+    for blank in ["", "%20%20"] {
+        let asked = server
+            .request(
+                "GET",
+                &format!("/api/prompt?pane={blank}"),
+                &[("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(asked.status, 400, "for {blank:?}");
+        assert_eq!(asked.body_text(), r#"{"error":"no pane"}"#);
+    }
+}
+
+// AYEAYE-48 — **the check between a request and somebody's terminal.** A pane id
+// that parses is not a pane. Every id here is refused, and the pane that really
+// exists is untouched afterwards — which is the assertion that matters, since a
+// 400 with the key already sent would look exactly like a pass.
+#[tokio::test]
+async fn a_pane_id_that_is_not_a_live_pane_sends_no_key_at_all() {
+    let Some((tmux, server, pane)) = server_on_its_own_tmux("forged", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+
+    for forged in [
+        // Well formed, and not there. This is what a forged id looks like.
+        "desktop/%9999".to_string(),
+        // The real pane, un-qualified. Ids go out qualified and come back
+        // qualified; a bare one is not an id this deployment issued.
+        bare.clone(),
+        // The real pane, on a machine that is not this one.
+        format!("gpu-box/{bare}"),
+        // The real pane, with something after it. tmux would take `%0` out of
+        // `%0 ; kill-server` as a target; membership never gets that far.
+        format!("desktop/{bare} ; kill-server"),
+        format!("desktop/{bare}\t"),
+        // A tmux target that is not a pane id at all: `-a` is every pane there
+        // is, and `.+` is the last pane of a window.
+        "desktop/-a".to_string(),
+        "desktop/.+".to_string(),
+        "desktop/%".to_string(),
+        // Not an id at all.
+        "desktop/".to_string(),
+        "/".to_string(),
+        String::new(),
+    ] {
+        let refusal = server
+            .write(
+                "/api/answer",
+                &format!(r#"{{"pane":{},"key":"1"}}"#, quoted(&forged)),
+            )
+            .await;
+        assert_eq!(refusal.status, 400, "{forged:?} was not refused");
+        assert!(
+            refusal.body_text().contains("pane"),
+            "{forged:?}: {}",
+            refusal.body_text()
+        );
+
+        let typing = server
+            .write(
+                "/api/send",
+                &format!(r#"{{"pane":{},"text":"whoops"}}"#, quoted(&forged)),
+            )
+            .await;
+        assert_eq!(
+            typing.status, 400,
+            "{forged:?} was not refused for /api/send"
+        );
+    }
+
+    // Nothing arrived anywhere. The pane that exists is still blank, and the
+    // server that would have been killed is still answering.
+    let screen = tmux.captured(&bare);
+    assert!(
+        screen.trim().is_empty(),
+        "a refused request still reached the pane: {screen:?}"
+    );
+    let still_there = server
+        .request("GET", "/api/panes", &[("X-Voice-Token", TOKEN)])
+        .await;
+    assert_eq!(still_there.status, 200);
+    assert!(still_there.body_text().contains(r#""name":"answering""#));
+}
+
+// AYEAYE-48 — "typing sends text without submitting it". The pane is the witness
+// worth having: `cat` repeats a line the moment a newline ends it, so one copy
+// on the screen is the proof that nothing was submitted and two is the proof
+// that the separate Enter arrived.
+#[tokio::test]
+async fn typing_sends_the_text_and_only_submits_when_asked() {
+    let Some((tmux, server, pane)) = server_on_its_own_tmux("typing", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+
+    let typed = server
+        .write(
+            "/api/send",
+            &format!(r#"{{"pane":"{pane}","text":"ship it"}}"#),
+        )
+        .await;
+    assert_eq!(typed.status, 200, "{}", typed.body_text());
+    assert_eq!(typed.body_text(), r#"{"ok":true}"#);
+    let screen = settles(&tmux, &pane, |said| said.contains("ship it")).await;
+    assert_eq!(
+        screen.matches("ship it").count(),
+        1,
+        "typing submitted the text: {screen:?}"
+    );
+
+    let submitted = server
+        .write(
+            "/api/send",
+            &format!(r#"{{"pane":"{pane}","text":"!","enter":true}}"#),
+        )
+        .await;
+    assert_eq!(submitted.status, 200);
+    let screen = settles(&tmux, &pane, |said| said.contains("ship it!\nship it!")).await;
+    assert!(
+        screen.contains("ship it!\nship it!"),
+        "the Enter never arrived: {screen:?}"
+    );
+}
+
+// AYEAYE-48 — text that would submit itself is refused before it reaches the
+// pane. `send-keys -l` writes the bytes straight to the terminal, so a newline
+// in the text is a submit nobody asked for and nobody saw — and an escape byte
+// is the start of a sequence the agent's TUI acts on rather than shows.
+#[tokio::test]
+async fn text_that_would_submit_itself_never_reaches_the_pane() {
+    let Some((tmux, server, pane)) = server_on_its_own_tmux("control", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+
+    for hostile in [
+        r"rm -rf ~\n",
+        r"a\rb",
+        r"a\u001b[2Jb",
+        r"a\u0000b",
+        r"\t",
+        "",
+    ] {
+        let refusal = server
+            .write(
+                "/api/send",
+                &format!(r#"{{"pane":"{pane}","text":"{hostile}"}}"#),
+            )
+            .await;
+        assert_eq!(refusal.status, 400, "{hostile:?} was typed into a pane");
+    }
+    assert!(
+        tmux.captured(&bare).trim().is_empty(),
+        "something reached the pane: {:?}",
+        tmux.captured(&bare)
+    );
+}
+
+// AYEAYE-48 — the key allow-list, at the seam it protects. This endpoint is
+// reachable over the network and must not become a general send-keys hole, so
+// what is refused is refused here and not only in the table.
+#[tokio::test]
+async fn only_a_key_from_the_allow_list_can_be_pressed() {
+    let Some((tmux, server, pane)) = server_on_its_own_tmux("keys", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let bare = pane.split_once('/').expect("a qualified id").1.to_string();
+
+    for hostile in [
+        r#""C-c""#,
+        r#""C-d""#,
+        r#""Enter""#,
+        r#""Escape""#,
+        r#""0""#,
+        r#""10""#,
+        r#""05""#,
+        r#""kill-server""#,
+        r#""""#,
+        "1",
+        "null",
+        "true",
+        "[]",
+    ] {
+        let refusal = server
+            .write(
+                "/api/answer",
+                &format!(r#"{{"pane":"{pane}","key":{hostile}}}"#),
+            )
+            .await;
+        assert_eq!(refusal.status, 400, "key {hostile} was pressed");
+        assert_eq!(refusal.body_text(), r#"{"error":"bad key"}"#, "{hostile}");
+    }
+    assert!(
+        tmux.captured(&bare).trim().is_empty(),
+        "a refused key still reached the pane: {:?}",
+        tmux.captured(&bare)
+    );
+}
+
+// AYEAYE-48 — a body off a socket is whatever somebody wrote. Every way it can
+// be wrong is an answer rather than a panic, and the server is still serving
+// afterwards, which a worker that took the runtime down with it would not be.
+#[tokio::test]
+async fn a_body_that_is_not_a_request_is_answered_rather_than_crashed_into() {
+    let server = Server::started().await;
+    let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+    for body in [
+        "",
+        "{",
+        "not json at all",
+        r#"["desktop/%0","1"]"#,
+        r#"{"pane":12,"key":"1"}"#,
+        r#"{"key":"1"}"#,
+        deep.as_str(),
+    ] {
+        for path in ["/api/answer", "/api/send"] {
+            let answer = server.write(path, body).await;
+            assert_eq!(answer.status, 400, "{path} with {body:.40}");
+            assert!(
+                answer.body_text().starts_with(r#"{"error":"#),
+                "{path}: {}",
+                answer.body_text()
+            );
+        }
+    }
+    assert_eq!(server.get("/").await.status, 200);
+}
+
+// AYEAYE-48 — the three routes are gated like everything else under `/api/`,
+// and the two that write are refused cross-site before their token is looked at.
+// A POST here presses a key in somebody's terminal; nothing about it may be
+// reachable from another origin's page.
+#[tokio::test]
+async fn the_prompt_routes_need_a_token_and_refuse_a_cross_site_write() {
+    let server = Server::started().await;
+    for path in ["/api/prompt?pane=desktop/%0", "/api/answer", "/api/send"] {
+        assert_eq!(server.get(path).await.status, 401, "GET {path}");
+        assert_eq!(
+            server.request("POST", path, &[]).await.status,
+            401,
+            "POST {path}"
+        );
+    }
+    for path in ["/api/answer", "/api/send"] {
+        let cross = server
+            .request(
+                "POST",
+                path,
+                &[("Sec-Fetch-Site", "cross-site"), ("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(cross.status, 403, "POST {path} cross-site");
+        let foreign = server
+            .request(
+                "POST",
+                path,
+                &[("Origin", "https://evil.example"), ("X-Voice-Token", TOKEN)],
+            )
+            .await;
+        assert_eq!(foreign.status, 403, "POST {path} from a foreign origin");
+    }
+    // And the methods nothing is mounted on are still a 404 rather than an
+    // answer, which is what the daemon says too.
+    assert_eq!(
+        server
+            .request("POST", "/api/prompt", &[("X-Voice-Token", TOKEN)])
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        server
+            .request("GET", "/api/answer", &[("X-Voice-Token", TOKEN)])
+            .await
+            .status,
+        404
+    );
+}
+
+// AYEAYE-48 — the query is percent-decoded before the id is compared, because
+// that is the id the panel encoded. Every tmux pane id starts with `%`, so the
+// encoded form and the raw form are never the same text — a server comparing
+// the raw text would be looking at something the panel never sent, and this
+// request would be refused.
+#[tokio::test]
+async fn a_pane_id_in_the_query_is_decoded_before_it_is_matched() {
+    let Some((_tmux, server, pane)) = server_on_its_own_tmux("encoded", "cat").await else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let sent = encoded(&pane);
+    assert!(sent.contains("%25") && sent != pane, "{sent}");
+    let asked = server
+        .request(
+            "GET",
+            &format!("/api/prompt?pane={sent}"),
+            &[("X-Voice-Token", TOKEN)],
+        )
+        .await;
+    assert_eq!(asked.status, 200, "{}", asked.body_text());
+    assert_eq!(asked.body_text(), r#"{"prompt":null}"#);
 }

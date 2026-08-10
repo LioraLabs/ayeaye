@@ -24,6 +24,7 @@ pub mod mel;
 pub mod pane;
 pub mod peer;
 pub mod process;
+pub mod prompt;
 pub mod service;
 pub mod sha1;
 pub mod tmux;

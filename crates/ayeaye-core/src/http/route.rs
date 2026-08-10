@@ -26,6 +26,12 @@ pub enum Route {
     Pane,
     /// A window resize, and the fit lease that holds it there.
     Resize,
+    /// The question one pane is stopped on, if it is stopped on one.
+    Prompt,
+    /// One key, pressed in one pane.
+    Answer,
+    /// Some text, typed into one pane.
+    Send,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -63,6 +69,13 @@ const PANE: &str = "/api/pane";
 
 /// A window resize. A POST, and gated as every POST is.
 const RESIZE: &str = "/api/resize";
+/// The three endpoints a pane at a prompt is answered through. Each is named
+/// here rather than left to the catch-all for the same reason `/api/panes` is:
+/// which paths exist is a table a test can read, and the two that write are the
+/// two most worth being able to point at.
+const PROMPT: &str = "/api/prompt";
+const ANSWER: &str = "/api/answer";
+const SEND: &str = "/api/send";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -126,6 +139,9 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
             PANES => Route::Panes,
             PANE => Route::Pane,
             RESIZE => Route::Resize,
+            PROMPT => Route::Prompt,
+            ANSWER => Route::Answer,
+            SEND => Route::Send,
             _ => Route::Api,
         };
     }
@@ -157,7 +173,13 @@ pub fn gate(method: &str, route: Route) -> Gate {
         return Gate::Token;
     }
     match route {
-        Route::Api | Route::Panes | Route::Pane | Route::Resize => Gate::Token,
+        Route::Api
+        | Route::Panes
+        | Route::Pane
+        | Route::Resize
+        | Route::Prompt
+        | Route::Answer
+        | Route::Send => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -382,5 +404,33 @@ mod tests {
             );
         }
         assert_eq!(gate("HEAD", resolve("/api/overview", false)), Gate::Token);
+    }
+
+    // AYEAYE-48 — the three paths a pane at a prompt is answered through, each a
+    // route of its own rather than one more unknown path under `/api/`. Every
+    // one of them is gated by every method, the two that write included: a POST
+    // here presses a key in somebody's terminal.
+    #[test]
+    fn the_prompt_paths_are_routes_and_every_method_needs_a_token() {
+        for (path, expected) in [
+            ("/api/prompt", Route::Prompt),
+            ("/api/answer", Route::Answer),
+            ("/api/send", Route::Send),
+        ] {
+            assert_eq!(resolve(path, false), expected);
+            // A token in the query does not turn one into a login.
+            assert_eq!(resolve(path, true), expected);
+            for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+                assert_eq!(
+                    gate(method, resolve(path, false)),
+                    Gate::Token,
+                    "{method} {path} must need a token"
+                );
+            }
+            // Only that path, so a new endpoint cannot arrive by accident under
+            // a name that merely starts with an old one.
+            assert_eq!(resolve(&format!("{path}/extra"), false), Route::Api);
+            assert_eq!(resolve(&format!("{path}2"), false), Route::Api);
+        }
     }
 }
