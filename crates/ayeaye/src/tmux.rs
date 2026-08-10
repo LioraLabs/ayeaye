@@ -73,6 +73,31 @@ impl Tmux {
         }
     }
 
+    /// The sessions on this machine, by name.
+    ///
+    /// Split on lines rather than on whitespace, which is a deliberate
+    /// departure from `bin/ayeaye`'s `live_sessions()`. That one does
+    /// `set(output.split())`, so a project directory called `my project`
+    /// produces the session `my project` and a live-session set holding `my`
+    /// and `project` — neither of which matches, so the next spawn there tries
+    /// to create a session that already exists and fails instead of adding a
+    /// window. A session name cannot contain a newline, so lines are exact.
+    ///
+    /// A machine with no server has no sessions, for the same reason it has no
+    /// panes: that is an answer, not a failure.
+    pub async fn sessions(&self) -> Result<Vec<String>, Trouble> {
+        match self.ask(&["list-sessions", "-F", "#{session_name}"]).await {
+            Ok(text) => Ok(text
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()),
+            Err(Trouble::Refused(said)) if no_server_running(&said) => Ok(Vec::new()),
+            Err(trouble) => Err(trouble),
+        }
+    }
+
     /// Every live pane on this machine, qualified with the name it goes by.
     ///
     /// A machine with no tmux server has no panes, and that is an answer rather

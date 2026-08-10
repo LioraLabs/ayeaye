@@ -25,11 +25,26 @@ ayeaye-infer.workspace = true
 # here: ayeaye-core is synchronous, and the constitution's effect budget
 # refuses `tokio` inside it.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time"] }
+# `fs` because a spawn stats the project directory and reads its `.tmux.yaml`
+# from inside a request. Both are one syscall on a local path and neither
+# deserves a thread — but `dir` arrives from the network, and a blocking stat
+# on a path under a hung mount would take a runtime worker with it.
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "net", "process", "time"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.
 form_urlencoded = "1"
+# For request bodies, and only in this crate: `ayeaye-core` declares no
+# dependencies at all, so the *writer* is hand-rolled there. Reading a hostile
+# document is the opposite trade — it is the one job in this app worth a real
+# parser, and the endpoint that starts processes is the last place to save a
+# dependency. Already in the lockfile by way of candle, so it costs no new
+# package and no C.
+serde_json = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# The suite builds request bodies containing paths and prompts full of quotes;
+# spelling those by hand in a format string is how a test asserts against a
+# body it did not send.
+serde_json = "1"

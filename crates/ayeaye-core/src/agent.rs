@@ -282,6 +282,25 @@ pub mod refused {
     /// asking about a pane that is not theirs to ask about.
     pub const NO_SUCH_PANE: &str = "no such pane";
 
+    /// A request naming a machine this deployment has never heard of.
+    ///
+    /// One of the two refusals here with no counterpart in `bin/ayeaye`, which
+    /// has never had a second machine to be asked about. The name is quoted
+    /// back because the caller is the only one who can correct it, and it came
+    /// from the caller in the first place.
+    pub fn no_such_machine(named: &str) -> String {
+        format!("no machine here is called {named:?}")
+    }
+
+    /// A request naming a machine we know but cannot reach.
+    ///
+    /// Unreachable today — the registry holds one peer and it is this one — and
+    /// written anyway, because it is what the `host` field means. The federated
+    /// case arrives as this branch being taken rather than as a new one.
+    pub fn not_reachable_yet(host: &str) -> String {
+        format!("{host} is another machine, and reaching one is not built yet")
+    }
+
     /// tmux ran and made nothing. `bin/ayeaye:1904`.
     pub fn nothing_was_created(created: super::Created) -> String {
         format!("tmux would not create the {}", created.as_str())

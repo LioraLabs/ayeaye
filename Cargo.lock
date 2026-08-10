@@ -97,6 +97,7 @@ dependencies = [
  "ayeaye-core",
  "ayeaye-infer",
  "form_urlencoded",
+ "serde_json",
  "tokio",
 ]
 

@@ -21,6 +21,8 @@ pub enum Route {
     Login,
     /// The pane list: every live pane on this machine, qualified.
     Panes,
+    /// Start an agent in a new pane.
+    Spawn,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -50,6 +52,10 @@ const API_PREFIX: &str = "/api/";
 /// the catch-all above stays, so a path nobody has written yet is still gated
 /// rather than being open by omission.
 const PANES: &str = "/api/panes";
+
+/// Starting an agent. A write, so the gate below refuses it without a token
+/// whatever the route table says.
+const SPAWN: &str = "/api/spawn";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -111,6 +117,7 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
     if path.starts_with(API_PREFIX) {
         return match path {
             PANES => Route::Panes,
+            SPAWN => Route::Spawn,
             _ => Route::Api,
         };
     }
@@ -142,7 +149,7 @@ pub fn gate(method: &str, route: Route) -> Gate {
         return Gate::Token;
     }
     match route {
-        Route::Api | Route::Panes => Gate::Token,
+        Route::Api | Route::Panes | Route::Spawn => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -305,6 +312,26 @@ mod tests {
         // new endpoint cannot arrive by accident.
         assert_eq!(resolve("/api/panes/extra", false), Route::Api);
         assert_eq!(resolve("/api/panes2", false), Route::Api);
+    }
+
+    // AYEAYE-51 — starting an agent is a route of its own. It is a POST, which
+    // the gate already refuses without a token whatever it names; naming it
+    // here is what keeps "which paths exist" a table rather than a chain of
+    // comparisons in the handler.
+    #[test]
+    fn spawning_an_agent_is_a_route_and_is_gated_like_the_rest_of_the_api() {
+        assert_eq!(resolve("/api/spawn", false), Route::Spawn);
+        assert_eq!(resolve("/api/spawn", true), Route::Spawn);
+        for method in ["GET", "HEAD", "POST", "DELETE"] {
+            assert_eq!(
+                gate(method, Route::Spawn),
+                Gate::Token,
+                "{method} /api/spawn must need a token"
+            );
+        }
+        // Only that path, so a neighbouring endpoint cannot arrive by accident.
+        assert_eq!(resolve("/api/spawn/now", false), Route::Api);
+        assert_eq!(resolve("/api/spawner", false), Route::Api);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at

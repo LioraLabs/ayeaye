@@ -61,6 +61,10 @@ async fn handle(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    // Last, because axum takes the body-consuming extractor last. Every route
+    // is handled here, so this is read for a GET of an icon too — it is the
+    // bytes that were sent, which for a GET is none.
+    body: axum::body::Bytes,
 ) -> Response {
     // The Host gate comes first and applies to everything, pages included:
     // it is what stops a page on an attacker's origin, resolving their name to
@@ -106,13 +110,38 @@ async fn handle(
             serve_asset(asset)
         }
         Route::Panes if method == Method::GET || method == Method::HEAD => panes(&settings).await,
+        // A write, and a POST — which is not incidental. The CSRF gate above
+        // exempts GET and HEAD, so it is safe only while every write is a POST;
+        // mounting this on a GET would put it outside that gate with no test
+        // able to notice.
+        Route::Spawn if method == Method::POST => {
+            answered(crate::agent::spawn(&settings, &body).await)
+        }
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
-        Route::Panes | Route::Api | Route::NotFound | Route::Login | Route::Asset(_) => {
-            json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
-        }
+        Route::Panes
+        | Route::Spawn
+        | Route::Api
+        | Route::NotFound
+        | Route::Login
+        | Route::Asset(_) => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
     }
+}
+
+/// An answer one of the write endpoints decided on.
+///
+/// The status comes back as a number rather than a `StatusCode` so that
+/// `crate::agent` names no HTTP type and can be driven without one.
+fn answered(answered: crate::agent::Answered) -> Response {
+    let status = StatusCode::from_u16(answered.status)
+        .expect("the endpoints answer 200 or 400 and nothing else");
+    build(
+        status,
+        "application/json",
+        Body::from(answered.body),
+        |response| response,
+    )
 }
 
 /// The one-time handshake: a token in the query becomes a cookie.
