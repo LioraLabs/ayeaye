@@ -151,16 +151,23 @@ pub fn without_test_blocks(source: &str) -> String {
 /// attribute may sit on a struct field or an enum variant, and scanning past
 /// the enclosing item's close brace would blank whatever shipped code comes
 /// next — a silent exemption, which is the one failure shape this crate is
-/// built to refuse. A `;` or `,` inside the field's own type (`[u8; 2]`,
-/// `Map<K, V>`) makes this stop early and leave a mangled tail in scope; that
-/// errs loud — at worst a false positive somebody can see — never silent.
+/// built to refuse. Both terminators count only outside `(…)` and `[…]`, so a
+/// multi-argument test fn, a stacked `#[derive(…)]`, a tuple struct and a
+/// `[u8; 2]` field all blank to their real extent. Angle brackets are *not*
+/// tracked — `a < b` in an expression opens a depth that never closes — so a
+/// comma inside bare generics (`fn t<T, U>`) still stops this early and
+/// leaves a mangled tail in scope. That errs loud: at worst a false positive
+/// somebody can see, never a silent exemption.
 fn item_end(stripped: &[char], from: usize) -> usize {
+    let mut nesting = 0usize;
     let mut i = from;
     while i < stripped.len() {
         match stripped[i] {
-            ';' | ',' => return i + 1,
-            '}' => return i,
-            '{' => {
+            '(' | '[' => nesting += 1,
+            ')' | ']' => nesting = nesting.saturating_sub(1),
+            ';' | ',' if nesting == 0 => return i + 1,
+            '}' if nesting == 0 => return i,
+            '{' if nesting == 0 => {
                 let mut depth = 0usize;
                 while i < stripped.len() {
                     match stripped[i] {
@@ -177,8 +184,9 @@ fn item_end(stripped: &[char], from: usize) -> usize {
                 }
                 return stripped.len();
             }
-            _ => i += 1,
+            _ => {}
         }
+        i += 1;
     }
     stripped.len()
 }
@@ -554,5 +562,53 @@ mod tests {
         assert!(out.contains("fn shipped()"), "{out}");
         assert!(!out.contains("probe"), "{out}");
         assert_eq!(out.matches('}').count(), source.matches('}').count());
+    }
+
+    // AYEAYE-64 — a comma inside an argument list is not a field's comma: a
+    // multi-argument test fn blanks whole, or its body's literals leak back
+    // into the duplication scope.
+    #[test]
+    fn a_cfg_test_fn_with_two_arguments_is_blanked_whole() {
+        let source =
+            "#[cfg(test)]\nfn helper(a: u8, b: u8) { let s = \"copied\"; }\nfn shipped() {}\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("fn shipped()"), "{out}");
+        assert!(!out.contains("copied"), "{out}");
+        assert!(!out.contains("b: u8"), "{out}");
+    }
+
+    // AYEAYE-64 — a stacked #[derive(Debug, Clone)] carries a comma of its
+    // own; stopping inside it would leave the whole item in scope.
+    #[test]
+    fn a_cfg_test_item_with_a_stacked_derive_is_blanked_whole() {
+        let source =
+            "#[cfg(test)]\n#[derive(Debug, Clone)]\nstruct Probe { x: u8 }\nfn shipped() {}\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("fn shipped()"), "{out}");
+        assert!(!out.contains("Probe"), "{out}");
+        assert!(!out.contains("Clone"), "{out}");
+    }
+
+    // AYEAYE-64 — a tuple struct's commas sit inside its parens; it ends at
+    // the semicolon.
+    #[test]
+    fn a_cfg_test_tuple_struct_is_blanked_through_its_semicolon() {
+        let source = "#[cfg(test)]\nstruct Probe(u8, u8);\nfn shipped() {}\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("fn shipped()"), "{out}");
+        assert!(!out.contains("Probe"), "{out}");
+        assert!(!out.contains("u8);"), "{out}");
+    }
+
+    // AYEAYE-64 — an array-typed field's `;` sits inside its brackets; the
+    // field blanks to its comma, and the next field survives.
+    #[test]
+    fn a_cfg_test_array_field_blanks_to_its_own_comma() {
+        let source =
+            "struct S {\n    #[cfg(test)]\n    probe: [u8; 2],\n    kept: u8,\n}\nfn shipped() {}\n";
+        let out = without_test_blocks(source);
+        assert!(out.contains("kept: u8"), "{out}");
+        assert!(out.contains("fn shipped()"), "{out}");
+        assert!(!out.contains("probe"), "{out}");
     }
 }
