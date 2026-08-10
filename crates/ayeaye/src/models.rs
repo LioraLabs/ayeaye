@@ -20,11 +20,14 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use ayeaye_core::model::hub::{self, Wanted};
+use ayeaye_core::model::residency::{self, Plan, Policy};
 use ayeaye_core::model::settings::{self, BadSetting, ModelSettings};
 use ayeaye_core::model::verify::{self, Unusable};
 use ayeaye_core::model::{Architecture, ModelId, Unsupported, architecture};
+use ayeaye_infer::{SpeechError, SpeechSlot};
 
 /// Something that can fetch one URL into one file.
 ///
@@ -376,12 +379,124 @@ pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullErro
     std::fs::write(config_file, after).map_err(disk(format!("write {}", config_file.display())))
 }
 
+/// A place a speech model is resident, and the thing that decides.
+///
+/// The deciding is `ayeaye_core::model::residency`, which is pure; this carries
+/// the decision out. The split is what makes "released before the new one is
+/// loaded" assertable at all — the plan says `Reload` and this is the two lines
+/// that honour the order.
+///
+/// Generic over [`Slot`] rather than holding a `SpeechSlot` directly, because a
+/// real slot's load is a directory of weights and hundreds of megabytes of
+/// device memory. That is a system boundary, and substituting it is what lets
+/// the suite assert the property that matters — that two models are never
+/// resident at once — without a machine and without a download.
+pub struct Residents<S: Slot> {
+    slot: S,
+    loaded: Option<ModelId>,
+    store: PathBuf,
+    policy: Policy,
+}
+
+/// Somewhere a model can be resident.
+///
+/// [`SpeechSlot`] is the real one. The trait exists for the reason above and
+/// has exactly its shape, so it is a boundary rather than an abstraction.
+pub trait Slot {
+    /// Load the model in `dir`, replacing whatever was resident.
+    fn load(&mut self, dir: &Path) -> Result<(), SpeechError>;
+    /// Release the resident model, saying whether there was one.
+    fn unload(&mut self) -> bool;
+}
+
+impl Slot for SpeechSlot {
+    fn load(&mut self, dir: &Path) -> Result<(), SpeechError> {
+        SpeechSlot::load(self, dir)
+    }
+
+    fn unload(&mut self) -> bool {
+        SpeechSlot::unload(self)
+    }
+}
+
+impl<S: Slot> Residents<S> {
+    /// A holder with nothing resident.
+    pub fn new(slot: S, store: PathBuf, policy: Policy) -> Self {
+        Residents {
+            slot,
+            loaded: None,
+            store,
+            policy,
+        }
+    }
+
+    /// Which model is resident, if any.
+    pub fn loaded(&self) -> Option<&ModelId> {
+        self.loaded.as_ref()
+    }
+
+    /// Make the resident model be the one that is wanted.
+    ///
+    /// This is the only thing that loads. `wanted` comes from the configuration
+    /// as it stands *now*, so a reconfiguration is not an event anything has to
+    /// be told about: the next request notices that what is resident is not
+    /// what is chosen, and the plan says to let go of it first.
+    pub fn ensure(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+        match residency::on_demand(self.loaded.as_ref(), wanted) {
+            Plan::Keep => Ok(()),
+            Plan::Release => {
+                self.release();
+                Ok(())
+            }
+            Plan::Load => self.take(wanted),
+            Plan::Reload => {
+                // Released first, and this ordering is the acceptance
+                // criterion rather than a preference. `SpeechSlot::load`
+                // happens to unload first as well; doing it here too is not
+                // redundant, because the thing being promised is a property of
+                // this decision and not of that implementation.
+                self.release();
+                self.take(wanted)
+            }
+        }
+    }
+
+    /// Let go of a model that has been idle too long, saying whether it did.
+    ///
+    /// `idle_for` is an argument rather than a clock read inside, so the caller
+    /// owns the one reading of the time and the whole thing stays testable.
+    pub fn sweep(&mut self, idle_for: Duration) -> bool {
+        match residency::on_idle(self.loaded.as_ref(), idle_for, &self.policy) {
+            Plan::Release => self.release(),
+            _ => false,
+        }
+    }
+
+    fn release(&mut self) -> bool {
+        self.loaded = None;
+        self.slot.unload()
+    }
+
+    fn take(&mut self, wanted: Option<&ModelId>) -> Result<(), SpeechError> {
+        let Some(wanted) = wanted else {
+            return Ok(());
+        };
+        self.slot.load(&self.store.join(wanted.relative_dir()))?;
+        // Recorded only once the load has worked. Recording first would leave
+        // the holder claiming a model it does not have, and the next request
+        // would decide to keep something that is not there.
+        self.loaded = Some(wanted.clone());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Curl, Fetcher, PullError, install, installed, pull, remove};
+    use super::{Curl, Fetcher, Policy, PullError, Residents, install, installed, pull, remove};
     use ayeaye_core::model::{CONFIG_FILE, ModelId, TOKENIZER_FILE, WEIGHTS_FILE};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     /// A directory of this test's own, removed when it goes out of scope.
     struct Scratch(PathBuf);
@@ -450,6 +565,127 @@ mod tests {
                 .ok_or_else(|| format!("nothing here answers {url}"))?;
             std::fs::write(into, bytes).map_err(|why| why.to_string())
         }
+    }
+
+    /// A slot that records what it is holding, and how much at once.
+    ///
+    /// `peak` is the assertion this exists for: the acceptance criterion is
+    /// that a model is never leaked across reconfiguration, and "two were
+    /// resident at the same moment" is that failure stated as a number. A test
+    /// that only checked the sequence of calls would pass on an implementation
+    /// that held both and happened to call unload afterwards.
+    #[derive(Default)]
+    struct Recording {
+        resident: Option<PathBuf>,
+        at_once: usize,
+        peak: usize,
+        loads: usize,
+    }
+
+    impl super::Slot for Recording {
+        fn load(&mut self, dir: &Path) -> Result<(), ayeaye_infer::SpeechError> {
+            self.resident = Some(dir.to_path_buf());
+            self.at_once += 1;
+            self.peak = self.peak.max(self.at_once);
+            self.loads += 1;
+            Ok(())
+        }
+
+        fn unload(&mut self) -> bool {
+            self.at_once = self.at_once.saturating_sub(1);
+            self.resident.take().is_some()
+        }
+    }
+
+    // AYEAYE-56 — lifetime and residency owned by ayeaye: loaded on demand,
+    // and never two at once across a reconfiguration.
+    #[test]
+    fn reconfiguring_never_holds_two_models_at_once() {
+        let small = ModelId::parse("openai/whisper-small.en").expect("an id");
+        let tiny = ModelId::parse("openai/whisper-tiny.en").expect("an id");
+        let store = PathBuf::from("/state");
+        let mut residents =
+            Residents::new(Recording::default(), store.clone(), Policy { idle: None });
+
+        // Nothing is resident until something wants it.
+        assert_eq!(residents.loaded(), None);
+        residents.ensure(Some(&small)).expect("it should load");
+        assert_eq!(residents.loaded(), Some(&small));
+        assert_eq!(
+            residents.slot.resident.as_deref(),
+            Some(store.join(small.relative_dir()).as_path()),
+            "it has to load from where the pull put it"
+        );
+
+        // Asking again for the same one does not reload hundreds of megabytes.
+        residents.ensure(Some(&small)).expect("it should keep");
+        assert_eq!(residents.slot.loads, 1);
+
+        // The reconfiguration itself.
+        residents.ensure(Some(&tiny)).expect("it should reload");
+        assert_eq!(residents.loaded(), Some(&tiny));
+        assert_eq!(residents.slot.loads, 2);
+        assert_eq!(
+            residents.slot.peak, 1,
+            "two models were resident at once, which is the leak this ticket \
+             exists to prevent"
+        );
+
+        // And configuring the model away lets go of it.
+        residents.ensure(None).expect("it should release");
+        assert_eq!(residents.loaded(), None);
+        assert_eq!(residents.slot.resident, None);
+    }
+
+    // AYEAYE-56 — released on a policy, and the sweep never loads.
+    #[test]
+    fn an_idle_model_is_swept_and_a_sweep_never_loads() {
+        let model = ModelId::parse("openai/whisper-small.en").expect("an id");
+        let mut residents = Residents::new(
+            Recording::default(),
+            PathBuf::from("/state"),
+            Policy {
+                idle: Some(Duration::from_secs(300)),
+            },
+        );
+        residents.ensure(Some(&model)).expect("it should load");
+
+        assert!(!residents.sweep(Duration::from_secs(60)), "still wanted");
+        assert_eq!(residents.loaded(), Some(&model));
+
+        assert!(residents.sweep(Duration::from_secs(600)), "long enough");
+        assert_eq!(residents.loaded(), None, "and the holder knows it let go");
+        assert_eq!(residents.slot.resident, None);
+
+        // Sweeping an empty slot loads nothing and is not an error.
+        assert!(!residents.sweep(Duration::from_secs(9_999)));
+        assert_eq!(residents.slot.loads, 1);
+    }
+
+    // AYEAYE-56 — a load that fails leaves the holder claiming nothing.
+    // Recording the model first would leave it insisting on a model it does
+    // not have, and the next request would decide to keep it.
+    #[test]
+    fn a_load_that_fails_leaves_nothing_claimed() {
+        struct Refuses;
+        impl super::Slot for Refuses {
+            fn load(&mut self, _: &Path) -> Result<(), ayeaye_infer::SpeechError> {
+                Err(ayeaye_infer::SpeechError::NotLoaded)
+            }
+            fn unload(&mut self) -> bool {
+                false
+            }
+        }
+
+        let model = ModelId::parse("openai/whisper-small.en").expect("an id");
+        let mut residents = Residents::new(Refuses, PathBuf::from("/state"), Policy { idle: None });
+
+        assert!(residents.ensure(Some(&model)).is_err());
+        assert_eq!(
+            residents.loaded(),
+            None,
+            "a holder that claims a model it failed to load would keep it forever"
+        );
     }
 
     // AYEAYE-56 — the whole point of the ticket, as an observable outcome: an

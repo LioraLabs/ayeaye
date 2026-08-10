@@ -14,6 +14,7 @@
 pub mod architecture;
 pub mod hub;
 pub mod id;
+pub mod residency;
 pub mod settings;
 pub mod verify;
 
