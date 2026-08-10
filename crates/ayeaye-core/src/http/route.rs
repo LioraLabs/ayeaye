@@ -40,6 +40,8 @@ pub enum Route {
     Dictate,
     /// What this machine can do about a dictation.
     Voice,
+    /// One pane's transcript, as server-sent events: backlog, then live rows.
+    Stream,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -101,6 +103,14 @@ const DICTATE: &str = "/api/dictate";
 /// write: two tickets landing in one handler is a merge nobody needs, and the
 /// answer is one `Capability` either way — see `ayeaye_core::dictation`.
 const VOICE: &str = "/api/voice";
+
+/// The transcript event stream. Its own route rather than one more path under
+/// the `Route::Api` catch-all, and not for the gate — the catch-all is gated
+/// too — but because its answer is a body that never ends, which the plain
+/// JSON endpoint chain cannot carry. `/api/message` has no line here for the
+/// same reason in reverse: it answers plain JSON and the catch-all already
+/// covers it.
+const STREAM: &str = "/api/stream";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -171,6 +181,7 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
             KILL => Route::Kill,
             DICTATE => Route::Dictate,
             VOICE => Route::Voice,
+            STREAM => Route::Stream,
             _ => Route::Api,
         };
     }
@@ -212,7 +223,8 @@ pub fn gate(method: &str, route: Route) -> Gate {
         | Route::Spawn
         | Route::Kill
         | Route::Dictate
-        | Route::Voice => Gate::Token,
+        | Route::Voice
+        | Route::Stream => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -469,6 +481,32 @@ mod tests {
             assert_eq!(resolve(&format!("{path}/extra"), false), Route::Api);
             assert_eq!(resolve(&format!("{path}2"), false), Route::Api);
         }
+    }
+
+    // AYEAYE-46 — the transcript stream is a route of its own, because its
+    // answer is a body that never ends, and it is gated exactly as the rest of
+    // the API is: the transcript is the conversation, the most private thing
+    // this server can show.
+    #[test]
+    fn the_event_stream_is_a_route_and_is_gated_like_the_rest_of_the_api() {
+        assert_eq!(resolve("/api/stream", false), Route::Stream);
+        // A token in the query does not turn it into a login.
+        assert_eq!(resolve("/api/stream", true), Route::Stream);
+        for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+            assert_eq!(
+                gate(method, Route::Stream),
+                Gate::Token,
+                "{method} /api/stream must need a token"
+            );
+        }
+        // Only that path, so a new endpoint cannot arrive by accident under a
+        // name that merely starts with this one. `/api/message` is deliberate:
+        // it answers plain JSON through the endpoint chain, so the catch-all
+        // is its route and its gate.
+        assert_eq!(resolve("/api/stream/extra", false), Route::Api);
+        assert_eq!(resolve("/api/streams", false), Route::Api);
+        assert_eq!(resolve("/api/message", false), Route::Api);
+        assert_eq!(gate("GET", resolve("/api/message", false)), Gate::Token);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at

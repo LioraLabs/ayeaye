@@ -252,6 +252,7 @@ async fn handle(
         | Route::Kill
         | Route::Dictate
         | Route::Voice
+        | Route::Stream
         | Route::Api
         | Route::NotFound
         | Route::Login
