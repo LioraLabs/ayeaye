@@ -46,16 +46,26 @@ impl Backend {
 /// `cuda` wins over `metal` when a build somehow carries both, which no
 /// released row of the matrix does; the tie is broken here rather than left to
 /// whichever `cfg` happens to be written first.
+///
+/// **Metal arrives two ways, and `target_os` is the one that matters.** A cargo
+/// feature nobody passes is off, so an Apple build gets Metal from the
+/// target-conditional dependency table in this crate's `Cargo.toml` rather than
+/// from `--features metal`. The manifest and this function are two halves of
+/// one claim, and the test named for it is what stops them drifting.
 pub const fn selected() -> Backend {
     #[cfg(feature = "cuda")]
     {
         Backend::Cuda
     }
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(all(not(feature = "cuda"), any(feature = "metal", target_os = "macos")))]
     {
         Backend::Metal
     }
-    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "metal"),
+        not(target_os = "macos")
+    ))]
     {
         Backend::Cpu
     }
@@ -187,13 +197,22 @@ mod tests {
     //
     // The assertion is chosen at compile time, because so is the answer: run
     // the suite with `--features cuda` and this test changes what it demands.
+    // AYEAYE-57 amends it: Metal arrives two ways, and being an Apple build is
+    // the one that matters, because nobody passes a feature. This arm is red on
+    // macOS until `selected()` learns it, and unreachable anywhere else — which
+    // is why `an_apple_build_gets_metal_without_anyone_passing_a_feature` above
+    // is the half that runs here.
     #[test]
     fn selected_reports_the_acceleration_this_build_was_compiled_with() {
         #[cfg(feature = "cuda")]
         assert_eq!(selected(), Backend::Cuda);
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        #[cfg(all(not(feature = "cuda"), any(feature = "metal", target_os = "macos")))]
         assert_eq!(selected(), Backend::Metal);
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        #[cfg(all(
+            not(feature = "cuda"),
+            not(feature = "metal"),
+            not(target_os = "macos")
+        ))]
         assert_eq!(selected(), Backend::Cpu);
     }
 
@@ -224,6 +243,39 @@ mod tests {
         assert_eq!(selection.got(), Backend::Cpu);
         assert!(matches!(selection.device, Device::Cpu));
         assert_eq!(selection.fallback, None);
+    }
+
+    // AYEAYE-57 — "the Apple feature is on by default in Apple builds", as
+    // something other than an intention.
+    //
+    // A cargo feature nobody passes is off, so `[features] metal` is not how an
+    // Apple build gets Metal; a target-conditional dependency table is. That
+    // table and the `target_os = "macos"` arm of `selected()` are two halves of
+    // one claim written in two files, and neither half can be compiled on this
+    // machine — so this is the test that holds them together here. It reads the
+    // manifest through the compiler, which is the only way a test gets at a
+    // file it must not open.
+    #[test]
+    fn an_apple_build_gets_metal_without_anyone_passing_a_feature() {
+        const MANIFEST: &str = include_str!("../Cargo.toml");
+
+        let table = MANIFEST
+            .split("[target.'cfg(target_os = \"macos\")'.dependencies]")
+            .nth(1)
+            .expect("a macOS dependency table, or an Apple build has no acceleration in it");
+        // To the next table header, so a later section cannot satisfy this.
+        let table = table.split("\n[").next().unwrap_or(table);
+
+        for crate_name in ["candle-core", "candle-nn", "candle-transformers"] {
+            let line = table
+                .lines()
+                .find(|line| line.trim_start().starts_with(crate_name))
+                .unwrap_or_else(|| panic!("{crate_name} is not in the macOS table: {table}"));
+            assert!(
+                line.contains("\"metal\""),
+                "{crate_name} is in the macOS table without metal on: {line}"
+            );
+        }
     }
 
     // AYEAYE-41

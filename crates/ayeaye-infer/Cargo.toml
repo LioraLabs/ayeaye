@@ -9,10 +9,45 @@ repository.workspace = true
 
 [features]
 default = []
-# Acceleration is a compile-time choice, not a runtime one: both of these pull
-# a toolchain the portable build deliberately does not have.
+# Acceleration is a compile-time choice, not a runtime one. The two are not
+# symmetric, and AYEAYE-57 measured the asymmetry rather than assuming it:
+#
+# **cuda costs a toolchain, and not the one rule 4 watches for.**
+# `candle-kernels`' build script runs `bindgen_cuda`, which shells out to
+# **nvcc** over every `.cu` file, then compiles `src/moe/*.cu` into a static
+# `libmoe.a` and emits `cargo:rustc-link-lib=stdc++` and
+# `cargo:rustc-link-lib=dylib=cudart`. So a cuda build needs the CUDA toolkit
+# and a host C++ compiler, and links the C++ runtime and the CUDA runtime
+# dynamically — which is why it is the one release row that is glibc-dynamic
+# rather than static musl. Note `bindgen_cuda` depends on `glob`, `num_cpus`
+# and `rayon` and **not** on `cc`: none of this is visible to the constitution's
+# lockfile rule, which is why rule 4 grew a second half. See `GATED` in
+# `crates/constitution/src/toolchain.rs`.
+#
+# **metal costs nothing.** `candle-metal-kernels` 0.9.2 declares `build = false`
+# and neither `metal` 0.29 nor `ug-metal` 0.5 carries a build script; the
+# kernels are compiled by the Metal runtime from source held in the binary.
+# It is pure Rust against frameworks every Mac already has.
+#
+# That asymmetry is why `metal` is not only a feature: the target table below
+# turns it on for every Apple build, because a feature nobody passes is off and
+# an Apple user should not have to ask for acceleration that costs nothing.
+# The feature stays because `crates/ayeaye/Cargo.toml` forwards it and the
+# release matrix may name it; on macOS it is now a no-op.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+# Apple acceleration, on by default in an Apple build and nowhere else.
+#
+# `target_os = "macos"` rather than Apple Silicon alone, because AYEAYE-59's
+# matrix is "both Apple architectures with Apple acceleration on". Note this
+# does not contradict `ayeaye-core`'s `machine::graphics`, which declines to
+# call an Intel Mac `metal`: that is a recommendation about which machine is
+# worth pointing at a model, and this is what the build can do if asked.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9.1", features = ["metal"] }
+candle-nn = { version = "0.9.1", features = ["metal"] }
+candle-transformers = { version = "0.9.1", features = ["metal"] }
 
 [dependencies]
 ayeaye-core.workspace = true
