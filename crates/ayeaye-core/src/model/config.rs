@@ -345,22 +345,30 @@ mod tests {
         assert_eq!(architecture_name(r#"{"architectures": ["\u+041"]}"#), None);
     }
 
-    // AYEAYE-56 — an escape this cannot decode, in a string it is only
-    // *skipping*, must not cost the model its architecture. `transformers`
-    // writes configs with `ensure_ascii=True` and `sort_keys=True`, so an
-    // emoji anywhere in the file arrives as a surrogate pair, in a key sorted
-    // before `architectures`. Sharing one function between skipping and
-    // decoding is what made this answer "names no architecture" about a config
-    // that plainly does.
+    // AYEAYE-56 — an escape this cannot make sense of, in a string it is only
+    // *skipping*, must not cost the model its architecture.
+    //
+    // The motivating case was the surrogate pair: `transformers` writes configs
+    // with `ensure_ascii=True` and `sort_keys=True`, so an emoji anywhere in the
+    // file arrives as `\ud83d\ude00`, in a key sorted before `architectures` —
+    // and sharing one function between skipping and decoding answered "names no
+    // architecture" about a config that plainly does. Joining the halves fixed
+    // that one, so the pair below documents it rather than guarding it.
+    //
+    // What still guards the property is an escape that genuinely cannot be
+    // decoded, of which there are two shapes: a half with no partner, and a
+    // letter that is not an escape at all. Mutation-checked — restore the
+    // shared decoding and this fails on either of them.
     #[test]
-    fn an_escape_in_a_string_that_is_only_skipped_costs_nothing() {
-        let smiley = r#"{
-          "_name_or_path": "\\ud83d\\ude00 tiny",
+    fn an_escape_that_cannot_be_decoded_costs_nothing_where_it_is_only_skipped() {
+        let awkward = r#"{
+          "_name_or_path": "\ud83d\ude00 tiny",
+          "_lone_half": "\ud83d",
           "_odd_escape": "\x41",
           "architectures": ["WhisperForConditionalGeneration"]
         }"#;
         assert_eq!(
-            architecture_name(smiley).as_deref(),
+            architecture_name(awkward).as_deref(),
             Some("WhisperForConditionalGeneration")
         );
     }
