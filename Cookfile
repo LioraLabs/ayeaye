@@ -109,11 +109,18 @@ recipe suite
 # cacheable at all. The sources themselves are the sealed probe above: cargo
 # consumes them, but it does not take them as arguments.
 
+#
+# `fixtures` is sealed here as well as on the bash suite: ayeaye-core's tests
+# read tests/fixtures through include_str!, which is a compile-time input and
+# so appears in no command line either. Without it, editing a captured probe
+# leaves the release gate replaying a cached green over a corpus that moved.
+
 recipe rust-suite
     ingredients "Cargo.toml"
     seal rust
     seal rust:toolchain
     seal rust:tools
+    seal fixtures
     test { cargo test --workspace --locked }
 
 # Separate from the suite so a lint failure and a test failure are two
@@ -124,6 +131,7 @@ recipe rust-lint
     seal rust
     seal rust:toolchain
     seal rust:tools
+    seal fixtures
     test { cargo clippy --workspace --all-targets --locked -- -D warnings }
 
 # --- release gates ------------------------------------------------------

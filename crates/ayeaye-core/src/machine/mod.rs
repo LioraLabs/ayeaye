@@ -55,6 +55,24 @@ pub(crate) use fixture;
 /// one probe it is about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Probes<'a> {
+    /// The first readable `/etc/os-release`-shaped file.
+    pub os_release: Option<&'a str>,
+    /// `uname -s`.
+    pub uname_s: Option<&'a str>,
+    /// `uname -m`.
+    pub uname_m: Option<&'a str>,
+    /// `sw_vers`, with no arguments, so one exec answers everything.
+    pub sw_vers: Option<&'a str>,
+    /// The commands `command -v` found on `PATH`. Only membership matters, and
+    /// only for names this crate asks about.
+    pub available_commands: &'a [&'a str],
+    /// Whether `systemctl --user show-environment` succeeded. A container has
+    /// the binary and no user session.
+    pub user_bus_responds: bool,
+    /// What `command -v brew` printed.
+    pub brew_on_path: Option<&'a str>,
+    /// The first standard prefix whose `bin/brew` is executable.
+    pub brew_in_prefix: Option<&'a str>,
     /// `nproc`.
     pub nproc: Option<&'a str>,
     /// `lscpu`, under `LC_ALL=C` — util-linux is translated.
@@ -105,4 +123,277 @@ pub struct Probes<'a> {
     /// Whether `route -n get default` resolved a route, on a machine with no
     /// `/proc` to read. `None` when there was no `route` command to ask.
     pub route_default_exists: Option<bool>,
+}
+
+/// Everything this crate can say about the machine it was handed.
+///
+/// One value, read once. The decision behind it is the ticket's: *one capability
+/// is described in exactly one place, and everything else reads that answer*. A
+/// previous run described voice three times in two framings, and the least
+/// accurate description was the one nobody read — so the tier, the cause, the
+/// reason, the acceleration, whether it is usable and why not, and the card's
+/// own name all come off this value and are computed nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    /// What this machine is.
+    pub platform: Platform,
+    /// What may be installed here, and what may only be asked.
+    pub packaging: Packaging,
+    /// Where a user service can be installed.
+    pub services: ServiceManager,
+    /// Homebrew, if it is installed, and how to invoke it.
+    pub homebrew: Option<Homebrew>,
+    /// What would do the listening work.
+    pub graphics: Graphics,
+    /// How much of this computer is yours.
+    pub share: Share,
+    /// Whether there is a way out to the internet.
+    pub network: Network,
+    /// Memory in whole megabytes, already brought down to the share.
+    pub ram_mb: Option<u64>,
+    /// Processors, already brought down to the share.
+    pub cores: Option<u64>,
+    /// Free space where the models would land, in whole megabytes.
+    pub disk_mb: Option<u64>,
+    /// What this machine can do, and why it is not more.
+    pub verdict: Verdict,
+}
+
+impl Machine {
+    /// Read the whole machine out of what its probes printed.
+    ///
+    /// The order is the shell's own: identify the platform, work out the share
+    /// before anything is measured, measure, and judge last.
+    pub fn read(probes: &Probes<'_>) -> Machine {
+        let platform = platform::identify(
+            probes.os_release,
+            probes.uname_s,
+            probes.uname_m,
+            probes.sw_vers,
+        );
+        let homebrew = platform::homebrew(probes.brew_on_path, probes.brew_in_prefix);
+        let packaging = platform::packaging(
+            platform.family,
+            platform.immutable,
+            probes.available_commands,
+            homebrew.as_ref(),
+        );
+        let services = platform::service_manager(
+            platform.os,
+            probes.available_commands,
+            probes.user_bus_responds,
+        );
+
+        let share = share::read(probes);
+        // The container correction, applied to the two figures a container lies
+        // about. Free space is not one of them: df inside a container reports
+        // the filesystem the container can actually write to.
+        let cores = share::clamp(size::cores(probes), share.cores);
+        let ram_mb = share::clamp(size::ram_mb(probes), share.ram_mb);
+        let disk_mb = size::disk_mb(probes);
+
+        let graphics = graphics::classify(&platform, probes);
+        let verdict = tier::judge(ram_mb, cores, disk_mb, &graphics, share.limits);
+
+        Machine {
+            platform,
+            packaging,
+            services,
+            homebrew,
+            graphics,
+            share,
+            network: network::classify(probes),
+            ram_mb,
+            cores,
+            disk_mb,
+            verdict,
+        }
+    }
+
+    /// What this machine can do. The one answer model selection consumes.
+    pub fn tier(&self) -> Tier {
+        self.verdict.tier
+    }
+
+    /// Whether this machine reached that tier or better.
+    pub fn tier_at_least(&self, tier: Tier) -> bool {
+        self.verdict.tier >= tier
+    }
+
+    /// What would do the listening work here.
+    pub fn acceleration(&self) -> Acceleration {
+        self.graphics.acceleration
+    }
+
+    /// Whether that acceleration is worth acting on, and why not.
+    pub fn usability(&self) -> Usability {
+        tier::usability(&self.graphics)
+    }
+
+    /// The card's own name, for a sentence that has to name it.
+    pub fn gpu_name(&self) -> Option<&str> {
+        self.graphics.name.as_deref()
+    }
+
+    /// Whether this layer recognised the machine well enough to act on its own.
+    pub fn is_known(&self) -> bool {
+        platform::is_known(&self.platform, &self.packaging)
+    }
+
+    /// The whole verdict as one line, for one line of output.
+    pub fn summary(&self) -> String {
+        platform::summary(&self.platform, &self.packaging, self.services)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Acceleration, Cause, Limits, Machine, PackageManager, Probes, Tier, Usability};
+
+    // AYEAYE-60 — the end-to-end answer tests/cases/hardware_probe_test.sh pins
+    // for hw_detect: lscpu sees the host's eight processors and meminfo its
+    // 64 GB, and the share is one gigabyte and two cores.
+    #[test]
+    fn a_container_is_judged_on_its_share_and_not_on_the_host() {
+        let machine = Machine::read(&Probes {
+            os_release: Some(fixture!("os-release/debian-12")),
+            uname_s: Some("Linux"),
+            uname_m: Some("x86_64"),
+            meminfo: Some(fixture!("meminfo/64gb")),
+            lscpu: Some(fixture!("lscpu/x86_64-8core")),
+            df_pk: Some(fixture!("df/roomy")),
+            container_marker: true,
+            cgroup_memory_max: Some(fixture!("cgroup/memory-max-1g")),
+            cgroup_cpu_max: Some(fixture!("cgroup/cpu-max-two-cores")),
+            ..Probes::default()
+        });
+        assert_eq!(machine.cores, Some(2), "lscpu sees eight; the share is two");
+        assert_eq!(
+            machine.ram_mb,
+            Some(1024),
+            "meminfo sees 64 GB; the share is one"
+        );
+        assert_eq!(
+            machine.tier(),
+            Tier::TextOnly,
+            "a gigabyte of memory is a gigabyte of memory"
+        );
+        assert_eq!(machine.share.limits, Limits::Known);
+        assert_eq!(
+            machine.disk_mb,
+            Some(510580),
+            "free space is not one of the figures a container lies about"
+        );
+    }
+
+    // AYEAYE-60 — nothing readable at all. Capped by not knowing, not by
+    // knowing something bad, and it must say which.
+    #[test]
+    fn a_machine_that_says_nothing_about_itself_is_capped_for_not_knowing() {
+        let machine = Machine::read(&Probes::default());
+        assert_eq!(machine.ram_mb, None);
+        assert_eq!(machine.cores, None);
+        assert_eq!(machine.disk_mb, None);
+        assert_eq!(machine.acceleration(), Acceleration::Cpu);
+        assert_eq!(machine.tier(), Tier::Lightweight);
+        assert_eq!(machine.verdict.cause, Some(Cause::RamUnknown));
+        assert!(
+            machine
+                .verdict
+                .reason
+                .is_some_and(|reason| reason.contains("could not"))
+        );
+        assert!(machine.verdict.cause.is_some_and(Cause::is_ignorance));
+        assert!(!machine.is_known());
+    }
+
+    // AYEAYE-60 — every answer about one capability comes off the one value.
+    #[test]
+    fn one_machine_answers_every_question_about_itself() {
+        let machine = Machine::read(&Probes {
+            os_release: Some(fixture!("os-release/ubuntu-24.04")),
+            uname_s: Some("Linux"),
+            uname_m: Some("x86_64"),
+            available_commands: &["apt-get", "systemctl"],
+            user_bus_responds: true,
+            meminfo: Some(fixture!("meminfo/64gb")),
+            lscpu: Some(fixture!("lscpu/x86_64-8core")),
+            df_pk: Some(fixture!("df/roomy")),
+            nvidia_smi: Some(fixture!("nvidia-smi/rtx-4090")),
+            route: Some(fixture!("route/default")),
+            ..Probes::default()
+        });
+        assert_eq!(machine.tier(), Tier::Maximum);
+        assert!(machine.tier_at_least(Tier::Recommended));
+        assert!(machine.tier_at_least(Tier::Maximum));
+        assert_eq!(machine.acceleration(), Acceleration::Cuda);
+        assert_eq!(machine.usability(), Usability::Usable);
+        assert_eq!(machine.gpu_name(), Some("NVIDIA GeForce RTX 4090"));
+        assert_eq!(machine.verdict.reason, None, "nothing held it back");
+        assert_eq!(machine.packaging.manager, PackageManager::AptGet);
+        assert!(machine.is_known());
+        assert_eq!(
+            machine.summary(),
+            "Ubuntu 24.04.1 LTS (debian) x86_64, packages: apt-get, services: systemd"
+        );
+    }
+
+    // AYEAYE-60 — the AMD decision, end to end: the card is detected, named,
+    // and declined with the reason stated.
+    #[test]
+    fn an_amd_machine_names_its_card_and_says_ayeaye_cannot_use_it() {
+        let machine = Machine::read(&Probes {
+            os_release: Some(fixture!("os-release/arch")),
+            uname_s: Some("Linux"),
+            uname_m: Some("x86_64"),
+            meminfo: Some(fixture!("meminfo/64gb")),
+            lscpu: Some(fixture!("lscpu/x86_64-8core")),
+            df_pk: Some(fixture!("df/roomy")),
+            rocminfo: Some(fixture!("rocminfo/gfx1100")),
+            ..Probes::default()
+        });
+        assert_eq!(
+            machine.acceleration(),
+            Acceleration::Rocm,
+            "the card is real"
+        );
+        assert_eq!(machine.gpu_name(), Some("AMD Radeon RX 7900 XTX"));
+        assert_eq!(
+            machine.usability(),
+            Usability::Unsupported("ayeaye cannot use an AMD graphics card")
+        );
+        assert_eq!(machine.tier(), Tier::Recommended);
+        assert_eq!(machine.verdict.cause, Some(Cause::GraphicsUnusable));
+    }
+
+    // AYEAYE-60 — an Apple Silicon Mac, whose memory is its graphics memory.
+    #[test]
+    fn a_mac_reaches_the_top_by_having_the_memory_for_it() {
+        let machine = Machine::read(&Probes {
+            uname_s: Some("Darwin"),
+            uname_m: Some("arm64"),
+            sw_vers: Some(fixture!("sw_vers/macos-15.1")),
+            available_commands: &["launchctl"],
+            brew_in_prefix: Some("/opt/homebrew"),
+            system_profiler: Some(fixture!("system_profiler/apple-m3-24gb")),
+            df_pk: Some(fixture!("df/roomy")),
+            route_default_exists: Some(true),
+            ..Probes::default()
+        });
+        assert_eq!(machine.acceleration(), Acceleration::Metal);
+        assert_eq!(machine.gpu_name(), Some("Apple M3"));
+        assert_eq!(machine.ram_mb, Some(24576));
+        assert_eq!(machine.cores, Some(8));
+        assert_eq!(machine.tier(), Tier::Maximum);
+        assert_eq!(machine.packaging.manager, PackageManager::Brew);
+        assert_eq!(
+            machine
+                .homebrew
+                .as_ref()
+                .map(|brew| brew.invocation.as_str()),
+            Some("/opt/homebrew/bin/brew"),
+            "found in its prefix and not on PATH, so a command line has to say where"
+        );
+        assert_eq!(machine.services.as_str(), "launchd");
+    }
 }
