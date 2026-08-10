@@ -2,8 +2,9 @@
 
 use std::fmt;
 
-/// The rules this crate enforces. Tier 1 — the four that hold the pure core
-/// pure, the strata apart, and a toolchain out of the portable build.
+/// The rules this crate enforces. Tier 1 holds the pure core pure, the strata
+/// apart, and a toolchain out of the portable build; tier 2 is the duplication
+/// rules, which are the ones the waiver ratchet exists for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// `ayeaye-core` may not reach outside itself.
@@ -17,6 +18,13 @@ pub enum Rule {
     /// Both halves of rule 4 report under this: `toolchain::check` over the
     /// lockfile, and `toolchain::gated` over the manifests.
     PureRustGraph,
+    /// A string literal may not be written in more than one crate.
+    DuplicateLiteral,
+    /// A run of code may not be copied across crates.
+    DuplicateCode,
+    /// The waiver file itself is held to the ratchet: every entry justified,
+    /// no entry waiving a violation that no longer exists.
+    Waiver,
 }
 
 impl Rule {
@@ -27,6 +35,9 @@ impl Rule {
             Rule::DependencyAllowlist => "dependency-allowlist",
             Rule::Stratum => "stratum",
             Rule::PureRustGraph => "pure-rust-graph",
+            Rule::DuplicateLiteral => "duplicate-literal",
+            Rule::DuplicateCode => "duplicate-code",
+            Rule::Waiver => "waiver",
         }
     }
 }
