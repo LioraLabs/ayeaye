@@ -8,10 +8,13 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ayeaye_core::http::hosts::AllowedHosts;
+use ayeaye_core::pane;
 use ayeaye_core::peer::{BadName, HostName, Peer, Registry};
 
+use crate::fit::{Fits, STATE_FILE};
 use crate::tmux::Tmux;
 
 use crate::cliban::Cliban;
@@ -58,6 +61,14 @@ pub struct Settings {
     /// that is when the daemon resolves it and because a PATH search per
     /// request is a directory walk per request.
     pub cliban: Cliban,
+    /// The history windows the terminal view has recently served, so a poll can
+    /// be answered with what changed. Shared across requests because that is
+    /// what makes it a cache; keyed on what the *client* says it holds, which is
+    /// what keeps it from being per-client state.
+    pub pane_cache: Arc<Mutex<pane::Cache>>,
+    /// The windows held at somebody's phone's size, and the file that outlives
+    /// this process.
+    pub fits: Arc<Fits>,
 }
 
 /// Why a configuration could not be resolved.
@@ -167,6 +178,8 @@ impl Settings {
             peers: Registry::new(vec![Peer::here(here)]).expect("one peer, and it is this machine"),
             tmux: Tmux::new(),
             cliban,
+            pane_cache: Arc::new(Mutex::new(pane::Cache::default())),
+            fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, fits_path())),
         })
     }
 
@@ -302,6 +315,18 @@ pub fn load_token() -> Result<String, ConfigError> {
         path.map(|path| path.display().to_string())
             .unwrap_or_else(|| "the state file".to_string())
     )))
+}
+
+/// Where the fit leases are written between runs.
+///
+/// `None` where there is no state directory to write to: a daemon that cannot
+/// survive its own restart is better than one that will not start. Nothing is
+/// written until a lease is actually taken, so resolving settings on a machine
+/// with no leases touches no file.
+///
+/// Deliberately **not** `bin/ayeaye`'s `fits.json` — see `crate::fit`.
+fn fits_path() -> Option<PathBuf> {
+    Some(state_dir()?.join(STATE_FILE))
 }
 
 /// Where the daemon keeps its state, or `None` if there is no home to look in.

@@ -317,9 +317,12 @@ mod tests {
         tree.thread_children(100, 100, "");
         // Only a scan could find this one, and its stat says 100 is its parent.
         tree.process(101, "codex", 100, 0);
+        // The empty slice is annotated because this crate also depends on
+        // serde_json, whose `PartialEq` impls make a bare `[]` ambiguous
+        // against a `Vec<u32>`. Nothing about the assertion changed.
         assert_eq!(
             tree.backend().children(100),
-            [],
+            [] as [u32; 0],
             "the kernel said none, and nothing went looking anyway"
         );
     }
@@ -363,7 +366,7 @@ mod tests {
     fn a_process_that_is_gone_has_no_children_and_no_name() {
         let tree = Tree::new("gone");
         tree.process(101, "codex", 4242, 0);
-        assert_eq!(tree.backend().children(4242), []);
+        assert_eq!(tree.backend().children(4242), [] as [u32; 0]);
         assert_eq!(tree.backend().comm(4242), None);
     }
 

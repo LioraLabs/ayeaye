@@ -27,8 +27,9 @@ ayeaye-infer.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # `process` and `time`: the standard library has no wait-with-timeout, and a
 # request that waits forever on a wedged tmux or cliban is the broken panel
-# AYEAYE-43 and AYEAYE-53 both exist to avoid.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time"] }
+# AYEAYE-43 and AYEAYE-53 both exist to avoid. `sync` for the async mutex that
+# holds a fit lease across the tmux restore it awaits.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "time", "sync"] }
 # The query string is percent-encoded and `+` means space; parse_qs gives the
 # daemon that for free and hand-rolling it is where a `next=%2F%2Fevil` slips
 # past a check that only looked at the raw text.
@@ -44,6 +45,12 @@ libc = "0.2"
 # questions could come from here; only this one does, because the other five
 # have captured output that a test on this machine can be held to.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
+# The resize body `share/app.html` sends, which cannot be changed. Read here in
+# the shell rather than in the core: `ayeaye-core` declares no dependencies, and
+# the hand-rolled scanner it does carry answers only the two questions cliban's
+# output poses. A serde-shaped reader is the thing that would put a dependency
+# on the allowlist, which is why this sits on this side of the line.
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time"] }

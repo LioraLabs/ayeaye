@@ -14,15 +14,18 @@ pub mod audio;
 pub mod board;
 pub mod chat;
 pub mod cleanup;
+pub mod fit;
 pub mod http;
 pub mod identity;
 pub mod json;
 pub mod logits;
 pub mod machine;
 pub mod mel;
+pub mod pane;
 pub mod peer;
 pub mod process;
 pub mod service;
+pub mod sha1;
 pub mod tmux;
 
 pub use audio::Pcm16kMono;

@@ -21,6 +21,11 @@ pub enum Route {
     Login,
     /// The pane list: every live pane on this machine, qualified.
     Panes,
+    /// One pane's terminal view, whole or as a diff against what the client
+    /// says it holds.
+    Pane,
+    /// A window resize, and the fit lease that holds it there.
+    Resize,
     /// A file compiled into the binary.
     Asset(Asset),
     /// Anything under `/api/`. Gated, whether or not it exists.
@@ -50,6 +55,14 @@ const API_PREFIX: &str = "/api/";
 /// the catch-all above stays, so a path nobody has written yet is still gated
 /// rather than being open by omission.
 const PANES: &str = "/api/panes";
+
+/// One pane's terminal view. Not a path under [`PANES`]: `/api/pane` and
+/// `/api/panes` are different endpoints and neither is a prefix of the other as
+/// far as this table is concerned.
+const PANE: &str = "/api/pane";
+
+/// A window resize. A POST, and gated as every POST is.
+const RESIZE: &str = "/api/resize";
 
 const fn asset(file: &'static str, content_type: &'static str) -> Asset {
     Asset { file, content_type }
@@ -111,6 +124,8 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
     if path.starts_with(API_PREFIX) {
         return match path {
             PANES => Route::Panes,
+            PANE => Route::Pane,
+            RESIZE => Route::Resize,
             _ => Route::Api,
         };
     }
@@ -142,7 +157,7 @@ pub fn gate(method: &str, route: Route) -> Gate {
         return Gate::Token;
     }
     match route {
-        Route::Api | Route::Panes => Gate::Token,
+        Route::Api | Route::Panes | Route::Pane | Route::Resize => Gate::Token,
         // The pages carry no data and no secrets, and the login handshake
         // presents its own token in the query. `NotFound` is open on purpose:
         // a 401 on an unknown path would tell an unauthenticated caller which
@@ -305,6 +320,35 @@ mod tests {
         // new endpoint cannot arrive by accident.
         assert_eq!(resolve("/api/panes/extra", false), Route::Api);
         assert_eq!(resolve("/api/panes2", false), Route::Api);
+    }
+
+    // AYEAYE-47 — the terminal view and the resize are routes of their own, and
+    // both are gated exactly as the rest of the API is. `/api/pane` is not
+    // `/api/panes` with a letter missing: they are different endpoints, and a
+    // table that let one fall through to the other would serve a pane list where
+    // a terminal was asked for.
+    #[test]
+    fn the_terminal_view_and_the_resize_are_routes_and_are_gated() {
+        assert_eq!(resolve("/api/pane", false), Route::Pane);
+        assert_eq!(resolve("/api/resize", false), Route::Resize);
+        assert_eq!(resolve("/api/panes", false), Route::Panes);
+        // A token in the query does not turn either into a login.
+        assert_eq!(resolve("/api/pane", true), Route::Pane);
+        assert_eq!(resolve("/api/resize", true), Route::Resize);
+        for method in ["GET", "HEAD", "POST", "DELETE"] {
+            for route in [Route::Pane, Route::Resize] {
+                assert_eq!(
+                    gate(method, route),
+                    Gate::Token,
+                    "{method} {route:?} must need a token"
+                );
+            }
+        }
+        // Only those paths. Anything near them is still the API's catch-all, so
+        // a new endpoint cannot arrive by accident.
+        assert_eq!(resolve("/api/pane/extra", false), Route::Api);
+        assert_eq!(resolve("/api/panel", false), Route::Api);
+        assert_eq!(resolve("/api/resizes", false), Route::Api);
     }
 
     // AYEAYE-42 — the daemon's `do_POST` gates every POST before it looks at

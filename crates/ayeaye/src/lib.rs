@@ -14,6 +14,7 @@ pub mod board;
 pub mod cliban;
 pub mod command;
 pub mod config;
+pub mod fit;
 pub mod process;
 pub mod server;
 pub mod tmux;
