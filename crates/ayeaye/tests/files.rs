@@ -271,7 +271,11 @@ fn settings_on_port(port: u16) -> Settings {
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-52-no-such-converter".to_string(),
+            ayeaye_infer::backend::select(),
         )),
+        // No path, as in serve.rs: a test must never write into the pick
+        // history of whoever is running the suite.
+        store: None,
     }
 }
 
