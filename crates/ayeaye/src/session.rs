@@ -165,10 +165,11 @@ impl Agents {
 
     /// What the pane's *process* says, given the line tmux printed about it.
     ///
-    /// `said` is the two [`FIELDS`], tab-separated, exactly as
-    /// `display-message` printed them. Both come out of one query: between two
-    /// queries the pane may have been closed and its id handed to another, so
-    /// two reads of "the same pane" can describe two different panes.
+    /// `said` is what tmux printed for `#{pane_current_command}` and
+    /// `#{pane_pid}`, tab-separated, in that order. Both come out of one
+    /// query: between two queries the pane may have been closed and its id
+    /// handed to another, so two reads of "the same pane" can describe two
+    /// different panes.
     ///
     /// This is where a test drives the whole resolution, because it is the
     /// whole resolution: everything above it is two tmux calls.
@@ -501,7 +502,7 @@ fn modified(path: &Path) -> Option<f64> {
 /// rollout's stamp in the machine's local time, and only the C library knows
 /// what that was on the day in question. `tm_isdst = -1` is what asks it to
 /// work out whether summer time was in force, rather than being told.
-pub fn instant(stamp: codex::Stamp) -> Option<f64> {
+fn instant(stamp: codex::Stamp) -> Option<f64> {
     // Zeroed rather than fielded one by one: `tm` has members beyond the seven
     // set here on every platform that has it, and a stack full of whatever was
     // there before is not an input to give a C function.
@@ -995,10 +996,41 @@ mod tests {
         assert_eq!(agents.behind_process(&fake, "codex\t100"), Behind::Nothing);
     }
 
-    // AYEAYE-45 — codex writes a rollout's stamp in local time, and only the C
-    // library knows what that was on the day in question. Round-tripped rather
-    // than compared against a constant, because a constant would be this
-    // machine's timezone written into the suite.
+    // AYEAYE-45 — the conversion pinned against the C library rather than
+    // against itself. Every other test that touches it derives both sides from
+    // `instant`, so a `tm_mon` or `tm_year` off by one would leave them all
+    // green while `started_with` silently never matched a real kernel start
+    // time. Against *now* rather than a constant, because a constant would be
+    // this machine's timezone written into the suite.
+    #[test]
+    fn a_local_moment_agrees_with_the_c_library_about_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs() as i64;
+        let mut broken: libc::tm = unsafe { std::mem::zeroed() };
+        let seconds = now as libc::time_t;
+        assert!(
+            !unsafe { libc::localtime_r(&seconds, &mut broken) }.is_null(),
+            "the C library can name this moment"
+        );
+
+        let stamp = codex::Stamp {
+            year: broken.tm_year + 1900,
+            month: (broken.tm_mon + 1) as u32,
+            day: broken.tm_mday as u32,
+            hour: broken.tm_hour as u32,
+            minute: broken.tm_min as u32,
+            second: broken.tm_sec as u32,
+        };
+        assert_eq!(
+            instant(stamp),
+            Some(now as f64),
+            "the round trip through local civil time lost the moment"
+        );
+    }
+
+    // AYEAYE-45 — and one second later really is one second later.
     #[test]
     fn a_local_moment_becomes_an_instant() {
         let stamp = codex::Stamp {
