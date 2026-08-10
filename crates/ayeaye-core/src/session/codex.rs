@@ -33,6 +33,12 @@ const JSONL: &str = ".jsonl";
 /// `YYYY-MM-DDTHH-MM-SS`: how much of a rollout's name is its moment.
 const STAMPED: usize = 19;
 
+/// The years `strptime` will read, and so the years this will.
+const YEARS: std::ops::RangeInclusive<i32> = 1..=9999;
+
+/// What `thread_source` says when a thread was spawned rather than started.
+const SUBAGENT: &str = "subagent";
+
 /// How early a rollout may appear relative to the process that owns it.
 ///
 /// Negative, and small: the two clocks are the same clock, and this is only
@@ -80,9 +86,6 @@ impl Meta {
             || self.thread_source.as_deref() == Some(SUBAGENT)
     }
 }
-
-/// What `thread_source` says when a thread was spawned rather than started.
-const SUBAGENT: &str = "subagent";
 
 /// The `session_meta` a rollout opens with, or `None`.
 ///
@@ -190,7 +193,8 @@ pub fn stamp(name: &str) -> Option<Stamp> {
         minute: field(14..16)?,
         second: field(17..19)?,
     };
-    ((1..=12).contains(&stamp.month)
+    (YEARS.contains(&stamp.year)
+        && (1..=12).contains(&stamp.month)
         && (1..=days_in(stamp.year, stamp.month)).contains(&stamp.day)
         && stamp.hour < 24
         && stamp.minute < 60
@@ -405,6 +409,12 @@ mod tests {
         );
         assert!(stamp("rollout-2000-02-29T09-00-02-x.jsonl").is_some());
         assert_eq!(stamp("rollout-1900-02-29T09-00-02-x.jsonl"), None);
+        assert_eq!(
+            stamp("rollout-0000-02-29T09-00-02-x.jsonl"),
+            None,
+            "the daemon's strptime refuses a year outside 1..9999, and mktime \
+             would not survive it either"
+        );
         assert!(
             stamp("rollout-2026-03-04T09-00-61-x.jsonl").is_some(),
             "61 is what strptime's %S accepts, and differing over it is a \
