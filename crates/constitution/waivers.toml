@@ -152,5 +152,5 @@ justification = "one common word, three meanings: a board section, a session gro
 # --- the one copied run ----------------------------------------------------
 
 [[waiver]]
-key = "duplicate-code/ae6943dadb9f02cc/ayeaye+ayeaye-core"
+key = "duplicate-code/3fc745bc78f49d17/ayeaye+ayeaye-core"
 justification = "both matches enumerate the full Route surface for different verdicts — the token gate in the core, the method-fallback 404 in the shell; a new variant already forces both through exhaustiveness, so the copy is compiler-supervised"
