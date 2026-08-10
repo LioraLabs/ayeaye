@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/ayeaye", "crates/ayeaye-core", "crates/ayeaye-infer"]
+members = [
+    "crates/ayeaye",
+    "crates/ayeaye-core",
+    "crates/ayeaye-infer",
+    "crates/constitution",
+]
 
 # One version for the whole workspace. install.sh still owns the release
 # version; this repeats it, and the release-version gate is what will be

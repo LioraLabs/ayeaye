@@ -1,0 +1,14 @@
+[package]
+name = "constitution"
+description = "The rules the workspace is held to, in enforceable form."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Manifests are read as TOML because that is what they are. Nothing else here
+# needs a dependency: the corpus walk is twenty lines of std.
+toml = "0.9"
