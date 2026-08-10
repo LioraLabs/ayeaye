@@ -85,7 +85,15 @@ pub async fn spawn(settings: &Settings, body: &[u8]) -> Answered {
         Ok(live) => live,
         Err(trouble) => return Answered::refused(trouble.to_string()),
     };
-    let made = agent::create(&session, dir, live.contains(&session));
+    // Matched by name, targeted by id. The match is an exact string comparison
+    // made here, where it is a comparison and not a tmux target — tmux never
+    // sees this name again, which is what makes a project directory called
+    // `$0` or `work:9` unable to reach somebody else's session.
+    let existing = live
+        .iter()
+        .find(|live| live.name == session)
+        .map(|live| live.id.as_str());
+    let made = agent::create(&session, dir, existing);
 
     let printed = match settings.tmux.ask(&borrowed(made.argv())).await {
         Ok(printed) => printed,

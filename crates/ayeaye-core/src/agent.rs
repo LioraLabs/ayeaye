@@ -99,22 +99,20 @@ pub fn session_name(dir: &str, tmux_yaml: Option<&str>) -> String {
         .replace(SEPARATORS, "_")
 }
 
-/// The characters tmux reads as target separators, which a session name may not
-/// carry.
+/// The characters tmux reads as target separators, folded out of a session
+/// name.
 ///
-/// A tmux target is `session:window.pane`, so both of these turn a name into a
-/// *different* name plus a coordinate. `bin/ayeaye:1403` folds only the dot,
-/// and the colon is the one that does real damage: tmux accepts a session
-/// literally called `work:9`, and `new-window -t "=work:9"` then opens window 9
-/// of the session `work` — someone else's project gaining a window nobody asked
-/// for, which is exactly what the `=` is there to prevent. The `=` forces an
-/// exact match on the *session* half and cannot help once the colon has ended
-/// it.
+/// A tmux target is `session:window.pane`, so a name carrying either of these
+/// cannot be typed at a tmux prompt as the session it names — `tmux attach -t
+/// work:9` attaches to window 9 of `work`. The name is something a person uses,
+/// and this keeps it usable. `bin/ayeaye:1403` folds only the dot.
 ///
-/// A deliberate departure from the daemon, in the same direction as
-/// `Tmux::sessions` splitting on lines: a project directory can be called
-/// anything, and this is the only place that can stop what it is called from
-/// naming somebody else's session.
+/// **This is not what stops a project from reaching another project's session.**
+/// That is [`create`] targeting the session *id*, and it has to be: folding is a
+/// list of characters, the list was wrong twice (the daemon's omits the colon;
+/// adding the colon still left a project called `$0` resolving to a session
+/// id), and a defence that is a list of characters is a defence that is one
+/// character out of date.
 const SEPARATORS: &[char] = &[':', '.'];
 
 /// The `session_name:` a project declares, if it declares one.
@@ -184,17 +182,16 @@ impl Creation {
 /// everything started in one project stays under one name. The argv and the
 /// label are one answer rather than two, because a caller that derived the
 /// label separately could report a window it did not make.
-pub fn create(session: &str, dir: &str, session_exists: bool) -> Creation {
-    // `=` forces an exact match. Without it tmux resolves `-t name` as a
-    // prefix, and a project whose name is the start of another project's would
-    // open its window in somebody else's session.
-    let (mut argv, created) = if session_exists {
+///
+/// `existing` is the **session id** tmux gave that session — `$3` — and not its
+/// name. See [`crate::tmux::Session`] for what goes wrong when a name is used as
+/// a target instead; the short version is that a session name is whatever a
+/// directory was called, and tmux's target grammar reads several characters in
+/// one as syntax.
+pub fn create(session: &str, dir: &str, existing: Option<&str>) -> Creation {
+    let (mut argv, created) = if let Some(id) = existing {
         (
-            vec![
-                "new-window".to_string(),
-                "-t".to_string(),
-                format!("={session}"),
-            ],
+            vec!["new-window".to_string(), "-t".to_string(), id.to_string()],
             Created::Window,
         )
     } else {
@@ -364,8 +361,8 @@ mod tests {
     use crate::peer::{HostName, PaneId};
     use crate::quoting::Unquotable;
 
-    fn argv(session: &str, dir: &str, exists: bool) -> Vec<String> {
-        create(session, dir, exists).argv().to_vec()
+    fn argv(session: &str, dir: &str, existing: Option<&str>) -> Vec<String> {
+        create(session, dir, existing).argv().to_vec()
     }
 
     fn claude() -> Agent {
@@ -514,7 +511,7 @@ mod tests {
     #[test]
     fn a_project_with_no_session_gets_one_and_a_project_with_one_gets_a_window() {
         assert_eq!(
-            argv("ayeaye", "/home/alex/dev/ayeaye", false),
+            argv("ayeaye", "/home/alex/dev/ayeaye", None),
             [
                 "new-session",
                 "-d",
@@ -528,23 +525,35 @@ mod tests {
             ]
         );
         assert_eq!(
-            create("ayeaye", "/home/alex/dev/ayeaye", false).created(),
+            create("ayeaye", "/home/alex/dev/ayeaye", None).created(),
             Created::Session
         );
     }
 
-    // AYEAYE-51 — and the `=`. Without it tmux resolves `-t ayeaye` as a
-    // prefix, so starting an agent in `ayeaye` would open a window in
-    // `ayeaye-one-binary` if that session sorted first — someone else's project
-    // gaining a window nobody asked for.
+    // AYEAYE-51 — an existing session is targeted by tmux's **id**, never by
+    // its name. A name is whatever a directory was called, and a tmux target is
+    // a grammar: `session:window.pane`, plus a leading `$` for a session id.
+    // Three ways that goes wrong, every one reproduced against a real tmux on a
+    // private socket, and none of them prevented by `=`:
+    //
+    // - a project called `work:9` targets `=work:9`, which opens **window 9 of
+    //   `work`** — somebody else's session;
+    // - a project called `$0` targets `=$0`, which resolves the *session id*
+    //   `$0` — again somebody else's session;
+    // - a project whose name matches a *window* name elsewhere resolves that
+    //   window instead, because `=name` is a window target and the window
+    //   lookup runs first.
+    //
+    // An id is tmux's own and reads as nothing else. A fold of awkward
+    // characters is not a substitute: that list was wrong twice.
     #[test]
-    fn an_existing_session_is_named_exactly_rather_than_by_prefix() {
+    fn an_existing_session_is_targeted_by_its_id_and_never_by_its_name() {
         assert_eq!(
-            argv("ayeaye", "/home/alex/dev/ayeaye", true),
+            argv("ayeaye", "/home/alex/dev/ayeaye", Some("$3")),
             [
                 "new-window",
                 "-t",
-                "=ayeaye",
+                "$3",
                 "-c",
                 "/home/alex/dev/ayeaye",
                 "-P",
@@ -553,9 +562,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            create("ayeaye", "/home/alex/dev/ayeaye", true).created(),
+            create("ayeaye", "/home/alex/dev/ayeaye", Some("$3")).created(),
             Created::Window
         );
+        // The session name does not reach the *target* when the session already
+        // exists, which is what makes the three failures above impossible
+        // rather than merely unlikely. It is the only argument position where a
+        // name is read as a grammar; the directory below it is a value, and a
+        // project really can be called `$0`.
+        let hostile = argv("$0", "/dev/$0", Some("$7"));
+        assert_eq!(hostile[..3], ["new-window", "-t", "$7"]);
+        assert_eq!(hostile[3..5], ["-c", "/dev/$0"]);
     }
 
     // AYEAYE-51 — "spawn takes a project path, an agent, and an **optional**
@@ -671,7 +688,7 @@ mod tests {
             spawned_body(
                 &pane("desktop", "%7"),
                 "ayeaye",
-                &create("ayeaye", "/home/alex/dev/ayeaye", true),
+                &create("ayeaye", "/home/alex/dev/ayeaye", Some("$3")),
                 claude()
             ),
             concat!(
@@ -686,7 +703,7 @@ mod tests {
             spawned_body(
                 &pane("Alex's Mac", "%1"),
                 r#"say "hi""#,
-                &create("say.hi", "/dev/say.hi", false),
+                &create("say_hi", "/dev/say.hi", None),
                 agent("codex").expect("codex is an agent")
             ),
             concat!(

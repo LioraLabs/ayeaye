@@ -738,10 +738,12 @@ fn scratch() -> &'static std::path::Path {
         let claude = root.join("bin/claude");
         std::fs::write(
             &claude,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > {}\n",
-                root.join("argv").display()
-            ),
+            // Where it records is `$AYEAYE_51_ARGV`, set per test through the
+            // pane's own environment. One shared log would be appended to by
+            // whichever spawn test ran beside this one -- and the tests run as
+            // threads in one process, so "what the agent was given" would
+            // become a claim about the whole file rather than about this test.
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"$AYEAYE_51_ARGV\"\n",
         )
         .expect("the stand-in agent should be writable");
         std::fs::set_permissions(
@@ -758,10 +760,9 @@ fn scratch() -> &'static std::path::Path {
 /// Polled rather than read once: the command is *typed into a shell*, so
 /// between the response and the argv landing there is a shell to read the line
 /// and a process to start. Giving up is a failure with what was there.
-async fn recorded_argv() -> Vec<String> {
-    let log = scratch().join("argv");
+async fn recorded_argv(log: &std::path::Path) -> Vec<String> {
     for _ in 0..200 {
-        if let Ok(text) = std::fs::read_to_string(&log) {
+        if let Ok(text) = std::fs::read_to_string(log) {
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
             // The first line is `$#`, so a log with that many lines after it is
             // a complete one rather than a half-written one.
@@ -806,11 +807,16 @@ async fn spawning_starts_the_agent_in_the_project_with_the_prompt_as_one_argumen
     //   Prepending would make that a matter of ordering; replacing makes
     //   "the stand-in is missing" a `claude: not found` and a failed test
     //   instead of somebody's actual agent starting in a temporary directory.
+    let log = scratch().join("argv-spawn");
     tmux.tmux(&[
         "set-option",
         "-g",
         "default-command",
-        &format!("PATH={} /bin/sh", scratch().join("bin").display()),
+        &format!(
+            "PATH={} AYEAYE_51_ARGV={} /bin/sh",
+            scratch().join("bin").display(),
+            log.display()
+        ),
     ]);
 
     let project = scratch().join("ayeaye-51-project");
@@ -851,7 +857,7 @@ async fn spawning_starts_the_agent_in_the_project_with_the_prompt_as_one_argumen
 
     // The agent really ran, in that directory, with the prompt as exactly one
     // argument — unsplit, unexpanded, and byte for byte what was sent.
-    let argv = recorded_argv().await;
+    let argv = recorded_argv(&log).await;
     assert_eq!(argv, ["1", prompt], "the agent was given {argv:?}");
 
     // And the panel can see the pane it was told about.
@@ -867,6 +873,88 @@ async fn spawning_starts_the_agent_in_the_project_with_the_prompt_as_one_argumen
     assert!(
         panes.contains(&format!(r#""id":"{pane}""#)),
         "the spawned pane is not in the pane list: {panes}"
+    );
+}
+
+// AYEAYE-51 — the second agent for a project joins the first one's session
+// rather than starting a second, and it does so **by that session's id**.
+//
+// Found at the final gate. A tmux target is a grammar — `session:window.pane`,
+// with a leading `$` meaning a session id — so a session *name* used as a
+// target is a directory's name being read as syntax. This is the case that
+// proves it: the machine already has a session whose tmux id is `$0`, and the
+// project is a directory literally called `$0`. Targeting by name sends the
+// second window into `important-work`; targeting by id sends it where it
+// belongs. Verified against a real tmux before it was written.
+#[tokio::test]
+async fn a_second_agent_joins_its_own_session_even_when_the_project_is_named_like_a_target() {
+    let Some(tmux) = common::Private::named("serve-spawn-twice") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    tmux.tmux(&[
+        "set-option",
+        "-g",
+        "default-command",
+        &format!(
+            "PATH={} AYEAYE_51_ARGV={} /bin/sh",
+            scratch().join("bin").display(),
+            scratch().join("argv-twice").display()
+        ),
+    ]);
+    // The session that must not gain a window. It is the first session on this
+    // server, so tmux calls it `$0` — which is also what the project below is
+    // called.
+    let hijackable = tmux
+        .output(&["list-sessions", "-F", "#{session_name}\t#{session_id}"])
+        .expect("the private server's own session");
+    assert!(
+        hijackable.contains("work\t$0"),
+        "this test needs `work` to be session $0: {hijackable}"
+    );
+
+    let project = scratch().join("$0");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let body = format!(
+        r#"{{"dir":{},"agent":"claude"}}"#,
+        serde_json::to_string(&project.to_string_lossy().into_owned()).unwrap()
+    );
+
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let first = server.post_as_us("/api/spawn", &body).await;
+    assert_eq!(first.status, 200, "{}", first.body_text());
+    assert!(
+        first.body_text().contains(r#""created":"session""#),
+        "{}",
+        first.body_text()
+    );
+
+    let second = server.post_as_us("/api/spawn", &body).await;
+    assert_eq!(second.status, 200, "{}", second.body_text());
+    assert!(
+        second.body_text().contains(r#""created":"window""#),
+        "the second agent should join the first one's session: {}",
+        second.body_text()
+    );
+
+    // Where the windows actually are. Asked of tmux by listing everything, not
+    // by naming a session — naming one is the very thing under test.
+    let windows = tmux
+        .output(&["list-windows", "-a", "-F", "#{session_name}"])
+        .expect("the window list");
+    let in_session = |name: &str| windows.lines().filter(|line| *line == name).count();
+    assert_eq!(
+        in_session("work"),
+        1,
+        "session `work` gained a window that belongs to the project: {windows}"
+    );
+    assert_eq!(
+        in_session("$0"),
+        2,
+        "both agents should be in the project's own session: {windows}"
     );
 }
 
