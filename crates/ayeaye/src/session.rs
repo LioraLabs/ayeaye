@@ -152,7 +152,13 @@ impl Agents {
                     .ask(&["capture-pane", "-p", "-t", pane.id.pane(), "-S", SCROLLBACK])
                     .await
                     .ok()?;
-                self.through_marker(&text)
+                // On the blocking pool for the same reason as the route above,
+                // and it is the *same* directory scan: the marker route differs
+                // only in where the id came from.
+                let agents = self.clone();
+                tokio::task::spawn_blocking(move || agents.through_marker(&text))
+                    .await
+                    .ok()?
             }
         }
     }
