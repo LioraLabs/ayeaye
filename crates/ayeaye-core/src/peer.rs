@@ -4,7 +4,7 @@
 pub const SEPARATOR: char = '/';
 
 /// A machine's name, in a form a qualified pane id can carry.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostName(String);
 
 impl HostName {
@@ -59,7 +59,7 @@ pub enum BadName {
 /// can live inside a qualified id. Whether it is a *usable tmux target* is a
 /// different question, and it belongs to whichever ticket first sends one to
 /// tmux rather than to the type that federates it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneId {
     host: HostName,
     pane: String,
@@ -449,6 +449,19 @@ mod tests {
         assert_eq!(
             registry.route("%12").unwrap_err(),
             Unroutable::NotAnId(BadPaneId::NoPane)
+        );
+
+        // The registry refuses `gpu-box` and `GPU-Box` as one machine under two
+        // names, so an id shouted back at it has to reach that machine. If the
+        // lookup were exact, the collision rule would be refusing lists it then
+        // could not route anyway.
+        let (shouted, _) = registry
+            .route("GPU-Box/%3")
+            .expect("one machine, either case");
+        assert_eq!(shouted.name().as_str(), "gpu-box");
+        assert_eq!(
+            registry.get("DESKTOP").map(|peer| peer.is_here()),
+            Some(true)
         );
     }
 }

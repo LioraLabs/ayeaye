@@ -117,20 +117,23 @@ pub fn panes_body(host: &HostName, panes: &[Pane], failed: Option<&str>) -> Stri
 /// completely different things from whoever is reading the panel.
 pub fn no_server_running(stderr: &str) -> bool {
     let said = stderr.to_lowercase();
-    NO_SERVER.iter().any(|phrase| said.contains(phrase))
+    if NO_SERVER.iter().any(|phrase| said.contains(phrase)) {
+        return true;
+    }
+    // `error connecting to <socket> (<reason>)` is the older wording, and the
+    // reason is the whole message: a socket that is not there and one that is
+    // there but refuses are no server, while one we are not allowed to open is
+    // a machine with panes on it we cannot see. Reporting that as "no panes"
+    // would be the panel saying nothing needs you when it does not know.
+    said.contains("error connecting to")
+        && (said.contains("no such file or directory") || said.contains("connection refused"))
 }
 
-/// The ways tmux says there is no server to talk to.
+/// The ways tmux says there is no server to talk to on its own.
 ///
-/// Matched as substrings because each comes with the socket path attached, and
-/// three spellings rather than one because they are three different tmux
-/// answers: a socket that was never there, a server that has since gone, and
-/// the wording older builds use.
-const NO_SERVER: &[&str] = &[
-    "no server running",
-    "server exited unexpectedly",
-    "error connecting to",
-];
+/// Matched as substrings because each comes with the socket path attached: a
+/// socket that was never there, and a server that has since gone.
+const NO_SERVER: &[&str] = &["no server running", "server exited unexpectedly"];
 
 #[cfg(test)]
 mod tests {
@@ -176,11 +179,18 @@ mod tests {
             "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\
              \t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
         );
-        assert_eq!(
-            MIXED.lines().count(),
-            5,
-            "the fixture is that format's output"
-        );
+        // And the fixture really is that format's output: seven fields on
+        // every line. A line count would pass over a fixture whose columns had
+        // drifted, which is the only way this could quietly stop being a test
+        // of the format at all.
+        assert_eq!(MIXED.lines().count(), 5);
+        for line in MIXED.lines() {
+            assert_eq!(
+                line.split('\t').count(),
+                PANE_FORMAT.matches('\t').count() + 1,
+                "one field per format specifier in {line:?}"
+            );
+        }
     }
 
     // AYEAYE-43 — a machine with no tmux server has no panes, which is not the
@@ -206,6 +216,33 @@ mod tests {
         assert!(!no_server_running(""));
         assert!(!no_server_running("unknown option -- Z"));
         assert!(!no_server_running("can't find pane: %99"));
+        // A socket that is there and will not open for us is a machine with
+        // panes we cannot see. Calling that "no panes" is the panel saying
+        // nothing needs you when it does not know.
+        assert!(!no_server_running(
+            "error connecting to /tmp/tmux-0/default (Permission denied)"
+        ));
+    }
+
+    // AYEAYE-43 — a line with *more* than seven fields is dropped too. A window
+    // renamed with a tab in it produces one, and reading the first seven fields
+    // out of it shifts every field past the tab: the command is read out of the
+    // window name and the flags are read out of the command. The pane would
+    // come back as a different pane, which is worse than not coming back.
+    // `bin/ayeaye`'s `len(parts) != 7` drops it, and so must this.
+    #[test]
+    fn a_line_with_an_extra_field_is_dropped_like_a_short_one() {
+        // A window named "two\tnames", on an inactive pane: eight fields, and
+        // the seventh is not the dead flag it would be mistaken for.
+        let text = "\
+%0\twork\t0\ttwo\tnames\tsh\t0\t0
+%2\twork\t1\tcook\tsh\t0\t0
+";
+        let ids: Vec<String> = panes(&host(), text)
+            .iter()
+            .map(|pane| pane.id.qualified())
+            .collect();
+        assert_eq!(ids, ["desktop/%2"]);
     }
 
     // AYEAYE-43 — a line that is not seven fields is skipped, not guessed at,
