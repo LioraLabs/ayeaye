@@ -9,6 +9,7 @@
 //! The rules themselves, and how to amend one, are written out in this crate's
 //! `README.md`. That file is normative; this one is the implementation of it.
 
+pub mod deps;
 pub mod effect_budget;
 pub mod finding;
 pub mod strip;
