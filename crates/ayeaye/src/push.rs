@@ -9,6 +9,12 @@ pub const SUBSCRIPTIONS_FILE: &str = "push-subscriptions.json";
 pub const VAPID_KEY_FILE: &str = "vapid-private-key";
 
 pub fn public_key(state_dir: &Path) -> std::io::Result<String> {
+    let secret = private_key(state_dir)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(secret.public_key().to_encoded_point(false).as_bytes()))
+}
+
+fn private_key(state_dir: &Path) -> std::io::Result<p256::SecretKey> {
     let path = state_dir.join(VAPID_KEY_FILE);
     let secret = match std::fs::read(&path)
         .ok()
@@ -24,8 +30,7 @@ pub fn public_key(state_dir: &Path) -> std::io::Result<String> {
             secret
         }
     };
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(secret.public_key().to_encoded_point(false).as_bytes()))
+    Ok(secret)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -35,6 +40,7 @@ pub struct Subscription {
     pub auth: String,
 }
 
+#[derive(Debug)]
 pub struct Store {
     state_dir: PathBuf,
     path: PathBuf,
@@ -63,6 +69,10 @@ impl Store {
         public_key(&self.state_dir)
     }
 
+    pub fn private_key(&self) -> std::io::Result<[u8; 32]> {
+        Ok(private_key(&self.state_dir)?.to_bytes().into())
+    }
+
     pub fn upsert(&mut self, subscription: Subscription) -> std::io::Result<()> {
         match self
             .subscriptions
@@ -78,6 +88,12 @@ impl Store {
     pub fn remove(&mut self, endpoint: &str) -> std::io::Result<()> {
         self.subscriptions
             .retain(|subscription| subscription.endpoint != endpoint);
+        self.save()
+    }
+
+    pub fn remove_if_current(&mut self, delivered: &Subscription) -> std::io::Result<()> {
+        self.subscriptions
+            .retain(|subscription| subscription != delivered);
         self.save()
     }
 

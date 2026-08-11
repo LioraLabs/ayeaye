@@ -116,9 +116,7 @@ pub struct Message {
     pub title: String,
     /// The question or the last words, with up to four options under it.
     pub body: String,
-    /// ntfy's icon tags.
-    pub tags: &'static [&'static str],
-    /// ntfy's 1–5 priority.
+    /// Message priority for the service worker.
     pub priority: u8,
 }
 
@@ -127,13 +125,13 @@ pub struct Message {
 /// Both mean the turn is yours; `blocked` is louder because a session at a
 /// prompt cannot make progress without you, where one that has handed back
 /// has at least finished.
-fn note(state: State) -> (&'static str, &'static [&'static str], u8) {
+fn note(state: State) -> (&'static str, u8) {
     match state {
-        State::Blocked => ("needs you", &["warning"], 4),
-        State::Waiting => ("finished its turn", &["bell"], 3),
+        State::Blocked => ("needs you", 4),
+        State::Waiting => ("finished its turn", 3),
         // A state somebody configured in beyond the defaults still reads as
         // something on a lock screen.
-        _ => ("needs you", &["bell"], 3),
+        _ => ("needs you", 3),
     }
 }
 
@@ -148,7 +146,7 @@ pub fn message(card: &Card) -> Message {
     // A card with no state cannot reach here through [`changes`] — it never
     // gets a key — but a direct caller gets the daemon's own default, which
     // is `note`'s fallback arm, not the waiting wording.
-    let (said, tags, priority) = note(card.state.unwrap_or(State::Working));
+    let (said, priority) = note(card.state.unwrap_or(State::Working));
     let question: String = card
         .prompt
         .as_ref()
@@ -184,55 +182,23 @@ pub fn message(card: &Card) -> Message {
     Message {
         title: format!("{}:{} · {} {}", pane.session, pane.window, agent, said),
         body,
-        tags,
         priority,
     }
 }
 
-/// The JSON one publish sends to ntfy.
-///
-/// The JSON API rather than ntfy's header form, exactly as the daemon
-/// chooses: HTTP headers are latin-1, so a non-ASCII character in a title
-/// arrives mangled — and agent questions are full of them.
-pub fn payload(topic: &str, message: &Message, click: &str) -> String {
-    let tags = message
-        .tags
-        .iter()
-        .map(|tag| json::string(tag))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut out = format!(
-        "{{\"topic\":{},\"title\":{},\"message\":{},\"priority\":{},\"tags\":[{}]",
-        json::string(topic),
+/// The JSON the service worker receives.
+pub fn payload(message: &Message) -> String {
+    format!(
+        "{{\"title\":{},\"body\":{},\"priority\":{}}}",
         json::string(&message.title),
         json::string(&message.body),
         message.priority,
-        tags,
-    );
-    if !click.is_empty() {
-        out.push_str(&format!(",\"click\":{}", json::string(click)));
-    }
-    out.push('}');
-    out
-}
-
-/// Where to POST and which topic to name: the configured URL's last path
-/// piece is the topic, the rest is the server.
-///
-/// The daemon's `NTFY_URL.rstrip("/").rpartition("/")` — the URL somebody
-/// configures is `https://ntfy.example/topic`, and the JSON API posts to the
-/// server root with the topic in the body.
-pub fn split_url(url: &str) -> (String, String) {
-    let trimmed = url.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(at) => (trimmed[..at].to_string(), trimmed[at + 1..].to_string()),
-        None => (String::new(), trimmed.to_string()),
-    }
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_STATES, Seen, changes, message, payload, split_url, wanted};
+    use super::{DEFAULT_STATES, Message, Seen, changes, message, payload, wanted};
     use crate::overview::Card;
     use crate::peer::{HostName, PaneId};
     use crate::prompt::{Choice, Prompt};
@@ -366,7 +332,13 @@ mod tests {
                 plain(State::Running),
                 plain(State::Waiting),
             ]),
-            [vec![], vec![State::Waiting], vec![], vec![], vec![State::Waiting]]
+            [
+                vec![],
+                vec![State::Waiting],
+                vec![],
+                vec![],
+                vec![State::Waiting]
+            ]
         );
     }
 
@@ -526,7 +498,6 @@ mod tests {
             format!("Hook range?\n\n1. Yes\n2. {}", "x".repeat(60)),
             "the labels are capped at sixty characters"
         );
-        assert_eq!(said.tags, ["warning"]);
         assert_eq!(said.priority, 4);
     }
 
@@ -539,11 +510,24 @@ mod tests {
         let said = message(&waiting);
         assert_eq!(said.title, "ppu-toys:1 · claude finished its turn");
         assert_eq!(said.body, "done — two bugs, both in the lexer");
-        assert_eq!(said.tags, ["bell"]);
         assert_eq!(said.priority, 3);
 
         let silent = card("%1", Some(State::Waiting), None);
         assert_eq!(message(&silent).body, "is waiting for you");
+    }
+
+    // AYEAYE-84 — the service worker receives transport-neutral browser JSON.
+    #[test]
+    fn push_payload_carries_the_words_and_priority() {
+        let message = Message {
+            title: "agent needs you".to_string(),
+            body: "Choose one".to_string(),
+            priority: 4,
+        };
+        assert_eq!(
+            payload(&message),
+            r#"{"title":"agent needs you","body":"Choose one","priority":4}"#
+        );
     }
 
     // AYEAYE-49 — a shell at a prompt is announced by what it runs, and a
@@ -576,44 +560,9 @@ mod tests {
             waiting.title
         );
         assert_ne!(
-            (blocked.tags, blocked.priority),
-            (fallback.tags, fallback.priority),
+            blocked.priority, fallback.priority,
             "blocked is louder than the fallback"
         );
         assert_ne!(blocked.title, waiting.title);
-    }
-
-    // AYEAYE-49 — the payload is ntfy's JSON API, not its header form:
-    // headers are latin-1 and agent questions are full of what latin-1
-    // mangles. Click rides along only when it is configured.
-    #[test]
-    fn the_payload_is_json_so_a_non_ascii_title_survives() {
-        let mut blocked = card("%1", Some(State::Working), Some("café ouvert ?"));
-        blocked.last = String::new();
-        let said = message(&blocked);
-        assert_eq!(
-            payload("mytopic", &said, "https://app.example/"),
-            concat!(
-                r#"{"topic":"mytopic","title":"ppu-toys:1 · claude needs you","#,
-                r#""message":"café ouvert ?\n\n1. Yes","priority":4,"tags":["warning"],"#,
-                r#""click":"https://app.example/"}"#
-            )
-        );
-        assert!(!payload("t", &said, "").contains("click"));
-    }
-
-    // AYEAYE-49 — the configured URL's last piece is the topic, the rest the
-    // server, exactly as the daemon splits it.
-    #[test]
-    fn the_url_splits_into_server_and_topic() {
-        assert_eq!(
-            split_url("https://ntfy.sh/my-agents"),
-            ("https://ntfy.sh".to_string(), "my-agents".to_string())
-        );
-        assert_eq!(
-            split_url("https://ntfy.example/team/agents/"),
-            ("https://ntfy.example/team".to_string(), "agents".to_string())
-        );
-        assert_eq!(split_url("topic-only"), (String::new(), "topic-only".to_string()));
     }
 }

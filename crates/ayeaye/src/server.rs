@@ -86,12 +86,7 @@ pub struct App {
 
 impl App {
     fn over(settings: Arc<Settings>) -> App {
-        let push = settings
-            .push
-            .as_deref()
-            .map(crate::push::Store::load)
-            .map(Mutex::new)
-            .map(Arc::new);
+        let push = settings.push.clone();
         App {
             settings,
             projects: Arc::new(projects::Picker::new(projects::Settings::from_env())),

@@ -14,6 +14,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// What running a program came to.
@@ -60,13 +61,33 @@ impl fmt::Display for Failed {
 /// reading the daemon's own stdin, and one that tries would otherwise block
 /// until the limit rather than answering.
 pub async fn run<S: AsRef<OsStr>>(argv: &[S], limit: Duration) -> Result<Ran, Failed> {
+    run_inner(argv, None, limit).await
+}
+
+pub async fn run_with_input<S: AsRef<OsStr>>(
+    argv: &[S],
+    input: &[u8],
+    limit: Duration,
+) -> Result<Ran, Failed> {
+    run_inner(argv, Some(input), limit).await
+}
+
+async fn run_inner<S: AsRef<OsStr>>(
+    argv: &[S],
+    input: Option<&[u8]>,
+    limit: Duration,
+) -> Result<Ran, Failed> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(Failed::NotStarted("no command to run".to_string()));
     };
     let named = program.as_ref().to_string_lossy().into_owned();
     let started = Command::new(program)
         .args(rest)
-        .stdin(std::process::Stdio::null())
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // The whole point. `wait_with_output` owns the child, so when the
@@ -74,11 +95,22 @@ pub async fn run<S: AsRef<OsStr>>(argv: &[S], limit: Duration) -> Result<Ran, Fa
         // what makes that drop a kill rather than an orphan.
         .kill_on_drop(true)
         .spawn();
-    let child = match started {
+    let mut child = match started {
         Ok(child) => child,
         Err(why) => return Err(Failed::NotStarted(format!("{named}: {why}"))),
     };
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
+    let waited = async {
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("piped when input is present")
+                .write_all(input)
+                .await?;
+        }
+        child.wait_with_output().await
+    };
+    match tokio::time::timeout(limit, waited).await {
         Ok(Ok(output)) => Ok(Ran {
             ok: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -91,7 +123,7 @@ pub async fn run<S: AsRef<OsStr>>(argv: &[S], limit: Duration) -> Result<Ran, Fa
 
 #[cfg(test)]
 mod tests {
-    use super::{Failed, run};
+    use super::{Failed, run, run_with_input};
     use std::time::{Duration, Instant};
 
     // AYEAYE-43 — both streams and the exit status come back, and a program
@@ -117,6 +149,19 @@ mod tests {
         .expect("a failing program still answers");
         assert!(!refused.ok);
         assert_eq!(refused.stderr, "no");
+    }
+
+    // AYEAYE-84 — encrypted push bodies contain arbitrary bytes, including NUL.
+    #[tokio::test]
+    async fn binary_input_reaches_the_program_on_stdin() {
+        let ran = run_with_input(
+            &["sh", "-c", "od -An -tx1"],
+            b"a\0b",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.stdout.split_whitespace().collect::<String>(), "610062");
     }
 
     // AYEAYE-43 — output that is not UTF-8 decodes lossily rather than failing.

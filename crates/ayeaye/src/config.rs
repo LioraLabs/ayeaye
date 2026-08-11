@@ -83,8 +83,8 @@ pub struct Settings {
     /// reason `tmux` is one — without it, the suite writes into the state
     /// directory of whoever is running it.
     pub store: Option<PathBuf>,
-    /// The state directory holding push subscriptions and the VAPID key.
-    pub push: Option<PathBuf>,
+    /// Push subscriptions and the VAPID key, shared by the API and watcher.
+    pub push: Option<Arc<Mutex<crate::push::Store>>>,
 }
 
 /// Why a configuration could not be resolved.
@@ -205,7 +205,11 @@ impl Settings {
             store: state
                 .as_ref()
                 .map(|dir| dir.join(crate::projects::store::FILE)),
-            push: state,
+            push: state
+                .as_deref()
+                .map(crate::push::Store::load)
+                .map(Mutex::new)
+                .map(Arc::new),
         })
     }
 
