@@ -1,6 +1,6 @@
 # ayeaye - the gates a release has to pass, and the artifacts it needs.
 #
-#   cook test      every test file as its own cached unit, plus the release gates
+#   cook test      the Rust suite, lint, and release gates
 #   cook bump vX   move the version everywhere it is written down
 #   cook dist      build the release tarball and its checksums
 #   cook publish   tag and upload it  (refuses a dirty tree)
@@ -93,8 +93,8 @@ probe rust:tools
 # cacheable at all. The sources themselves are the sealed probe above: cargo
 # consumes them, but it does not take them as arguments.
 #
-# `fixtures` is sealed here as well as on the bash suite: the Rust tests read
-# the captured unit and probe fixtures through `include_str!`, so a golden file
+# `fixtures` is sealed because Rust tests read captured unit and probe fixtures
+# through `include_str!`, so a golden file
 # is an input to `cargo test` that appears on no command line and that the
 # `rust` probe - a glob under crates/ - cannot see. Without it, editing a
 # fixture leaves the release gate replaying a cached green over a corpus that
