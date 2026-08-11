@@ -287,7 +287,7 @@ async fn push_subscriptions_and_vapid_key_use_the_gated_browser_api() {
     let state = scratch().join(format!("push-api-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
     let mut settings = settings_on_port(0);
-    settings.push = Some(state.clone());
+    settings.push = Some(Arc::new(Mutex::new(ayeaye::push::Store::load(&state))));
     let server = Server::start(settings).await;
 
     assert_eq!(server.get("/api/push/public-key").await.status, 401);
@@ -664,8 +664,14 @@ async fn the_overview_answers_with_the_real_pane_and_voice() {
     assert_eq!(answer.status, 200);
     assert_eq!(answer.header("content-type"), Some("application/json"));
     let body = answer.body_text();
-    assert!(body.starts_with(r#"{"host":"desktop","panes":[{"id":"desktop/%"#), "{body}");
-    assert!(body.contains(r#""kind":null,"agent_id":null,"state":null"#), "{body}");
+    assert!(
+        body.starts_with(r#"{"host":"desktop","panes":[{"id":"desktop/%"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#""kind":null,"agent_id":null,"state":null"#),
+        "{body}"
+    );
     assert!(body.contains(r#"],"voice":"#), "{body}");
 }
 
@@ -1261,7 +1267,9 @@ async fn a_spawn_records_the_pick_where_the_picker_reads_it() {
     let project = stand_in_root().join("ayeaye-71-project");
     std::fs::create_dir_all(&project).expect("a project directory");
 
-    let store = stand_in_root().join("ayeaye-71-state").join("projects.json");
+    let store = stand_in_root()
+        .join("ayeaye-71-state")
+        .join("projects.json");
     let mut settings = settings_on_port(0);
     settings.tmux = tmux.layer();
     settings.store = Some(store.clone());
@@ -1294,7 +1302,9 @@ async fn a_spawn_records_the_pick_where_the_picker_reads_it() {
     // And a store that cannot be written costs ranking and nothing else: a
     // directory where the file should be refuses every write, and the spawn
     // response never hears about it.
-    let blocked = stand_in_root().join("ayeaye-71-blocked").join("projects.json");
+    let blocked = stand_in_root()
+        .join("ayeaye-71-blocked")
+        .join("projects.json");
     std::fs::create_dir_all(&blocked).expect("a directory where the file should be");
     let mut settings = settings_on_port(0);
     settings.tmux = tmux.layer();

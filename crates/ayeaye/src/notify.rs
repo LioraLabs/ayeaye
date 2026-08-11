@@ -3,7 +3,7 @@
 //!
 //! The decision is `ayeaye_core::notify`'s; this is the loop around it and
 //! the transport under it. The transport is `curl`, and that is the model
-//! store's precedent applied for the model store's reason: an ntfy URL is
+//! store's precedent applied for the model store's reason: a push endpoint is
 //! HTTPS, an in-process client for HTTPS needs TLS, every TLS stack in the
 //! ecosystem reaches `ring` or `aws-lc-sys`, and both put `cc` in
 //! `Cargo.lock`, which the constitution refuses. A notification is one small
@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use ayeaye_core::notify;
 use ayeaye_core::session::status::State;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand_core::{OsRng, RngCore};
 
 use crate::config::Settings;
 
@@ -30,16 +32,9 @@ const PUBLISH_LIMIT: Duration = Duration::from_secs(15);
 /// How often the board is swept when nothing says otherwise.
 const DEFAULT_EVERY: u64 = 10;
 
-/// Everything the watcher was told: where to publish, what to say is
-/// tappable, how often to look, and which states are worth a message.
+/// How often to look and which states are worth a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The server half of the configured URL — what curl POSTs to.
-    base: String,
-    /// The topic half — named in the body, ntfy's JSON API shape.
-    topic: String,
-    /// Opened when the notification is tapped, or empty.
-    click: String,
     /// The gap between sweeps.
     every: Duration,
     /// The states that fire.
@@ -47,30 +42,19 @@ pub struct Config {
 }
 
 impl Config {
-    /// The watcher's settings, or `None` when no URL is configured — and no
-    /// URL disables the watcher entirely: the app works without it, this
-    /// only saves you from having to look.
-    ///
-    /// `AYEAYE_NTFY_URL` first, then the daemon's own `VOICE_NTFY_URL` —
-    /// the `choose_cliban` pattern, because these four never wore the
-    /// `VOICE_REMOTE_` prefix the general lookup tries. An `EVERY` that
+    /// The watcher's settings. An `EVERY` that
     /// does not parse falls back to the default where the daemon's `int()`
     /// would have refused to start: a mistyped nicety must not take the
     /// daemon down with it.
-    pub fn resolve(look_up: impl Fn(&str) -> Option<String>) -> Option<Config> {
-        let url = named(&look_up, "NTFY_URL")?;
-        let (base, topic) = notify::split_url(&url);
+    pub fn resolve(look_up: impl Fn(&str) -> Option<String>) -> Config {
         let every = named(&look_up, "NOTIFY_EVERY")
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_EVERY);
         let states = named(&look_up, "NOTIFY_STATES");
-        Some(Config {
-            base,
-            topic,
-            click: named(&look_up, "NTFY_CLICK").unwrap_or_default(),
+        Config {
             every: Duration::from_secs(every),
             wanted: notify::wanted(states.as_deref().unwrap_or(notify::DEFAULT_STATES)),
-        })
+        }
     }
 
     /// One line for the startup journal: what fires, and where it goes.
@@ -81,7 +65,7 @@ impl Config {
             .map(|state| state.as_str())
             .collect::<Vec<_>>();
         states.sort_unstable();
-        format!("notifying {} on {}/{}", states.join(","), self.base, self.topic)
+        format!("notifying {} with Web Push", states.join(","))
     }
 }
 
@@ -97,34 +81,6 @@ fn named(look_up: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String
         }
     }
     None
-}
-
-/// The command line one publish runs.
-///
-/// `--fail` so an ntfy error page is a refusal rather than a success;
-/// `--max-time` is the daemon's own ten-second deadline; the payload rides
-/// as an argument because it never carries a secret — the token in this
-/// process authenticates the *panel*, and none of it goes to ntfy. The `--`
-/// ends the options, so a base URL somebody configured starting with a dash
-/// arrives as data.
-pub fn argv(base: &str, payload: &str) -> Vec<String> {
-    [
-        "curl",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--max-time",
-        "10",
-        "--header",
-        "Content-Type: application/json",
-        "--data-binary",
-        payload,
-        "--",
-    ]
-    .iter()
-    .map(|arg| (*arg).to_string())
-    .chain([format!("{base}/")])
-    .collect()
 }
 
 /// Sweep the board on a clock, and publish each pane's arrival once.
@@ -149,7 +105,7 @@ pub fn watcher(settings: Arc<Settings>, config: Config) {
             };
             let (fresh, next) = notify::changes(&cards, &seen, &config.wanted);
             for card in fresh {
-                publish(&config, &notify::message(card)).await;
+                publish(&settings, &notify::message(card)).await;
             }
             seen = next;
         }
@@ -157,19 +113,143 @@ pub fn watcher(settings: Arc<Settings>, config: Config) {
 }
 
 /// One message, published, best effort.
-async fn publish(config: &Config, message: &notify::Message) {
-    let payload = notify::payload(&config.topic, message, &config.click);
-    match crate::command::run(&argv(&config.base, &payload), PUBLISH_LIMIT).await {
-        Ok(ran) if ran.ok => {}
-        Ok(ran) => eprintln!("ayeaye: notify failed: {}", ran.stderr.trim()),
-        Err(why) => eprintln!("ayeaye: notify failed: {why}"),
+async fn publish(settings: &Settings, message: &notify::Message) {
+    let Some(store) = &settings.push else {
+        return;
+    };
+    deliver(
+        store,
+        message,
+        "curl",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .await;
+}
+
+pub async fn deliver(
+    store: &Arc<std::sync::Mutex<crate::push::Store>>,
+    message: &notify::Message,
+    program: &str,
+    now: u64,
+) {
+    let (private_key, subscriptions) = {
+        let store = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let private_key = match store.private_key() {
+            Ok(key) => key,
+            Err(why) => {
+                eprintln!("ayeaye: notify failed: {why}");
+                return;
+            }
+        };
+        (private_key, store.subscriptions().to_vec())
+    };
+    let payload = notify::payload(message);
+    for subscription in subscriptions {
+        let result = push(
+            &subscription,
+            &private_key,
+            payload.as_bytes(),
+            message.priority,
+            program,
+            now,
+        )
+        .await;
+        match result {
+            Ok(404 | 410) => {
+                let removed = store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&subscription.endpoint);
+                if let Err(why) = removed {
+                    eprintln!("ayeaye: notify failed: {why}");
+                }
+            }
+            Ok(200..=299) => {}
+            Ok(status) => eprintln!("ayeaye: notify failed: HTTP {status}"),
+            Err(why) => eprintln!("ayeaye: notify failed: {why}"),
+        }
     }
+}
+
+async fn push(
+    subscription: &crate::push::Subscription,
+    vapid_private: &[u8; 32],
+    payload: &[u8],
+    priority: u8,
+    program: &str,
+    now: u64,
+) -> Result<u16, String> {
+    let user_public = URL_SAFE_NO_PAD
+        .decode(&subscription.p256dh)
+        .map_err(|why| why.to_string())?;
+    let auth = URL_SAFE_NO_PAD
+        .decode(&subscription.auth)
+        .map_err(|why| why.to_string())?;
+    let ephemeral = p256::SecretKey::random(&mut OsRng);
+    let ephemeral: [u8; 32] = ephemeral.to_bytes().into();
+    let mut salt = [0; 16];
+    OsRng.fill_bytes(&mut salt);
+    let encrypted = ayeaye_core::web_push::encrypt(payload, &user_public, &auth, &salt, &ephemeral)
+        .map_err(|why| format!("encryption: {why:?}"))?;
+    let signed = ayeaye_core::web_push::vapid(
+        &subscription.endpoint,
+        now + 43_200,
+        now,
+        "https://github.com/LioraLabs/ayeaye",
+        vapid_private,
+    )
+    .map_err(|why| format!("VAPID: {why:?}"))?;
+    let urgency = if priority >= 4 { "high" } else { "normal" };
+    let argv = vec![
+        program.to_string(),
+        "--silent".to_string(),
+        "--show-error".to_string(),
+        "--max-time".to_string(),
+        "10".to_string(),
+        "--output".to_string(),
+        "/dev/null".to_string(),
+        "--write-out".to_string(),
+        "%{http_code}".to_string(),
+        "--request".to_string(),
+        "POST".to_string(),
+        "--header".to_string(),
+        format!("Content-Encoding: {}", encrypted.content_encoding),
+        "--header".to_string(),
+        "Content-Type: application/octet-stream".to_string(),
+        "--header".to_string(),
+        "TTL: 2419200".to_string(),
+        "--header".to_string(),
+        format!("Urgency: {urgency}"),
+        "--header".to_string(),
+        format!("Authorization: {}", signed.authorization),
+        "--data-binary".to_string(),
+        "@-".to_string(),
+        "--".to_string(),
+        subscription.endpoint.clone(),
+    ];
+    let ran = crate::command::run_with_input(&argv, &encrypted.body, PUBLISH_LIMIT)
+        .await
+        .map_err(|why| why.to_string())?;
+    if !ran.ok {
+        return Err(ran.stderr.trim().to_string());
+    }
+    ran.stdout
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad HTTP status {:?}", ran.stdout.trim()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, argv};
+    use super::{Config, deliver};
     use ayeaye_core::notify;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn env(values: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> Option<String> {
@@ -181,32 +261,13 @@ mod tests {
         }
     }
 
-    // AYEAYE-49 — no URL disables the watcher entirely: the app works
-    // without it, and an empty value is unset, as every other setting reads.
+    // AYEAYE-84 — the watcher exists without transport configuration; an
+    // empty subscription store makes delivery the no-op.
     #[test]
-    fn no_url_means_no_watcher_at_all() {
-        assert_eq!(Config::resolve(env(vec![])), None);
-        assert_eq!(Config::resolve(env(vec![("VOICE_NTFY_URL", "  ")])), None);
-    }
-
-    // AYEAYE-49 — the daemon's own spelling still works, the new one wins,
-    // and the defaults are the daemon's: ten seconds, blocked and waiting.
-    #[test]
-    fn the_daemons_spelling_works_and_the_new_one_wins() {
-        let legacy = Config::resolve(env(vec![("VOICE_NTFY_URL", "https://ntfy.sh/agents")]))
-            .expect("a configured watcher");
-        assert_eq!(legacy.base, "https://ntfy.sh");
-        assert_eq!(legacy.topic, "agents");
-        assert_eq!(legacy.click, "");
-        assert_eq!(legacy.every, Duration::from_secs(10));
-        assert_eq!(legacy.wanted, notify::wanted("blocked,waiting"));
-
-        let both = Config::resolve(env(vec![
-            ("AYEAYE_NTFY_URL", "https://new.example/topic"),
-            ("VOICE_NTFY_URL", "https://old.example/topic"),
-        ]))
-        .expect("a configured watcher");
-        assert_eq!(both.base, "https://new.example");
+    fn no_transport_setting_is_required() {
+        let config = Config::resolve(env(vec![]));
+        assert_eq!(config.every, Duration::from_secs(10));
+        assert_eq!(config.wanted, notify::wanted("blocked,waiting"));
     }
 
     // AYEAYE-49 — the sweep gap and the states narrow by configuration, and
@@ -215,21 +276,13 @@ mod tests {
     #[test]
     fn the_gap_and_the_states_narrow_by_configuration() {
         let config = Config::resolve(env(vec![
-            ("VOICE_NTFY_URL", "https://ntfy.sh/agents"),
             ("VOICE_NOTIFY_EVERY", "30"),
             ("VOICE_NOTIFY_STATES", "blocked"),
-            ("VOICE_NTFY_CLICK", "https://app.example/"),
-        ]))
-        .expect("a configured watcher");
+        ]));
         assert_eq!(config.every, Duration::from_secs(30));
         assert_eq!(config.wanted, notify::wanted("blocked"));
-        assert_eq!(config.click, "https://app.example/");
 
-        let mistyped = Config::resolve(env(vec![
-            ("VOICE_NTFY_URL", "https://ntfy.sh/agents"),
-            ("VOICE_NOTIFY_EVERY", "soon"),
-        ]))
-        .expect("a configured watcher");
+        let mistyped = Config::resolve(env(vec![("VOICE_NOTIFY_EVERY", "soon")]));
         assert_eq!(mistyped.every, Duration::from_secs(10));
     }
 
@@ -237,36 +290,88 @@ mod tests {
     // is the one place a misconfigured topic shows itself before the first
     // quiet hour is mistaken for peace.
     #[test]
-    fn the_journal_line_names_the_states_and_the_destination() {
-        let config = Config::resolve(env(vec![("VOICE_NTFY_URL", "https://ntfy.sh/agents")]))
-            .expect("a configured watcher");
-        assert_eq!(
-            config.describe(),
-            "notifying blocked,waiting on https://ntfy.sh/agents"
-        );
+    fn the_journal_line_names_the_states_and_the_transport() {
+        let config = Config::resolve(env(vec![]));
+        assert_eq!(config.describe(), "notifying blocked,waiting with Web Push");
     }
 
-    // AYEAYE-49 — the publish command line: --fail so an error page is a
-    // refusal, the daemon's ten-second deadline, the JSON as one argv
-    // element, and -- so a hostile base cannot be read as a flag.
-    #[test]
-    fn the_publish_command_line_is_exactly_this() {
+    // AYEAYE-84 — every subscription is attempted, binary aes128gcm and the
+    // required headers reach curl, and a gone endpoint alone is forgotten.
+    #[tokio::test]
+    async fn delivery_continues_and_permanently_drops_gone_subscriptions() {
+        let state =
+            std::env::temp_dir().join(format!("ayeaye-push-delivery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let script = state.join("curl");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+for endpoint
+do
+  :
+done
+case "$endpoint" in
+  *failed*) id=failed; status=503 ;;
+  *gone*) id=gone; status=410 ;;
+  *) id=live; status=201 ;;
+esac
+cat > "{0}/$id.body"
+printf '%s\n' "$@" > "{0}/$id.args"
+printf '%s' "$status"
+"#,
+                state.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut store = crate::push::Store::load(&state);
+        for endpoint in ["failed", "gone", "live"] {
+            store
+                .upsert(crate::push::Subscription {
+                    endpoint: format!("https://push.example/{endpoint}"),
+                    p256dh: "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4".to_string(),
+                    auth: "BTBZMqHH6r4Tts7J_aSIgg".to_string(),
+                })
+                .unwrap();
+        }
+        let message = notify::Message {
+            title: "agent needs you".to_string(),
+            body: "Choose one".to_string(),
+            priority: 4,
+        };
+        let store = Arc::new(std::sync::Mutex::new(store));
+        deliver(&store, &message, script.to_str().unwrap(), 1_700_000_000).await;
+
+        for endpoint in ["failed", "gone", "live"] {
+            assert!(
+                state
+                    .join(format!("{endpoint}.body"))
+                    .metadata()
+                    .unwrap()
+                    .len()
+                    > 86
+            );
+        }
+        let args = std::fs::read_to_string(state.join("live.args")).unwrap();
+        for header in [
+            "Content-Encoding: aes128gcm",
+            "TTL: 2419200",
+            "Urgency: high",
+            "Authorization: vapid t=",
+        ] {
+            assert!(args.contains(header), "missing {header:?} in {args}");
+        }
+        let stored = crate::push::Store::load(&state);
         assert_eq!(
-            argv("https://ntfy.sh", r#"{"topic":"agents"}"#),
-            [
-                "curl",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "10",
-                "--header",
-                "Content-Type: application/json",
-                "--data-binary",
-                r#"{"topic":"agents"}"#,
-                "--",
-                "https://ntfy.sh/",
-            ]
+            stored
+                .subscriptions()
+                .iter()
+                .map(|subscription| subscription.endpoint.as_str())
+                .collect::<Vec<_>>(),
+            ["https://push.example/failed", "https://push.example/live"]
         );
     }
 }
