@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 # Move the release version everywhere it is written down, in one command.
 #
-# install.sh owns the version; the Cookfile repeats it because recipe output
-# paths are literals; the Cargo workspace claims it again in Cargo.toml, and
-# the lockfile repeats that once per workspace member - which the release
-# workflow's `--locked` verify turns into a red tag if it lags. This rewrites
-# all of them from the one value given, and the release-version gate stays
-# the check that nothing was missed.
+# Cargo.toml's [workspace.package] owns the version; the Cookfile repeats it
+# because recipe output paths are literals, and the lockfile repeats it once
+# per workspace member - which the release workflow's `--locked` verify turns
+# into a red tag if it lags. This rewrites all of them from the one value
+# given, and the release-version gate stays the check that nothing was
+# missed. The installer is not touched: it is a downloader with nothing
+# pinned in it (AYEAYE-63).
 #
 # The lockfile edit touches only sourceless blocks - packages with no
 # `source =` line, which is how Cargo marks workspace-local crates - because
 # a dependency is allowed to share our version number and must not move.
-#
-# The stamp is cleared, not kept: between this bump and `cook stamp` the old
-# checksum describes an artifact this version will never be, and a stale sum
-# fails loudly at a stranger's machine where an absent one falls back to the
-# published SHA256SUMS and says so. Honest and weaker beats wrong and scary.
 #
 # [root] exists for the tests, which run this against a copied tree rather
 # than the repository they live in.
@@ -29,29 +25,26 @@ case "$version" in
   *) echo "versions look like v0.2.0, not '$version'" >&2; exit 1 ;;
 esac
 
-install_sh="$root/install.sh"
 cookfile="$root/Cookfile"
 cargo_toml="$root/Cargo.toml"
 cargo_lock="$root/Cargo.lock"
-for f in "$install_sh" "$cookfile" "$cargo_toml" "$cargo_lock"; do
+for f in "$cookfile" "$cargo_toml" "$cargo_lock"; do
   [ -f "$f" ] || { echo "no $f to bump" >&2; exit 1; }
 done
 
-old="$(sed -n 's/^AYEAYE_VERSION="\([^"]*\)".*$/\1/p' "$install_sh" | head -1)"
-[ -n "$old" ] || { echo "no AYEAYE_VERSION in $install_sh" >&2; exit 1; }
+old_plain="$(awk '
+  /^\[/ { wp = ($0 == "[workspace.package]") }
+  wp && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
+' "$cargo_toml")"
+[ -n "$old_plain" ] || { echo "no [workspace.package] version in $cargo_toml" >&2; exit 1; }
+old="v$old_plain"
 if [ "$old" = "$version" ]; then
   echo "already at $version" >&2
   exit 0
 fi
+new_plain="${version#v}"
 
-# install.sh: the version, and the stamp it no longer has.
-tmp="$install_sh.tmp.$$"
-trap 'rm -f "$tmp" "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"' EXIT
-sed -e 's|^AYEAYE_VERSION=".*"$|AYEAYE_VERSION="'"$version"'"|' \
-    -e 's|^AYEAYE_SHA256=".*"$|AYEAYE_SHA256=""|' "$install_sh" > "$tmp"
-grep -q "^AYEAYE_VERSION=\"$version\"\$" "$tmp" \
-  || { echo "could not write the version into $install_sh" >&2; exit 1; }
-bash -n "$tmp" || { echo "bumping broke $install_sh, so it was not written" >&2; exit 1; }
+trap 'rm -f "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"' EXIT
 
 # Cookfile: every place the old version appears is a place the new one
 # belongs - artifact names, the gate's argument, the publish default.
@@ -66,8 +59,6 @@ fi
 # Cargo.toml: the one version line inside [workspace.package], and nothing
 # else - the bare number can legitimately appear elsewhere in the manifest as
 # a dependency requirement.
-old_plain="${old#v}"
-new_plain="${version#v}"
 awk -v old="$old_plain" -v new="$new_plain" '
   /^\[/ { wp = ($0 == "[workspace.package]") }
   wp && $0 == "version = \"" old "\"" { print "version = \"" new "\""; next }
@@ -97,20 +88,17 @@ awk -v old="$old_plain" -v new="$new_plain" '
 grep -q "^version = \"$new_plain\"\$" "$cargo_lock.tmp.$$" \
   || { echo "could not write the version into $cargo_lock" >&2; exit 1; }
 
-cat "$tmp" > "$install_sh"
 cat "$cookfile.tmp.$$" > "$cookfile"
 cat "$cargo_toml.tmp.$$" > "$cargo_toml"
 cat "$cargo_lock.tmp.$$" > "$cargo_lock"
 trap - EXIT
-rm -f "$tmp" "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"
+rm -f "$cookfile.tmp.$$" "$cargo_toml.tmp.$$" "$cargo_lock.tmp.$$"
 
 cat <<EOF
-bumped $old -> $version in install.sh, the Cookfile, Cargo.toml and Cargo.lock.
-The stamp was cleared; the release flow from here:
+bumped $old -> $version in Cargo.toml, Cargo.lock and the Cookfile.
+The release flow from here:
 
   commit this, then:
-    cook dist         build the artifact from that commit
-    cook stamp        write its checksum into install.sh
-  commit the stamp, push, then:
+    cook dist            build the artifact from that commit
     cook publish $version
 EOF

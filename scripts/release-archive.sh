@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build the release tarball from HEAD, reproducibly.
 #
-# Reproducible matters here because the checksum baked into install.sh is the
-# only thing standing between a stranger and whatever a compromised CDN feels
-# like handing them. If the same commit does not produce the same bytes, the
-# checksum is a number nobody can re-derive, and "verify the download" becomes
-# a ritual rather than a check.
+# Reproducible matters here because the checksum published in SHA256SUMS is
+# the only thing standing between a stranger and whatever a compromised CDN
+# feels like handing them. If the same commit does not produce the same bytes,
+# the checksum is a number nobody can re-derive, and "verify the download"
+# becomes a ritual rather than a check.
 #
 # Two sources of noise, both closed:
 #   git archive  takes mtimes from the commit, not from the clock
@@ -21,19 +21,22 @@ cd "$root"
 # an old release's artifact after a version bump must reproduce the old
 # bytes, prefix included, or the reproducibility check would compare a
 # v0.1.0 tarball against a v0.2.0 rebuild and blame the wrong thing.
-version="$(git show "$commit:install.sh" \
-  | sed -n 's/^AYEAYE_VERSION="\([^"]*\)".*$/\1/p' | head -1)"
-[ -n "$version" ] || { echo "no AYEAYE_VERSION in $commit:install.sh" >&2; exit 1; }
+version="$(git show "$commit:Cargo.toml" 2>/dev/null | awk '
+  /^\[/ { wp = ($0 == "[workspace.package]") }
+  wp && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
+')"
+[ -n "$version" ] || { echo "no [workspace.package] version in $commit:Cargo.toml" >&2; exit 1; }
+version="v$version"
 
 # The artifact is built from a commit, so a dirty tree means it does not
 # contain what is on screen. Not fatal while developing - `cook publish` is
 # where it has to be clean - but it must not pass silently.
 #
 # One kind of dirt is fatal: an uncommitted version bump. The archive takes
-# its content from HEAD and its name from the bumped Cookfile, so building
-# through it would mint a tarball whose installer disagrees with its own
-# filename - and `cook stamp` would then checksum that mislabeled artifact
-# into install.sh as if it were the release. Refused here, where the lie
+# its content from HEAD and its name from the bumped manifest, so building
+# through it would mint a tarball whose contents disagree with its own
+# filename - and the checksums published beside it would describe that
+# mislabeled artifact as if it were the release. Refused here, where the lie
 # would be minted, rather than caught three steps later by a checker.
 if [ "$commit" = HEAD ]; then
   tree_version="$(bash scripts/release-version.sh)"

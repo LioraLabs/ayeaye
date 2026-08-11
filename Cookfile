@@ -3,26 +3,25 @@
 #   cook test      every test file as its own cached unit, plus the release gates
 #   cook bump vX   move the version everywhere it is written down
 #   cook dist      build the release tarball and its checksums
-#   cook stamp     write the artifact's checksum into install.sh
 #   cook publish   tag and upload it  (refuses a dirty tree)
 #
-# The version lives in AYEAYE_VERSION at the top of install.sh, and
-# `release-version` fails if this file, the README, or the Cargo workspace
-# (Cargo.toml and its lockfile, which claim it without the v) has drifted
-# from it. `cook bump` moves every one of those claims together.
+# The version lives in Cargo.toml's [workspace.package], and
+# `release-version` fails if this file or the lockfile has drifted from it,
+# or the README stops naming the one-liner. `cook bump` moves every one of
+# those claims together. The installer claims nothing: it is a downloader
+# that fetches the newest release and verifies it against the SHA256SUMS
+# published beside it (AYEAYE-63), so there is no stamp step any more.
 #
-# Cutting a release is two commits, in this order:
+# Cutting a release is one commit:
 #
-#   cook bump v0.2.2    then commit           (the build commit)
+#   cook bump v0.2.2    then commit and push
 #   cook dist
-#   cook stamp          then commit and push  (the stamp commit)
 #   cook publish v0.2.2
 #
-# The tag lands on the build commit, not the stamp commit: the artifact is
-# archived from it, and publish reads that commit back out of the tarball and
-# tags exactly that. The stamped install.sh on main then verifies the artifact
-# built one commit before it - which is the design, not an accident of order;
-# a checksum cannot describe the very commit it is written into.
+# The tag lands on that commit: the artifact is archived from it, and publish
+# reads the commit back out of the tarball and tags exactly that. The release
+# workflow then builds the per-platform binaries on the tag and publishes
+# SHA256SUMS over every uploaded name.
 
 # --- determinants -------------------------------------------------------
 # What changes a test's answer without ever appearing on its command line.
@@ -181,19 +180,13 @@ recipe release-installable: dist
     test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.2.2.tar.gz }
 
 # --- publishing ---------------------------------------------------------
-# Chores, not recipes: they mutate a tracked file and talk to GitHub, and
-# neither belongs in `cook test`.
+# A chore, not a recipe: it talks to GitHub, and `cook test` must never
+# reach it.
 
-chore stamp: dist
-    bash scripts/release-stamp.sh dist/SHA256SUMS install.sh
-
-# Deliberately not depending on dist: dist is sealed on the commit, and the
-# stamp commit moves it, so a publish that rebuilt dist would upload a tarball
-# the stamp in install.sh does not describe. Publish takes the artifact on
-# disk and verifies it against the stamp itself; the suite and version gates
-# still stand in the way of a red tree. The dirty-tree refusal lives in the
-# script, which can tell an uncommitted stamp from ordinary dirt and say
-# "commit it and go" rather than only "no".
+# Deliberately not depending on dist: publish takes the artifact on disk and
+# proves it reproducible from the commit named inside it, so a stale or
+# hand-built tarball is refused rather than silently rebuilt. The suite and
+# version gates still stand in the way of a red tree.
 chore publish version="v0.2.2": suite release-version rust-suite rust-lint
     bash scripts/release-publish.sh $<version>
 

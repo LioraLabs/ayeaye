@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Is the thing on disk something the bootstrap can actually install?
-#
-# Every assertion here mirrors a refusal in install.sh's _bootstrap_unpack. A
-# tarball that fails one of these is a tarball that 404s past verification and
-# then dies at the unpack, on somebody else's machine, with the network already
-# paid for.
+# Is the source tarball on disk something a stranger can actually unpack and
+# trust? The installer no longer unpacks it - it fetches a binary (AYEAYE-63)
+# - but the tarball is still a published, checksummed release artifact, and
+# one that lies about its shape or its source commit is one nobody notices
+# until they are debugging something else entirely.
 set -euo pipefail
 
 artifact="${1:?usage: check-release-artifact.sh <artifact.tar.gz>}"
@@ -21,42 +20,37 @@ check() {  # check <what> <status>
 
 # Listed once, into a variable. A `tar | grep -q` stops at the first match and
 # kills tar with a broken pipe, which under `set -o pipefail` is the status the
-# check would have reported - install.sh's own unpack carries a comment about
-# exactly this, and writing it the wrong way here failed with a bare 141.
+# check would have reported - writing it the wrong way here failed with a
+# bare 141.
 listing="$(tar -tzf "$artifact")"
 
 # has <pattern> - true when the listing contains it, without a pipe that can
 # die early.
 has() { case "$(printf '%s\n' "$listing" | grep -e "$1" || true)" in "") return 1 ;; *) return 0 ;; esac; }
 
-# 1. Nothing escaping the directory it unpacks into. install.sh refuses these
-#    outright, so a release containing one is dead on arrival.
+# 1. Nothing escaping the directory it unpacks into: a tarball that writes
+#    outside itself is dead on arrival wherever it lands.
 escaping="$(printf '%s\n' "$listing" | grep -e '^/' -e '^\.\./' -e '/\.\./' || true)"
 [ -z "$escaping" ]; check "no path escapes the unpack directory" $?
 
-# 2. Exactly one top-level directory. With more than one the bootstrap treats
-#    the scratch directory itself as the payload, and the layout check below
-#    is what then fails - confusingly, and one step too late.
+# 2. Exactly one top-level directory, so an unpack puts the tree in one
+#    self-describing place rather than spraying it over the cwd.
 tops="$(printf '%s\n' "$listing" | awk -F/ 'NF>1 {print $1}' | sort -u | wc -l | tr -d ' ')"
 [ "$tops" = 1 ]; check "one top-level directory (found $tops)" $?
 
-# 3. The two files the bootstrap demands before it will hand over to a payload.
+# 3. The front door and the app are in the archive.
 has "/install.sh$";  check "contains install.sh" $?
 has "/bin/ayeaye$";  check "contains bin/ayeaye" $?
 
-# 4. The installer inside agrees about which release this is. A tarball whose
-#    install.sh disagrees with the tag it hangs under is the sort of thing
-#    nobody notices until they are debugging something else entirely.
+# 4. The installer inside parses. It pins no version of its own any more -
+#    it is a downloader (AYEAYE-63) - so parseability is the whole claim.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 tar -xzf "$artifact" -C "$work"
 inner="$(find "$work" -maxdepth 2 -name install.sh -print -quit)"
 [ -n "$inner" ]; check "install.sh is where the unpack looks for it" $?
 if [ -n "$inner" ]; then
-  inner_version="$(sed -n 's/^AYEAYE_VERSION="\([^"]*\)".*$/\1/p' "$inner" | head -1)"
-  [ "$inner_version" = "$version" ]
-  check "the installer inside says $version (says: ${inner_version:-nothing})" $?
-  bash -n "$inner"; check "the installer inside parses" $?
+  sh -n "$inner"; check "the installer inside parses" $?
 fi
 
 # 5. Reproducible. Build it again and compare: if the same commit does not
