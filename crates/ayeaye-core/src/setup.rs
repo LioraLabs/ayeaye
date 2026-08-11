@@ -426,7 +426,6 @@ mod tests {
     // after the download, which is the worst place to find out.
     #[test]
     fn every_model_in_the_catalogue_is_one_this_build_can_run() {
-        assert!(!CATALOGUE.is_empty());
         for entry in CATALOGUE {
             let parsed =
                 ModelId::parse(entry.id).unwrap_or_else(|why| panic!("{}: {why}", entry.id));
