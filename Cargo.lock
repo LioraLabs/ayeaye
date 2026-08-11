@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "ayeaye"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "axum",
  "ayeaye-core",
@@ -106,11 +106,11 @@ dependencies = [
 
 [[package]]
 name = "ayeaye-core"
-version = "0.2.2"
+version = "0.3.0"
 
 [[package]]
 name = "ayeaye-infer"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "ayeaye-core",
  "candle-core",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "constitution"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "toml",
 ]
