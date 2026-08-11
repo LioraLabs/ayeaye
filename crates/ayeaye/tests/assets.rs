@@ -125,4 +125,27 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
     ] {
         assert!(page.contains(required), "app is missing {required:?}");
     }
+
+    let daemon_unsubscribe = page.find("const response = await fetch('/api/push/unsubscribe'").unwrap();
+    let reject_unsubscribe = page[daemon_unsubscribe..]
+        .find("if(!response.ok) throw new Error('the server refused to unsubscribe')")
+        .map(|at| daemon_unsubscribe + at)
+        .unwrap();
+    let browser_unsubscribe = page[reject_unsubscribe..]
+        .find("await current.unsubscribe()")
+        .map(|at| reject_unsubscribe + at)
+        .unwrap();
+    assert!(daemon_unsubscribe < reject_unsubscribe && reject_unsubscribe < browser_unsubscribe);
+
+    let register = page.find("const response = await fetch('/api/push/subscribe'").unwrap();
+    let reject_register = page[register..]
+        .find("if(!response.ok) throw new Error('the server refused the subscription')")
+        .map(|at| register + at)
+        .unwrap();
+    let rollback = page[reject_register..]
+        .find("await subscription.unsubscribe()")
+        .map(|at| reject_register + at)
+        .unwrap();
+    assert!(register < reject_register && reject_register < rollback);
+    assert!(page.contains("notification permission was not granted"));
 }

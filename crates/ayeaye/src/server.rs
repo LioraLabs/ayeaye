@@ -1082,7 +1082,7 @@ fn serve_asset(asset: Asset) -> Response {
             asset.content_type,
             Body::from(bytes),
             |response| {
-                if asset.file == "service-worker.js" {
+                if asset.file == route::SERVICE_WORKER_FILE {
                     response.header("Service-Worker-Allowed", "/")
                 } else {
                     response
