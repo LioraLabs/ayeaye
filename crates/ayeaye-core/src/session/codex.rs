@@ -136,6 +136,48 @@ pub fn held(path: &str, sessions_root: &str) -> bool {
         && rollout_name(file_name(path))
 }
 
+/// What a thread-writer lock is called, after its id.
+const LOCK: &str = ".lock";
+
+/// The thread id a writer-lock path names, if it is one.
+///
+/// Codex 0.147 closes its rollout descriptor when the session idles, and the
+/// lock under `~/.codex/thread-writer-locks/<thread-id>.lock` is what stays
+/// held for the session's whole life — including a session that has never been
+/// asked anything and so has no rollout at all. The filename is the thread id,
+/// which is the session id everywhere else.
+///
+/// The same inside-the-root discipline as [`held`]: the separator is part of
+/// the prefix, so a sibling directory sharing the name as a prefix does not
+/// count, and a name that is only the suffix has no id to give.
+pub fn lock_id(path: &str, locks_root: &str) -> Option<String> {
+    let root = locks_root.trim_end_matches('/');
+    if path.len() <= root.len()
+        || !path.starts_with(root)
+        || path.as_bytes().get(root.len()) != Some(&b'/')
+    {
+        return None;
+    }
+    let id = file_name(path).strip_suffix(LOCK)?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Whether a name in a rollout directory is the rollout for this id.
+///
+/// The id is everything between the stamp and the suffix, because that is
+/// where codex puts it: `rollout-YYYY-MM-DDTHH-MM-SS-<id>.jsonl`. Anchored at
+/// the stamp's fixed width rather than matched as a suffix, or the tail of an
+/// id would find another id's rollout.
+pub fn rollout_for(name: &str, id: &str) -> bool {
+    !id.is_empty()
+        && name
+            .strip_prefix(ROLLOUT)
+            .and_then(|rest| rest.strip_suffix(JSONL))
+            .and_then(|rest| rest.get(STAMPED..))
+            .and_then(|tail| tail.strip_prefix('-'))
+            == Some(id)
+}
+
 /// A wall-clock moment, as a rollout's name spells it.
 ///
 /// Fields rather than an instant, and that is the whole point: codex writes
@@ -236,7 +278,7 @@ pub fn delay(rollout_at: f64, process_start: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stamp, delay, held, meta, rollout_name, stamp};
+    use super::{Stamp, delay, held, lock_id, meta, rollout_for, rollout_name, stamp};
     use crate::machine::fixture;
 
     const ROOT: &str = "/Users/someone/.codex/sessions";
@@ -310,6 +352,65 @@ mod tests {
         let read = meta(r#"{"payload":{"id":"aaaa","thread_source":"cli"}}"#).expect("a payload");
         assert_eq!(read.cwd, None);
         assert_eq!(read.id, "aaaa");
+    }
+
+    // AYEAYE-80 — codex 0.147 closes its rollout descriptor when the session
+    // idles; the writer lock is what stays held, and its filename is the
+    // session id. The same inside-the-root discipline as `held`: a sibling
+    // directory sharing the name as a prefix is somebody else's.
+    #[test]
+    fn a_writer_lock_names_its_thread() {
+        const LOCKS: &str = "/Users/someone/.codex/thread-writer-locks";
+        assert_eq!(
+            lock_id(&format!("{LOCKS}/0123abcd-dead-beef.lock"), LOCKS).as_deref(),
+            Some("0123abcd-dead-beef")
+        );
+        // A trailing slash on the root is the same root.
+        assert_eq!(
+            lock_id(
+                &format!("{LOCKS}/0123abcd-dead-beef.lock"),
+                &format!("{LOCKS}/")
+            )
+            .as_deref(),
+            Some("0123abcd-dead-beef")
+        );
+        for (path, why) in [
+            (
+                "/Users/someone/.codex/thread-writer-locks-backup/aaaa.lock".to_string(),
+                "a sibling directory sharing the prefix",
+            ),
+            (
+                format!("{LOCKS}/0123abcd-dead-beef"),
+                "no .lock suffix, so not a lock",
+            ),
+            (format!("{LOCKS}/.lock"), "a suffix with no id in front of it"),
+            (LOCKS.to_string(), "the directory itself"),
+            (
+                "/home/other/.codex/thread-writer-locks/aaaa.lock".to_string(),
+                "somebody else's locks entirely",
+            ),
+        ] {
+            assert_eq!(lock_id(&path, LOCKS), None, "{why}: {path}");
+        }
+    }
+
+    // AYEAYE-80 — the id is the rollout filename's tail because codex puts it
+    // there, and that is what lets a lock resolve a rollout whose descriptor
+    // is closed.
+    #[test]
+    fn a_rollout_is_found_by_the_id_in_its_name() {
+        let name = "rollout-2026-03-04T09-00-02-0123abcd-dead-beef.jsonl";
+        assert!(rollout_for(name, "0123abcd-dead-beef"));
+        assert!(
+            !rollout_for(name, "dead-beef"),
+            "a tail of the id is a different id"
+        );
+        assert!(!rollout_for(name, "ffffffff-0000-1111"));
+        assert!(
+            !rollout_for("notes-0123abcd-dead-beef.jsonl", "0123abcd-dead-beef"),
+            "the name must still be a rollout"
+        );
+        assert!(!rollout_for(name, ""), "no id finds nothing");
     }
 
     // AYEAYE-45 — the fixed prefix-and-suffix test that replaces the daemon's
