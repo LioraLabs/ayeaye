@@ -41,6 +41,9 @@ probe commit
 probe scripts
     files { "scripts/*.sh" }
 
+probe installer
+    files { "install.sh" }
+
 # Every input to `cargo test --workspace`. cargo iterates the workspace, not a
 # file list, so none of this appears on the command line and nothing else would
 # tell cook the answer had changed. The lockfile is in here because the suite
@@ -121,6 +124,11 @@ recipe rust-lint
     seal fixtures
     test { cargo clippy --workspace --all-targets --locked -- -D warnings }
 
+recipe installer-suite
+    ingredients "tests/install.sh"
+    seal installer
+    test { sh $<in> }
+
 # --- release gates ------------------------------------------------------
 
 # The gate reads the crate manifest and its lockfile as version claims, so
@@ -140,7 +148,7 @@ recipe release-version
 # Sealed on the sources because `git archive` names none of them, so nothing
 # else would tell cook the artifact is stale.
 
-recipe dist: release-version rust-suite rust-lint
+recipe dist: release-version rust-suite rust-lint installer-suite
     seal commit
     seal scripts
     cook "dist/ayeaye-v0.3.1.tar.gz" { bash scripts/release-archive.sh $<out> }
@@ -159,7 +167,7 @@ recipe release-installable: dist
 # proves it reproducible from the commit named inside it, so a stale or
 # hand-built tarball is refused rather than silently rebuilt. The Rust and
 # version gates still stand in the way of a red tree.
-chore publish version="v0.3.1": release-version rust-suite rust-lint
+chore publish version="v0.3.1": release-version rust-suite rust-lint installer-suite
     bash scripts/release-publish.sh $<version>
 
 chore bump version

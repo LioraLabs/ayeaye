@@ -41,30 +41,43 @@ esac
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-echo "fetching $artifact"
-curl -fsSL -o "$work/ayeaye" "$base/$artifact"
 curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS"
 
-want="$(awk -v name="$artifact" '$2 == name { print $1; exit }' "$work/SHA256SUMS")"
-[ -n "$want" ] || { echo "the release's SHA256SUMS does not mention $artifact" >&2; exit 1; }
-if command -v sha256sum >/dev/null 2>&1; then
-  got="$(sha256sum "$work/ayeaye")"
-elif command -v shasum >/dev/null 2>&1; then
-  got="$(shasum -a 256 "$work/ayeaye")"
-else
-  echo "neither sha256sum nor shasum is on this machine - nothing can verify the download" >&2
-  exit 1
-fi
-got="${got%% *}"
-if [ "$got" != "$want" ]; then
-  echo "checksum mismatch for $artifact - refusing to run it" >&2
-  echo "  published $want" >&2
-  echo "  fetched   $got" >&2
-  exit 1
+fetch() {
+  echo "fetching $artifact"
+  curl -fsSL -o "$work/ayeaye" "$base/$artifact"
+  want="$(awk -v name="$artifact" '$2 == name { print $1; exit }' "$work/SHA256SUMS")"
+  [ -n "$want" ] || { echo "the release's SHA256SUMS does not mention $artifact" >&2; return 1; }
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$work/ayeaye")"
+  elif command -v shasum >/dev/null 2>&1; then
+    got="$(shasum -a 256 "$work/ayeaye")"
+  else
+    echo "neither sha256sum nor shasum is on this machine - nothing can verify the download" >&2
+    return 1
+  fi
+  got="${got%% *}"
+  if [ "$got" != "$want" ]; then
+    echo "checksum mismatch for $artifact - refusing to run it" >&2
+    echo "  published $want" >&2
+    echo "  fetched   $got" >&2
+    return 1
+  fi
+  chmod +x "$work/ayeaye"
+  "$work/ayeaye" --version >/dev/null 2>&1
+}
+
+if ! fetch; then
+  if [ "$artifact" != ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
+    echo "$artifact cannot run on this machine - keeping the existing install" >&2
+    exit 1
+  fi
+  echo "the CUDA build cannot run on this machine; falling back to the portable CPU build" >&2
+  artifact=ayeaye-x86_64-unknown-linux-musl
+  fetch || { echo "the portable CPU build cannot run either - keeping the existing install" >&2; exit 1; }
 fi
 
 # Release assets are bare bytes; the exec bit is this script's to grant.
-chmod +x "$work/ayeaye"
 mkdir -p "$bin_dir"
 mv "$work/ayeaye" "$bin_dir/ayeaye"
 echo "installed $bin_dir/ayeaye"

@@ -57,6 +57,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: linter, as an error gate
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: installer fallback
+        run: sh tests/install.sh
 
   build:
     needs: verify
