@@ -72,6 +72,7 @@ pub enum Gate {
 
 const HTML: &str = "text/html; charset=utf-8";
 const PNG: &str = "image/png";
+pub const SERVICE_WORKER_FILE: &str = "service-worker.js";
 
 /// Everything below this is the API. The trailing slash matters: `/apifake` is
 /// not the API, and must not be gated as though it were.
@@ -146,6 +147,7 @@ pub const ASSET_ROUTES: &[(&str, Asset)] = &[
     ("/", asset("app.html", HTML)),
     ("/index.html", asset("app.html", HTML)),
     ("/message", asset("app.html", HTML)),
+    ("/service-worker.js", asset(SERVICE_WORKER_FILE, "text/javascript")),
     ("/board", asset("board.html", HTML)),
     ("/board.html", asset("board.html", HTML)),
     // Static, data-free, and needed before login: the manifest is what makes
@@ -298,6 +300,7 @@ mod tests {
             ("/", "app.html", "text/html; charset=utf-8"),
             ("/index.html", "app.html", "text/html; charset=utf-8"),
             ("/message", "app.html", "text/html; charset=utf-8"),
+            ("/service-worker.js", "service-worker.js", "text/javascript"),
             ("/board", "board.html", "text/html; charset=utf-8"),
             ("/board.html", "board.html", "text/html; charset=utf-8"),
             (
