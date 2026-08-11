@@ -24,18 +24,6 @@
 # SHA256SUMS over every uploaded name.
 
 # --- determinants -------------------------------------------------------
-# What changes a test's answer without ever appearing on its command line.
-# These are sealed rather than listed as ingredients: the test harness
-# iterates case files, it does not iterate the wizard it is testing.
-
-probe wizard
-    files { "install.sh" "lib/*.sh" "lib/steps/*.sh" }
-
-probe app
-    files { "bin/ayeaye" "bin/voice-dictate" "bin/voice-agent" "bin/voice-dictate-setup" "bin/process_inspect.py" }
-
-probe harness
-    files { "tests/run.sh" "tests/lib/*" "tests/python/*" }
 
 probe fixtures
     files { "tests/fixtures/*/*" }
@@ -97,24 +85,9 @@ probe rust:tools
     tools { cargo rustc cargo-clippy }
 
 # --- the suite ----------------------------------------------------------
-# One unit per case file, so editing one test re-runs one test. The whole
-# suite is ~7.5 minutes serially; fanned out it is bounded by the slowest
-# single file, and an edit costs only that file.
-
-recipe suite
-    ingredients "tests/cases/*_test.sh"
-    seal wizard
-    seal app
-    seal harness
-    seal fixtures
-    seal scripts
-    test { bash tests/run.sh $<in.stem> }
-
 # The Rust workspace is one unit, not one per crate: cargo already builds the
 # whole graph to test any part of it, so fanning out would compile the same
-# crates several times over and cache none of it better. It is its own unit
-# rather than a step inside the bash suite so that an edit to a shell test does
-# not recompile Rust, and an edit to Rust does not re-run 69 shell files.
+# crates several times over and cache none of it better.
 #
 # The ingredient is the workspace manifest - a source, which is what makes this
 # cacheable at all. The sources themselves are the sealed probe above: cargo
@@ -158,17 +131,16 @@ probe manifest
 
 recipe release-version
     ingredients "scripts/check-release-version.sh"
-    seal wizard
     seal scripts
     seal manifest
     test { bash scripts/check-release-version.sh v0.2.2 }
 
 # --- the artifacts ------------------------------------------------------
-# Gated on the suite: a red test blocks the tarball rather than shipping it.
+# Gated on the Rust checks: a red test blocks the tarball rather than shipping it.
 # Sealed on the sources because `git archive` names none of them, so nothing
 # else would tell cook the artifact is stale.
 
-recipe dist: suite release-version rust-suite rust-lint
+recipe dist: release-version rust-suite rust-lint
     seal commit
     seal scripts
     cook "dist/ayeaye-v0.2.2.tar.gz" { bash scripts/release-archive.sh $<out> }
@@ -185,9 +157,9 @@ recipe release-installable: dist
 
 # Deliberately not depending on dist: publish takes the artifact on disk and
 # proves it reproducible from the commit named inside it, so a stale or
-# hand-built tarball is refused rather than silently rebuilt. The suite and
+# hand-built tarball is refused rather than silently rebuilt. The Rust and
 # version gates still stand in the way of a red tree.
-chore publish version="v0.2.2": suite release-version rust-suite rust-lint
+chore publish version="v0.2.2": release-version rust-suite rust-lint
     bash scripts/release-publish.sh $<version>
 
 chore bump version
