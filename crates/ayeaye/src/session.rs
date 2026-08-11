@@ -87,6 +87,10 @@ pub struct Agents {
     claude_projects: PathBuf,
     /// `~/.codex/sessions`: rollouts, filed by date.
     codex_sessions: PathBuf,
+    /// `~/.codex/thread-writer-locks`: one lock per live thread, named for the
+    /// thread's id. Codex 0.147 closes its rollout descriptor when the session
+    /// idles; the lock is what stays held for the session's whole life.
+    codex_locks: PathBuf,
 }
 
 impl Agents {
@@ -106,6 +110,7 @@ impl Agents {
             claude_sessions: home.join(".claude").join("sessions"),
             claude_projects: home.join(".claude").join("projects"),
             codex_sessions: home.join(".codex").join("sessions"),
+            codex_locks: home.join(".codex").join("thread-writer-locks"),
         }
     }
 
@@ -224,6 +229,9 @@ impl Agents {
         if let Some(session) = self.held(processes, pid) {
             return Some(session);
         }
+        if let Some(session) = self.locked(processes, pid) {
+            return Some(session);
+        }
         let started = processes.start_time(pid)?;
         // A second probe on macOS, so it is only asked for once the answer
         // above has failed and it can still help.
@@ -269,6 +277,68 @@ impl Agents {
             }
         }
         let (_, path, id) = best?;
+        Some(Session::new(Kind::Codex, &id, &path))
+    }
+
+    /// The session named by a thread-writer lock this codex is holding.
+    ///
+    /// The route for codex 0.147, which closes its rollout descriptor when the
+    /// session idles and holds only the lock — so a *resumed* session with its
+    /// rollout closed is invisible to both older routes: the descriptor is
+    /// gone, and the rollout was written days before the process. The lock's
+    /// filename is the thread id, and the id finds the rollout wherever codex
+    /// filed it.
+    ///
+    /// Codex holds its subagents' locks too, so each candidate's rollout is
+    /// read and the spawned ones are put aside, exactly as [`Agents::held`]
+    /// does. A lock whose rollout does not exist *anywhere* is a session that
+    /// has never been asked anything — codex writes the rollout at the first
+    /// message — and it is still the session in the pane: its id comes from
+    /// the lock, and the lock file stands in as the transcript, whose
+    /// emptiness classifies as waiting, which is the truth of it. (A
+    /// rollout-backed answer always wins over a bare lock: a thread with live
+    /// subagents has conversation, hence a rollout, so the bare-lock pick only
+    /// ever chooses among a fresh session's single lock.)
+    fn locked(&self, processes: &dyn Processes, pid: u32) -> Option<Session> {
+        let root = self.codex_locks.to_string_lossy().into_owned();
+        let mut locks: Vec<(String, String)> = Vec::new();
+        for path in processes.open_files(pid) {
+            if let Some(id) = codex::lock_id(&path, &root) {
+                locks.push((id, path));
+            }
+        }
+        if locks.is_empty() {
+            return None;
+        }
+        // One walk for all the locks, not one per lock: the walk lists every
+        // day directory codex has ever had, and this runs per pane per poll.
+        let mut best: Option<(f64, PathBuf, String)> = None;
+        for path in walk(&self.codex_sessions, ROLLOUT_DEPTH, &|name| {
+            locks.iter().any(|(id, _)| codex::rollout_for(name, id))
+        }) {
+            let Some(meta) = first_line(&path).as_deref().and_then(codex::meta) else {
+                continue;
+            };
+            if meta.is_subagent() {
+                continue;
+            }
+            let Some(written) = modified(&path) else {
+                continue;
+            };
+            // Last write, first path on a tie: the same rule as the other
+            // scans in this file, for the same reason.
+            let better = best
+                .as_ref()
+                .is_none_or(|(when, at, _)| written > *when || (written == *when && &path < at));
+            if better {
+                best = Some((written, path, meta.id));
+            }
+        }
+        if let Some((_, path, id)) = best {
+            return Some(Session::new(Kind::Codex, &id, &path.to_string_lossy()));
+        }
+        // No rollout for any lock: first path, the standing tie rule.
+        let (id, path) = locks.into_iter().min_by(|a, b| a.1.cmp(&b.1))?;
         Some(Session::new(Kind::Codex, &id, &path))
     }
 
@@ -583,6 +653,15 @@ mod tests {
             path
         }
 
+        /// One thread-writer lock, held the way codex 0.147 holds them.
+        fn lock(&self, id: &str) -> PathBuf {
+            let dir = self.0.join(".codex").join("thread-writer-locks");
+            fs::create_dir_all(&dir).expect("a locks directory");
+            let path = dir.join(format!("{id}.lock"));
+            fs::write(&path, "").expect("a lock");
+            path
+        }
+
         /// One rollout, filed the way codex files them.
         fn rollout(&self, day: &str, name: &str, line: &str) -> PathBuf {
             let mut dir = self.0.join(".codex").join("sessions");
@@ -798,6 +877,116 @@ mod tests {
         let fake = Fake::pane("codex")
             .started(200, STARTED)
             .holding(200, &[mine.clone(), theirs]);
+
+        let found = home.agents().behind_process(&fake, "codex\t100");
+        let Behind::Found(session) = found else {
+            panic!("no session: {found:?}");
+        };
+        assert_eq!(session.path, mine.to_string_lossy());
+    }
+
+    // AYEAYE-80 — codex 0.147 closes its rollout descriptor when the session
+    // idles, and what stays held is the thread-writer lock. A resumed session
+    // with its rollout closed is invisible to both older routes: the
+    // descriptor is gone and the rollout was written days before the process.
+    // The lock names the thread, and the thread names its rollout.
+    #[test]
+    fn a_codex_holding_only_its_lock_resolves_through_the_lock() {
+        let home = Home::new("locked");
+        let rollout = home.rollout(
+            "2026/03/01",
+            &format!("rollout-2026-03-01T09-00-02-{CODEX_ID}.jsonl"),
+            &meta_line(CODEX_ID, "/dev/thing", None),
+        );
+        let lock = home.lock(CODEX_ID);
+        // Started days after the rollout was written, somewhere else, and
+        // holding no rollout at all.
+        let fake = Fake::pane("codex")
+            .started(200, STARTED)
+            .cwd(200, "/dev/somewhere-else")
+            .holding(200, std::slice::from_ref(&lock));
+
+        let found = home.agents().behind_process(&fake, "codex\t100");
+        let Behind::Found(session) = found else {
+            panic!("the lock names the session: {found:?}");
+        };
+        assert_eq!(session.kind, Kind::Codex);
+        assert_eq!(session.id, "77770000");
+        assert_eq!(session.path, rollout.to_string_lossy());
+    }
+
+    // AYEAYE-80 — codex holds its subagents' locks too, so the pane's process
+    // has several and only one is its own. The rollout each lock names says
+    // which threads were spawned; the session in the pane came from nobody.
+    #[test]
+    fn a_subagents_lock_is_not_the_session_in_the_pane() {
+        let home = Home::new("locked-subagent");
+        let mine = home.rollout(
+            "2026/03/01",
+            &format!("rollout-2026-03-01T09-00-02-{CODEX_ID}.jsonl"),
+            &meta_line(CODEX_ID, "/dev/thing", None),
+        );
+        // Written later, so it wins on last-write and must still lose.
+        home.rollout(
+            "2026/03/01",
+            "rollout-2026-03-01T09-04-11-88880000-aaaa.jsonl",
+            &meta_line("88880000-aaaa", "/dev/thing", Some(CODEX_ID)),
+        );
+        let locks = [home.lock(CODEX_ID), home.lock("88880000-aaaa")];
+        let fake = Fake::pane("codex").started(200, STARTED).holding(200, &locks);
+
+        let found = home.agents().behind_process(&fake, "codex\t100");
+        let Behind::Found(session) = found else {
+            panic!("no session: {found:?}");
+        };
+        assert_eq!(session.path, mine.to_string_lossy());
+    }
+
+    // AYEAYE-80 — the pane on the live machine this ticket was filed about: a
+    // codex that has never been asked anything. No rollout exists anywhere —
+    // not closed, never written — and the lock is the only artifact there is.
+    // Its id is still the session, and the lock file stands in as the
+    // transcript: it is empty, which classifies as waiting, which is the truth
+    // of a codex nobody has spoken to.
+    #[test]
+    fn a_codex_that_never_wrote_a_rollout_is_still_its_lock() {
+        let home = Home::new("locked-bare");
+        let lock = home.lock(CODEX_ID);
+        let fake = Fake::pane("codex")
+            .started(200, STARTED)
+            .cwd(200, "/dev/thing")
+            .holding(200, std::slice::from_ref(&lock));
+
+        let found = home.agents().behind_process(&fake, "codex\t100");
+        let Behind::Found(session) = found else {
+            panic!("a live codex is not a shell: {found:?}");
+        };
+        assert_eq!(session.kind, Kind::Codex);
+        assert_eq!(session.id, "77770000");
+        assert_eq!(session.path, lock.to_string_lossy());
+    }
+
+    // AYEAYE-80 — the descriptor outranks the lock: what the process holds
+    // open is a fact needing no lookup, so a rollout in hand is answered
+    // before the locks are read at all.
+    #[test]
+    fn a_held_rollout_outranks_the_locks() {
+        let home = Home::new("locked-held");
+        let mine = home.rollout(
+            "2026/03/01",
+            &format!("rollout-2026-03-01T09-00-02-{CODEX_ID}.jsonl"),
+            &meta_line(CODEX_ID, "/dev/thing", None),
+        );
+        // Another session's lock, newer rollout and all: still not this pane.
+        home.rollout(
+            "2026/03/02",
+            "rollout-2026-03-02T10-00-00-99990000-bbbb.jsonl",
+            &meta_line("99990000-bbbb", "/dev/other", None),
+        );
+        let stray_lock = home.lock("99990000-bbbb");
+        let fake = Fake::pane("codex")
+            .started(200, STARTED)
+            .holding(200, &[mine.clone(), stray_lock]);
 
         let found = home.agents().behind_process(&fake, "codex\t100");
         let Behind::Found(session) = found else {

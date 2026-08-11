@@ -3,7 +3,7 @@
 //! Codex hooks would be the clean route, and they are not available: on 0.145.0
 //! `SessionStart` never fires in an interactive session (openai/codex#17532) —
 //! verified with a valid matcher and trust granted — and `SessionEnd` is dead
-//! too. So there are two answers here, in the order they deserve.
+//! too. So there are three answers here, in the order they deserve.
 //!
 //! **What the process has open is asked first.** It is a fact about the process
 //! rather than an inference about it: the kernel is asked which file it holds,
@@ -12,11 +12,18 @@
 //! days before the process that reopened it, and no window around a start time
 //! will ever contain it.
 //!
+//! **Then the thread-writer lock**, because 0.147 closes the rollout when the
+//! session idles and the lock is what stays held for the session's whole life.
+//! Its filename is the thread id, and the id finds the rollout wherever codex
+//! filed it — or names the session outright when no rollout has been written
+//! at all, which is what a codex that has never been asked anything leaves.
+//!
 //! **Then the timestamp match**, because older codex did not hold the rollout
-//! reliably. A rollout is created within a second or two of the process
-//! starting and its filename carries that moment, and pairing that with the
-//! working directory keeps two codex agents in one directory distinct. Both
-//! work however codex was launched, not just from this app.
+//! reliably and predates the locks. A rollout is created within a second or
+//! two of the process starting and its filename carries that moment, and
+//! pairing that with the working directory keeps two codex agents in one
+//! directory distinct. All three work however codex was launched, not just
+//! from this app.
 //!
 //! Codex holds its subagents' rollouts open too, so the ones it is keeping on
 //! someone else's behalf are put aside here: a spawned thread records the parent
