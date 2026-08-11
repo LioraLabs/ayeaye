@@ -588,6 +588,19 @@ async fn every_page_manifest_and_icon_is_served_with_its_type() {
     }
 }
 
+// AYEAYE-85 — the browser can register the embedded worker for the whole app.
+#[tokio::test]
+async fn the_service_worker_is_served_as_javascript_with_root_scope() {
+    let answer = Server::started().await.get("/service-worker.js").await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("content-type"), Some("text/javascript"));
+    assert_eq!(answer.header("service-worker-allowed"), Some("/"));
+    assert_eq!(
+        answer.body,
+        ayeaye::assets::bytes("service-worker.js").expect("the worker is embedded")
+    );
+}
+
 // AYEAYE-42 — the Host gate applies to everything, pages included. A page on
 // an attacker's origin that resolves their name to this address still sends
 // their Host, and that is what has to be refused — before any route is even

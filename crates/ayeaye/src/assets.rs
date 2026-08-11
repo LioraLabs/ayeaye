@@ -17,6 +17,10 @@ const EMBEDDED: &[(&str, &[u8])] = &[
     ("app.html", include_bytes!("../../../share/app.html")),
     ("board.html", include_bytes!("../../../share/board.html")),
     (
+        ayeaye_core::http::route::SERVICE_WORKER_FILE,
+        include_bytes!("../../../share/service-worker.js"),
+    ),
+    (
         "manifest.webmanifest",
         include_bytes!("../../../share/manifest.webmanifest"),
     ),
