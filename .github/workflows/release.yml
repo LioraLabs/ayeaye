@@ -118,8 +118,10 @@ jobs:
         # architectures. Turing and older get CPU inference.
         env:
           CUDA_COMPUTE_CAP: "80"
+        # `set -eu`, not `-o pipefail`: there is no pipe here, and the cuda
+        # container's /bin/sh is dash, which has no pipefail to set.
         run: |
-          set -euo pipefail
+          set -eu
           cmd=build
           [ "${{ matrix.kind }}" = zigbuild ] && cmd=zigbuild
           features="${{ matrix.features }}"
