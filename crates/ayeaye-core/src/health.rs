@@ -1,6 +1,6 @@
 //! Did what was set up actually work?
 //!
-//! A port of `lib/steps/80-health.sh`, which is the last thing setup does before
+//! The health report is the last thing setup does before
 //! it tells somebody they are finished. Every check here is a pure function from
 //! *evidence* to a [`Verdict`]: an HTTP status, a command's exit status, a name
 //! on `PATH`. Making the request is the shell's; deciding what it means is this.

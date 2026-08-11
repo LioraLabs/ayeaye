@@ -14,7 +14,7 @@
 //! a definition installed months ago can never disagree with the settings in
 //! force.
 //!
-//! This is a port of `lib/steps/70-service.sh` and `lib/service.sh`, and the
+//! The service definitions and operations live here, and the
 //! golden files under `tests/fixtures/units/` are what makes it a port rather
 //! than a rewrite: the renderers here are compared against them byte for byte.
 
@@ -246,7 +246,7 @@ impl Session {
     /// This is where the detector and the verbs meet, and `None` is the third
     /// answer [`Manager`] refuses to carry: a machine with neither manager. It
     /// is not a failure — a container and a stripped-down Linux both really are
-    /// one, and `lib/steps/70-service.sh` treats starting ayeaye by hand as a
+    /// one, and starting ayeaye by hand remains a
     /// supported way to use it — so the caller is expected to reach for
     /// [`manual_instructions`] rather than to give up.
     ///

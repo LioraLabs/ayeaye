@@ -38,9 +38,9 @@ escaping="$(printf '%s\n' "$listing" | grep -e '^/' -e '^\.\./' -e '/\.\./' || t
 tops="$(printf '%s\n' "$listing" | awk -F/ 'NF>1 {print $1}' | sort -u | wc -l | tr -d ' ')"
 [ "$tops" = 1 ]; check "one top-level directory (found $tops)" $?
 
-# 3. The front door and the app are in the archive.
+# 3. The download front door and the Rust product are in the source archive.
 has "/install.sh$";  check "contains install.sh" $?
-has "/bin/ayeaye$";  check "contains bin/ayeaye" $?
+has "/crates/ayeaye/Cargo.toml$"; check "contains the ayeaye crate" $?
 
 # 4. The installer inside parses. It pins no version of its own any more -
 #    it is a downloader (AYEAYE-63) - so parseability is the whole claim.

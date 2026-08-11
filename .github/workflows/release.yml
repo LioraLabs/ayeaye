@@ -46,7 +46,7 @@ env:
 
 jobs:
   # Nothing builds until every version claim in the tree agrees with the tag,
-  # both suites pass, and the linter passes as an error gate.
+  # the suite passes, and the linter passes as an error gate.
   verify:
     runs-on: ubuntu-24.04
     steps:
@@ -57,8 +57,6 @@ jobs:
         run: cargo test --workspace --locked
       - name: linter, as an error gate
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: shell suite
-        run: bash tests/run.sh
 
   build:
     needs: verify

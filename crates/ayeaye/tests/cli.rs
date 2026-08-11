@@ -109,7 +109,7 @@ fn help_names_every_variable_the_server_reads() {
     assert_eq!(code, 0);
     for name in [
         "AYEAYE_BIND",
-        "AYEAYE_DEV_PORT",
+        "AYEAYE_PORT",
         "AYEAYE_ALLOWED_HOSTS",
         "AYEAYE_TOKEN",
     ] {
@@ -147,8 +147,7 @@ fn ayeaye_on_a_bare_machine(args: &[&str], home: &Path) -> (i32, String, String)
 // AYEAYE-62 — the third answer, as the binary. AYEAYE-61 recorded that a machine
 // with neither service manager got a `systemctl` that is not there; this is the
 // door that proves it no longer does. `install` and `repair` are *finished*
-// runs, because `lib/steps/70-service.sh` returns SKIP here and ends the run
-// successfully: ayeaye started by hand is a supported way to use it.
+// runs, because ayeaye started by hand is a supported way to use it.
 #[test]
 fn a_machine_with_no_service_manager_is_told_how_to_run_it_by_hand() {
     let home = scratch("no-manager");
@@ -208,8 +207,8 @@ fn setup_with_nobody_to_ask_writes_its_own_files_and_nothing_else() {
 
     // The health checks are the last thing it does, and on a machine with
     // nothing running most of them cannot be made — but setup still *finishes*.
-    // `lib/steps/80-health.sh` answers PENDING for everything it can be unhappy
-    // about, and a pending step never stops a run: needing tmux installed is not
+    // Health answers pending for everything it can be unhappy about, and a
+    // pending step never stops a run: needing tmux installed is not
     // setup having failed at its job. `ayeaye check` reports the same thing and
     // exits 1, because that one was asked as a question.
     assert_eq!(

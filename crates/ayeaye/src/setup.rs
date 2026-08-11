@@ -460,7 +460,7 @@ fn write_settings(places: &Places, flags: &Flags) -> Result<String, Failed> {
         wanted.push(("BIND", bind.clone()));
     }
     if let Some(port) = flags.port {
-        wanted.push(("DEV_PORT", port.to_string()));
+        wanted.push(("PORT", port.to_string()));
     }
 
     let dir = places
@@ -927,7 +927,7 @@ mod tests {
             !after.contains("10.0.0.1"),
             "the old value is gone: {after}"
         );
-        assert!(after.contains("AYEAYE_DEV_PORT=9001"), "{after}");
+        assert!(after.contains("AYEAYE_PORT=9001"), "{after}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
