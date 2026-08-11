@@ -390,7 +390,10 @@ mod tests {
                 format!("{LOCKS}/0123abcd-dead-beef"),
                 "no .lock suffix, so not a lock",
             ),
-            (format!("{LOCKS}/.lock"), "a suffix with no id in front of it"),
+            (
+                format!("{LOCKS}/.lock"),
+                "a suffix with no id in front of it",
+            ),
             (LOCKS.to_string(), "the directory itself"),
             (
                 "/home/other/.codex/thread-writer-locks/aaaa.lock".to_string(),

@@ -74,7 +74,7 @@ pub enum Behind {
 
 /// Where the two agents keep what they leave behind.
 ///
-/// The three directories are fields rather than constants for the same reason
+/// The four directories are fields rather than constants for the same reason
 /// `process::linux::Linux`'s `/proc` root is: without that, a test either reads
 /// whatever the person running it happens to have in their home directory, or
 /// does not test this at all.
@@ -103,7 +103,7 @@ impl Agents {
         Agents::under(std::env::var("HOME").unwrap_or_default())
     }
 
-    /// The same three directories under a home of the caller's choosing.
+    /// The same four directories under a home of the caller's choosing.
     pub fn under(home: impl AsRef<Path>) -> Agents {
         let home = home.as_ref();
         Agents {
@@ -295,10 +295,16 @@ impl Agents {
     /// has never been asked anything — codex writes the rollout at the first
     /// message — and it is still the session in the pane: its id comes from
     /// the lock, and the lock file stands in as the transcript, whose
-    /// emptiness classifies as waiting, which is the truth of it. (A
-    /// rollout-backed answer always wins over a bare lock: a thread with live
-    /// subagents has conversation, hence a rollout, so the bare-lock pick only
-    /// ever chooses among a fresh session's single lock.)
+    /// emptiness classifies as waiting, which is the truth of it.
+    ///
+    /// The bare-lock answer is given only when **no** held lock has a rollout
+    /// by name. A rollout that matched and was then put aside — a subagent's,
+    /// or a first line read mid-write — means the disk knows more than the
+    /// locks are saying, and guessing an id from the remaining locks could
+    /// name a subagent; the route answers nothing and the next poll reads a
+    /// settled file instead. (A thread with live subagents has conversation,
+    /// hence a rollout, so the bare-lock pick only ever chooses among a fresh
+    /// session's locks.)
     fn locked(&self, processes: &dyn Processes, pid: u32) -> Option<Session> {
         let root = self.codex_locks.to_string_lossy().into_owned();
         let mut locks: Vec<(String, String)> = Vec::new();
@@ -312,10 +318,12 @@ impl Agents {
         }
         // One walk for all the locks, not one per lock: the walk lists every
         // day directory codex has ever had, and this runs per pane per poll.
-        let mut best: Option<(f64, PathBuf, String)> = None;
-        for path in walk(&self.codex_sessions, ROLLOUT_DEPTH, &|name| {
+        let matched = walk(&self.codex_sessions, ROLLOUT_DEPTH, &|name| {
             locks.iter().any(|(id, _)| codex::rollout_for(name, id))
-        }) {
+        });
+        let any_matched = !matched.is_empty();
+        let mut best: Option<(f64, PathBuf, String)> = None;
+        for path in matched {
             let Some(meta) = first_line(&path).as_deref().and_then(codex::meta) else {
                 continue;
             };
@@ -336,6 +344,12 @@ impl Agents {
         }
         if let Some((_, path, id)) = best {
             return Some(Session::new(Kind::Codex, &id, &path.to_string_lossy()));
+        }
+        if any_matched {
+            // Rollouts exist and every one was put aside: the disk knows more
+            // than the locks are saying, and a guess here could name a
+            // subagent. Nothing, and the next poll reads a settled file.
+            return None;
         }
         // No rollout for any lock: first path, the standing tie rule.
         let (id, path) = locks.into_iter().min_by(|a, b| a.1.cmp(&b.1))?;
@@ -933,7 +947,9 @@ mod tests {
             &meta_line("88880000-aaaa", "/dev/thing", Some(CODEX_ID)),
         );
         let locks = [home.lock(CODEX_ID), home.lock("88880000-aaaa")];
-        let fake = Fake::pane("codex").started(200, STARTED).holding(200, &locks);
+        let fake = Fake::pane("codex")
+            .started(200, STARTED)
+            .holding(200, &locks);
 
         let found = home.agents().behind_process(&fake, "codex\t100");
         let Behind::Found(session) = found else {
@@ -964,6 +980,33 @@ mod tests {
         assert_eq!(session.kind, Kind::Codex);
         assert_eq!(session.id, "77770000");
         assert_eq!(session.path, lock.to_string_lossy());
+    }
+
+    // AYEAYE-80 — when rollouts matched the locks and every one was put
+    // aside, the disk knows more than the locks are saying, and guessing an
+    // id from the remaining locks could name a subagent. Nothing is the
+    // answer; the next poll reads a settled file.
+    #[test]
+    fn a_lock_is_not_guessed_at_when_its_rollouts_were_put_aside() {
+        let home = Home::new("locked-refused");
+        // The only rollout on disk is a subagent's; the main thread's is
+        // missing — a first line mid-write, a cleanup, whatever it was.
+        home.rollout(
+            "2026/03/01",
+            "rollout-2026-03-01T09-04-11-88880000-aaaa.jsonl",
+            &meta_line("88880000-aaaa", "/dev/thing", Some(CODEX_ID)),
+        );
+        let locks = [home.lock(CODEX_ID), home.lock("88880000-aaaa")];
+        let fake = Fake::pane("codex")
+            .started(200, STARTED)
+            .cwd(200, "/dev/thing")
+            .holding(200, &locks);
+
+        assert_eq!(
+            home.agents().behind_process(&fake, "codex\t100"),
+            Behind::Nothing,
+            "a guess could name the subagent, and nothing self-corrects"
+        );
     }
 
     // AYEAYE-80 — the descriptor outranks the lock: what the process holds
