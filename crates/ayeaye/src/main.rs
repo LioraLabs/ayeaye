@@ -858,8 +858,8 @@ fn nodename(runner: &impl Runner) -> Option<String> {
 
 /// What to say on a machine with nowhere to install a service.
 ///
-/// Not an apology and not a failure. `lib/steps/70-service.sh` calls this the
-/// documented manual mode and returns a *finished* run from it: ayeaye works
+/// Not an apology and not a failure. This is the documented manual mode:
+/// ayeaye works
 /// perfectly well started by hand, and a container, a stripped-down Linux or a
 /// Mac without launchctl is a machine where saying so plainly is the whole of
 /// the right answer.
@@ -1001,8 +1001,7 @@ mod tests {
 
     // AYEAYE-62 — the third answer, at the door. `install` and `repair` are the
     // verbs setup itself drives, and on a machine with nowhere to install a
-    // service they are *finished*: lib/steps/70-service.sh returns SKIP here and
-    // ends the run successfully, because running ayeaye by hand is a supported
+    // service they are *finished*, because running ayeaye by hand is a supported
     // way to use it and not a fault to come back and fix. The six that address a
     // manager did not happen, so they say so and fail.
     #[test]

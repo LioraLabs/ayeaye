@@ -385,13 +385,8 @@ pub fn env_then_file(config_file: &Path) -> impl Fn(&str) -> Option<String> {
     move |name| layered(name, |key| std::env::var(key).ok(), &file)
 }
 
-/// The shared secret, from the environment or from the file the Python daemon
-/// wrote.
-///
-/// This does not *generate* a token when it finds none, and that is deliberate
-/// while both daemons run: a second generated token would be a second secret,
-/// and the phone is logged in with the first. Minting one belongs to
-/// `ayeaye setup`, once there is only one daemon left to own it.
+/// The shared secret, from the environment or from the file `ayeaye setup`
+/// writes. Serving never mutates setup state, so a missing token is refused.
 pub fn load_token() -> Result<String, ConfigError> {
     if let Some(token) = env_var("TOKEN") {
         return Ok(token);
@@ -406,7 +401,7 @@ pub fn load_token() -> Result<String, ConfigError> {
         }
     }
     Err(ConfigError::NoToken(format!(
-        "no token: set AYEAYE_TOKEN, or start the Python daemon once so it writes {}",
+        "no token: set AYEAYE_TOKEN, or run `ayeaye setup` so it writes {}",
         path.map(|path| path.display().to_string())
             .unwrap_or_else(|| "the state file".to_string())
     )))

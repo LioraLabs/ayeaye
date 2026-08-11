@@ -1,6 +1,6 @@
 //! The server, observed the way a browser observes it: over a socket.
 //!
-//! Every test here binds port 0, so the suite never collides with the Python
+//! Every test here binds port 0, so the suite never collides with a running
 //! daemon or with itself, and speaks raw HTTP/1.1 with `Connection: close` so
 //! the body ends at EOF and no HTTP client crate is needed to read it. That
 //! keeps the seam the highest one that can see the behaviour — a route table

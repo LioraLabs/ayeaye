@@ -26,8 +26,8 @@ ayeaye setup
 ayeaye check
 ```
 
-The only required runtime tool is `tmux`. Voice additionally needs `ffmpeg` or
-`sox` to turn a recording into audio samples. A model is downloaded separately
+The only required runtime tool is `tmux`. Voice additionally needs `ffmpeg` to
+turn a recording into audio samples. A model is downloaded separately
 because the binary ships inference, not model weights:
 
 ```sh
