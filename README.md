@@ -64,6 +64,31 @@ in `$XDG_CONFIG_HOME/ayeaye/env`, or `~/.config/ayeaye/env` by default.
 Environment variables override that file; the common ones are `AYEAYE_BIND`,
 `AYEAYE_PORT`, `AYEAYE_ALLOWED_HOSTS`, and `AYEAYE_TOKEN`.
 
+## HTTPS for notifications
+
+Browser notifications require HTTPS. A plain-HTTP install still serves the app,
+but gets no notifications. Keep ayeaye on its default local port and put either
+of these HTTPS front ends in front of it.
+
+With [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve), run:
+
+```sh
+tailscale serve --bg http://127.0.0.1:8911
+```
+
+Then open the HTTPS URL printed by `tailscale serve status`.
+
+For local TLS with [Caddy](https://caddyserver.com/docs/automatic-https#local-https),
+use this `Caddyfile`:
+
+```caddyfile
+ayeaye.localhost {
+	reverse_proxy 127.0.0.1:8911
+}
+```
+
+Run `caddy run`, then open `https://ayeaye.localhost`.
+
 ## Voice from another device
 
 `bin/voice-agent` is the one deliberate exception to the server's one-binary
