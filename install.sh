@@ -91,6 +91,8 @@ trap - EXIT
 # Piped through bash, stdin is this script and already spent; hand setup the
 # terminal instead, so it can still ask its two questions.
 if [ ! -t 0 ] && (exec </dev/tty) 2>/dev/null; then
-  exec "$bin_dir/ayeaye" setup "$@" </dev/tty
+  "$bin_dir/ayeaye" setup "$@" </dev/tty
+else
+  "$bin_dir/ayeaye" setup "$@"
 fi
-exec "$bin_dir/ayeaye" setup "$@"
+echo "Notifications require HTTPS; see the README's 'HTTPS for notifications' section."

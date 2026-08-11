@@ -46,7 +46,10 @@ candidate ayeaye-x86_64-unknown-linux-gnu-cuda 127
 candidate ayeaye-x86_64-unknown-linux-musl 0
 sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
 printf '%s\n' old >"$work/home/.local/bin/ayeaye"
-install
+install_output="$(install)"
+# AYEAYE-86 — successful installs steer notification users to HTTPS setup.
+printf '%s\n' "$install_output" | grep -q 'Notifications require HTTPS'
+printf '%s\n' "$install_output" | grep -q 'README.*HTTPS'
 grep -qx ayeaye-x86_64-unknown-linux-musl "$work/ran"
 grep -q unknown-linux-musl "$work/home/.local/bin/ayeaye"
 
