@@ -152,11 +152,16 @@ async fn a_prompt_drawn_in_a_real_pane_is_read_back_off_it() {
         eprintln!("skipped: no tmux on this machine");
         return;
     };
-    let pane = only_pane_of(&server, "asking", "cat").await;
+    // `>/dev/null` because a bare `cat` writes every line back, and where the
+    // terminal puts that second copy relative to the echo is a scheduling race:
+    // adjacent on a fast machine, a separate block on a loaded one, and the
+    // parser reads doubled options off the latter. The echo alone is already
+    // "a terminal drew it", which is all this test wants on the screen.
+    let pane = only_pane_of(&server, "asking", "cat >/dev/null").await;
     let layer = server.layer();
 
-    // Drawn by the pane's own program rather than typed by us, so what is parsed
-    // is what a terminal put on a screen.
+    // Drawn onto the pane by its own pty echo rather than trusted from memory,
+    // so what is parsed is what a terminal put on a screen.
     layer
         .type_text(&pane, prompt::typed("Pick one? ").expect("typeable"))
         .await
