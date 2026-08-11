@@ -10,3 +10,8 @@ repository.workspace = true
 # Every name here has to earn a place on the constitution's allowlist first.
 # See crates/constitution/README.md.
 [dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+sha2 = "0.10"
