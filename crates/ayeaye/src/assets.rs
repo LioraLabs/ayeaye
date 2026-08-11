@@ -17,6 +17,10 @@ const EMBEDDED: &[(&str, &[u8])] = &[
     ("app.html", include_bytes!("../../../share/app.html")),
     ("board.html", include_bytes!("../../../share/board.html")),
     (
+        "service-worker.js",
+        include_bytes!("../../../share/service-worker.js"),
+    ),
+    (
         "manifest.webmanifest",
         include_bytes!("../../../share/manifest.webmanifest"),
     ),

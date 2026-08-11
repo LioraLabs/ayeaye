@@ -1081,7 +1081,13 @@ fn serve_asset(asset: Asset) -> Response {
             StatusCode::OK,
             asset.content_type,
             Body::from(bytes),
-            |response| response,
+            |response| {
+                if asset.file == "service-worker.js" {
+                    response.header("Service-Worker-Allowed", "/")
+                } else {
+                    response
+                }
+            },
         ),
         // Unreachable while `tests/assets.rs` passes — it asserts every file
         // the route table names is embedded. Answered rather than panicked

@@ -91,6 +91,12 @@
   }
   .seg a.on{background:var(--panel);color:var(--fg);
             box-shadow:0 1px 3px rgba(0,0,0,.35)}
+  #notificationSetup{display:flex;align-items:center;gap:8px;padding:7px 14px;
+                     border-bottom:1px solid var(--line);font-size:11px;color:var(--muted)}
+  #notificationSetup:empty{display:none}
+  #notifications{flex:none;border:1px solid var(--line2);border-radius:8px;
+                 padding:4px 9px;background:var(--panel2);color:var(--blue)}
+  #notificationStatus a{color:var(--blue)}
 
   /* ---- view tabs --------------------------------------------------------- */
   #modes{display:flex;align-items:center;gap:8px;padding:2px 14px 10px;flex:none}
@@ -478,6 +484,10 @@
     <a id="boardlink" href="/board">board</a>
   </nav>
 </header>
+<div id="notificationSetup">
+  <button id="notifications" type="button">enable notifications</button>
+  <span id="notificationStatus" role="status" aria-live="polite"></span>
+</div>
 
 <div id="modes">
   <div class="tabs">
@@ -565,6 +575,78 @@ function connUI(ok, label){
   $('#conn').className = ok ? 'ok' : 'off';
   $('#connlbl').textContent = label;
 }
+
+// ---- notifications -------------------------------------------------------
+const notificationButton = $('#notifications');
+const notificationStatus = $('#notificationStatus');
+let pushRegistration = null;
+
+function notificationState(text, enabled){
+  notificationStatus.textContent = text;
+  notificationButton.textContent = enabled ? 'disable notifications' : 'enable notifications';
+  notificationButton.dataset.enabled = enabled ? 'yes' : 'no';
+}
+
+function applicationKey(value){
+  const padding = '='.repeat((4 - value.length % 4) % 4);
+  const bytes = atob((value + padding).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(bytes, byte => byte.charCodeAt(0));
+}
+
+async function configureNotifications(){
+  const iphone = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  if(location.protocol !== 'https:'){
+    notificationButton.hidden = true;
+    notificationStatus.innerHTML = 'notifications need HTTPS — <a href="https://github.com/LioraLabs/ayeaye#secure-serving">secure serving in the README</a>';
+    return;
+  }
+  if(iphone && !installed){
+    notificationButton.hidden = true;
+    notificationStatus.textContent = 'Install this app first: Share → Add to Home Screen';
+    return;
+  }
+  if(!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)){
+    notificationButton.hidden = true;
+    notificationState('notifications are not supported by this browser', false);
+    return;
+  }
+  if(Notification.permission === 'denied'){
+    notificationButton.hidden = true;
+    notificationState('notification permission is denied in browser settings', false);
+    return;
+  }
+  pushRegistration = await navigator.serviceWorker.register('/service-worker.js');
+  const subscription = await pushRegistration.pushManager.getSubscription();
+  notificationState(subscription ? 'notifications enabled' : '', !!subscription);
+}
+
+notificationButton.onclick = async () => {
+  notificationButton.disabled = true;
+  try{
+    const current = await pushRegistration.pushManager.getSubscription();
+    if(current){
+      await fetch('/api/push/unsubscribe', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({endpoint:current.endpoint})});
+      await current.unsubscribe();
+      notificationState('notifications disabled', false);
+    }else{
+      const permission = await Notification.requestPermission();
+      if(permission !== 'granted') return notificationState('notification permission is denied', false);
+      const key = await (await fetch('/api/push/public-key')).json();
+      const subscription = await pushRegistration.pushManager.subscribe({
+        userVisibleOnly:true, applicationServerKey:applicationKey(key.publicKey)
+      });
+      const response = await fetch('/api/push/subscribe', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify(subscription)});
+      if(!response.ok) throw new Error('the server refused the subscription');
+      notificationState('notifications enabled', true);
+    }
+  }catch(error){ notificationState('notifications failed: '+error.message, false); }
+  finally{ notificationButton.disabled = false; }
+};
+configureNotifications().catch(error => notificationState('notifications failed: '+error.message, false));
 
 // ---- ticket links ---------------------------------------------------------
 // Agents talk about tickets constantly; a ticket key anywhere in their

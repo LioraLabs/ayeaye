@@ -81,3 +81,48 @@ fn every_file_the_route_table_names_is_embedded() {
         );
     }
 }
+
+// AYEAYE-85 — the worker does exactly push and click, with no cache/fetch scope.
+#[test]
+fn the_service_worker_always_notifies_and_clicks_back_into_the_app() {
+    let worker = String::from_utf8_lossy(
+        ayeaye::assets::bytes("service-worker.js").expect("the worker is embedded"),
+    );
+    for required in [
+        "addEventListener('push'",
+        "showNotification",
+        "addEventListener('notificationclick'",
+        ".focus()",
+        "clients.openWindow('/')",
+    ] {
+        assert!(worker.contains(required), "worker is missing {required:?}");
+    }
+    assert!(!worker.contains("addEventListener('fetch'"));
+    assert!(!worker.contains("caches."));
+}
+
+// AYEAYE-85 — the shipped page owns the complete native opt-in state machine.
+#[test]
+fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
+    let page = String::from_utf8_lossy(
+        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
+    );
+    for required in [
+        "id=\"notifications\"",
+        "aria-live=\"polite\"",
+        "serviceWorker.register('/service-worker.js')",
+        "Notification.requestPermission()",
+        "pushManager.subscribe",
+        "'/api/push/public-key'",
+        "'/api/push/subscribe'",
+        "'/api/push/unsubscribe'",
+        ".unsubscribe()",
+        "notifications are not supported",
+        "notification permission is denied",
+        "Share → Add to Home Screen",
+        "notifications need HTTPS",
+        "href=\"https://github.com/LioraLabs/ayeaye#secure-serving\"",
+    ] {
+        assert!(page.contains(required), "app is missing {required:?}");
+    }
+}

@@ -146,6 +146,7 @@ pub const ASSET_ROUTES: &[(&str, Asset)] = &[
     ("/", asset("app.html", HTML)),
     ("/index.html", asset("app.html", HTML)),
     ("/message", asset("app.html", HTML)),
+    ("/service-worker.js", asset("service-worker.js", "text/javascript")),
     ("/board", asset("board.html", HTML)),
     ("/board.html", asset("board.html", HTML)),
     // Static, data-free, and needed before login: the manifest is what makes
