@@ -56,7 +56,11 @@ pub struct Places {
     pub state_dir: PathBuf,
     /// The key.
     pub token_file: PathBuf,
-    /// Where model weights land.
+    /// Where model weights land, spelled the way `models::` expects its
+    /// `store` argument: the state dir itself. `models::pull` and
+    /// `models::installed` append `models/` on their own, so a pre-joined
+    /// path here puts the weights in `models/models/` — a directory the
+    /// daemon never reads.
     pub model_store: PathBuf,
 }
 
@@ -67,7 +71,7 @@ impl Places {
             config_file: PathBuf::from(&layout.env_file),
             state_dir: state_dir.to_path_buf(),
             token_file: state_dir.join("token"),
-            model_store: state_dir.join("models"),
+            model_store: state_dir.to_path_buf(),
         }
     }
 }
@@ -666,7 +670,7 @@ mod tests {
             config_file: root.join("config/ayeaye/env"),
             state_dir: root.join("state/ayeaye"),
             token_file: root.join("state/ayeaye/token"),
-            model_store: root.join("state/ayeaye/models"),
+            model_store: root.join("state/ayeaye"),
         }
     }
 
@@ -676,6 +680,21 @@ mod tests {
             &root.join("config").to_string_lossy(),
             &root.join("state").to_string_lossy(),
         )
+    }
+
+    // AYEAYE-81's sibling — setup's pull and the daemon's read must name the
+    // same store. `models::` appends `models/` internally, so the store is the
+    // state dir itself; a pre-joined `state_dir.join("models")` here once put
+    // every setup-fetched model in `models/models/`, where `Voice` (handed
+    // `config::state_dir()` bare) never looked, and dictation reported the
+    // model absent right after setup said it fetched it.
+    #[test]
+    fn the_model_store_is_the_path_the_daemon_reads_models_from() {
+        let root = scratch("store-agreement");
+        let state_dir = root.join("state/ayeaye");
+        let handed = Places::from(&layout(&root), &state_dir);
+        assert_eq!(handed.model_store, state_dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // AYEAYE-62 — the flags, including the pair that ask for opposite things. A
