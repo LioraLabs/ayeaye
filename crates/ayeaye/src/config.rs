@@ -21,14 +21,8 @@ use crate::tmux::Tmux;
 
 use crate::cliban::Cliban;
 
-/// The port the Rust daemon listens on until the cutover.
-///
-/// Deliberately not 8911. The Python daemon keeps the real port for the rest
-/// of the milestone, and the two have to be able to run side by side on one
-/// machine — which is also why this reads `AYEAYE_DEV_PORT` and not
-/// `AYEAYE_PORT`: a shell already configured for the daemon must not drag this
-/// onto the port that daemon is already holding.
-pub const DEFAULT_DEV_PORT: u16 = 8912;
+/// The port ayeaye listens on when nothing says otherwise.
+pub const DEFAULT_PORT: u16 = 8911;
 
 /// The address to bind when nothing says otherwise.
 pub const DEFAULT_BIND: &str = "127.0.0.1";
@@ -99,7 +93,7 @@ pub enum ConfigError {
     /// A value was given but could not be read as what it has to be.
     NotAPort(String),
     /// An argument nobody recognises. Refused rather than ignored: a typo'd
-    /// `--prot 9000` that silently binds 8912 is worse than a refusal.
+    /// `--prot 9000` that silently binds 8911 is worse than a refusal.
     UnknownArgument(String),
     /// No token in the environment and none on disk.
     NoToken(String),
@@ -144,7 +138,7 @@ impl Settings {
     /// a decision.
     ///
     /// `env` is a lookup rather than `std::env` so this is a decision a test
-    /// can drive. It is handed the *bare* name — `BIND`, `DEV_PORT` — and is
+    /// can drive. It is handed the *bare* name — `BIND`, `PORT` — and is
     /// expected to try `AYEAYE_<name>` before the legacy `VOICE_REMOTE_<name>`.
     /// The daemon hands it [`env_then_file`], which layers the settings file
     /// `ayeaye setup` owns beneath the environment; [`env_var`] is the
@@ -160,9 +154,9 @@ impl Settings {
         voice: Arc<Voice>,
     ) -> Result<Settings, ConfigError> {
         let mut bind = env("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
-        let mut port = match env("DEV_PORT") {
+        let mut port = match env("PORT") {
             Some(value) => parse_port(&value)?,
-            None => DEFAULT_DEV_PORT,
+            None => DEFAULT_PORT,
         };
 
         let mut rest = args.iter();
@@ -477,7 +471,7 @@ fn choose_state_dir(base: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, DEFAULT_DEV_PORT, Path, Settings};
+    use super::{ConfigError, DEFAULT_PORT, Path, Settings};
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -540,9 +534,7 @@ mod tests {
             "/opt/cliban"
         );
         // And the current name wins over the legacy one, which is the order
-        // every other setting here is read in. Both are honoured because the
-        // env file, the README and the installer all still write the legacy
-        // one, and the cutover ticket is where that changes.
+        // every other setting here is read in.
         assert_eq!(
             super::choose_cliban(
                 env(vec![
@@ -654,11 +646,11 @@ mod tests {
         // The file answers when the environment is silent, whichever spelling
         // the line uses — setup's own, a bare name, or the legacy prefix.
         assert_eq!(
-            super::layered("DEV_PORT", silent, "AYEAYE_DEV_PORT=9005\n"),
+            super::layered("PORT", silent, "AYEAYE_PORT=9005\n"),
             Some("9005".to_string())
         );
         assert_eq!(
-            super::layered("DEV_PORT", silent, "DEV_PORT=9006\n"),
+            super::layered("PORT", silent, "PORT=9006\n"),
             Some("9006".to_string())
         );
         assert_eq!(
@@ -677,9 +669,9 @@ mod tests {
         );
         // The environment wins over the file, so a unit that injects the file
         // with EnvironmentFile= and this layer cannot disagree.
-        let unit = |key: &str| (key == "AYEAYE_DEV_PORT").then(|| "9100".to_string());
+        let unit = |key: &str| (key == "AYEAYE_PORT").then(|| "9100".to_string());
         assert_eq!(
-            super::layered("DEV_PORT", unit, "AYEAYE_DEV_PORT=9005\n"),
+            super::layered("PORT", unit, "AYEAYE_PORT=9005\n"),
             Some("9100".to_string())
         );
         // The last line wins, as it would when a shell sourced the file; a key
@@ -692,22 +684,13 @@ mod tests {
         assert_eq!(super::layered("BIND", silent, ""), None);
     }
 
-    // AYEAYE-42 — "the port is configurable so both daemons can run side by
-    // side". The default has to be a port the Python daemon is not already
-    // holding, or the two cannot run at once at all.
     #[test]
-    fn the_default_port_is_not_the_one_the_python_daemon_holds() {
-        // The claim is about the constant, not about this call: asserting it
-        // on `settings.port` after asserting that equals the constant is a
-        // second assertion that can never fail on its own.
-        assert_ne!(
-            DEFAULT_DEV_PORT, 8911,
-            "the daemon's port cannot be the default"
-        );
+    fn the_default_port_is_the_production_port() {
+        assert_eq!(DEFAULT_PORT, 8911);
         let settings = resolve(&[], no_env).expect("the defaults should resolve");
-        assert_eq!(settings.port, DEFAULT_DEV_PORT);
+        assert_eq!(settings.port, DEFAULT_PORT);
         assert_eq!(settings.bind, "127.0.0.1");
-        assert_eq!(settings.address(), format!("127.0.0.1:{DEFAULT_DEV_PORT}"));
+        assert_eq!(settings.address(), format!("127.0.0.1:{DEFAULT_PORT}"));
     }
 
     // AYEAYE-42 — an argument beats the environment, and the environment beats
@@ -716,7 +699,7 @@ mod tests {
     #[test]
     fn an_argument_beats_the_environment_which_beats_the_default() {
         let env = |name: &str| match name {
-            "DEV_PORT" => Some("9101".to_string()),
+            "PORT" => Some("9101".to_string()),
             "BIND" => Some("0.0.0.0".to_string()),
             _ => None,
         };
@@ -732,7 +715,7 @@ mod tests {
 
     // AYEAYE-42 — the allow-list is built from the port that won, not the one
     // that was asked for: a server on 9202 that only trusts Host values naming
-    // 8912 refuses every request it receives.
+    // 8911 refuses every request it receives.
     #[test]
     fn the_allow_list_is_built_from_the_port_that_won() {
         let settings = resolve(&["--port", "9202"], no_env).expect("arguments should resolve");

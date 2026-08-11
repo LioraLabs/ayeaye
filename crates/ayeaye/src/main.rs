@@ -69,7 +69,7 @@ a model ID is owner/name, as in openai/whisper-small.en, optionally
 
 environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_BIND           address to bind (default 127.0.0.1)
-  AYEAYE_DEV_PORT       port to bind (default 8912)
+  AYEAYE_PORT       port to bind (default 8911)
   AYEAYE_ALLOWED_HOSTS  comma-separated extra Host values to answer to
   AYEAYE_TOKEN          the shared secret; otherwise read from the state file
   AYEAYE_CLIBAN         the cliban the board tab reads (legacy VOICE_CLIBAN);
@@ -681,8 +681,8 @@ fn check(
             bind,
             setup::effective(
                 &places.config_file,
-                "DEV_PORT",
-                &config::DEFAULT_DEV_PORT.to_string()
+                "PORT",
+                &config::DEFAULT_PORT.to_string()
             )
         ),
         allowed_hosts: setup::effective(&places.config_file, "ALLOWED_HOSTS", "")

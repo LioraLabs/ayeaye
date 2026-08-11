@@ -109,7 +109,7 @@ fn help_names_every_variable_the_server_reads() {
     assert_eq!(code, 0);
     for name in [
         "AYEAYE_BIND",
-        "AYEAYE_DEV_PORT",
+        "AYEAYE_PORT",
         "AYEAYE_ALLOWED_HOSTS",
         "AYEAYE_TOKEN",
     ] {
