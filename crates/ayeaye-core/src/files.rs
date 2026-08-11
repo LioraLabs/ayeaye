@@ -255,7 +255,9 @@ pub fn candidates<'a>(
                 0
             } else if wanted.contains('/') && suffixed(tracked, wanted) {
                 1
-            } else if paths::file_name(tracked) == wanted_name {
+            } else if (!wanted.contains('/') || !tracked.contains('/'))
+                && paths::file_name(tracked) == wanted_name
+            {
                 2
             } else {
                 return None;
@@ -615,7 +617,7 @@ mod tests {
             vec!["src/main.rs"],
         );
         assert_eq!(candidates("main.rs", "", ["src/domain.rs"]), Vec::<&str>::new());
-        // And a suffix match is whole components: `b/c.txt` is not `ab/c.txt`.
+        // AYEAYE-76 — a suffix match is whole components: `b/c.txt` is not `ab/c.txt`.
         assert_eq!(candidates("b/c.txt", "", ["ab/c.txt"]), Vec::<&str>::new());
         assert_eq!(candidates("b/c.txt", "", ["a/b/c.txt"]), vec!["a/b/c.txt"]);
         assert_eq!(candidates("", "", ["a.txt"]), Vec::<&str>::new());
