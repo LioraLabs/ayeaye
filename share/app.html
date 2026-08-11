@@ -599,7 +599,7 @@ async function configureNotifications(){
   const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
   if(location.protocol !== 'https:'){
     notificationButton.hidden = true;
-    notificationStatus.innerHTML = 'notifications need HTTPS — <a href="https://github.com/LioraLabs/ayeaye#secure-serving">secure serving in the README</a>';
+    notificationStatus.innerHTML = 'notifications need HTTPS — <a href="https://github.com/LioraLabs/ayeaye#https-for-notifications">secure serving in the README</a>';
     return;
   }
   if(iphone && !installed){
