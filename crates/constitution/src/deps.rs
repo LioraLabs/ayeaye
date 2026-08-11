@@ -14,7 +14,7 @@ use crate::finding::{Finding, Rule};
 /// *our* source — which is exactly why this rule is not redundant with the
 /// effect budget. It is also why timestamp and cookie handling are hand-rolled
 /// rather than pulled from crates that carry a clock along with them.
-pub const ALLOWED: &[&str] = &[];
+pub const ALLOWED: &[&str] = &["aes-gcm", "base64", "hkdf", "p256", "sha2"];
 
 /// The crate this rule is about. Nothing else in the workspace is held to it:
 /// `ayeaye-infer` and `ayeaye` exist in order to have effects.

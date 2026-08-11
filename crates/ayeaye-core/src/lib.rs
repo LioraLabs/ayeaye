@@ -42,6 +42,7 @@ pub mod sha1;
 pub mod tmux;
 pub mod transcript;
 pub mod vocab;
+pub mod web_push;
 
 pub use audio::Pcm16kMono;
 pub use identity::Identity;
