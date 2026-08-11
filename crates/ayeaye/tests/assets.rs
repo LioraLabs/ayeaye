@@ -5,6 +5,7 @@
 //! binary can tell you that.
 
 use std::fs;
+use std::process::Command;
 use std::path::PathBuf;
 
 fn share_dir() -> PathBuf {
@@ -148,4 +149,64 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
         .unwrap();
     assert!(register < reject_register && reject_register < rollback);
     assert!(page.contains("notification permission was not granted"));
+}
+
+fn notification_case(mode: &str) {
+    let page = String::from_utf8_lossy(
+        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
+    );
+    let source = page
+        .split_once("// ---- notifications -------------------------------------------------------\n")
+        .and_then(|(_, rest)| {
+            rest.split_once("// ---- ticket links ---------------------------------------------------------")
+        })
+        .map(|(source, _)| source)
+        .expect("the notification block is bounded");
+    let harness = r#"
+const mode = __MODE__;
+let localUnsubscribes = 0;
+const subscription = {endpoint:'https://push.example/device', unsubscribe:async()=>{localUnsubscribes++}};
+const button = {dataset:{}, hidden:false, disabled:false};
+const status = {};
+const document = {querySelector:s=>s==='#notifications'?button:status};
+const $ = s => document.querySelector(s);
+const registration = {pushManager:{
+  getSubscription:async()=>mode==='unregister-fails'?subscription:null,
+  subscribe:async()=>subscription
+}};
+const navigator = {userAgent:'Firefox',platform:'Linux',maxTouchPoints:0,
+  serviceWorker:{register:async()=>registration}};
+const window = {PushManager:{},Notification:{}};
+const location = {protocol:'https:'};
+const matchMedia = () => ({matches:false});
+const Notification = {permission:'default',requestPermission:async()=>'granted'};
+const atob = value => Buffer.from(value, 'base64').toString('binary');
+const fetch = async path => {
+  if(path==='/api/push/public-key') return {json:async()=>({publicKey:'AA'})};
+  if(path==='/api/push/subscribe') return {ok:mode!=='register-fails'};
+  if(path==='/api/push/unsubscribe') return {ok:mode!=='unregister-fails'};
+  throw new Error('unexpected fetch '+path);
+};
+eval(__SOURCE__);
+(async()=>{
+  await new Promise(resolve=>setImmediate(resolve));
+  await button.onclick();
+  const expected = mode==='register-fails' ? 1 : 0;
+  if(localUnsubscribes!==expected) throw new Error(`${mode}: local unsubscribes ${localUnsubscribes}, expected ${expected}`);
+})().catch(error=>{console.error(error);process.exitCode=1});
+"#
+    .replace("__MODE__", &serde_json::to_string(mode).unwrap())
+    .replace("__SOURCE__", &serde_json::to_string(source).unwrap());
+    let status = Command::new("node")
+        .args(["-e", &harness])
+        .status()
+        .expect("Node runs the shipped notification state machine");
+    assert!(status.success(), "notification case {mode} failed");
+}
+
+// AYEAYE-85 — failed daemon writes cannot split browser and daemon state.
+#[test]
+fn notification_failures_keep_browser_and_daemon_state_synchronized() {
+    notification_case("register-fails");
+    notification_case("unregister-fails");
 }
