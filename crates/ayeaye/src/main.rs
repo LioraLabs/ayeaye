@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         None => report(),
         Some("--version" | "-V") => report(),
         Some("--help" | "-h") => {
-            println!("{}", USAGE);
+            println!("{USAGE}");
             ExitCode::SUCCESS
         }
         Some(other) => {
@@ -321,7 +321,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                 if let Err(why) = models::choose(&config_file, key, &id.to_string()) {
                     return complain(&format!("ayeaye: {why}"));
                 }
-                println!("{} is the model to transcribe with", id);
+                println!("{id} is the model to transcribe with");
                 println!("  written to {}", config_file.display());
                 // Said rather than refused: choosing a model before fetching it
                 // is a reasonable order to do things in, and refusing it would
@@ -407,8 +407,7 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         Ok(here) => here,
         Err(why) => {
             return complain(&format!(
-                "ayeaye: {:?} cannot be a machine name: {why:?}",
-                named
+                "ayeaye: {named:?} cannot be a machine name: {why:?}"
             ));
         }
     };

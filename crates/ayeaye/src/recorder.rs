@@ -310,7 +310,7 @@ mod tests {
             &b""[..],
         ] {
             let said = parse(&answer("HTTP/1.1 200 OK", body)).expect("a well-formed answer");
-            assert!(!said.healthy(), "{:?} is not a working recorder", body);
+            assert!(!said.healthy(), "{body:?} is not a working recorder");
         }
         // A refusal is not healthy however it is worded.
         let refused = parse(&answer("HTTP/1.1 401 Unauthorized", br#"{"ok":true}"#))
