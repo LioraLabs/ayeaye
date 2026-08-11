@@ -122,7 +122,6 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
         "notification permission is denied",
         "Share → Add to Home Screen",
         "notifications need HTTPS",
-        "href=\"https://github.com/LioraLabs/ayeaye#secure-serving\"",
     ] {
         assert!(page.contains(required), "app is missing {required:?}");
     }
@@ -149,6 +148,36 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
         .unwrap();
     assert!(register < reject_register && reject_register < rollback);
     assert!(page.contains("notification permission was not granted"));
+}
+
+// AYEAYE-87 — the insecure fallback names the README heading that really ships.
+#[test]
+fn the_notification_https_link_matches_the_readme_heading() {
+    let readme = fs::read_to_string(share_dir().parent().unwrap().join("README.md"))
+        .expect("README.md should be readable");
+    let heading = readme
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .find(|heading| *heading == "HTTPS for notifications")
+        .expect("the established HTTPS for notifications heading exists");
+    let slug: String = heading
+        .to_lowercase()
+        .chars()
+        .filter_map(|character| match character {
+            'a'..='z' | '0'..='9' | '-' => Some(character),
+            ' ' => Some('-'),
+            _ => None,
+        })
+        .collect();
+    let page = String::from_utf8_lossy(
+        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
+    );
+    assert!(
+        page.contains(&format!(
+            "href=\"https://github.com/LioraLabs/ayeaye#{slug}\""
+        )),
+        "the notification fallback does not link to README.md's #{slug}"
+    );
 }
 
 fn notification_case(mode: &str) {
