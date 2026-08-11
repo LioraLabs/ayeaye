@@ -276,6 +276,7 @@ fn settings_on_port(port: u16) -> Settings {
         // No path, as in serve.rs: a test must never write into the pick
         // history of whoever is running the suite.
         store: None,
+        push: None,
     }
 }
 

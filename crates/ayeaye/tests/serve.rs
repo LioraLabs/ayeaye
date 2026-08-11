@@ -277,7 +277,54 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // into the pick history of whoever is running the suite. The case
         // that proves spawn teaches the picker points this at its own file.
         store: None,
+        push: None,
     }
+}
+
+// AYEAYE-83 — native PushSubscription JSON is persisted through the gated API.
+#[tokio::test]
+async fn push_subscriptions_and_vapid_key_use_the_gated_browser_api() {
+    let state = scratch().join(format!("push-api-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let mut settings = settings_on_port(0);
+    settings.push = Some(state.clone());
+    let server = Server::start(settings).await;
+
+    assert_eq!(server.get("/api/push/public-key").await.status, 401);
+    let key = server.api("/api/push/public-key").await;
+    assert_eq!(key.status, 200);
+    assert!(key.body_text().contains("\"publicKey\":"));
+
+    let cross_site = server
+        .post(
+            "/api/push/subscribe",
+            r#"{"endpoint":"https://push.example/one","keys":{"p256dh":"key-one","auth":"auth-one"}}"#,
+            &[("X-Voice-Token", TOKEN), ("Sec-Fetch-Site", "cross-site")],
+        )
+        .await;
+    assert_eq!(cross_site.status, 403);
+
+    for endpoint in ["one", "two"] {
+        let answer = server
+            .post_as_us(
+                "/api/push/subscribe",
+                &format!(r#"{{"endpoint":"https://push.example/{endpoint}","keys":{{"p256dh":"key-{endpoint}","auth":"auth-{endpoint}"}}}}"#),
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{}", answer.body_text());
+    }
+    server
+        .post_as_us(
+            "/api/push/unsubscribe",
+            r#"{"endpoint":"https://push.example/one"}"#,
+        )
+        .await;
+    let stored = ayeaye::push::Store::load(&state);
+    assert_eq!(stored.subscriptions().len(), 1);
+    assert_eq!(
+        stored.subscriptions()[0].endpoint,
+        "https://push.example/two"
+    );
 }
 
 /// A deployment of one machine, under the name a test wants to see.

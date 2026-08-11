@@ -6,7 +6,7 @@
 //! without them — but nothing in this file decides anything. Every verdict
 //! comes from `ayeaye_core::http`, which a test can reach without a socket.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -81,13 +81,21 @@ pub fn router(settings: Arc<Settings>) -> Router {
 pub struct App {
     settings: Arc<Settings>,
     projects: Arc<projects::Picker>,
+    push: Option<Arc<Mutex<crate::push::Store>>>,
 }
 
 impl App {
     fn over(settings: Arc<Settings>) -> App {
+        let push = settings
+            .push
+            .as_deref()
+            .map(crate::push::Store::load)
+            .map(Mutex::new)
+            .map(Arc::new);
         App {
             settings,
             projects: Arc::new(projects::Picker::new(projects::Settings::from_env())),
+            push,
         }
     }
 }
@@ -203,6 +211,7 @@ async fn handle(
         // to, and threading `App` through `api()` to spare one arm would put
         // the picker's cache in front of every endpoint that does not want it.
         Route::Api if method == Method::GET => match uri.path() {
+            "/api/push/public-key" => push_public_key(&app),
             "/api/projects" => {
                 let body = app
                     .projects
@@ -227,6 +236,7 @@ async fn handle(
             json_owned(StatusCode::OK, crate::overview::body(&settings).await)
         }
         Route::Send if method == Method::POST => send(&settings, body).await,
+        Route::Api if method == Method::POST => push_write(&app, uri.path(), body).await,
         // GET only, no HEAD: every other read answers HEAD from its GET
         // handler, but this body never ends, so a HEAD would hold the
         // connection open promising bytes that are defined never to come.
@@ -285,6 +295,68 @@ async fn handle(
         | Route::NotFound
         | Route::Login
         | Route::Asset(_) => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
+    }
+}
+
+fn push_public_key(app: &App) -> Response {
+    let Some(store) = &app.push else {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, "push state unavailable");
+    };
+    match store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .public_key()
+    {
+        Ok(key) => body_of(
+            StatusCode::OK,
+            format!(r#"{{"publicKey":{}}}"#, json::string(&key)),
+        ),
+        Err(why) => refused(StatusCode::INTERNAL_SERVER_ERROR, &why.to_string()),
+    }
+}
+
+async fn push_write(app: &App, path: &str, body: Body) -> Response {
+    if !matches!(path, "/api/push/subscribe" | "/api/push/unsubscribe") {
+        return json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#);
+    }
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
+        return refused(StatusCode::BAD_REQUEST, "bad body");
+    };
+    let Some(store) = &app.push else {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, "push state unavailable");
+    };
+    let mut store = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = if path == "/api/push/subscribe" {
+        serde_json::from_slice::<crate::push::SubscriptionInput>(&bytes)
+            .map(crate::push::Subscription::from)
+            .map_err(|_| "bad subscription".to_string())
+            .and_then(|subscription| {
+                if subscription.endpoint.is_empty()
+                    || subscription.p256dh.is_empty()
+                    || subscription.auth.is_empty()
+                {
+                    return Err("endpoint, p256dh and auth required".to_string());
+                }
+                store.upsert(subscription).map_err(|why| why.to_string())
+            })
+    } else {
+        serde_json::from_slice::<crate::push::Unsubscribe>(&bytes)
+            .map_err(|_| "bad unsubscribe".to_string())
+            .and_then(|asked| {
+                if asked.endpoint.is_empty() {
+                    return Err("endpoint required".to_string());
+                }
+                store.remove(&asked.endpoint).map_err(|why| why.to_string())
+            })
+    };
+    match result {
+        Ok(()) => body_of(StatusCode::OK, r#"{"ok":true}"#.to_string()),
+        Err(why) if why.contains("required") || why.starts_with("bad ") => {
+            refused(StatusCode::BAD_REQUEST, &why)
+        }
+        Err(why) => refused(StatusCode::INTERNAL_SERVER_ERROR, &why),
     }
 }
 
