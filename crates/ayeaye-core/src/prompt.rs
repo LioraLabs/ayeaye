@@ -282,13 +282,19 @@ fn capped(text: &str, limit: usize) -> String {
 /// reads `d && d.prompt` and clears the card on a null, while a failed request
 /// leaves the last card standing for the next poll to correct.
 pub fn body(prompt: Option<&Prompt>) -> String {
-    let Some(prompt) = prompt else {
-        return r#"{"prompt":null}"#.to_string();
-    };
-    let mut out = format!(
-        r#"{{"prompt":{{"question":{},"options":["#,
-        json::string(&prompt.question)
-    );
+    match prompt {
+        None => r#"{"prompt":null}"#.to_string(),
+        Some(prompt) => format!(r#"{{"prompt":{}}}"#, object(prompt)),
+    }
+}
+
+/// One prompt as a bare JSON object, without the `{"prompt": …}` wrapper.
+///
+/// Split from [`body`] because the overview carries the same object as a
+/// field of every pane's card, where the wrapper would be a second spelling
+/// of the shape `share/app.html` reads.
+pub fn object(prompt: &Prompt) -> String {
+    let mut out = format!(r#"{{"question":{},"options":["#, json::string(&prompt.question));
     for (index, choice) in prompt.options.iter().enumerate() {
         if index > 0 {
             out.push(',');
@@ -299,7 +305,7 @@ pub fn body(prompt: Option<&Prompt>) -> String {
             json::string(&choice.label)
         ));
     }
-    out.push_str("]}}");
+    out.push_str("]}");
     out
 }
 

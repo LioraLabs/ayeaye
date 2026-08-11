@@ -40,6 +40,9 @@ pub enum Route {
     Dictate,
     /// What this machine can do about a dictation.
     Voice,
+    /// The main panel view: every pane with its state, the ones needing you
+    /// first.
+    Overview,
     /// A transcript's file reference, resolved against one pane's tracked
     /// files. A POST: the reference is free text out of a transcript, and free
     /// text belongs in a body rather than a query string.
@@ -106,10 +109,15 @@ const DICTATE: &str = "/api/dictate";
 
 /// The capability probe. A GET, and gated like every other read under `/api/`.
 ///
-/// Its own path rather than a field on `/api/overview`, which is AYEAYE-49's to
-/// write: two tickets landing in one handler is a merge nobody needs, and the
-/// answer is one `Capability` either way — see `ayeaye_core::dictation`.
+/// Its own path rather than a field on `/api/overview`: two tickets landing in
+/// one handler is a merge nobody needs, and the answer is one `Capability`
+/// either way — the overview's `voice` field and this body are both read off
+/// `ayeaye_core::dictation`.
 const VOICE: &str = "/api/voice";
+
+/// The main panel view. A GET, and the poll the panel lives on: every pane,
+/// its state, and whether voice is worth offering, in one answer.
+const OVERVIEW: &str = "/api/overview";
 
 /// Resolving a file reference. A POST, and gated as every POST is.
 const FILES_RESOLVE: &str = "/api/files/resolve";
@@ -195,6 +203,7 @@ pub fn resolve(path: &str, has_token_query: bool) -> Route {
             KILL => Route::Kill,
             DICTATE => Route::Dictate,
             VOICE => Route::Voice,
+            OVERVIEW => Route::Overview,
             FILES_RESOLVE => Route::FilesResolve,
             FILES_PREVIEW => Route::FilesPreview,
             STREAM => Route::Stream,
@@ -240,6 +249,7 @@ pub fn gate(method: &str, route: Route) -> Gate {
         | Route::Kill
         | Route::Dictate
         | Route::Voice
+        | Route::Overview
         | Route::FilesResolve
         | Route::FilesPreview
         | Route::Stream => Gate::Token,
@@ -356,10 +366,10 @@ mod tests {
     // because they carry no data and every call they go on to make is gated.
     #[test]
     fn a_get_is_gated_under_api_and_open_on_the_pages() {
-        assert_eq!(resolve("/api/overview", false), Route::Api);
+        assert_eq!(resolve("/api/nothing-has-this-yet", false), Route::Api);
         assert_eq!(resolve("/api/", false), Route::Api);
         // A token in the query does not make an API path a login.
-        assert_eq!(resolve("/api/overview", true), Route::Api);
+        assert_eq!(resolve("/api/nothing-has-this-yet", true), Route::Api);
         assert_eq!(gate("GET", Route::Api), Gate::Token);
         for path in [
             "/",
@@ -587,6 +597,28 @@ mod tests {
             );
         }
         assert_eq!(gate("HEAD", resolve("/api/overview", false)), Gate::Token);
+    }
+
+    // AYEAYE-49 — the panel's poll is a route of its own rather than one more
+    // unknown path under `/api/`, and it is gated by every method: the
+    // overview is who is doing what in every pane, which is exactly what the
+    // token exists to protect.
+    #[test]
+    fn the_overview_is_a_route_and_every_method_needs_a_token() {
+        assert_eq!(resolve("/api/overview", false), Route::Overview);
+        // A token in the query does not turn it into a login.
+        assert_eq!(resolve("/api/overview", true), Route::Overview);
+        for method in ["GET", "HEAD", "POST", "PUT", "DELETE"] {
+            assert_eq!(
+                gate(method, Route::Overview),
+                Gate::Token,
+                "{method} /api/overview must need a token"
+            );
+        }
+        // Only that path, so a new endpoint cannot arrive by accident under a
+        // name that merely starts with this one.
+        assert_eq!(resolve("/api/overview/extra", false), Route::Api);
+        assert_eq!(resolve("/api/overviews", false), Route::Api);
     }
 
     // AYEAYE-48 — the three paths a pane at a prompt is answered through, each a

@@ -84,6 +84,10 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_PROJECT_WAIT   seconds a request waits for a walk (default 0.4)
   AYEAYE_PROJECT_TTL    seconds a finished search stays usable (default 60)
   AYEAYE_PROJECT_SKIP   extra directory names never walked, comma-separated
+  AYEAYE_NTFY_URL       ntfy topic URL; enables turn notifications
+  AYEAYE_NTFY_CLICK     URL opened when a notification is tapped
+  AYEAYE_NOTIFY_EVERY   seconds between notification checks (default 10)
+  AYEAYE_NOTIFY_STATES  states that notify (default blocked,waiting)
   VOICE_PORT            the port the recording agent listens on (default 8787)";
 
 /// One line naming the version and what this build can do *here*.
@@ -230,7 +234,14 @@ fn serve(args: &[String]) -> ExitCode {
         // left at phone width goes back now, and the file it was recorded in is
         // consumed so a later start cannot restore it a second time.
         settings.fits.recover(&settings.tmux, &settings.peers).await;
-        if let Err(why) = server::serve(listener, Arc::new(settings)).await {
+        let settings = Arc::new(settings);
+        if let Some(notifications) =
+            ayeaye::notify::Config::resolve(|name| std::env::var(name).ok())
+        {
+            eprintln!("ayeaye: {}", notifications.describe());
+            ayeaye::notify::watcher(Arc::clone(&settings), notifications);
+        }
+        if let Err(why) = server::serve(listener, settings).await {
             eprintln!("ayeaye: server stopped: {why}");
             return ExitCode::FAILURE;
         }

@@ -66,9 +66,19 @@ pub fn rows(line: &str, kind: Kind) -> Vec<Row> {
     let Ok(parsed) = json::parse(line) else {
         return Vec::new();
     };
+    rows_of(&parsed, kind)
+}
+
+/// The same rows, for a line the caller has already parsed.
+///
+/// Split from [`rows`] the way the daemon splits `rows_from` from `rows_for`,
+/// and for the same caller: session status reads every line of a tail twice —
+/// once for whose turn it is, once for what the session is waiting on — and
+/// must not pay to parse it twice.
+pub fn rows_of(line: &Value, kind: Kind) -> Vec<Row> {
     match kind {
-        Kind::Claude => rows_claude(&parsed),
-        Kind::Codex => rows_codex(&parsed),
+        Kind::Claude => rows_claude(line),
+        Kind::Codex => rows_codex(line),
     }
 }
 

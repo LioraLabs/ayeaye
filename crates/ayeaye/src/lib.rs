@@ -21,6 +21,8 @@ pub mod files;
 pub mod fit;
 pub mod health;
 pub mod models;
+pub mod notify;
+pub mod overview;
 pub mod probe;
 pub mod process;
 pub mod projects;

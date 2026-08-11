@@ -21,6 +21,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod status;
 
 use crate::json;
 

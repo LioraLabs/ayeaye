@@ -26,6 +26,8 @@ pub mod logits;
 pub mod machine;
 pub mod mel;
 pub mod model;
+pub mod notify;
+pub mod overview;
 pub mod pane;
 pub mod paths;
 pub mod peer;

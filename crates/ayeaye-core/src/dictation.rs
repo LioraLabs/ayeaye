@@ -106,12 +106,9 @@ impl Capability {
     /// The body the capability probe answers with.
     ///
     /// `voice` is the field name `share/app.html` reads to decide whether the
-    /// talk button is live — but it reads it off `/api/overview`, which is
-    /// AYEAYE-49's to write and does not exist here yet. **So nothing consumes
-    /// this today**, and the page's `voiceOK` defaults to `true` until it does.
-    /// The shape is here now so that AYEAYE-49 adds a field out of this
-    /// `Capability` rather than writing a second probe that can disagree with
-    /// this one. The rest is what somebody needs in order to fix it.
+    /// talk button is live, read off `/api/overview`. The overview adds a field
+    /// out of this `Capability` rather than running a second probe that can
+    /// disagree with this one. The rest is what somebody needs to fix it.
     pub fn body(&self) -> String {
         let model = |chosen: &Option<ModelId>| match chosen {
             Some(id) => json::string(&id.to_string()),

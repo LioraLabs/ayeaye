@@ -223,6 +223,9 @@ async fn handle(
         Route::Voice if method == Method::GET || method == Method::HEAD => {
             json_body(settings.voice.probe().await.body())
         }
+        Route::Overview if method == Method::GET || method == Method::HEAD => {
+            json_owned(StatusCode::OK, crate::overview::body(&settings).await)
+        }
         Route::Send if method == Method::POST => send(&settings, body).await,
         // GET only, no HEAD: every other read answers HEAD from its GET
         // handler, but this body never ends, so a HEAD would hold the
@@ -274,6 +277,7 @@ async fn handle(
         | Route::Kill
         | Route::Dictate
         | Route::Voice
+        | Route::Overview
         | Route::FilesResolve
         | Route::FilesPreview
         | Route::Stream

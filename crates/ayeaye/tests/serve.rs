@@ -564,9 +564,8 @@ async fn a_foreign_host_is_refused_even_for_the_panel() {
     assert_eq!(server.get("/").await.status, 200);
 }
 
-// AYEAYE-42 — the token gate, observed as the difference between 401 and 404:
-// an /api/ path is refused before anyone learns whether it exists, and is
-// answered once a token arrives, by header or by the login cookie.
+// AYEAYE-42 — the token gate: an /api/ path is refused before it is answered,
+// then accepted by header or by the login cookie.
 #[tokio::test]
 async fn the_api_needs_a_token_by_header_or_by_cookie() {
     let server = Server::started().await;
@@ -584,12 +583,10 @@ async fn the_api_needs_a_token_by_header_or_by_cookie() {
         .await;
     assert_eq!(wrong.status, 401, "a wrong token is not a token");
 
-    // 404, not 401: the gate let it through and nothing answers there yet.
     let by_header = server
         .request("GET", "/api/overview", &[("X-Voice-Token", TOKEN)])
         .await;
-    assert_eq!(by_header.status, 404);
-    assert_eq!(by_header.body_text(), r#"{"error":"not found"}"#);
+    assert_eq!(by_header.status, 200);
 
     let by_cookie = server
         .request(
@@ -599,9 +596,30 @@ async fn the_api_needs_a_token_by_header_or_by_cookie() {
         )
         .await;
     assert_eq!(
-        by_cookie.status, 404,
+        by_cookie.status, 200,
         "the login cookie should authenticate"
     );
+}
+
+// AYEAYE-49 — the overview at the browser's seam: a real private tmux pane
+// arrives as a stateless shell card, beside the host and the voice capability.
+#[tokio::test]
+async fn the_overview_answers_with_the_real_pane_and_voice() {
+    let Some(tmux) = Private::named("serve-overview") else {
+        eprintln!("skipped: no tmux on this machine");
+        return;
+    };
+    let mut settings = settings_on_port(0);
+    settings.tmux = tmux.layer();
+    let server = Server::start(settings).await;
+
+    let answer = server.api("/api/overview").await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("content-type"), Some("application/json"));
+    let body = answer.body_text();
+    assert!(body.starts_with(r#"{"host":"desktop","panes":[{"id":"desktop/%"#), "{body}");
+    assert!(body.contains(r#""kind":null,"agent_id":null,"state":null"#), "{body}");
+    assert!(body.contains(r#"],"voice":"#), "{body}");
 }
 
 // AYEAYE-42 — anything that could write is gated whatever it names, which is
