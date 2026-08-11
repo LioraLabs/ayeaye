@@ -164,7 +164,7 @@ pub async fn deliver(
                 let removed = store
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&subscription.endpoint);
+                    .remove_if_current(&subscription);
                 if let Err(why) = removed {
                     eprintln!("ayeaye: notify failed: {why}");
                 }
@@ -315,6 +315,7 @@ done
 case "$endpoint" in
   *failed*) id=failed; status=503 ;;
   *gone*) id=gone; status=410 ;;
+  *missing*) id=missing; status=404 ;;
   *) id=live; status=201 ;;
 esac
 cat > "{0}/$id.body"
@@ -328,7 +329,7 @@ printf '%s' "$status"
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut store = crate::push::Store::load(&state);
-        for endpoint in ["failed", "gone", "live"] {
+        for endpoint in ["failed", "gone", "missing", "live"] {
             store
                 .upsert(crate::push::Subscription {
                     endpoint: format!("https://push.example/{endpoint}"),
@@ -345,7 +346,7 @@ printf '%s' "$status"
         let store = Arc::new(std::sync::Mutex::new(store));
         deliver(&store, &message, script.to_str().unwrap(), 1_700_000_000).await;
 
-        for endpoint in ["failed", "gone", "live"] {
+        for endpoint in ["failed", "gone", "missing", "live"] {
             assert!(
                 state
                     .join(format!("{endpoint}.body"))
@@ -373,5 +374,75 @@ printf '%s' "$status"
                 .collect::<Vec<_>>(),
             ["https://push.example/failed", "https://push.example/live"]
         );
+    }
+
+    // AYEAYE-84 — a permanent response belongs to the keys that were sent;
+    // it must not erase replacement keys registered while curl was in flight.
+    #[tokio::test]
+    async fn stale_gone_response_keeps_a_replacement_subscription() {
+        let state = std::env::temp_dir().join(format!(
+            "ayeaye-push-delivery-replacement-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let script = state.join("curl");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+touch "{0}/started"
+while test ! -f "{0}/release"
+do
+  sleep 0.01
+done
+cat >/dev/null
+printf 410
+"#,
+                state.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let endpoint = "https://push.example/replaced";
+        let old = crate::push::Subscription {
+            endpoint: endpoint.to_string(),
+            p256dh: "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4".to_string(),
+            auth: "BTBZMqHH6r4Tts7J_aSIgg".to_string(),
+        };
+        let replacement = crate::push::Subscription {
+            endpoint: endpoint.to_string(),
+            p256dh: "BPUt7QNVMuU5BT9xEOUDESWgf8_B0cDsIMZQVou-DVZe0T60XJQFDFkCYX9-n7R0tC7QpM-nOPzyQxUwDpOJQ-I".to_string(),
+            auth: "6I3hFM3LWVox3SuX1mCK2A".to_string(),
+        };
+        let mut held = crate::push::Store::load(&state);
+        held.upsert(old).unwrap();
+        let store = Arc::new(std::sync::Mutex::new(held));
+        let task = tokio::spawn({
+            let store = Arc::clone(&store);
+            let program = script.to_string_lossy().into_owned();
+            async move {
+                deliver(
+                    &store,
+                    &notify::Message {
+                        title: "title".to_string(),
+                        body: "body".to_string(),
+                        priority: 3,
+                    },
+                    &program,
+                    1_700_000_000,
+                )
+                .await;
+            }
+        });
+        while !state.join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        store.lock().unwrap().upsert(replacement.clone()).unwrap();
+        std::fs::write(state.join("release"), "").unwrap();
+        task.await.unwrap();
+
+        assert_eq!(store.lock().unwrap().subscriptions(), [replacement]);
     }
 }

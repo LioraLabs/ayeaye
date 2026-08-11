@@ -91,6 +91,12 @@ impl Store {
         self.save()
     }
 
+    pub fn remove_if_current(&mut self, delivered: &Subscription) -> std::io::Result<()> {
+        self.subscriptions
+            .retain(|subscription| subscription != delivered);
+        self.save()
+    }
+
     fn save(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
