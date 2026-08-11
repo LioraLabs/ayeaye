@@ -172,6 +172,7 @@ async fn the_picker_answers_over_a_socket() {
         // the `fits: None` above makes: nothing here writes into the state
         // of whoever is running the suite.
         store: None,
+        push: None,
     };
     let listener = ayeaye::server::listen(&settings)
         .await

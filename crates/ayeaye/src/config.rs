@@ -83,6 +83,8 @@ pub struct Settings {
     /// reason `tmux` is one — without it, the suite writes into the state
     /// directory of whoever is running it.
     pub store: Option<PathBuf>,
+    /// The state directory holding push subscriptions and the VAPID key.
+    pub push: Option<PathBuf>,
 }
 
 /// Why a configuration could not be resolved.
@@ -184,6 +186,7 @@ impl Settings {
         // then a name it can at least be routed by, because every pane id on
         // this machine is qualified with this and there is no "unnamed".
         let here = HostName::new(&machine_name(&env, nodename)).map_err(ConfigError::BadName)?;
+        let state = state_dir();
         Ok(Settings {
             allowed_hosts: AllowedHosts::new(&bind, port, &extra),
             bind,
@@ -199,7 +202,10 @@ impl Settings {
             pane_cache: Arc::new(Mutex::new(pane::Cache::default())),
             fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, fits_path())),
             voice,
-            store: state_dir().map(|dir| dir.join(crate::projects::store::FILE)),
+            store: state
+                .as_ref()
+                .map(|dir| dir.join(crate::projects::store::FILE)),
+            push: state,
         })
     }
 
