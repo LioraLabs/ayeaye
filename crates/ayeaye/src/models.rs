@@ -245,6 +245,15 @@ pub fn add(store: &Path, source: &Path) -> Result<Added, PullError> {
         why: why.to_string(),
     })?;
     let imported = files.into_iter().try_for_each(|(name, from)| {
+        if !from
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(PullError::Invalid(format!(
+                "{} is not a regular file",
+                from.display()
+            )));
+        }
         if std::fs::hard_link(&from, staging.join(name)).is_ok() {
             Ok(())
         } else {
@@ -1107,7 +1116,10 @@ mod tests {
 
         // The hour-later case: resident, swept idle, wanted again.
         assert!(residents.ensure(Some(&tiny)).expect("it should load again"));
-        assert!(residents.sweep(Duration::from_secs(600)), "swept for idleness");
+        assert!(
+            residents.sweep(Duration::from_secs(600)),
+            "swept for idleness"
+        );
         assert!(
             residents.ensure(Some(&tiny)).expect("the late load"),
             "a load after a sweep is a load, which is what lets the daemon \

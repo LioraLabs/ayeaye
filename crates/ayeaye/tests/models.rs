@@ -249,6 +249,33 @@ fn cleanup_import_names_missing_companions_and_unsupported_architectures() {
     assert!(listed.contains(&format!("{id}  cleanup")), "{listed:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn local_import_refuses_symlinks_instead_of_leaving_the_store_external() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = Scratch::named("add-symlink");
+    let source = scratch.0.join("speech");
+    std::fs::create_dir_all(&source).expect("source directory");
+    std::fs::write(
+        source.join("config.json"),
+        br#"{"architectures":["WhisperForConditionalGeneration"]}"#,
+    )
+    .expect("config");
+    std::fs::write(source.join("tokenizer.json"), br#"{"model":{}}"#).expect("tokenizer");
+    std::fs::write(scratch.0.join("weights"), weights()).expect("external weights");
+    symlink(scratch.0.join("weights"), source.join("model.safetensors")).expect("weights link");
+
+    let (code, _, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("not a regular file"), "{err:?}");
+    assert!(walk(&scratch.0.join("state/ayeaye/models")).is_empty());
+}
+
 // AYEAYE-56 — the whole acquisition path, end to end, through the real
 // transport: a model is fetched, verified, stored under the state directory,
 // listed, chosen, and removed.
