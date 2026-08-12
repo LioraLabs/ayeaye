@@ -45,7 +45,7 @@ usage: ayeaye [serve [--bind ADDR] [--port N]]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-       ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
+       ayeaye model <ls|search [QUERY]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
@@ -271,6 +271,43 @@ fn model_verb(args: &[String]) -> ExitCode {
     };
 
     match args.first().map(String::as_str) {
+        Some("search") => {
+            let installed = models::inspect(&store);
+            let selected = |role, id: Option<&ayeaye_core::model::ModelId>| {
+                installed.iter().find(|model| model.role == Ok(role) && Some(&model.id) == id)
+                    .map(|model| model.bytes).unwrap_or(0)
+            };
+            let machine = probe::capture(&probe::System, &store.to_string_lossy()).machine();
+            let mb = 1024 * 1024;
+            let limits = models::SearchLimits {
+                ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
+                disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
+                speech_bytes: selected(ayeaye_core::model::Role::Speech, settings.speech.as_ref()),
+                cleanup_bytes: selected(ayeaye_core::model::Role::Cleanup, settings.cleanup.as_ref()),
+            };
+            match models::search(&models::Curl, &settings.hub, &args[1..].join(" "), limits) {
+                Err(why) => complain(&format!("ayeaye: {why}")),
+                Ok(found) => {
+                    let token = match models::token_available() {
+                        Ok(token) => token,
+                        Err(why) => return complain(&format!("ayeaye: {why}")),
+                    };
+                    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                        for model in found {
+                            let gated = if model.gated && !token { "  gated" } else { "" };
+                            println!("{}  {}  {}  {}{gated}", model.id, model.role, human(model.bytes), model.evidence);
+                        }
+                    } else {
+                        let rows: Vec<_> = found.into_iter().map(|model| serde_json::json!({
+                            "id": model.id, "role": model.role.to_string(), "bytes": model.bytes,
+                            "gated": model.gated && !token, "evidence": model.evidence,
+                        })).collect();
+                        println!("{}", serde_json::Value::Array(rows));
+                    }
+                    ExitCode::SUCCESS
+                }
+            }
+        }
         Some("ls") => {
             let installed = models::inspect(&store);
             if installed.is_empty() {
@@ -403,7 +440,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Err(why) => complain(&format!("ayeaye: {why}")),
             },
         },
-        _ => complain("usage: ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
+        _ => complain("usage: ayeaye model <ls|search [QUERY]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
     }
 }
 
