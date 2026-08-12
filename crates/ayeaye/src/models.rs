@@ -86,13 +86,18 @@ impl Curl {
         ])
         .collect()
     }
+
+    fn authorization(url: &str, token: &str) -> Option<String> {
+        url.starts_with(&format!("{}/", hub::DEFAULT_HOST))
+            .then(|| format!("oauth2-bearer = \"{token}\""))
+    }
 }
 
 impl Fetcher for Curl {
     fn get(&self, url: &str, into: &Path) -> Result<(), String> {
         let mut argv = Curl::argv(url, into);
-        let token = hf_token()?;
-        if token.is_some() {
+        let authorization = hf_token()?.and_then(|token| Self::authorization(url, &token));
+        if authorization.is_some() {
             let before_separator = argv.len() - 2;
             argv.splice(
                 before_separator..before_separator,
@@ -101,7 +106,7 @@ impl Fetcher for Curl {
         }
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
-        if token.is_some() {
+        if authorization.is_some() {
             command.stdin(Stdio::piped());
         }
         let mut child = command
@@ -109,12 +114,9 @@ impl Fetcher for Curl {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|why| format!("could not run curl: {why}"))?;
-        if let Some(token) = token {
-            writeln!(
-                child.stdin.take().expect("piped stdin"),
-                "header = \"Authorization: Bearer {token}\""
-            )
-            .map_err(|why| format!("could not authorize curl: {why}"))?;
+        if let Some(authorization) = authorization {
+            writeln!(child.stdin.take().expect("piped stdin"), "{authorization}")
+                .map_err(|why| format!("could not authorize curl: {why}"))?;
         }
         let ran = child
             .wait_with_output()
@@ -1545,6 +1547,24 @@ mod tests {
         assert_eq!(
             argv.last().unwrap(),
             "https://hub.test/a/b/resolve/main/config.json"
+        );
+    }
+
+    #[test]
+    fn a_hugging_face_token_is_protected_and_never_sent_to_a_custom_hub() {
+        assert_eq!(
+            Curl::authorization(
+                "https://huggingface.co/org/model/resolve/main/file",
+                "hf_secret"
+            ),
+            Some("oauth2-bearer = \"hf_secret\"".to_string())
+        );
+        assert_eq!(
+            Curl::authorization(
+                "https://hub.example/org/model/resolve/main/file",
+                "hf_secret"
+            ),
+            None
         );
     }
 }
