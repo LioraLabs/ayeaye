@@ -45,7 +45,7 @@ usage: ayeaye [serve [--bind ADDR] [--port N]]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-       ayeaye model <ls|pull ID|add PATH|use ID|rm ID>
+       ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
@@ -74,7 +74,8 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_TOKEN          the shared secret; otherwise read from the state file
   AYEAYE_CLIBAN         the cliban the board tab reads (legacy VOICE_CLIBAN);
                         otherwise the first on PATH, else ~/.cargo/bin/cliban
-  AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use` writes it
+  AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use speech` writes it
+  AYEAYE_CLEANUP_MODEL  which model cleans transcripts; `ayeaye model use cleanup` writes it
   AYEAYE_CLEANUP_PROMPT what the cleanup model is told it is for
   AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
   AYEAYE_MODEL_HUB      where models are fetched from
@@ -336,29 +337,63 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Err(why) => complain(&format!("ayeaye: {why}")),
             },
         },
-        Some("use") => match id(args.get(1)) {
-            Err(why) => complain(&format!("ayeaye: {why}")),
-            Ok(id) => {
-                let key = ayeaye_core::model::settings::SPEECH_MODEL;
-                if let Err(why) = models::choose(&config_file, key, &id.to_string()) {
-                    return complain(&format!("ayeaye: {why}"));
+        Some("use") => {
+            let (role, given) = match args.get(1).map(String::as_str) {
+                Some("speech") => (ayeaye_core::model::Role::Speech, args.get(2)),
+                Some("cleanup") => (ayeaye_core::model::Role::Cleanup, args.get(2)),
+                _ => (ayeaye_core::model::Role::Speech, args.get(1)),
+            };
+            match id(given) {
+                Err(why) => complain(&format!("ayeaye: {why}")),
+                Ok(id) => {
+                    let Some(installed) = models::inspect(&store)
+                        .into_iter()
+                        .find(|model| model.id == id)
+                    else {
+                        return complain(&format!(
+                            "ayeaye: {id} is not installed — `ayeaye model pull {id}` or `ayeaye model add PATH`"
+                        ));
+                    };
+                    let actual = match installed.role {
+                        Ok(actual) if actual == role => actual,
+                        Ok(actual) => {
+                            return complain(&format!("ayeaye: {id} serves {actual}, not {role}"));
+                        }
+                        Err(why) => return complain(&format!("ayeaye: {id} is unusable: {why}")),
+                    };
+                    let key = match actual {
+                        ayeaye_core::model::Role::Speech => {
+                            ayeaye_core::model::settings::SPEECH_MODEL
+                        }
+                        ayeaye_core::model::Role::Cleanup => {
+                            ayeaye_core::model::settings::CLEANUP_MODEL
+                        }
+                    };
+                    if let Err(why) = models::choose(&config_file, key, &id.to_string()) {
+                        return complain(&format!("ayeaye: {why}"));
+                    }
+                    match role {
+                        ayeaye_core::model::Role::Speech => {
+                            println!("{id} is the model to transcribe with")
+                        }
+                        ayeaye_core::model::Role::Cleanup => println!("{id} is the cleanup model"),
+                    }
+                    println!("  written to {}", config_file.display());
+                    ExitCode::SUCCESS
                 }
-                println!("{id} is the model to transcribe with");
-                println!("  written to {}", config_file.display());
-                // Said rather than refused: choosing a model before fetching it
-                // is a reasonable order to do things in, and refusing it would
-                // make the two commands care about each other for no reason.
-                if !models::installed(&store).contains(&id) {
-                    println!("  it is not on this machine yet — `ayeaye model pull {id}`");
-                }
-                ExitCode::SUCCESS
             }
-        },
+        }
         Some("rm") => match id(args.get(1)) {
             Err(why) => complain(&format!("ayeaye: {why}")),
             Ok(id) => match models::remove(&store, &id) {
                 Ok(true) => {
                     println!("removed {id}");
+                    if settings.speech.as_ref() == Some(&id) {
+                        println!("  warning: the speech selection now has no installed model");
+                    }
+                    if settings.cleanup.as_ref() == Some(&id) {
+                        println!("  warning: the cleanup selection now has no installed model");
+                    }
                     ExitCode::SUCCESS
                 }
                 Ok(false) => {
@@ -368,7 +403,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Err(why) => complain(&format!("ayeaye: {why}")),
             },
         },
-        _ => complain("usage: ayeaye model <ls|pull ID|add PATH|use ID|rm ID>"),
+        _ => complain("usage: ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
     }
 }
 
