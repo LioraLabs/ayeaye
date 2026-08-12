@@ -158,7 +158,7 @@ pub fn search(
                 .map_err(|why| format!("malformed Hub response: {why}"))?;
             for repo in &mut repos {
                 let Some(id) = repo["id"].as_str() else { continue };
-                let detail_url = format!("{}/api/models/{id}?expand%5B%5D=config&expand%5B%5D=cardData&expand%5B%5D=siblings&expand%5B%5D=gated", hub_host.trim_end_matches('/'));
+                let detail_url = format!("{}/api/models/{id}?expand%5B%5D=config&expand%5B%5D=cardData&expand%5B%5D=siblings&expand%5B%5D=gated&files_metadata=true", hub_host.trim_end_matches('/'));
                 fetcher.get(&detail_url, &file)
                     .map_err(|why| format!("could not inspect {id}: {why}"))?;
                 let json = std::fs::read_to_string(&file).map_err(|why| why.to_string())?;
@@ -170,7 +170,7 @@ pub fn search(
                     .chain(repo["cardData"]["base_model"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str))
             }).map(str::to_string).filter(|base| !repos.iter().any(|repo| repo["id"] == *base)).collect();
             for base in bases {
-                let base_url = format!("{}/api/models/{base}?expand%5B%5D=config&expand%5B%5D=siblings", hub_host.trim_end_matches('/'));
+                let base_url = format!("{}/api/models/{base}?expand%5B%5D=config&expand%5B%5D=siblings&files_metadata=true", hub_host.trim_end_matches('/'));
                 fetcher.get(&base_url, &file)
                     .map_err(|why| format!("could not inspect {base}: {why}"))?;
                 let json = std::fs::read_to_string(&file).map_err(|why| why.to_string())?;
@@ -1231,6 +1231,9 @@ mod tests {
     impl Fetcher for RecordedHub {
         fn get(&self, url: &str, into: &Path) -> Result<(), String> {
             let response = if url.contains("/api/models/good/speech?") {
+                if !url.contains("files_metadata=true") {
+                    return Err("per-repository metadata did not request file sizes".to_string());
+                }
                 r#"{"id":"good/speech","config":{"model_type":"whisper"},"siblings":[
                     {"rfilename":"config.json","size":10},{"rfilename":"tokenizer.json","size":10},
                     {"rfilename":"model.safetensors","size":300}]}"#
