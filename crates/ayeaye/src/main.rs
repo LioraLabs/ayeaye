@@ -45,7 +45,7 @@ usage: ayeaye [serve [--bind ADDR] [--port N]]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-       ayeaye model <ls|pull ID|use ID|rm ID>
+       ayeaye model <ls|pull ID|add PATH|use ID|rm ID>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
@@ -316,6 +316,26 @@ fn model_verb(args: &[String]) -> ExitCode {
                 }
             }
         },
+        Some("add") => match args.get(1) {
+            None => complain("ayeaye: which model? give a file or directory path"),
+            Some(path) => match models::add(&store, &PathBuf::from(path)) {
+                Ok(added) => {
+                    let state = if added.already {
+                        "already in"
+                    } else {
+                        "imported into"
+                    };
+                    println!(
+                        "{} {state} {} ({})",
+                        added.id,
+                        added.dir.display(),
+                        added.role
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(why) => complain(&format!("ayeaye: {why}")),
+            },
+        },
         Some("use") => match id(args.get(1)) {
             Err(why) => complain(&format!("ayeaye: {why}")),
             Ok(id) => {
@@ -348,7 +368,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Err(why) => complain(&format!("ayeaye: {why}")),
             },
         },
-        _ => complain("usage: ayeaye model <ls|pull ID|use ID|rm ID>"),
+        _ => complain("usage: ayeaye model <ls|pull ID|add PATH|use ID|rm ID>"),
     }
 }
 

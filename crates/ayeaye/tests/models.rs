@@ -44,6 +44,21 @@ fn weights() -> Vec<u8> {
     bytes
 }
 
+fn gguf(architecture: &str) -> Vec<u8> {
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    for text in ["general.architecture", architecture] {
+        bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        if text == "general.architecture" {
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+        }
+    }
+    bytes
+}
+
 /// Lay out one repository the way the hub serves it, and answer with the URL
 /// that reaches it.
 fn hub(at: &Path, repo: &str, config: &[u8]) -> String {
@@ -120,6 +135,118 @@ fn listing_reports_roles_sizes_both_selections_and_unusable_models() {
     assert_eq!(out.matches("(in use)").count(), 2, "{out:?}");
     assert!(out.contains("local/broken  unusable:"), "{out:?}");
     assert!(out.lines().all(|line| line.contains(" bytes")), "{out:?}");
+}
+
+#[test]
+fn local_models_are_validated_imported_once_and_removed_uniformly() {
+    let scratch = Scratch::named("add");
+    let source = scratch.0.join("my-whisper");
+    std::fs::create_dir_all(&source).expect("source directory");
+    std::fs::write(
+        source.join("config.json"),
+        br#"{"architectures":["WhisperForConditionalGeneration"]}"#,
+    )
+    .expect("config");
+    std::fs::write(source.join("tokenizer.json"), br#"{"model":{}}"#).expect("tokenizer");
+    std::fs::write(source.join("model.safetensors"), weights()).expect("weights");
+
+    let (code, first, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 0, "stdout {first:?} stderr {err:?}");
+    let id = first.split_whitespace().next().expect("the imported id");
+    assert!(id.starts_with("local/my-whisper@"), "{first:?}");
+    let imported = scratch.0.join("state/ayeaye/models").join(
+        ayeaye_core::model::ModelId::parse(id)
+            .expect("a model id")
+            .relative_dir()
+            .strip_prefix("models")
+            .expect("a relative model path"),
+    );
+    assert_eq!(
+        std::fs::metadata(source.join("model.safetensors"))
+            .expect("source metadata")
+            .len(),
+        std::fs::metadata(imported.join("model.safetensors"))
+            .expect("import metadata")
+            .len()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(source.join("model.safetensors"))
+                .expect("source metadata")
+                .ino(),
+            std::fs::metadata(imported.join("model.safetensors"))
+                .expect("import metadata")
+                .ino(),
+            "same-filesystem imports should hardlink"
+        );
+    }
+
+    let (code, second, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 0, "{err:?}");
+    assert!(
+        second.contains(id) && second.contains("already"),
+        "{second:?}"
+    );
+
+    let (code, listed, err) = ayeaye(&scratch.0, "file:///unused", &["model", "ls"]);
+    assert_eq!(code, 0, "{err:?}");
+    assert!(listed.contains(&format!("{id}  speech")), "{listed:?}");
+
+    let (code, _, err) = ayeaye(&scratch.0, "file:///unused", &["model", "use", id]);
+    assert_eq!(code, 0, "{err:?}");
+    let (_, listed, _) = ayeaye(&scratch.0, "file:///unused", &["model", "ls"]);
+    assert!(listed.contains(&format!("{id}  speech")) && listed.contains("(in use)"));
+
+    let (code, removed, err) = ayeaye(&scratch.0, "file:///unused", &["model", "rm", id]);
+    assert_eq!(code, 0, "{err:?}");
+    assert!(removed.contains("removed"), "{removed:?}");
+    assert!(!imported.exists());
+}
+
+#[test]
+fn cleanup_import_names_missing_companions_and_unsupported_architectures() {
+    let scratch = Scratch::named("add-cleanup");
+    let source = scratch.0.join("cleanup.gguf");
+    std::fs::write(&source, gguf("llama")).expect("gguf");
+
+    let (code, _, missing) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 1);
+    assert!(missing.contains("tokenizer.json"), "{missing:?}");
+
+    std::fs::write(source.with_file_name("tokenizer.json"), br#"{"model":{}}"#).expect("tokenizer");
+    std::fs::write(&source, gguf("mamba")).expect("unsupported gguf");
+    let (code, _, unsupported) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 1);
+    assert!(unsupported.contains("mamba"), "{unsupported:?}");
+
+    std::fs::write(&source, gguf("llama")).expect("supported gguf");
+    let (code, out, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "add", source.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(code, 0, "stdout {out:?} stderr {err:?}");
+    let id = out.split_whitespace().next().expect("the imported id");
+    let (_, listed, _) = ayeaye(&scratch.0, "file:///unused", &["model", "ls"]);
+    assert!(listed.contains(&format!("{id}  cleanup")), "{listed:?}");
 }
 
 // AYEAYE-56 — the whole acquisition path, end to end, through the real
