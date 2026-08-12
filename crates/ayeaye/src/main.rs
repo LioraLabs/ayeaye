@@ -45,7 +45,7 @@ usage: ayeaye [serve [--bind ADDR] [--port N]]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-       ayeaye model <ls|search [QUERY]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
+       ayeaye model <ls|search [QUERY]|choose [speech|cleanup]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
@@ -335,6 +335,69 @@ fn model_verb(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some("choose") => {
+            let role = match args.get(1).map(String::as_str) {
+                None => None,
+                Some("speech") => Some(ayeaye_core::model::Role::Speech),
+                Some("cleanup") => Some(ayeaye_core::model::Role::Cleanup),
+                Some(_) => return complain("usage: ayeaye model choose [speech|cleanup]"),
+            };
+            if args.len() > 2 {
+                return complain("usage: ayeaye model choose [speech|cleanup]");
+            }
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                return complain(
+                    "ayeaye: model choose needs a terminal; script it with `ayeaye model search`, then `ayeaye model pull ID` and `ayeaye model use speech|cleanup ID`",
+                );
+            }
+            let installed = models::inspect(&store);
+            let selected_bytes = |role, id: Option<&ayeaye_core::model::ModelId>| {
+                installed.iter().find(|model| model.role == Ok(role) && Some(&model.id) == id)
+                    .map(|model| model.bytes).unwrap_or(0)
+            };
+            let machine = probe::capture(&probe::System, &store.to_string_lossy()).machine();
+            let mb = 1024 * 1024;
+            let limits = models::SearchLimits {
+                ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
+                disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
+                speech_bytes: selected_bytes(ayeaye_core::model::Role::Speech, settings.speech.as_ref()),
+                cleanup_bytes: selected_bytes(ayeaye_core::model::Role::Cleanup, settings.cleanup.as_ref()),
+            };
+            let cleanup = match models::cleanup_policy(&config_file) {
+                Ok(cleanup) => cleanup,
+                Err(why) => return complain(&format!("ayeaye: {why}")),
+            };
+            let mut smoke = models::RealSmoke {
+                selection: ayeaye_infer::backend::select(),
+                cleanup,
+                engine: models::InProcess,
+            };
+            match models::choose_interactive(
+                &models::Curl,
+                &mut smoke,
+                &setup::Tty,
+                models::Interactive {
+                    store: &store,
+                    config_file: &config_file,
+                    hub_host: &settings.hub,
+                    limits,
+                    role,
+                },
+            ) {
+                Err(why) => complain(&format!(
+                    "ayeaye: {why}; previous configuration is intact"
+                )),
+                Ok(result) => {
+                    for selected in result.selected {
+                        println!("{} selected; smoke output: {}", selected.id, selected.smoke.trim());
+                    }
+                    if result.cleanup_declined {
+                        println!("cleanup left unset; dictation will use raw transcripts");
+                    }
+                    ExitCode::SUCCESS
+                }
+            }
+        }
         Some("pull") => match id(args.get(1)) {
             Err(why) => complain(&format!("ayeaye: {why}")),
             Ok(id) => {
@@ -440,7 +503,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Err(why) => complain(&format!("ayeaye: {why}")),
             },
         },
-        _ => complain("usage: ayeaye model <ls|search [QUERY]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
+        _ => complain("usage: ayeaye model <ls|search [QUERY]|choose [speech|cleanup]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
     }
 }
 
