@@ -1030,6 +1030,15 @@ pub fn cleanup_policy(config_file: &Path) -> Result<CleanupPolicy, PolicyError> 
 /// Read, change one key, write the whole file back. Not an append: appending
 /// leaves the old value above the new one, and the file then says two things.
 pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullError> {
+    choose_with(config_file, key, value, |from, to| std::fs::rename(from, to))
+}
+
+fn choose_with(
+    config_file: &Path,
+    key: &str,
+    value: &str,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), PullError> {
     let disk = |what: String| {
         move |why: std::io::Error| PullError::Disk {
             what,
@@ -1041,7 +1050,14 @@ pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullErro
     }
     let before = std::fs::read_to_string(config_file).unwrap_or_default();
     let after = settings::upsert(&before, key, value);
-    std::fs::write(config_file, after).map_err(disk(format!("write {}", config_file.display())))
+    let temporary = config_file.with_extension(format!("new-{}", std::process::id()));
+    std::fs::write(&temporary, after).map_err(disk(format!("write {}", temporary.display())))?;
+    let result = rename(&temporary, config_file)
+        .map_err(disk(format!("replace {}", config_file.display())));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -1054,33 +1070,48 @@ pub trait Smoke {
     fn run(&mut self, role: Role, dir: &Path) -> Result<String, String>;
 }
 
-pub struct RealSmoke<'a> {
+pub struct RealSmoke {
     pub selection: ayeaye_infer::backend::Selection,
-    pub cleanup: &'a CleanupPolicy,
+    pub cleanup: CleanupPolicy,
 }
 
-impl Smoke for RealSmoke<'_> {
+impl Smoke for RealSmoke {
     fn run(&mut self, role: Role, dir: &Path) -> Result<String, String> {
-        let output = match role {
+        use base64::Engine;
+        let selection = self.selection.clone();
+        let cleanup = self.cleanup.clone();
+        let dir = dir.to_path_buf();
+        let output = bounded(Duration::from_secs(30), role, move || { Ok(match role {
             Role::Speech => {
-                let mut slot = SpeechSlot::on(self.selection.clone());
-                slot.load(dir).map_err(|why| why.to_string())?;
-                let audio = ayeaye_core::Pcm16kMono::new(
-                    (0..8_000).map(|i| ((i % 32) as f32 / 16.0 - 1.0) * 0.2).collect(),
-                );
+                let mut slot = SpeechSlot::on(selection);
+                slot.load(&dir).map_err(|why| why.to_string())?;
+                let wav = base64::engine::general_purpose::STANDARD
+                    .decode(include_str!("smoke.wav.b64").trim()).map_err(|why| why.to_string())?;
+                let audio = ayeaye_core::audio::from_wav(&wav).map_err(|why| why.to_string())?;
                 slot.transcribe(&audio).map_err(|why| why.to_string())?.text()
             }
             Role::Cleanup => {
-                let mut slot = LanguageSlot::on(self.selection.clone());
-                slot.load(dir).map_err(|why| why.to_string())?;
-                let mut policy = self.cleanup.clone();
+                let mut slot = LanguageSlot::on(selection);
+                slot.load(&dir).map_err(|why| why.to_string())?;
+                let mut policy = cleanup;
                 policy.max_new_tokens = policy.max_new_tokens.min(32);
                 slot.rewrite("um run the tests", &policy).map_err(|why| why.to_string())?
             }
-        };
+        }) })?;
         (!output.trim().is_empty()).then_some(output)
             .ok_or_else(|| format!("{role} smoke produced no output"))
     }
+}
+
+fn bounded(
+    limit: Duration,
+    role: Role,
+    work: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Result<String, String> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(work()).ok());
+    receive.recv_timeout(limit)
+        .map_err(|_| format!("{role} smoke exceeded {} seconds", limit.as_secs_f32()))?
 }
 
 pub fn select_staged(
@@ -1309,7 +1340,7 @@ mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
         installed, pull, remove, search, search_response, select_staged, Smoke,
-        CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
+        bounded, choose_with, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
     };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, Role, TOKENIZER_FILE, WEIGHTS_FILE};
 
@@ -1507,6 +1538,35 @@ mod tests {
 
         select_staged(&Pins, &mut FallbackSmoke(selection), &store, &scratch.0.join("env"),
             "https://hub.test", Role::Speech, "acme/model").unwrap();
+    }
+
+    #[test]
+    fn the_bundled_spoken_sample_and_smoke_deadline_are_real() {
+        use base64::Engine;
+        let wav = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("smoke.wav.b64").trim()).unwrap();
+        let audio = ayeaye_core::audio::from_wav(&wav).unwrap();
+        assert!(audio.duration_secs() < 1.0);
+        let error = bounded(Duration::from_millis(1), Role::Speech, || {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok("too late".to_string())
+        }).unwrap_err();
+        assert!(error.contains("exceeded"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_config_commit_preserves_the_previous_selection() {
+        let scratch = Scratch::named("selection-write-failure");
+        let config = scratch.0.join("env");
+        let before = "# mine\nAYEAYE_SPEECH_MODEL=old/model@working\n";
+        std::fs::write(&config, before).unwrap();
+
+        let error = choose_with(&config, super::settings::SPEECH_MODEL, "new/model@pinned", |_, _| {
+            Err(std::io::Error::other("disk stopped"))
+        }).unwrap_err();
+
+        assert!(error.to_string().contains("disk stopped"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
     }
 
     /// A safetensors file of the smallest shape that is a real one.
