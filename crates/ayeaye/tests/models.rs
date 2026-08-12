@@ -71,6 +71,8 @@ fn ayeaye(scratch: &Path, hub: &str, args: &[&str]) -> (i32, String, String) {
         .env("AYEAYE_TOKEN", "test-token-not-a-real-secret")
         .env_remove("AYEAYE_SPEECH_MODEL")
         .env_remove("VOICE_REMOTE_SPEECH_MODEL")
+        .env_remove("AYEAYE_CLEANUP_MODEL")
+        .env_remove("VOICE_REMOTE_CLEANUP_MODEL")
         .output()
         .expect("the binary should be runnable");
     (
@@ -78,6 +80,46 @@ fn ayeaye(scratch: &Path, hub: &str, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+#[test]
+fn listing_reports_roles_sizes_both_selections_and_unusable_models() {
+    let scratch = Scratch::named("role-list");
+    let store = scratch.0.join("state/ayeaye/models");
+    let speech = store.join("openai/whisper-tiny.en/main");
+    std::fs::create_dir_all(&speech).expect("speech model directory");
+    std::fs::write(speech.join("config.json"), br#"{}"#).expect("speech config");
+    std::fs::write(speech.join("tokenizer.json"), br#"{}"#).expect("speech tokenizer");
+    std::fs::write(speech.join("model.safetensors"), weights()).expect("speech weights");
+
+    let cleanup = store.join("local/cleanup/main");
+    std::fs::create_dir_all(&cleanup).expect("cleanup model directory");
+    let mut gguf = b"GGUF".to_vec();
+    gguf.extend_from_slice(&3u32.to_le_bytes());
+    gguf.extend_from_slice(&0u64.to_le_bytes());
+    gguf.extend_from_slice(&0u64.to_le_bytes());
+    std::fs::write(cleanup.join("model.gguf"), gguf).expect("cleanup weights");
+    std::fs::write(cleanup.join("tokenizer.json"), br#"{}"#).expect("cleanup tokenizer");
+
+    let unusable = store.join("local/broken/main");
+    std::fs::create_dir_all(&unusable).expect("unusable model directory");
+    std::fs::write(unusable.join("notes.txt"), b"not a model").expect("junk file");
+
+    let config = scratch.0.join("config/ayeaye/env");
+    std::fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+    std::fs::write(
+        config,
+        "AYEAYE_SPEECH_MODEL=openai/whisper-tiny.en\nAYEAYE_CLEANUP_MODEL=local/cleanup\n",
+    )
+    .expect("model selections");
+
+    let (code, out, err) = ayeaye(&scratch.0, "file:///unused", &["model", "ls"]);
+    assert_eq!(code, 0, "stdout {out:?} stderr {err:?}");
+    assert!(out.contains("openai/whisper-tiny.en  speech"), "{out:?}");
+    assert!(out.contains("local/cleanup  cleanup"), "{out:?}");
+    assert_eq!(out.matches("(in use)").count(), 2, "{out:?}");
+    assert!(out.contains("local/broken  unusable:"), "{out:?}");
+    assert!(out.lines().all(|line| line.contains(" bytes")), "{out:?}");
 }
 
 // AYEAYE-56 — the whole acquisition path, end to end, through the real

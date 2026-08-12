@@ -27,6 +27,24 @@ mod config;
 pub use architecture::{Architecture, Unsupported};
 pub use id::{BadModelId, ModelId};
 
+/// The job an installed model can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Turn audio into text.
+    Speech,
+    /// Rewrite a raw transcript.
+    Cleanup,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::Speech => "speech",
+            Self::Cleanup => "cleanup",
+        })
+    }
+}
+
 /// The model's own description of its shape and vocabulary.
 ///
 /// These three names are what acquisition writes and what
