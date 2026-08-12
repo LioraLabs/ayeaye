@@ -76,6 +76,24 @@ pub fn architecture(path: &Path) -> Result<String, LanguageError> {
 /// The GGUF metadata key naming the token that ends a generation.
 const EOS_KEY: &str = "tokenizer.ggml.eos_token_id";
 
+/// Read the architecture from a GGUF without loading its tensors.
+pub fn architecture(path: &Path) -> Result<String, LanguageError> {
+    let mut file = std::fs::File::open(path).map_err(|e| LanguageError::read(path, e))?;
+    let content =
+        gguf_file::Content::read(&mut file).map_err(|e| LanguageError::malformed(path, e))?;
+    content
+        .metadata
+        .get(ARCHITECTURE_KEY)
+        .and_then(|value| value.to_string().ok())
+        .cloned()
+        .ok_or_else(|| {
+            LanguageError::malformed(
+                path,
+                format!("no {ARCHITECTURE_KEY} in the file's metadata"),
+            )
+        })
+}
+
 /// The weights, behind whichever loader understands them.
 ///
 /// An enum rather than a trait object: there are two, the workspace owns

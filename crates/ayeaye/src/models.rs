@@ -179,6 +179,8 @@ pub enum PullError {
         /// What the filesystem said.
         why: String,
     },
+    /// A local path is not a model this build can import.
+    Invalid(String),
 }
 
 impl fmt::Display for PullError {
@@ -188,8 +190,182 @@ impl fmt::Display for PullError {
             PullError::Fetch { url, why } => write!(out, "could not fetch {url}: {why}"),
             PullError::Unusable(why) => write!(out, "{why}"),
             PullError::Disk { what, why } => write!(out, "could not {what}: {why}"),
+            PullError::Invalid(why) => out.write_str(why),
         }
     }
+}
+
+/// A local model that is now in the managed store.
+pub struct Added {
+    pub id: ModelId,
+    pub dir: PathBuf,
+    pub role: Role,
+    pub already: bool,
+}
+
+/// Validate and import a local speech directory or GGUF model.
+pub fn add(store: &Path, source: &Path) -> Result<Added, PullError> {
+    let (name, role, files): (String, Role, Vec<(&str, PathBuf)>) = if source.is_dir() {
+        let role = role(source).map_err(PullError::Invalid)?;
+        let files = match role {
+            Role::Speech => {
+                let config = std::fs::read_to_string(source.join(CONFIG_FILE)).map_err(|why| {
+                    PullError::Invalid(format!(
+                        "could not read {}: {why}",
+                        source.join(CONFIG_FILE).display()
+                    ))
+                })?;
+                architecture::in_config(&config).map_err(PullError::Unsupported)?;
+                vec![CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE]
+            }
+            Role::Cleanup => {
+                check_cleanup_architecture(&source.join(CLEANUP_WEIGHTS_FILE))?;
+                vec![CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE]
+            }
+        }
+        .into_iter()
+        .map(|file| (file, source.join(file)))
+        .collect();
+        (
+            source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            role,
+            files,
+        )
+    } else if source.is_file() && source.extension().is_some_and(|ext| ext == "gguf") {
+        let tokenizer = source.with_file_name(CLEANUP_TOKENIZER_FILE);
+        if !tokenizer.is_file() {
+            return Err(PullError::Invalid(format!(
+                "missing companion {} beside {}",
+                CLEANUP_TOKENIZER_FILE,
+                source.display()
+            )));
+        }
+        valid_json(&tokenizer).map_err(PullError::Invalid)?;
+        check_cleanup_architecture(source)?;
+        (
+            source
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            Role::Cleanup,
+            vec![
+                (CLEANUP_TOKENIZER_FILE, tokenizer),
+                (CLEANUP_WEIGHTS_FILE, source.to_path_buf()),
+            ],
+        )
+    } else {
+        return Err(PullError::Invalid(format!(
+            "{} is not a model directory or a GGUF file",
+            source.display()
+        )));
+    };
+
+    let revision = content_hash(&files)?;
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let id = ModelId::parse(&format!("local/{safe_name}@{revision}"))
+        .map_err(|why| PullError::Invalid(why.to_string()))?;
+    let dir = store.join(id.relative_dir());
+    if dir.is_dir() {
+        return Ok(Added {
+            id,
+            dir,
+            role,
+            already: true,
+        });
+    }
+    let staging = staging_dir(store, &id);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|why| PullError::Disk {
+        what: format!("create {}", staging.display()),
+        why: why.to_string(),
+    })?;
+    let imported = files.into_iter().try_for_each(|(name, from)| {
+        if !from
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(PullError::Invalid(format!(
+                "{} is not a regular file",
+                from.display()
+            )));
+        }
+        if std::fs::hard_link(&from, staging.join(name)).is_ok() {
+            Ok(())
+        } else {
+            std::fs::copy(&from, staging.join(name))
+                .map(|_| ())
+                .map_err(|why| PullError::Disk {
+                    what: format!("import {}", from.display()),
+                    why: why.to_string(),
+                })
+        }
+    });
+    if let Err(why) = imported {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(why);
+    }
+    install(&staging, &dir)?;
+    Ok(Added {
+        id,
+        dir,
+        role,
+        already: false,
+    })
+}
+
+fn check_cleanup_architecture(path: &Path) -> Result<(), PullError> {
+    let found = ayeaye_infer::language::model::architecture(path)
+        .map_err(|why| PullError::Invalid(why.to_string()))?;
+    if ayeaye_infer::language::model::SUPPORTED.contains(&found.as_str()) {
+        Ok(())
+    } else {
+        Err(PullError::Invalid(format!(
+            "{found:?} is not a GGUF architecture this build can run; it runs {}",
+            ayeaye_infer::language::model::SUPPORTED.join(", ")
+        )))
+    }
+}
+
+fn content_hash(files: &[(&str, PathBuf)]) -> Result<String, PullError> {
+    // FNV-1a is enough here: the revision is a stable content pin, not a security boundary.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut buffer = [0u8; 64 * 1024];
+    for (name, path) in files {
+        for byte in name.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut file = std::fs::File::open(path).map_err(|why| PullError::Disk {
+            what: format!("read {}", path.display()),
+            why: why.to_string(),
+        })?;
+        loop {
+            let read = file.read(&mut buffer).map_err(|why| PullError::Disk {
+                what: format!("read {}", path.display()),
+                why: why.to_string(),
+            })?;
+            if read == 0 {
+                break;
+            }
+            for byte in &buffer[..read] {
+                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 impl std::error::Error for PullError {}
