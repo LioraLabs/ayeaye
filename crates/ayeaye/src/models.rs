@@ -1030,6 +1030,22 @@ pub fn cleanup_policy(config_file: &Path) -> Result<CleanupPolicy, PolicyError> 
 /// Read, change one key, write the whole file back. Not an append: appending
 /// leaves the old value above the new one, and the file then says two things.
 pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullError> {
+    choose_with(
+        config_file,
+        key,
+        value,
+        |from, to| std::fs::rename(from, to),
+        |dir| std::fs::File::open(dir).and_then(|dir| dir.sync_all()),
+    )
+}
+
+fn choose_with(
+    config_file: &Path,
+    key: &str,
+    value: &str,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), PullError> {
     let disk = |what: String| {
         move |why: std::io::Error| PullError::Disk {
             what,
@@ -1039,9 +1055,144 @@ pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullErro
     if let Some(parent) = config_file.parent() {
         std::fs::create_dir_all(parent).map_err(disk(format!("create {}", parent.display())))?;
     }
-    let before = std::fs::read_to_string(config_file).unwrap_or_default();
+    let before = match std::fs::read_to_string(config_file) {
+        Ok(text) => text,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(why) => return Err(disk(format!("read {}", config_file.display()))(why)),
+    };
     let after = settings::upsert(&before, key, value);
-    std::fs::write(config_file, after).map_err(disk(format!("write {}", config_file.display())))
+    let temporary = config_file.with_extension(format!("new-{}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(disk(format!("write {}", temporary.display())))?;
+        file.write_all(after.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(disk(format!("write {}", temporary.display())))?;
+        rename(&temporary, config_file)
+            .map_err(disk(format!("replace {}", config_file.display())))?;
+        // Rename is the commit point. A directory sync is still attempted for
+        // crash durability, but a failure after commit cannot honestly be
+        // reported as though the prior selection survived.
+        let _ = sync_parent(config_file.parent().unwrap_or(Path::new(".")));
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[derive(Debug)]
+pub struct Selected {
+    pub id: ModelId,
+    pub smoke: String,
+}
+
+pub trait Smoke {
+    fn run(&mut self, role: Role, dir: &Path) -> Result<String, String>;
+}
+
+pub trait SmokeEngine {
+    fn speech(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        audio: &ayeaye_core::Pcm16kMono) -> Result<String, String>;
+    fn cleanup(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        raw: &str, policy: &CleanupPolicy) -> Result<String, String>;
+}
+
+pub struct InProcess;
+
+impl SmokeEngine for InProcess {
+    fn speech(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        audio: &ayeaye_core::Pcm16kMono) -> Result<String, String> {
+        let mut slot = SpeechSlot::on(selection);
+        slot.load(dir).map_err(|why| why.to_string())?;
+        Ok(slot.transcribe(audio).map_err(|why| why.to_string())?.text())
+    }
+
+    fn cleanup(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        raw: &str, policy: &CleanupPolicy) -> Result<String, String> {
+        let mut slot = LanguageSlot::on(selection);
+        slot.load(dir).map_err(|why| why.to_string())?;
+        slot.rewrite(raw, policy).map_err(|why| why.to_string())
+    }
+}
+
+pub struct RealSmoke<E = InProcess> {
+    pub selection: ayeaye_infer::backend::Selection,
+    pub cleanup: CleanupPolicy,
+    pub engine: E,
+}
+
+impl<E: SmokeEngine> Smoke for RealSmoke<E> {
+    fn run(&mut self, role: Role, dir: &Path) -> Result<String, String> {
+        use base64::Engine;
+        let selection = self.selection.clone();
+        let cleanup = self.cleanup.clone();
+        let output = match role {
+            Role::Speech => {
+                let wav = base64::engine::general_purpose::STANDARD
+                    .decode(include_str!("smoke.wav.b64").trim()).map_err(|why| why.to_string())?;
+                let audio = ayeaye_core::audio::from_wav(&wav).map_err(|why| why.to_string())?;
+                self.engine.speech(selection, dir, &audio)?
+            }
+            Role::Cleanup => {
+                let mut policy = cleanup;
+                policy.max_new_tokens = policy.max_new_tokens.min(32);
+                self.engine.cleanup(selection, dir, "um run the tests", &policy)?
+            }
+        };
+        (!output.trim().is_empty()).then_some(output)
+            .ok_or_else(|| format!("{role} smoke produced no output"))
+    }
+}
+
+pub fn select_staged(
+    fetcher: &impl Fetcher,
+    smoke: &mut impl Smoke,
+    store: &Path,
+    config_file: &Path,
+    hub_host: &str,
+    role: Role,
+    given: &str,
+) -> Result<Selected, String> {
+    let requested = ModelId::parse(given).map_err(|why| why.to_string())?;
+    let id = if given.contains('@') {
+        requested
+    } else {
+        std::fs::create_dir_all(store)
+            .map_err(|why| format!("could not create {}: {why}", store.display()))?;
+        let url = format!("{}/api/models/{}/revision/main", hub_host.trim_end_matches('/'), requested.repo());
+        let metadata = store.join(format!(".pin-{}-{}", std::process::id(), requested.name()));
+        let result = fetcher.get(&url, &metadata)
+            .map_err(|why| format!("could not resolve {}: {why}", requested.repo()))
+            .and_then(|()| std::fs::read_to_string(&metadata).map_err(|why| why.to_string()))
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).map_err(|why| why.to_string()))
+            .and_then(|json| json["sha"].as_str().map(str::to_string)
+                .ok_or_else(|| "Hub metadata names no concrete revision".to_string()));
+        let _ = std::fs::remove_file(&metadata);
+        ModelId::parse(&format!("{}@{}", requested.repo(), result?)).map_err(|why| why.to_string())?
+    };
+    let dir = store.join(id.relative_dir());
+    if !dir.is_dir() {
+        pull(fetcher, store, hub_host, &id).map_err(|why| why.to_string())?;
+    }
+    let installed = inspect(store).into_iter().find(|model| model.id == id)
+        .ok_or_else(|| format!("{id} did not land in the model store"))?;
+    match installed.role {
+        Ok(actual) if actual == role => {}
+        Ok(actual) => return Err(format!("{id} serves {actual}, not {role}")),
+        Err(why) => return Err(format!("{id} is unusable: {why}")),
+    }
+    let result = smoke.run(role, &dir)?;
+    if result.trim().is_empty() {
+        return Err(format!("{role} smoke produced no output"));
+    }
+    let key = match role {
+        Role::Speech => settings::SPEECH_MODEL,
+        Role::Cleanup => settings::CLEANUP_MODEL,
+    };
+    choose(config_file, key, &id.to_string()).map_err(|why| why.to_string())?;
+    Ok(Selected { id, smoke: result })
 }
 
 /// A place a speech model is resident, and the thing that decides.
@@ -1222,9 +1373,69 @@ impl<S: Slot> Residents<S> {
 mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
-        installed, pull, remove, search, search_response,
+        installed, pull, remove, search, search_response, select_staged, Smoke,
+        choose_with, RealSmoke, SmokeEngine, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
     };
-    use ayeaye_core::model::{CONFIG_FILE, ModelId, TOKENIZER_FILE, WEIGHTS_FILE};
+    use ayeaye_core::model::{CONFIG_FILE, ModelId, Role, TOKENIZER_FILE, WEIGHTS_FILE};
+
+    struct Pins;
+    impl Fetcher for Pins {
+        fn get(&self, url: &str, into: &Path) -> Result<(), String> {
+            assert!(url.ends_with("/api/models/acme/model/revision/main"), "{url}");
+            std::fs::write(into, r#"{"sha":"deadbeef"}"#).map_err(|why| why.to_string())
+        }
+    }
+
+    struct PinsThenStops;
+    impl Fetcher for PinsThenStops {
+        fn get(&self, url: &str, into: &Path) -> Result<(), String> {
+            if url.ends_with("/api/models/acme/model/revision/main") {
+                std::fs::write(into, r#"{"sha":"deadbeef"}"#).map_err(|why| why.to_string())
+            } else {
+                Err("fixture stops after pinning".to_string())
+            }
+        }
+    }
+
+    struct Reports(Result<String, String>);
+    impl Smoke for Reports {
+        fn run(&mut self, _: Role, _: &Path) -> Result<String, String> { self.0.clone() }
+    }
+
+    struct Expects(Role);
+    impl Smoke for Expects {
+        fn run(&mut self, role: Role, _: &Path) -> Result<String, String> {
+            assert_eq!(role, self.0);
+            Ok("rewritten".to_string())
+        }
+    }
+
+    struct FallbackSmoke(ayeaye_infer::backend::Selection);
+    impl Smoke for FallbackSmoke {
+        fn run(&mut self, _: Role, _: &Path) -> Result<String, String> {
+            assert_eq!(self.0.got(), ayeaye_infer::Backend::Cpu);
+            assert!(self.0.fallback().is_some());
+            Ok("heard on cpu".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct ReachesInference { speech: bool, cleanup: bool }
+    impl SmokeEngine for ReachesInference {
+        fn speech(&mut self, _: ayeaye_infer::backend::Selection, _: &Path,
+            audio: &ayeaye_core::Pcm16kMono) -> Result<String, String> {
+            assert!(audio.duration_secs() < 1.0);
+            self.speech = true;
+            Ok("heard it".to_string())
+        }
+        fn cleanup(&mut self, _: ayeaye_infer::backend::Selection, _: &Path,
+            raw: &str, policy: &super::CleanupPolicy) -> Result<String, String> {
+            assert_eq!(raw, "um run the tests");
+            assert_eq!(policy.max_new_tokens, 32);
+            self.cleanup = true;
+            Ok("run the tests".to_string())
+        }
+    }
 
     struct RecordedHub;
 
@@ -1310,6 +1521,142 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn installed_speech(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), br#"{"architectures":["WhisperForConditionalGeneration"]}"#).unwrap();
+        std::fs::write(dir.join(TOKENIZER_FILE), b"{}").unwrap();
+        std::fs::write(dir.join(WEIGHTS_FILE), weights()).unwrap();
+    }
+
+    #[test]
+    fn staged_selection_pins_and_writes_only_after_nonempty_smoke_output() {
+        let scratch = Scratch::named("staged-selection");
+        let store = scratch.0.join("state");
+        installed_speech(&store.join("models/acme/model/deadbeef"));
+        let config = scratch.0.join("env");
+        std::fs::write(&config, "AYEAYE_SPEECH_MODEL=old/model@working\n").unwrap();
+
+        let selected = select_staged(&Pins, &mut Reports(Ok("heard it".into())), &store,
+            &config, "https://hub.test", Role::Speech, "acme/model").unwrap();
+
+        assert_eq!(selected.id.revision(), "deadbeef");
+        assert_eq!(selected.smoke, "heard it");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(),
+            "AYEAYE_SPEECH_MODEL=acme/model@deadbeef\n");
+    }
+
+    #[test]
+    fn first_selection_can_pin_before_the_model_store_exists() {
+        let scratch = Scratch::named("first-staged-selection");
+        let store = scratch.0.join("missing/store");
+
+        let error = select_staged(&PinsThenStops, &mut Reports(Ok("unused".into())), &store,
+            &scratch.0.join("env"), "https://hub.test", Role::Speech, "acme/model")
+            .unwrap_err();
+
+        assert!(store.is_dir());
+        assert!(error.contains("fixture stops after pinning"), "{error}");
+    }
+
+    #[test]
+    fn failed_smoke_preserves_the_previous_selection_and_store() {
+        let scratch = Scratch::named("staged-rollback");
+        let store = scratch.0.join("state");
+        let old = store.join("models/old/model/working");
+        let candidate = store.join("models/acme/model/deadbeef");
+        installed_speech(&old);
+        installed_speech(&candidate);
+        let config = scratch.0.join("env");
+        let before = "# keep me\nAYEAYE_SPEECH_MODEL=old/model@working\n";
+        std::fs::write(&config, before).unwrap();
+
+        let error = select_staged(&Pins, &mut Reports(Err("load failed".into())), &store,
+            &config, "https://hub.test", Role::Speech, "acme/model").unwrap_err();
+
+        assert_eq!(error, "load failed");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+        assert!(old.is_dir());
+        assert!(candidate.is_dir(), "a failed candidate remains removable");
+
+        let empty = select_staged(&Pins, &mut Reports(Ok(String::new())), &store,
+            &config, "https://hub.test", Role::Speech, "acme/model").unwrap_err();
+        assert_eq!(empty, "speech smoke produced no output");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn staged_cleanup_uses_the_cleanup_smoke_and_setting() {
+        let scratch = Scratch::named("staged-cleanup");
+        let store = scratch.0.join("state");
+        let dir = store.join("models/acme/model/deadbeef");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(CLEANUP_WEIGHTS_FILE), gguf("llama")).unwrap();
+        std::fs::write(dir.join(CLEANUP_TOKENIZER_FILE), b"{}").unwrap();
+        let config = scratch.0.join("env");
+
+        select_staged(&Pins, &mut Expects(Role::Cleanup), &store, &config,
+            "https://hub.test", Role::Cleanup, "acme/model").unwrap();
+
+        assert_eq!(std::fs::read_to_string(config).unwrap(),
+            "AYEAYE_CLEANUP_MODEL=acme/model@deadbeef\n");
+    }
+
+    #[test]
+    fn staged_smoke_keeps_the_established_device_fallback() {
+        let scratch = Scratch::named("staged-fallback");
+        let store = scratch.0.join("state");
+        installed_speech(&store.join("models/acme/model/deadbeef"));
+        let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cuda, |_| {
+            ayeaye_infer::backend::open(ayeaye_infer::Backend::Cpu)
+        });
+
+        select_staged(&Pins, &mut FallbackSmoke(selection), &store, &scratch.0.join("env"),
+            "https://hub.test", Role::Speech, "acme/model").unwrap();
+    }
+
+    #[test]
+    fn real_smoke_reaches_speech_and_cleanup_inference_with_bounded_inputs() {
+        use base64::Engine;
+        let wav = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("smoke.wav.b64").trim()).unwrap();
+        let audio = ayeaye_core::audio::from_wav(&wav).unwrap();
+        assert!(audio.duration_secs() < 1.0);
+
+        let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cpu,
+            |_| ayeaye_infer::backend::open(ayeaye_infer::Backend::Cpu));
+        let mut smoke = RealSmoke { selection, cleanup: super::CleanupPolicy::default(),
+            engine: ReachesInference::default() };
+        assert_eq!(smoke.run(Role::Speech, Path::new("/model")).unwrap(), "heard it");
+        assert_eq!(smoke.run(Role::Cleanup, Path::new("/model")).unwrap(), "run the tests");
+        assert!(smoke.engine.speech && smoke.engine.cleanup);
+    }
+
+    #[test]
+    fn a_failed_config_commit_preserves_the_previous_selection() {
+        let scratch = Scratch::named("selection-write-failure");
+        let config = scratch.0.join("env");
+        let before = "# mine\nAYEAYE_SPEECH_MODEL=old/model@working\n";
+        std::fs::write(&config, before).unwrap();
+
+        let error = choose_with(&config, super::settings::SPEECH_MODEL, "new/model@pinned", |_, _| {
+            Err(std::io::Error::other("disk stopped"))
+        }, |_| Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("disk stopped"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+
+        let unreadable = scratch.0.join("directory-not-a-file");
+        std::fs::create_dir(&unreadable).unwrap();
+        let error = choose_with(&unreadable, super::settings::SPEECH_MODEL,
+            "new/model@pinned", |_, _| Ok(()), |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("read"), "{error}");
+
+        choose_with(&config, super::settings::SPEECH_MODEL, "new/model@pinned",
+            |from, to| std::fs::rename(from, to),
+            |_| Err(std::io::Error::other("post-commit sync failed"))).unwrap();
+        assert!(std::fs::read_to_string(&config).unwrap().contains("new/model@pinned"));
     }
 
     /// A safetensors file of the smallest shape that is a real one.
