@@ -68,6 +68,11 @@ pub fn search_response(json: &str, limits: SearchLimits) -> Result<Vec<SearchRes
                 })
         })
     };
+    let tokenizer_size = |id: &str| {
+        repos.iter().find(|repo| repo["id"] == id)?["siblings"].as_array()?
+            .iter().find(|file| file["rfilename"] == TOKENIZER_FILE)
+            .and_then(|file| file["size"].as_u64().or_else(|| file["lfs"]["size"].as_u64()))
+    };
     let mut found = Vec::new();
     for repo in &repos {
         let Some(id) = repo["id"].as_str() else { continue };
@@ -79,8 +84,9 @@ pub fn search_response(json: &str, limits: SearchLimits) -> Result<Vec<SearchRes
         let speech = architecture::in_config(&repo["config"].to_string()).is_ok();
         let (role, bytes) = if speech {
             let Some(weights) = named(WEIGHTS_FILE).and_then(file_size) else { continue };
-            if named(CONFIG_FILE).is_none() || named(TOKENIZER_FILE).is_none() { continue; }
-            (Role::Speech, weights)
+            let Some(config) = named(CONFIG_FILE).and_then(file_size) else { continue };
+            let Some(tokenizer) = named(TOKENIZER_FILE).and_then(file_size) else { continue };
+            (Role::Speech, weights + config + tokenizer)
         } else {
             let mut ggufs: Vec<_> = files.iter().filter(|file| {
                 file["rfilename"].as_str().is_some_and(|name| {
@@ -91,16 +97,19 @@ pub fn search_response(json: &str, limits: SearchLimits) -> Result<Vec<SearchRes
                 (!file["rfilename"].as_str().unwrap_or_default().to_ascii_uppercase().contains("Q4_K_M"), *bytes)
             });
             let Some((_, bytes)) = ggufs.first() else { continue };
-            let base = repo["cardData"]["base_model"].as_str();
+            let bases: Vec<&str> = repo["cardData"]["base_model"].as_str().into_iter()
+                .chain(repo["cardData"]["base_model"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str))
+                .collect();
             let architecture = if hub_model_type(repo).is_empty() {
-                base.and_then(|id| repos.iter().find(|candidate| candidate["id"] == id))
+                bases.iter().find_map(|id| repos.iter().find(|candidate| candidate["id"] == **id))
                     .map(hub_model_type).unwrap_or_default()
             } else { hub_model_type(repo) };
             if !ayeaye_infer::language::model::SUPPORTED.contains(&architecture) { continue; }
-            let tokenizer = named(TOKENIZER_FILE).is_some()
-                || base.is_some_and(has_tokenizer);
-            if !tokenizer { continue; }
-            (Role::Cleanup, *bytes)
+            let tokenizer = named(TOKENIZER_FILE).and_then(file_size)
+                .or_else(|| bases.iter().find_map(|base| tokenizer_size(base)));
+            let Some(tokenizer) = tokenizer else { continue };
+            debug_assert!(named(TOKENIZER_FILE).is_some() || bases.iter().any(|base| has_tokenizer(base)));
+            (Role::Cleanup, *bytes + tokenizer)
         };
         let resident = bytes + match role {
             Role::Speech => limits.cleanup_bytes,
@@ -147,9 +156,19 @@ pub fn search(
         .and_then(|json| {
             let mut repos: Vec<serde_json::Value> = serde_json::from_str(&json)
                 .map_err(|why| format!("malformed Hub response: {why}"))?;
-            let bases: Vec<String> = repos.iter().filter_map(|repo| {
-                repo["cardData"]["base_model"].as_str().map(str::to_string)
-            }).filter(|base| !repos.iter().any(|repo| repo["id"] == *base)).collect();
+            for repo in &mut repos {
+                let Some(id) = repo["id"].as_str() else { continue };
+                let detail_url = format!("{}/api/models/{id}?expand%5B%5D=config&expand%5B%5D=cardData&expand%5B%5D=siblings&expand%5B%5D=gated", hub_host.trim_end_matches('/'));
+                fetcher.get(&detail_url, &file)
+                    .map_err(|why| format!("could not inspect {id}: {why}"))?;
+                let json = std::fs::read_to_string(&file).map_err(|why| why.to_string())?;
+                *repo = serde_json::from_str(&json)
+                    .map_err(|why| format!("malformed Hub response for {id}: {why}"))?;
+            }
+            let bases: Vec<String> = repos.iter().flat_map(|repo| {
+                repo["cardData"]["base_model"].as_str().into_iter()
+                    .chain(repo["cardData"]["base_model"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str))
+            }).map(str::to_string).filter(|base| !repos.iter().any(|repo| repo["id"] == *base)).collect();
             for base in bases {
                 let base_url = format!("{}/api/models/{base}?expand%5B%5D=config&expand%5B%5D=siblings", hub_host.trim_end_matches('/'));
                 fetcher.get(&base_url, &file)
@@ -1203,9 +1222,37 @@ impl<S: Slot> Residents<S> {
 mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
-        installed, pull, remove, search_response,
+        installed, pull, remove, search, search_response,
     };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, TOKENIZER_FILE, WEIGHTS_FILE};
+
+    struct RecordedHub;
+
+    impl Fetcher for RecordedHub {
+        fn get(&self, url: &str, into: &Path) -> Result<(), String> {
+            let response = if url.contains("/api/models/good/speech?") {
+                r#"{"id":"good/speech","config":{"model_type":"whisper"},"siblings":[
+                    {"rfilename":"config.json","size":10},{"rfilename":"tokenizer.json","size":10},
+                    {"rfilename":"model.safetensors","size":300}]}"#
+            } else {
+                r#"[{"id":"good/speech","siblings":[{"rfilename":"config.json"},
+                    {"rfilename":"tokenizer.json"},{"rfilename":"model.safetensors"}]}]"#
+            };
+            std::fs::write(into, response).map_err(|why| why.to_string())
+        }
+    }
+
+    #[test]
+    fn search_fetches_per_repository_metadata_when_the_list_has_no_sizes() {
+        let found = search(&RecordedHub, "https://hub.test", "speech", SearchLimits {
+            ram_bytes: 1_000,
+            disk_bytes: 1_000,
+            speech_bytes: 0,
+            cleanup_bytes: 0,
+        }).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].bytes, 320);
+    }
 
     #[test]
     fn hub_search_keeps_only_loadable_models_that_fit_beside_the_other_role() {
@@ -1215,7 +1262,7 @@ mod tests {
             {"rfilename":"config.json","size":10},{"rfilename":"tokenizer.json","size":10},
             {"rfilename":"model.safetensors","size":300}]},
           {"id":"good/cleanup","gated":"manual",
-            "cardData":{"base_model":"base/tokenizer"},"siblings":[{"rfilename":"model-q4.gguf","size":200}]},
+            "cardData":{"base_model":["base/tokenizer"]},"siblings":[{"rfilename":"model-q4.gguf","size":200}]},
           {"id":"split/cleanup","config":{"model_type":"llama"},"siblings":[
             {"rfilename":"model-00001-of-00002.gguf","size":100},{"rfilename":"model-00002-of-00002.gguf","size":100},{"rfilename":"tokenizer.json","size":10}]},
           {"id":"too-big/speech","config":{"model_type":"whisper"},"siblings":[
@@ -1230,8 +1277,10 @@ mod tests {
         }).unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].id, "good/cleanup");
+        assert_eq!(found[0].bytes, 210, "GGUF plus its base tokenizer");
         assert!(found[0].gated);
         assert_eq!(found[1].id, "good/speech");
+        assert_eq!(found[1].bytes, 320, "weights plus both required companions");
         assert!(found.iter().all(|model| model.evidence == "metadata heuristic"));
     }
     use std::cell::RefCell;
