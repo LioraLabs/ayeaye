@@ -1055,13 +1055,18 @@ fn choose_with(
     };
     let after = settings::upsert(&before, key, value);
     let temporary = config_file.with_extension(format!("new-{}", std::process::id()));
-    let mut file = std::fs::File::create(&temporary)
-        .map_err(disk(format!("write {}", temporary.display())))?;
-    file.write_all(after.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(disk(format!("write {}", temporary.display())))?;
-    let result = rename(&temporary, config_file)
-        .map_err(disk(format!("replace {}", config_file.display())));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(disk(format!("write {}", temporary.display())))?;
+        file.write_all(after.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(disk(format!("write {}", temporary.display())))?;
+        rename(&temporary, config_file)
+            .map_err(disk(format!("replace {}", config_file.display())))?;
+        std::fs::File::open(config_file.parent().unwrap_or(Path::new(".")))
+            .and_then(|dir| dir.sync_all())
+            .map_err(disk(format!("sync directory for {}", config_file.display())))
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -1078,31 +1083,53 @@ pub trait Smoke {
     fn run(&mut self, role: Role, dir: &Path) -> Result<String, String>;
 }
 
-pub struct RealSmoke {
-    pub selection: ayeaye_infer::backend::Selection,
-    pub cleanup: CleanupPolicy,
+pub trait SmokeEngine {
+    fn speech(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        audio: &ayeaye_core::Pcm16kMono) -> Result<String, String>;
+    fn cleanup(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        raw: &str, policy: &CleanupPolicy) -> Result<String, String>;
 }
 
-impl Smoke for RealSmoke {
+pub struct InProcess;
+
+impl SmokeEngine for InProcess {
+    fn speech(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        audio: &ayeaye_core::Pcm16kMono) -> Result<String, String> {
+        let mut slot = SpeechSlot::on(selection);
+        slot.load(dir).map_err(|why| why.to_string())?;
+        Ok(slot.transcribe(audio).map_err(|why| why.to_string())?.text())
+    }
+
+    fn cleanup(&mut self, selection: ayeaye_infer::backend::Selection, dir: &Path,
+        raw: &str, policy: &CleanupPolicy) -> Result<String, String> {
+        let mut slot = LanguageSlot::on(selection);
+        slot.load(dir).map_err(|why| why.to_string())?;
+        slot.rewrite(raw, policy).map_err(|why| why.to_string())
+    }
+}
+
+pub struct RealSmoke<E = InProcess> {
+    pub selection: ayeaye_infer::backend::Selection,
+    pub cleanup: CleanupPolicy,
+    pub engine: E,
+}
+
+impl<E: SmokeEngine> Smoke for RealSmoke<E> {
     fn run(&mut self, role: Role, dir: &Path) -> Result<String, String> {
         use base64::Engine;
         let selection = self.selection.clone();
         let cleanup = self.cleanup.clone();
         let output = match role {
             Role::Speech => {
-                let mut slot = SpeechSlot::on(selection);
-                slot.load(dir).map_err(|why| why.to_string())?;
                 let wav = base64::engine::general_purpose::STANDARD
                     .decode(include_str!("smoke.wav.b64").trim()).map_err(|why| why.to_string())?;
                 let audio = ayeaye_core::audio::from_wav(&wav).map_err(|why| why.to_string())?;
-                slot.transcribe(&audio).map_err(|why| why.to_string())?.text()
+                self.engine.speech(selection, dir, &audio)?
             }
             Role::Cleanup => {
-                let mut slot = LanguageSlot::on(selection);
-                slot.load(dir).map_err(|why| why.to_string())?;
                 let mut policy = cleanup;
                 policy.max_new_tokens = policy.max_new_tokens.min(32);
-                slot.rewrite("um run the tests", &policy).map_err(|why| why.to_string())?
+                self.engine.cleanup(selection, dir, "um run the tests", &policy)?
             }
         };
         (!output.trim().is_empty()).then_some(output)
@@ -1336,7 +1363,7 @@ mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
         installed, pull, remove, search, search_response, select_staged, Smoke,
-        choose_with, RealSmoke, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
+        choose_with, RealSmoke, SmokeEngine, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
     };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, Role, TOKENIZER_FILE, WEIGHTS_FILE};
 
@@ -1367,6 +1394,24 @@ mod tests {
             assert_eq!(self.0.got(), ayeaye_infer::Backend::Cpu);
             assert!(self.0.fallback().is_some());
             Ok("heard on cpu".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct ReachesInference { speech: bool, cleanup: bool }
+    impl SmokeEngine for ReachesInference {
+        fn speech(&mut self, _: ayeaye_infer::backend::Selection, _: &Path,
+            audio: &ayeaye_core::Pcm16kMono) -> Result<String, String> {
+            assert!(audio.duration_secs() < 1.0);
+            self.speech = true;
+            Ok("heard it".to_string())
+        }
+        fn cleanup(&mut self, _: ayeaye_infer::backend::Selection, _: &Path,
+            raw: &str, policy: &super::CleanupPolicy) -> Result<String, String> {
+            assert_eq!(raw, "um run the tests");
+            assert_eq!(policy.max_new_tokens, 32);
+            self.cleanup = true;
+            Ok("run the tests".to_string())
         }
     }
 
@@ -1537,21 +1582,20 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_spoken_sample_is_subsecond_and_real_smoke_loads_both_roles() {
+    fn real_smoke_reaches_speech_and_cleanup_inference_with_bounded_inputs() {
         use base64::Engine;
         let wav = base64::engine::general_purpose::STANDARD
             .decode(include_str!("smoke.wav.b64").trim()).unwrap();
         let audio = ayeaye_core::audio::from_wav(&wav).unwrap();
         assert!(audio.duration_secs() < 1.0);
 
-        let scratch = Scratch::named("real-smoke-loads");
         let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cpu,
             |_| ayeaye_infer::backend::open(ayeaye_infer::Backend::Cpu));
-        let mut smoke = RealSmoke { selection, cleanup: super::CleanupPolicy::default() };
-        for role in [Role::Speech, Role::Cleanup] {
-            let error = smoke.run(role, &scratch.0).unwrap_err();
-            assert!(error.contains("model"), "{role}: {error}");
-        }
+        let mut smoke = RealSmoke { selection, cleanup: super::CleanupPolicy::default(),
+            engine: ReachesInference::default() };
+        assert_eq!(smoke.run(Role::Speech, Path::new("/model")).unwrap(), "heard it");
+        assert_eq!(smoke.run(Role::Cleanup, Path::new("/model")).unwrap(), "run the tests");
+        assert!(smoke.engine.speech && smoke.engine.cleanup);
     }
 
     #[test]
