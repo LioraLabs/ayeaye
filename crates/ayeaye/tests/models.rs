@@ -122,6 +122,77 @@ fn listing_reports_roles_sizes_both_selections_and_unusable_models() {
     assert!(out.lines().all(|line| line.contains(" bytes")), "{out:?}");
 }
 
+#[test]
+fn use_selects_only_installed_models_for_their_inspected_role() {
+    let scratch = Scratch::named("role-use");
+    let store = scratch.0.join("state/ayeaye/models");
+    let speech = store.join("openai/whisper-tiny.en/main");
+    std::fs::create_dir_all(&speech).expect("speech model directory");
+    std::fs::write(speech.join("config.json"), br#"{}"#).expect("speech config");
+    std::fs::write(speech.join("tokenizer.json"), br#"{}"#).expect("speech tokenizer");
+    std::fs::write(speech.join("model.safetensors"), weights()).expect("speech weights");
+
+    let cleanup = store.join("local/cleanup/main");
+    std::fs::create_dir_all(&cleanup).expect("cleanup model directory");
+    let mut gguf = b"GGUF".to_vec();
+    gguf.extend_from_slice(&3u32.to_le_bytes());
+    std::fs::write(cleanup.join("model.gguf"), gguf).expect("cleanup weights");
+    std::fs::write(cleanup.join("tokenizer.json"), br#"{}"#).expect("cleanup tokenizer");
+
+    for args in [
+        &["model", "use", "speech", "openai/whisper-tiny.en"][..],
+        &["model", "use", "cleanup", "local/cleanup"][..],
+    ] {
+        let (code, _, err) = ayeaye(&scratch.0, "file:///unused", args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+    }
+    let config = std::fs::read_to_string(scratch.0.join("config/ayeaye/env")).unwrap();
+    assert!(
+        config.contains("AYEAYE_SPEECH_MODEL=openai/whisper-tiny.en"),
+        "{config}"
+    );
+    assert!(
+        config.contains("AYEAYE_CLEANUP_MODEL=local/cleanup"),
+        "{config}"
+    );
+
+    let (code, _, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "use", "cleanup", "openai/whisper-tiny.en"],
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("speech"), "{err}");
+    assert!(err.contains("cleanup"), "{err}");
+
+    let (code, _, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "use", "speech", "local/missing"],
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("not installed"), "{err}");
+    assert!(err.contains("pull") && err.contains("add"), "{err}");
+
+    let (code, _, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "use", "openai/whisper-tiny.en"],
+    );
+    assert_eq!(code, 0, "legacy speech selection: {err}");
+
+    let (code, out, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "rm", "local/cleanup"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("cleanup") && out.contains("selection"),
+        "{out}"
+    );
+}
+
 // AYEAYE-56 — the whole acquisition path, end to end, through the real
 // transport: a model is fetched, verified, stored under the state directory,
 // listed, chosen, and removed.
