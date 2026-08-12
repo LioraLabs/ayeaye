@@ -23,9 +23,9 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use ayeaye_core::machine::Acceleration;
-use ayeaye_core::model::{ModelId, settings};
+use ayeaye_core::model::{Role, settings};
 use ayeaye_core::service::{Definition, Layout, Session, manual_instructions};
-use ayeaye_core::setup::{Choices, Consent, Consequence, Existing, Plan, Step, Wanted, plan};
+use ayeaye_core::setup::{Choices, Consent, Consequence, Existing, Plan, Step, plan};
 
 use crate::models::{self, Fetcher};
 use crate::probe::Captured;
@@ -114,7 +114,9 @@ impl Ask for Tty {
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line).ok()?;
-        line.trim().parse::<usize>().ok()
+        line.trim()
+            .parse::<usize>()
+            .ok()
             .filter(|choice| (1..=options.len()).contains(choice))
             .map(|choice| choice - 1)
     }
@@ -148,6 +150,10 @@ impl Ask for Assumed {
     fn confirm(&self, _question: &str, _default: bool) -> bool {
         self.0
     }
+
+    fn choose(&self, _question: &str, options: &[String]) -> Option<usize> {
+        (self.0 && !options.is_empty()).then_some(0)
+    }
 }
 
 /// What was typed on the command line.
@@ -159,8 +165,6 @@ pub struct Flags {
     pub no_service: bool,
     /// Do not fetch any model.
     pub no_model: bool,
-    /// Fetch this one rather than the one that suits this machine.
-    pub model: Option<ModelId>,
     /// The address to listen on.
     pub bind: Option<String>,
     /// The port to listen on.
@@ -182,8 +186,8 @@ pub fn parse(args: &[String]) -> Result<Flags, String> {
             "--no-service" => flags.no_service = true,
             "--no-model" => flags.no_model = true,
             "--model" => {
-                let given = value("--model")?;
-                flags.model = Some(ModelId::parse(&given).map_err(|why| why.to_string())?);
+                let _ = value("--model")?;
+                return Err("--model was replaced; use `ayeaye model pull ID` then `ayeaye model use speech ID`, or run `ayeaye model choose`".to_string());
             }
             "--bind" => flags.bind = Some(value("--bind")?),
             "--port" => {
@@ -196,9 +200,6 @@ pub fn parse(args: &[String]) -> Result<Flags, String> {
             }
             other => return Err(format!("unknown option {other:?}")),
         }
-    }
-    if flags.no_model && flags.model.is_some() {
-        return Err("--model and --no-model ask for opposite things".to_string());
     }
     Ok(flags)
 }
@@ -273,16 +274,11 @@ pub fn decide(run: &Run<'_>, ask: &impl Ask) -> Plan {
         // the same way, and disagreeing would mean setup keeps a key the daemon
         // then refuses to use.
         key: std::fs::read_to_string(&places.token_file).is_ok_and(|held| !held.trim().is_empty()),
-        models: models::installed(&places.model_store),
     };
     let choices = Choices {
         consent: Consent::default(),
         service: !flags.no_service,
-        model: match (&flags.model, flags.no_model) {
-            (Some(id), _) => Wanted::Named(id.clone()),
-            (None, true) => Wanted::None,
-            (None, false) => Wanted::Suited,
-        },
+        models: !flags.no_model,
     };
 
     // Asked once, having seen what there is to consent to. A plan built with no
@@ -316,11 +312,13 @@ pub fn decide(run: &Run<'_>, ask: &impl Ask) -> Plan {
 }
 
 /// Do it.
-pub fn carry_out<R: Runner, F: Fetcher>(
+pub fn carry_out<R: Runner, F: Fetcher, S: models::Smoke>(
     plan: &Plan,
     run: &Run<'_>,
     runner: R,
     fetcher: &F,
+    smoke: &mut S,
+    ask: &impl Ask,
     stamp: &str,
 ) -> Result<Did, Failed> {
     let Run {
@@ -354,21 +352,49 @@ pub fn carry_out<R: Runner, F: Fetcher>(
                 let written = write_settings(places, flags)?;
                 did.lines.push(written);
             }
-            Step::FetchModel(id) => {
-                let pulled = models::pull(
-                    fetcher,
-                    &places.model_store,
-                    ayeaye_core::model::hub::DEFAULT_HOST,
-                    id,
-                )
-                .map_err(|why| Failed::Model(why.to_string()))?;
-                models::choose(&places.config_file, settings::SPEECH_MODEL, &id.to_string())
+            Step::ChooseModels => {
+                let settings = models::settings(&places.config_file)
                     .map_err(|why| Failed::Model(why.to_string()))?;
-                did.lines.push(format!(
-                    "fetched {} into {}, and set it as the model to transcribe with",
-                    pulled.id,
-                    pulled.dir.display()
-                ));
+                let installed = models::inspect(&places.model_store);
+                let selected_bytes = |role, id: Option<&ayeaye_core::model::ModelId>| {
+                    installed
+                        .iter()
+                        .find(|model| model.role == Ok(role) && Some(&model.id) == id)
+                        .map(|model| model.bytes)
+                        .unwrap_or(0)
+                };
+                let machine = captured.machine();
+                let mb = 1024 * 1024;
+                let result = models::choose_interactive(
+                    fetcher,
+                    smoke,
+                    ask,
+                    models::Interactive {
+                        store: &places.model_store,
+                        config_file: &places.config_file,
+                        hub_host: &settings.hub,
+                        limits: models::SearchLimits {
+                            ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
+                            disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
+                            speech_bytes: selected_bytes(Role::Speech, settings.speech.as_ref()),
+                            cleanup_bytes: selected_bytes(Role::Cleanup, settings.cleanup.as_ref()),
+                        },
+                        role: None,
+                    },
+                );
+                match result {
+                    Ok(result) => {
+                        did.lines.extend(result.selected.into_iter().map(|selected| {
+                            format!("{} selected; smoke output: {}", selected.id, selected.smoke.trim())
+                        }));
+                        if result.cleanup_declined {
+                            did.lines.push("cleanup left unset; dictation will use raw transcripts".to_string());
+                        }
+                    }
+                    Err(why) => did.declined.push(format!(
+                        "models skipped ({why}) — `ayeaye model add PATH` for an offline model, or `ayeaye model choose` when online"
+                    )),
+                }
             }
             Step::InstallService => {
                 let session = session.expect("a service step needs a session");
@@ -589,13 +615,12 @@ pub fn build_acceleration() -> Acceleration {
 #[cfg(test)]
 mod tests {
     use super::{
-        Assumed, Flags, Places, Run, answer, build_acceleration, carry_out, decide, effective,
+        Ask, Assumed, Flags, Places, Run, answer, build_acceleration, carry_out, decide, effective,
         mint, parse, record_consent, write_settings,
     };
     use crate::probe::{Captured, Sources, capture};
     use crate::service::{Outcome, Runner};
     use ayeaye_core::machine::Acceleration;
-    use ayeaye_core::model::ModelId;
     use ayeaye_core::service::{Layout, Session};
     use ayeaye_core::setup::{Step, urlsafe};
     use std::cell::RefCell;
@@ -627,6 +652,14 @@ mod tests {
         fn get(&self, url: &str, _into: &Path) -> Result<(), String> {
             self.asked.borrow_mut().push(url.to_string());
             Err("this test never reaches the network".to_string())
+        }
+    }
+
+    struct NoSmoke;
+
+    impl crate::models::Smoke for NoSmoke {
+        fn run(&mut self, _role: ayeaye_core::model::Role, _dir: &Path) -> Result<String, String> {
+            panic!("these checks never reach inference")
         }
     }
 
@@ -737,25 +770,64 @@ mod tests {
         assert_eq!(all.bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(all.port, Some(9000));
 
-        assert_eq!(
+        assert!(
             parse(&["--model".to_string(), "openai/whisper-tiny.en".to_string()])
-                .expect("valid")
-                .model,
-            ModelId::parse("openai/whisper-tiny.en").ok()
+                .unwrap_err()
+                .contains("ayeaye model choose")
         );
         assert!(parse(&["--soop".to_string()]).is_err());
         assert!(parse(&["--port".to_string()]).is_err(), "no value");
         assert!(parse(&["--port".to_string(), "eight".to_string()]).is_err());
         assert!(parse(&["--model".to_string(), "not an id".to_string()]).is_err());
-        assert!(
-            parse(&[
-                "--model".to_string(),
-                "openai/whisper-tiny.en".to_string(),
-                "--no-model".to_string()
-            ])
-            .is_err(),
-            "opposite things"
+    }
+
+    #[test]
+    fn unattended_consent_takes_the_top_ranked_model() {
+        let answers = Assumed(true);
+        assert_eq!(
+            answers.choose("choose", &["first".into(), "second".into()]),
+            Some(0)
         );
+    }
+
+    #[test]
+    fn offline_model_discovery_does_not_abort_setup() {
+        let root = scratch("offline-models");
+        let captured = machine_with(&["tmux"]);
+        let flags = Flags {
+            yes: true,
+            no_service: true,
+            ..Flags::default()
+        };
+        let places = places(&root);
+        let layout = layout(&root);
+        let run = Run {
+            captured: &captured,
+            places: &places,
+            session: None,
+            layout: &layout,
+            program: "/opt/ayeaye",
+            flags: &flags,
+        };
+        let plan = decide(&run, &Assumed(true));
+        let did = carry_out(
+            &plan,
+            &run,
+            Recorder::default(),
+            &NoDownloads::default(),
+            &mut NoSmoke,
+            &Assumed(true),
+            "1",
+        )
+        .expect("offline setup still completes");
+        assert!(
+            did.declined
+                .iter()
+                .any(|line| line.contains("ayeaye model add PATH")),
+            "{:#?}",
+            did.declined
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // AYEAYE-62 — the acceptance criterion, and the reason `ayeaye setup` is safe
@@ -787,7 +859,16 @@ mod tests {
 
         let fetcher = NoDownloads::default();
         let runner = Recorder::default();
-        let did = carry_out(&decided, &run, &runner, &fetcher, "1").expect("it should finish");
+        let did = carry_out(
+            &decided,
+            &run,
+            &runner,
+            &fetcher,
+            &mut NoSmoke,
+            &Assumed(false),
+            "1",
+        )
+        .expect("it should finish");
 
         assert!(fetcher.asked.borrow().is_empty(), "nothing was downloaded");
         assert!(
@@ -831,8 +912,16 @@ mod tests {
         };
         let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
-            .expect("it should finish");
+        let did = carry_out(
+            &decided,
+            &run,
+            &runner,
+            &NoDownloads::default(),
+            &mut NoSmoke,
+            &Assumed(false),
+            "1",
+        )
+        .expect("it should finish");
 
         let unit = root.join("config/systemd/user/ayeaye.service");
         assert!(unit.exists(), "{:?}", did.lines);
@@ -1068,8 +1157,16 @@ mod tests {
         let decided = decide(&run, &Assumed(true));
         assert!(!decided.steps.contains(&Step::InstallService));
         let runner = Recorder::default();
-        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
-            .expect("a finished run");
+        let did = carry_out(
+            &decided,
+            &run,
+            &runner,
+            &NoDownloads::default(),
+            &mut NoSmoke,
+            &Assumed(false),
+            "1",
+        )
+        .expect("a finished run");
         assert!(
             did.lines
                 .iter()
@@ -1103,8 +1200,16 @@ mod tests {
         };
         let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(&decided, &run, &runner, &NoDownloads::default(), "1")
-            .expect("a finished run");
+        let did = carry_out(
+            &decided,
+            &run,
+            &runner,
+            &NoDownloads::default(),
+            &mut NoSmoke,
+            &Assumed(false),
+            "1",
+        )
+        .expect("a finished run");
         assert!(
             did.lines
                 .iter()
@@ -1228,7 +1333,15 @@ mod tests {
                 }
             }
         }
-        let failed = carry_out(&decided, &run, Refuses, &NoDownloads::default(), "7");
+        let failed = carry_out(
+            &decided,
+            &run,
+            Refuses,
+            &NoDownloads::default(),
+            &mut NoSmoke,
+            &Assumed(false),
+            "7",
+        );
         assert!(failed.is_err(), "the enable should have failed");
         let held = std::fs::read_to_string(places.state_dir.join("consent"))
             .expect("the record survives the failure it preceded");

@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage: ayeaye [serve [--bind ADDR] [--port N]]
-       ayeaye setup [--yes] [--no-service] [--no-model] [--model ID]
+       ayeaye setup [--yes] [--no-service] [--no-model]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
@@ -753,7 +753,37 @@ fn setup_verb(args: &[String]) -> ExitCode {
         setup::decide(&run, &setup::Assumed(false))
     };
 
-    let did = match setup::carry_out(&plan, &run, Subprocess, &models::Curl, &stamp()) {
+    let cleanup = match models::cleanup_policy(&places.config_file) {
+        Ok(cleanup) => cleanup,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    let mut smoke = models::RealSmoke {
+        selection: ayeaye_infer::backend::select(),
+        cleanup,
+        engine: models::InProcess,
+    };
+    let carried = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        setup::carry_out(
+            &plan,
+            &run,
+            Subprocess,
+            &models::Curl,
+            &mut smoke,
+            &setup::Tty,
+            &stamp(),
+        )
+    } else {
+        setup::carry_out(
+            &plan,
+            &run,
+            Subprocess,
+            &models::Curl,
+            &mut smoke,
+            &setup::Assumed(flags.yes),
+            &stamp(),
+        )
+    };
+    let did = match carried {
         Ok(did) => did,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };

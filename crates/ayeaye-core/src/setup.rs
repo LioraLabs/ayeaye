@@ -30,79 +30,7 @@
 //! configured. That is not an omission; it is the milestone's decision, and the
 //! reason those are health checks rather than steps.
 
-use crate::machine::{Machine, Tier};
-use crate::model::ModelId;
-
-/// A model the catalogue knows, and what it is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Suggestion {
-    /// The repository it is fetched from, as `ayeaye model pull` takes it.
-    pub id: &'static str,
-    /// The lowest verdict this model is within.
-    ///
-    /// Named rather than inferred. "Is this bigger than the machine was measured
-    /// for" is a question about tiers, and answering it by comparing file sizes
-    /// would be this module forming an opinion about hardware — the one thing it
-    /// may not do.
-    pub tier: Tier,
-    /// What it is, to somebody who has never heard of a model.
-    pub words: &'static str,
-}
-
-/// Every listening model ayeaye knows.
-///
-/// A port of `lib/steps/40-voice.sh`'s catalogue with the *ids* changed and the
-/// mapping untouched. The shell names ggml files for whisper.cpp — `tiny.en`,
-/// `small.en` — and this fetches safetensors repositories from the hub, so
-/// `tiny.en` becomes `openai/whisper-tiny.en`. Which model a tier gets is
-/// exactly what it was.
-///
-/// The sizes and checksums the shell carries are deliberately not ported: they
-/// priced a single ggml artifact, and a repository is several files whose sizes
-/// this build learns from the hub at pull time.
-pub const CATALOGUE: &[Suggestion] = &[
-    Suggestion {
-        id: "openai/whisper-tiny.en",
-        tier: Tier::Lightweight,
-        words: "the smallest one there is: quick everywhere, and it will mishear names",
-    },
-    Suggestion {
-        id: "openai/whisper-base.en",
-        tier: Tier::Lightweight,
-        words: "a little better than the smallest, and still small",
-    },
-    Suggestion {
-        id: "openai/whisper-small.en",
-        tier: Tier::Recommended,
-        words: "the balanced one: accurate enough to trust, small enough to be quick",
-    },
-    Suggestion {
-        id: "openai/whisper-medium.en",
-        tier: Tier::Maximum,
-        words: "more accurate again, and noticeably slower without a graphics card",
-    },
-    Suggestion {
-        id: "openai/whisper-large-v3-turbo",
-        tier: Tier::Maximum,
-        words: "the most accurate one that is still fast, on a machine with room for it",
-    },
-];
-
-/// The model this machine is offered, or nothing at all.
-///
-/// The port of `_voice_preset_model`: the tier a machine reached names the model
-/// it gets, and a machine that reached only [`Tier::TextOnly`] is offered
-/// nothing — typing to your agents is the whole product working, and downloading
-/// a model onto a machine that cannot run it is worse than not offering one.
-pub fn suggested(tier: Tier) -> Option<&'static Suggestion> {
-    let id = match tier {
-        Tier::TextOnly => return None,
-        Tier::Lightweight => "openai/whisper-tiny.en",
-        Tier::Recommended => "openai/whisper-small.en",
-        Tier::Maximum => "openai/whisper-large-v3-turbo",
-    };
-    CATALOGUE.iter().find(|entry| entry.id == id)
-}
+use crate::machine::Machine;
 
 /// Why a step needs saying yes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,8 +60,8 @@ pub enum Step {
     MintKey,
     /// Write the settings file setup owns, merging rather than replacing.
     WriteSettings,
-    /// Fetch a model's weights.
-    FetchModel(ModelId),
+    /// Discover, smoke-test, and select speech and optional cleanup models.
+    ChooseModels,
     /// Write the service definition.
     InstallService,
     /// Make the service start at login, and start it now.
@@ -144,7 +72,7 @@ impl Step {
     /// Why this needs consent, or `None` when it does not.
     pub fn consequence(&self) -> Option<Consequence> {
         match self {
-            Step::FetchModel(_) => Some(Consequence::Network),
+            Step::ChooseModels => Some(Consequence::Network),
             Step::EnableService => Some(Consequence::RunsAtLogin),
             Step::MintKey | Step::WriteSettings | Step::InstallService => None,
         }
@@ -155,7 +83,7 @@ impl Step {
         match self {
             Step::MintKey => "generate the key that locks the page".to_string(),
             Step::WriteSettings => "write the settings file".to_string(),
-            Step::FetchModel(id) => format!("download {id} from the model hub"),
+            Step::ChooseModels => "discover and choose models from the model hub".to_string(),
             Step::InstallService => "write the service definition".to_string(),
             Step::EnableService => "start ayeaye now, and whenever you log in".to_string(),
         }
@@ -168,7 +96,7 @@ impl Step {
     /// declined.
     pub fn by_hand(&self) -> Option<String> {
         match self {
-            Step::FetchModel(id) => Some(format!("ayeaye model pull {id}")),
+            Step::ChooseModels => Some("ayeaye model choose".to_string()),
             Step::EnableService => Some("ayeaye service enable".to_string()),
             _ => None,
         }
@@ -183,8 +111,6 @@ impl Step {
 pub struct Existing {
     /// A key is already here.
     pub key: bool,
-    /// The models already in the store.
-    pub models: Vec<ModelId>,
 }
 
 /// A key, from random bytes, in the alphabet a URL can carry.
@@ -213,20 +139,6 @@ pub fn urlsafe(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-/// Which model setup should get.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Wanted {
-    /// Whatever suits this machine.
-    #[default]
-    Suited,
-    /// This one, named on the command line. An explicit choice is not overruled
-    /// by a tier: somebody who typed it has made a decision this module has no
-    /// business reversing.
-    Named(ModelId),
-    /// None at all.
-    None,
 }
 
 /// What was agreed to.
@@ -269,8 +181,8 @@ pub struct Choices {
     pub consent: Consent,
     /// Whether to install a service at all.
     pub service: bool,
-    /// Which model.
-    pub model: Wanted,
+    /// Whether to choose models.
+    pub models: bool,
 }
 
 impl Default for Choices {
@@ -278,7 +190,7 @@ impl Default for Choices {
         Choices {
             consent: Consent::default(),
             service: true,
-            model: Wanted::Suited,
+            models: true,
         }
     }
 }
@@ -314,7 +226,7 @@ impl Plan {
 /// running ayeaye by hand is a supported way to use it, and offering to enable a
 /// service on a machine that has nowhere to put one would be an offer nobody can
 /// take up.
-pub fn plan(machine: &Machine, has_manager: bool, existing: &Existing, choices: &Choices) -> Plan {
+pub fn plan(_machine: &Machine, has_manager: bool, existing: &Existing, choices: &Choices) -> Plan {
     let mut plan = Plan::default();
 
     if !existing.key {
@@ -322,10 +234,8 @@ pub fn plan(machine: &Machine, has_manager: bool, existing: &Existing, choices: 
     }
     plan.steps.push(Step::WriteSettings);
 
-    if let Some(id) = wanted_model(machine, choices)
-        && !existing.models.contains(&id)
-    {
-        gate(&mut plan, Step::FetchModel(id), &choices.consent);
+    if choices.models {
+        gate(&mut plan, Step::ChooseModels, &choices.consent);
     }
 
     if has_manager && choices.service {
@@ -348,29 +258,10 @@ fn gate(plan: &mut Plan, step: Step, consent: &Consent) {
     }
 }
 
-/// Which model this run is about, if any.
-///
-/// A named model is taken as named and is never checked against the tier. The
-/// shell warns and then allows exactly this, and its reasoning holds: an
-/// explicit override is not a silent one, and somebody who typed the id has made
-/// a decision setup has no business overruling.
-fn wanted_model(machine: &Machine, choices: &Choices) -> Option<ModelId> {
-    match &choices.model {
-        Wanted::None => None,
-        Wanted::Named(id) => Some(id.clone()),
-        Wanted::Suited => {
-            suggested(machine.tier()).and_then(|suggestion| ModelId::parse(suggestion.id).ok())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CATALOGUE, Choices, Consent, Consequence, Existing, Step, Wanted, plan, suggested,
-    };
-    use crate::machine::{Machine, Probes, Tier};
-    use crate::model::{ModelId, architecture};
+    use super::{Choices, Consent, Consequence, Existing, Step, plan};
+    use crate::machine::{Machine, Probes};
 
     /// The captured probe output, reaching this crate the only way it may.
     macro_rules! fixture {
@@ -396,72 +287,12 @@ mod tests {
         })
     }
 
-    fn id(text: &str) -> ModelId {
-        ModelId::parse(text).expect("a model id")
-    }
-
-    // AYEAYE-62 — the port of _voice_preset_model, tier for tier. The ids change
-    // because the shell names ggml files for whisper.cpp and this fetches
-    // repositories from the hub; the mapping does not.
-    #[test]
-    fn each_tier_is_offered_the_model_the_shell_offers_it() {
-        assert_eq!(suggested(Tier::TextOnly), None, "download nothing");
-        assert_eq!(
-            suggested(Tier::Lightweight).map(|one| one.id),
-            Some("openai/whisper-tiny.en")
-        );
-        assert_eq!(
-            suggested(Tier::Recommended).map(|one| one.id),
-            Some("openai/whisper-small.en")
-        );
-        assert_eq!(
-            suggested(Tier::Maximum).map(|one| one.id),
-            Some("openai/whisper-large-v3-turbo")
-        );
-    }
-
-    // AYEAYE-62 — a model the catalogue names has to be one this build could
-    // actually run, and it has to be a well-formed id. A catalogue entry that
-    // fails the allowlist would be an offer that dies at `ayeaye model pull`,
-    // after the download, which is the worst place to find out.
-    #[test]
-    fn every_model_in_the_catalogue_is_one_this_build_can_run() {
-        for entry in CATALOGUE {
-            let parsed =
-                ModelId::parse(entry.id).unwrap_or_else(|why| panic!("{}: {why}", entry.id));
-            assert_eq!(parsed.to_string(), entry.id, "{} round-trips", entry.id);
-            assert!(!entry.words.is_empty(), "{} says nothing", entry.id);
-            // Whisper is the architecture the allowlist admits, and every entry
-            // here is a Whisper repository.
-            assert!(
-                architecture::SUPPORTED
-                    .iter()
-                    .any(|allowed| entry.id.contains(allowed.model_type)),
-                "{} is not an architecture this build implements",
-                entry.id
-            );
-        }
-        // And every tier that offers something offers something from this list.
-        for tier in [Tier::Lightweight, Tier::Recommended, Tier::Maximum] {
-            let offered = suggested(tier).expect("an offer");
-            assert!(CATALOGUE.contains(offered));
-            assert!(
-                offered.tier <= tier,
-                "{} needs a bigger machine than the tier it is offered to",
-                offered.id
-            );
-        }
-    }
-
     // AYEAYE-62 — the two acts with a consequence, and the three without. This
     // is the answer to the milestone's load-bearing unknown, and it is asserted
     // rather than left in a comment.
     #[test]
     fn exactly_two_steps_have_a_consequence_worth_asking_about() {
-        assert_eq!(
-            Step::FetchModel(id("openai/whisper-tiny.en")).consequence(),
-            Some(Consequence::Network),
-        );
+        assert_eq!(Step::ChooseModels.consequence(), Some(Consequence::Network),);
         assert_eq!(
             Step::EnableService.consequence(),
             Some(Consequence::RunsAtLogin)
@@ -494,7 +325,7 @@ mod tests {
             vec![
                 Step::MintKey,
                 Step::WriteSettings,
-                Step::FetchModel(id("openai/whisper-large-v3-turbo")),
+                Step::ChooseModels,
                 Step::InstallService,
                 Step::EnableService,
             ]
@@ -515,13 +346,7 @@ mod tests {
             vec![Step::MintKey, Step::WriteSettings, Step::InstallService]
         );
         assert!(!made.consequential());
-        assert_eq!(
-            made.declined,
-            vec![
-                Step::FetchModel(id("openai/whisper-large-v3-turbo")),
-                Step::EnableService
-            ]
-        );
+        assert_eq!(made.declined, vec![Step::ChooseModels, Step::EnableService]);
         for step in &made.declined {
             let by_hand = step.by_hand().expect("a way to take it later");
             assert!(by_hand.starts_with("ayeaye "), "{by_hand}");
@@ -530,14 +355,10 @@ mod tests {
 
     // AYEAYE-62 — the acceptance criterion: re-runnable, and does not damage an
     // existing install. A key already here is kept, because a bookmark already on
-    // somebody's phone is logged in with it; a model already in the store is not
-    // fetched again.
+    // somebody's phone is logged in with it.
     #[test]
-    fn a_second_run_keeps_the_key_and_does_not_fetch_what_is_already_here() {
-        let already = Existing {
-            key: true,
-            models: vec![id("openai/whisper-large-v3-turbo")],
-        };
+    fn a_second_run_keeps_the_key() {
+        let already = Existing { key: true };
         let made = plan(
             &roomy(),
             true,
@@ -548,13 +369,6 @@ mod tests {
             },
         );
         assert!(!made.steps.contains(&Step::MintKey), "the key is kept");
-        assert!(
-            !made
-                .steps
-                .iter()
-                .any(|step| matches!(step, Step::FetchModel(_))),
-            "it is already here"
-        );
         assert!(made.declined.is_empty(), "and nothing is owed either");
         // The definition is still written every time: service::plan_install
         // compares it and leaves an identical one alone, which is the difference
@@ -566,6 +380,7 @@ mod tests {
             made.steps,
             vec![
                 Step::WriteSettings,
+                Step::ChooseModels,
                 Step::InstallService,
                 Step::EnableService
             ]
@@ -595,76 +410,6 @@ mod tests {
         assert!(made.steps.contains(&Step::WriteSettings));
     }
 
-    // AYEAYE-62 — a machine too small for any model is not offered one, and that
-    // is not a failure: typing to your agents is the whole product working.
-    #[test]
-    fn a_machine_with_no_room_is_offered_no_model_at_all() {
-        let tiny = a_machine(Probes {
-            os_release: Some(fixture!("os-release/debian-12")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            container_marker: true,
-            cgroup_memory_max: Some(fixture!("cgroup/memory-max-1g")),
-            cgroup_cpu_max: Some(fixture!("cgroup/cpu-max-two-cores")),
-            ..Probes::default()
-        });
-        assert_eq!(tiny.tier(), Tier::TextOnly);
-        let made = plan(
-            &tiny,
-            true,
-            &Existing::default(),
-            &Choices {
-                consent: Consent::all(),
-                ..Choices::default()
-            },
-        );
-        assert!(
-            !made
-                .steps
-                .iter()
-                .any(|step| matches!(step, Step::FetchModel(_)))
-        );
-        assert!(made.declined.is_empty());
-    }
-
-    // AYEAYE-62 — a model named on the command line is taken as named and is
-    // never checked against the tier. The shell warns and then allows exactly
-    // this: an explicit override is not a silent one, and somebody who typed the
-    // id has made a decision setup has no business reversing.
-    #[test]
-    fn a_named_model_is_not_overruled_by_the_tier() {
-        let tiny = a_machine(Probes {
-            os_release: Some(fixture!("os-release/debian-12")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            container_marker: true,
-            cgroup_memory_max: Some(fixture!("cgroup/memory-max-1g")),
-            cgroup_cpu_max: Some(fixture!("cgroup/cpu-max-two-cores")),
-            ..Probes::default()
-        });
-        assert_eq!(tiny.tier(), Tier::TextOnly, "it would offer nothing");
-        let made = plan(
-            &tiny,
-            true,
-            &Existing::default(),
-            &Choices {
-                consent: Consent::all(),
-                model: Wanted::Named(id("openai/whisper-large-v3-turbo")),
-                ..Choices::default()
-            },
-        );
-        assert!(
-            made.steps
-                .contains(&Step::FetchModel(id("openai/whisper-large-v3-turbo")))
-        );
-    }
-
     // AYEAYE-62 — and asking for no model, or no service, is taken as meant.
     #[test]
     fn asking_for_less_gets_less() {
@@ -675,7 +420,7 @@ mod tests {
             &Choices {
                 consent: Consent::all(),
                 service: false,
-                model: Wanted::None,
+                models: false,
             },
         );
         assert_eq!(made.steps, vec![Step::MintKey, Step::WriteSettings]);
@@ -700,12 +445,7 @@ mod tests {
                 ..Choices::default()
             },
         );
-        assert!(
-            network_only
-                .steps
-                .iter()
-                .any(|step| matches!(step, Step::FetchModel(_)))
-        );
+        assert!(network_only.steps.contains(&Step::ChooseModels));
         assert_eq!(network_only.declined, vec![Step::EnableService]);
 
         let service_only = plan(
@@ -721,10 +461,7 @@ mod tests {
             },
         );
         assert!(service_only.steps.contains(&Step::EnableService));
-        assert_eq!(
-            service_only.declined,
-            vec![Step::FetchModel(id("openai/whisper-large-v3-turbo"))]
-        );
+        assert_eq!(service_only.declined, vec![Step::ChooseModels]);
     }
 
     // AYEAYE-62 — the key goes on the end of a URL, so it has to survive being
@@ -763,7 +500,7 @@ mod tests {
         for step in [
             Step::MintKey,
             Step::WriteSettings,
-            Step::FetchModel(id("openai/whisper-tiny.en")),
+            Step::ChooseModels,
             Step::InstallService,
             Step::EnableService,
         ] {
@@ -774,11 +511,9 @@ mod tests {
                 "{said:?} is a clause in a list, not a sentence on its own"
             );
         }
-        assert!(
-            Step::FetchModel(id("openai/whisper-tiny.en"))
-                .describe()
-                .contains("openai/whisper-tiny.en"),
-            "a download that does not name what it downloads is not consent"
+        assert_eq!(
+            Step::ChooseModels.by_hand().as_deref(),
+            Some("ayeaye model choose")
         );
     }
 }
