@@ -18,9 +18,9 @@
 //! daemon serves without it, and only acquiring needs it.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use ayeaye_core::cleanup::{Policy as CleanupPolicy, PolicyError};
@@ -32,6 +32,7 @@ use ayeaye_core::model::{Architecture, ModelId, Role, Unsupported, architecture}
 use ayeaye_core::model::{CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE};
 use ayeaye_infer::language::model::{
     TOKENIZER_FILE as CLEANUP_TOKENIZER_FILE, WEIGHTS_FILE as CLEANUP_WEIGHTS_FILE,
+    architecture as gguf_architecture,
 };
 use ayeaye_infer::{LanguageError, LanguageSlot, SpeechError, SpeechSlot};
 
@@ -89,11 +90,35 @@ impl Curl {
 
 impl Fetcher for Curl {
     fn get(&self, url: &str, into: &Path) -> Result<(), String> {
-        let argv = Curl::argv(url, into);
-        let ran = Command::new(&argv[0])
-            .args(&argv[1..])
-            .output()
+        let mut argv = Curl::argv(url, into);
+        let token = hf_token()?;
+        if token.is_some() {
+            let before_separator = argv.len() - 2;
+            argv.splice(
+                before_separator..before_separator,
+                ["--config".to_string(), "-".to_string()],
+            );
+        }
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        if token.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|why| format!("could not run curl: {why}"))?;
+        if let Some(token) = token {
+            writeln!(
+                child.stdin.take().expect("piped stdin"),
+                "header = \"Authorization: Bearer {token}\""
+            )
+            .map_err(|why| format!("could not authorize curl: {why}"))?;
+        }
+        let ran = child
+            .wait_with_output()
+            .map_err(|why| format!("could not wait for curl: {why}"))?;
         if ran.status.success() {
             return Ok(());
         }
@@ -106,6 +131,28 @@ impl Fetcher for Curl {
             said
         })
     }
+}
+
+fn hf_token() -> Result<Option<String>, String> {
+    let token = std::env::var("HF_TOKEN").ok().or_else(|| {
+        let home = std::env::var_os("HF_HOME").map(PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface"))
+        })?;
+        std::fs::read_to_string(home.join("token")).ok()
+    });
+    let token = token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    if token.as_deref().is_some_and(|token| {
+        !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        return Err(
+            "HF_TOKEN or the Hugging Face CLI token file contains invalid characters".to_string(),
+        );
+    }
+    Ok(token)
 }
 
 /// Why a model could not be acquired.
@@ -153,7 +200,7 @@ pub struct Pulled {
     /// Where its files are.
     pub dir: PathBuf,
     /// What it turned out to be.
-    pub architecture: Architecture,
+    pub architecture: String,
     /// How much was fetched, in bytes.
     pub bytes: u64,
 }
@@ -215,7 +262,10 @@ fn fetch_all(
     staging: &Path,
     hub_host: &str,
     id: &ModelId,
-) -> Result<(Architecture, u64), PullError> {
+) -> Result<(String, u64), PullError> {
+    if let Some(cleanup) = cleanup_plan(fetcher, staging, hub_host, id)? {
+        return fetch_cleanup(fetcher, staging, hub_host, id, cleanup);
+    }
     let mut architecture = None;
     let mut bytes = 0u64;
 
@@ -224,7 +274,12 @@ fn fetch_all(
         let into = staging.join(wanted.file);
         fetcher
             .get(&url, &into)
-            .map_err(|why| PullError::Fetch { url, why })?;
+            .map_err(|why| PullError::Fetch {
+                url,
+                why: format!(
+                    "{why}. The repository may be gated; provide HF_TOKEN or the standard Hugging Face CLI token file"
+                ),
+            })?;
 
         let contents = std::fs::read(&into).map_err(|why| PullError::Disk {
             what: format!("read back {}", into.display()),
@@ -242,6 +297,122 @@ fn fetch_all(
     // architecture, and a pull that skipped the whole point of itself must not
     // quietly succeed.
     let architecture = architecture.ok_or(PullError::Unsupported(Unsupported { found: None }))?;
+    Ok((architecture.hf_name().to_string(), bytes))
+}
+
+struct CleanupPlan {
+    weights: String,
+    base: ModelId,
+}
+
+fn cleanup_plan(
+    fetcher: &impl Fetcher,
+    staging: &Path,
+    hub_host: &str,
+    id: &ModelId,
+) -> Result<Option<CleanupPlan>, PullError> {
+    let url = format!(
+        "{}/api/models/{}/{}/revision/{}",
+        hub_host.trim_end_matches('/'),
+        id.owner(),
+        id.name(),
+        id.revision()
+    );
+    let file = staging.join(".hub.json");
+    if fetcher.get(&url, &file).is_err() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&file).map_err(|why| PullError::Disk {
+        what: format!("read back {}", file.display()),
+        why: why.to_string(),
+    })?;
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).map_err(|why| {
+        PullError::Unusable(Unusable::Malformed {
+            file: "Hub metadata".to_string(),
+            why: why.to_string(),
+        })
+    })?;
+    let mut candidates: Vec<&str> = metadata["siblings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file["rfilename"].as_str())
+        .filter(|file| file.ends_with(".gguf") && !file.contains('/') && !file.contains("-of-"))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    candidates.sort_unstable_by_key(|file| (!file.to_ascii_uppercase().contains("Q4_K_M"), *file));
+    let base = metadata["cardData"]["base_model"]
+        .as_str()
+        .or_else(|| {
+            metadata["cardData"]["base_model"]
+                .as_array()?
+                .first()?
+                .as_str()
+        })
+        .ok_or_else(|| {
+            PullError::Unusable(Unusable::Malformed {
+                file: "Hub metadata".to_string(),
+                why: "names no base_model for the tokenizer".to_string(),
+            })
+        })?;
+    let base = ModelId::parse(base).map_err(|why| {
+        PullError::Unusable(Unusable::Malformed {
+            file: "Hub metadata".to_string(),
+            why: format!("has an invalid base_model: {why}"),
+        })
+    })?;
+    Ok(Some(CleanupPlan {
+        weights: candidates[0].to_string(),
+        base,
+    }))
+}
+
+fn fetch_cleanup(
+    fetcher: &impl Fetcher,
+    staging: &Path,
+    hub_host: &str,
+    id: &ModelId,
+    plan: CleanupPlan,
+) -> Result<(String, u64), PullError> {
+    let weights_url = hub::file_url(hub_host, id, &plan.weights);
+    let weights = staging.join(CLEANUP_WEIGHTS_FILE);
+    fetcher
+        .get(&weights_url, &weights)
+        .map_err(|why| PullError::Fetch {
+            url: weights_url,
+            why,
+        })?;
+    let architecture = gguf_architecture(&weights).map_err(|why| {
+        PullError::Unusable(Unusable::Malformed {
+            file: CLEANUP_WEIGHTS_FILE.to_string(),
+            why: why.to_string(),
+        })
+    })?;
+    let tokenizer_wanted = Wanted {
+        file: CLEANUP_TOKENIZER_FILE,
+        decides: false,
+    };
+    let tokenizer_url = hub::url(hub_host, &plan.base, &tokenizer_wanted);
+    let tokenizer = staging.join(CLEANUP_TOKENIZER_FILE);
+    fetcher.get(&tokenizer_url, &tokenizer).map_err(|why| PullError::Fetch {
+        url: tokenizer_url,
+        why: format!("{why}. The base repository may be gated; provide HF_TOKEN or the standard Hugging Face CLI token file"),
+    })?;
+    let tokenizer_bytes = std::fs::read(&tokenizer).map_err(|why| PullError::Disk {
+        what: format!("read back {}", tokenizer.display()),
+        why: why.to_string(),
+    })?;
+    verify::check(CLEANUP_TOKENIZER_FILE, &tokenizer_bytes).map_err(PullError::Unusable)?;
+    let bytes = std::fs::metadata(&weights)
+        .map_err(|why| PullError::Disk {
+            what: format!("inspect {}", weights.display()),
+            why: why.to_string(),
+        })?
+        .len()
+        + tokenizer_bytes.len() as u64;
+    let _ = std::fs::remove_file(staging.join(".hub.json"));
     Ok((architecture, bytes))
 }
 
@@ -803,6 +974,106 @@ mod tests {
         }
     }
 
+    fn gguf(architecture: &str) -> Vec<u8> {
+        let key = b"general.architecture";
+        let value = architecture.as_bytes();
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    struct CleanupHub {
+        metadata: Vec<u8>,
+        architecture: &'static str,
+        asked: RefCell<Vec<String>>,
+    }
+
+    struct Refuses;
+
+    impl Fetcher for Refuses {
+        fn get(&self, _: &str, _: &Path) -> Result<(), String> {
+            Err("HTTP 401".to_string())
+        }
+    }
+
+    impl Fetcher for CleanupHub {
+        fn get(&self, url: &str, into: &Path) -> Result<(), String> {
+            self.asked.borrow_mut().push(url.to_string());
+            let bytes = if url.contains("/api/models/") {
+                self.metadata.clone()
+            } else if url.ends_with("tokenizer.json") {
+                br#"{"model":{"vocab":{}}}"#.to_vec()
+            } else if url.ends_with(".gguf") {
+                gguf(self.architecture)
+            } else {
+                return Err(format!("nothing here answers {url}"));
+            };
+            std::fs::write(into, bytes).map_err(|why| why.to_string())
+        }
+    }
+
+    #[test]
+    fn a_gguf_repository_pulls_one_quantization_and_its_base_tokenizer() {
+        let scratch = Scratch::named("cleanup-pull");
+        let hub = CleanupHub {
+            metadata: br#"{"siblings":[{"rfilename":"model-Q8_0-00001-of-00002.gguf"},{"rfilename":"model-Q8_0-00002-of-00002.gguf"},{"rfilename":"model-Q5_K_M.gguf"},{"rfilename":"model-Q4_K_M.gguf"}],"cardData":{"base_model":"Qwen/Qwen2.5-1.5B-Instruct"}}"#.to_vec(),
+            architecture: "qwen2",
+            asked: RefCell::new(Vec::new()),
+        };
+        let id = ModelId::parse("bartowski/Qwen2.5-GGUF").expect("an id");
+
+        let pulled = pull(&hub, &scratch.0, "https://hub.test", &id).expect("cleanup pull");
+
+        assert!(pulled.dir.join("model.gguf").is_file());
+        assert!(pulled.dir.join("tokenizer.json").is_file());
+        assert_eq!(
+            hub.asked.borrow().as_slice(),
+            [
+                "https://hub.test/api/models/bartowski/Qwen2.5-GGUF/revision/main",
+                "https://hub.test/bartowski/Qwen2.5-GGUF/resolve/main/model-Q4_K_M.gguf",
+                "https://hub.test/Qwen/Qwen2.5-1.5B-Instruct/resolve/main/tokenizer.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unsupported_gguf_architecture_never_replaces_the_working_model() {
+        let scratch = Scratch::named("cleanup-unsupported");
+        let id = ModelId::parse("someone/model-GGUF").expect("an id");
+        let dir = scratch.0.join(id.relative_dir());
+        std::fs::create_dir_all(&dir).expect("old model");
+        std::fs::write(dir.join("model.gguf"), b"working").expect("old weights");
+        let hub = CleanupHub {
+            metadata: br#"{"siblings":[{"rfilename":"model.gguf"}],"cardData":{"base_model":"someone/model"}}"#.to_vec(),
+            architecture: "gemma",
+            asked: RefCell::new(Vec::new()),
+        };
+
+        let error = pull(&hub, &scratch.0, "https://hub.test", &id).unwrap_err();
+
+        assert!(error.to_string().contains("gemma"), "{error}");
+        assert_eq!(std::fs::read(dir.join("model.gguf")).unwrap(), b"working");
+        assert_eq!(hub.asked.borrow().len(), 2, "tokenizer must not be fetched");
+    }
+
+    #[test]
+    fn a_gated_repository_names_both_supported_token_sources() {
+        let scratch = Scratch::named("gated");
+        let id = ModelId::parse("private/model").expect("an id");
+        let error = pull(&Refuses, &scratch.0, "https://hub.test", &id).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("gated"), "{message}");
+        assert!(message.contains("HF_TOKEN"), "{message}");
+        assert!(message.contains("CLI token file"), "{message}");
+    }
+
     /// A slot that records what it is holding, and how much at once.
     ///
     /// `peak` is the assertion this exists for: the acceptance criterion is
@@ -940,7 +1211,10 @@ mod tests {
 
         // The hour-later case: resident, swept idle, wanted again.
         assert!(residents.ensure(Some(&tiny)).expect("it should load again"));
-        assert!(residents.sweep(Duration::from_secs(600)), "swept for idleness");
+        assert!(
+            residents.sweep(Duration::from_secs(600)),
+            "swept for idleness"
+        );
         assert!(
             residents.ensure(Some(&tiny)).expect("the late load"),
             "a load after a sweep is a load, which is what lets the daemon \
@@ -1020,10 +1294,10 @@ mod tests {
             "{refused}"
         );
         assert_eq!(
-            hub.urls(),
-            vec!["https://hub.test/meta-llama/Llama-3.2-1B/resolve/main/config.json"],
-            "only the small file that decides may be fetched before the judgement"
+            hub.urls().last().unwrap(),
+            "https://hub.test/meta-llama/Llama-3.2-1B/resolve/main/config.json"
         );
+        assert!(hub.urls().iter().all(|url| !url.ends_with(WEIGHTS_FILE)));
         // And nothing is left on disk for a later run to mistake for a model.
         assert_eq!(installed(&scratch.0), Vec::new());
         assert!(!scratch.0.join(id.relative_dir()).exists());
@@ -1046,7 +1320,7 @@ mod tests {
         for file in [CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE] {
             assert!(pulled.dir.join(file).is_file(), "{file} is missing");
         }
-        assert_eq!(hub.urls().len(), 3);
+        assert_eq!(hub.urls().len(), 4);
         assert_eq!(installed(&scratch.0), vec![id.clone()]);
 
         // And it is findable and removable by the same id it was asked for.

@@ -307,7 +307,7 @@ fn model_verb(args: &[String]) -> ExitCode {
                             "{} is in {} ({}, {})",
                             pulled.id,
                             pulled.dir.display(),
-                            pulled.architecture.hf_name(),
+                            pulled.architecture,
                             human(pulled.bytes)
                         );
                         ExitCode::SUCCESS

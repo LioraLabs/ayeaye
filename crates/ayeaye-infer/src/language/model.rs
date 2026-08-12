@@ -50,6 +50,29 @@ pub const SUPPORTED: &[&str] = &["llama", "qwen2"];
 /// The GGUF metadata key naming the architecture.
 const ARCHITECTURE_KEY: &str = "general.architecture";
 
+/// Read only the GGUF header and return an architecture this build can load.
+pub fn architecture(path: &Path) -> Result<String, LanguageError> {
+    let mut file = std::fs::File::open(path).map_err(|e| LanguageError::read(path, e))?;
+    let content =
+        gguf_file::Content::read(&mut file).map_err(|e| LanguageError::malformed(path, e))?;
+    let found = content
+        .metadata
+        .get(ARCHITECTURE_KEY)
+        .and_then(|value| value.to_string().ok())
+        .cloned()
+        .ok_or_else(|| {
+            LanguageError::malformed(
+                path,
+                format!("no {ARCHITECTURE_KEY} in the file's metadata"),
+            )
+        })?;
+    if SUPPORTED.contains(&found.as_str()) {
+        Ok(found)
+    } else {
+        Err(LanguageError::UnsupportedArchitecture { found })
+    }
+}
+
 /// The GGUF metadata key naming the token that ends a generation.
 const EOS_KEY: &str = "tokenizer.ggml.eos_token_id";
 
