@@ -1048,10 +1048,18 @@ fn choose_with(
     if let Some(parent) = config_file.parent() {
         std::fs::create_dir_all(parent).map_err(disk(format!("create {}", parent.display())))?;
     }
-    let before = std::fs::read_to_string(config_file).unwrap_or_default();
+    let before = match std::fs::read_to_string(config_file) {
+        Ok(text) => text,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(why) => return Err(disk(format!("read {}", config_file.display()))(why)),
+    };
     let after = settings::upsert(&before, key, value);
     let temporary = config_file.with_extension(format!("new-{}", std::process::id()));
-    std::fs::write(&temporary, after).map_err(disk(format!("write {}", temporary.display())))?;
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(disk(format!("write {}", temporary.display())))?;
+    file.write_all(after.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(disk(format!("write {}", temporary.display())))?;
     let result = rename(&temporary, config_file)
         .map_err(disk(format!("replace {}", config_file.display())));
     if result.is_err() {
@@ -1080,11 +1088,10 @@ impl Smoke for RealSmoke {
         use base64::Engine;
         let selection = self.selection.clone();
         let cleanup = self.cleanup.clone();
-        let dir = dir.to_path_buf();
-        let output = bounded(Duration::from_secs(30), role, move || { Ok(match role {
+        let output = match role {
             Role::Speech => {
                 let mut slot = SpeechSlot::on(selection);
-                slot.load(&dir).map_err(|why| why.to_string())?;
+                slot.load(dir).map_err(|why| why.to_string())?;
                 let wav = base64::engine::general_purpose::STANDARD
                     .decode(include_str!("smoke.wav.b64").trim()).map_err(|why| why.to_string())?;
                 let audio = ayeaye_core::audio::from_wav(&wav).map_err(|why| why.to_string())?;
@@ -1092,26 +1099,15 @@ impl Smoke for RealSmoke {
             }
             Role::Cleanup => {
                 let mut slot = LanguageSlot::on(selection);
-                slot.load(&dir).map_err(|why| why.to_string())?;
+                slot.load(dir).map_err(|why| why.to_string())?;
                 let mut policy = cleanup;
                 policy.max_new_tokens = policy.max_new_tokens.min(32);
                 slot.rewrite("um run the tests", &policy).map_err(|why| why.to_string())?
             }
-        }) })?;
+        };
         (!output.trim().is_empty()).then_some(output)
             .ok_or_else(|| format!("{role} smoke produced no output"))
     }
-}
-
-fn bounded(
-    limit: Duration,
-    role: Role,
-    work: impl FnOnce() -> Result<String, String> + Send + 'static,
-) -> Result<String, String> {
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || send.send(work()).ok());
-    receive.recv_timeout(limit)
-        .map_err(|_| format!("{role} smoke exceeded {} seconds", limit.as_secs_f32()))?
 }
 
 pub fn select_staged(
@@ -1340,7 +1336,7 @@ mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
         installed, pull, remove, search, search_response, select_staged, Smoke,
-        bounded, choose_with, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
+        choose_with, RealSmoke, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
     };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, Role, TOKENIZER_FILE, WEIGHTS_FILE};
 
@@ -1541,17 +1537,21 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_spoken_sample_and_smoke_deadline_are_real() {
+    fn the_bundled_spoken_sample_is_subsecond_and_real_smoke_loads_both_roles() {
         use base64::Engine;
         let wav = base64::engine::general_purpose::STANDARD
             .decode(include_str!("smoke.wav.b64").trim()).unwrap();
         let audio = ayeaye_core::audio::from_wav(&wav).unwrap();
         assert!(audio.duration_secs() < 1.0);
-        let error = bounded(Duration::from_millis(1), Role::Speech, || {
-            std::thread::sleep(Duration::from_millis(20));
-            Ok("too late".to_string())
-        }).unwrap_err();
-        assert!(error.contains("exceeded"), "{error}");
+
+        let scratch = Scratch::named("real-smoke-loads");
+        let selection = ayeaye_infer::backend::choose(ayeaye_infer::Backend::Cpu,
+            |_| ayeaye_infer::backend::open(ayeaye_infer::Backend::Cpu));
+        let mut smoke = RealSmoke { selection, cleanup: super::CleanupPolicy::default() };
+        for role in [Role::Speech, Role::Cleanup] {
+            let error = smoke.run(role, &scratch.0).unwrap_err();
+            assert!(error.contains("model"), "{role}: {error}");
+        }
     }
 
     #[test]
@@ -1567,6 +1567,12 @@ mod tests {
 
         assert!(error.to_string().contains("disk stopped"));
         assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+
+        let unreadable = scratch.0.join("directory-not-a-file");
+        std::fs::create_dir(&unreadable).unwrap();
+        let error = choose_with(&unreadable, super::settings::SPEECH_MODEL,
+            "new/model@pinned", |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("read"), "{error}");
     }
 
     /// A safetensors file of the smallest shape that is a real one.
