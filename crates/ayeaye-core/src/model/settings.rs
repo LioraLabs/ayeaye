@@ -271,6 +271,22 @@ pub fn upsert(text: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// Remove every occurrence of one setting, leaving everything else in place.
+pub fn remove(text: &str, key: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if parse_env_file(line)
+            .first()
+            .is_some_and(|(name, _)| name == key)
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Quote a value that would not survive the round trip unquoted.
 fn quote_if_needed(value: &str) -> String {
     let plain = !value.is_empty()

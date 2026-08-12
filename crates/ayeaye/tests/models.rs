@@ -197,6 +197,20 @@ fn use_selects_only_installed_models_for_their_inspected_role() {
 }
 
 #[test]
+fn choose_refuses_without_a_terminal_and_names_the_scripted_path() {
+    let scratch = Scratch::named("choose-no-tty");
+    let (code, _, err) = ayeaye(
+        &scratch.0,
+        "file:///unused",
+        &["model", "choose", "speech"],
+    );
+    assert_eq!(code, 1);
+    for command in ["model search", "model pull", "model use"] {
+        assert!(err.contains(command), "{err:?}");
+    }
+}
+
+#[test]
 fn local_models_are_validated_imported_once_and_removed_uniformly() {
     let scratch = Scratch::named("add");
     let source = scratch.0.join("my-whisper");

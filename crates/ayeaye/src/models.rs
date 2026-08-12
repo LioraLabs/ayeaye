@@ -1155,6 +1155,23 @@ pub fn select_staged(
     role: Role,
     given: &str,
 ) -> Result<Selected, String> {
+    let selected = stage(fetcher, smoke, store, hub_host, role, given)?;
+    let key = match role {
+        Role::Speech => settings::SPEECH_MODEL,
+        Role::Cleanup => settings::CLEANUP_MODEL,
+    };
+    choose(config_file, key, &selected.id.to_string()).map_err(|why| why.to_string())?;
+    Ok(selected)
+}
+
+fn stage(
+    fetcher: &impl Fetcher,
+    smoke: &mut impl Smoke,
+    store: &Path,
+    hub_host: &str,
+    role: Role,
+    given: &str,
+) -> Result<Selected, String> {
     let requested = ModelId::parse(given).map_err(|why| why.to_string())?;
     let id = if given.contains('@') {
         requested
@@ -1187,12 +1204,135 @@ pub fn select_staged(
     if result.trim().is_empty() {
         return Err(format!("{role} smoke produced no output"));
     }
-    let key = match role {
-        Role::Speech => settings::SPEECH_MODEL,
-        Role::Cleanup => settings::CLEANUP_MODEL,
-    };
-    choose(config_file, key, &id.to_string()).map_err(|why| why.to_string())?;
     Ok(Selected { id, smoke: result })
+}
+
+pub struct Interactive<'a> {
+    pub store: &'a Path,
+    pub config_file: &'a Path,
+    pub hub_host: &'a str,
+    pub limits: SearchLimits,
+    pub role: Option<Role>,
+}
+
+fn replace_config(config_file: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = config_file.parent() {
+        std::fs::create_dir_all(parent).map_err(|why| why.to_string())?;
+    }
+    let temporary = config_file.with_extension(format!("restore-{}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary).map_err(|why| why.to_string())?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|why| why.to_string())?;
+        std::fs::rename(&temporary, config_file).map_err(|why| why.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[derive(Debug)]
+pub struct InteractiveResult {
+    pub selected: Vec<Selected>,
+    pub cleanup_declined: bool,
+}
+
+pub fn choose_interactive(
+    fetcher: &impl Fetcher,
+    smoke: &mut impl Smoke,
+    ask: &impl crate::setup::Ask,
+    run: Interactive<'_>,
+) -> Result<InteractiveResult, String> {
+    let Interactive {
+        store,
+        config_file,
+        hub_host,
+        mut limits,
+        role,
+    } = run;
+    let before = match std::fs::read_to_string(config_file) {
+        Ok(text) => text,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(why) => return Err(format!("could not read {}: {why}", config_file.display())),
+    };
+    let paired = role.is_none();
+    let mut selected = Vec::new();
+    let mut cleanup_declined = false;
+    let roles: &[Role] = match role {
+        Some(Role::Speech) => &[Role::Speech],
+        Some(Role::Cleanup) => &[Role::Cleanup],
+        None => &[Role::Speech, Role::Cleanup],
+    };
+    for &role in roles {
+        if role == Role::Cleanup
+            && paired
+            && !ask.confirm(
+                "add cleanup too? Without it, dictation uses raw transcripts.",
+                false,
+            )
+        {
+            cleanup_declined = true;
+            break;
+        }
+            let found: Vec<_> = search(fetcher, hub_host, &role.to_string(), limits)?
+                .into_iter()
+                .filter(|model| model.role == role)
+                .collect();
+            if found.is_empty() {
+                return Err(format!("no compatible {role} models fit this machine"));
+            }
+            let labels: Vec<_> = found
+                .iter()
+                .map(|model| {
+                    format!(
+                        "{}  {}  {} bytes  fits ({} bytes free)  {}{}",
+                        model.id,
+                        model.role,
+                        model.bytes,
+                        model.headroom,
+                        model.evidence,
+                        if model.gated { "  gated" } else { "" },
+                    )
+                })
+                .collect();
+            let choice = ask
+                .choose(&format!("choose a {role} model:"), &labels)
+                .ok_or_else(|| format!("no {role} model chosen"))?;
+            let candidate = found
+                .get(choice)
+                .ok_or_else(|| format!("no {role} model chosen"))?;
+            let outcome = stage(
+                fetcher,
+                smoke,
+                store,
+                hub_host,
+                role,
+                &candidate.id,
+            )?;
+            match role {
+                Role::Speech => limits.speech_bytes = candidate.bytes,
+                Role::Cleanup => limits.cleanup_bytes = candidate.bytes,
+            }
+            selected.push(outcome);
+    }
+    let mut after = before;
+    if cleanup_declined {
+        after = settings::remove(&after, settings::CLEANUP_MODEL);
+    }
+    for selected in &selected {
+        let key = match inspect(store).into_iter().find(|model| model.id == selected.id)
+            .and_then(|model| model.role.ok()) {
+            Some(Role::Speech) => settings::SPEECH_MODEL,
+            Some(Role::Cleanup) => settings::CLEANUP_MODEL,
+            None => return Err(format!("{} became unusable before selection", selected.id)),
+        };
+        after = settings::upsert(&after, key, &selected.id.to_string());
+    }
+    replace_config(config_file, &after)
+        .map_err(|why| format!("could not commit model choices: {why}; previous configuration is intact"))?;
+    Ok(InteractiveResult { selected, cleanup_declined })
 }
 
 /// A place a speech model is resident, and the thing that decides.
@@ -1373,8 +1513,8 @@ impl<S: Slot> Residents<S> {
 mod tests {
     use super::{
         Curl, Fetcher, Policy, PullError, Residents, SearchLimits, cleanup_policy, install,
-        installed, pull, remove, search, search_response, select_staged, Smoke,
-        choose_with, RealSmoke, SmokeEngine, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
+        installed, pull, remove, search, search_response, select_staged, choose_interactive, Smoke,
+        choose_with, Interactive, RealSmoke, SmokeEngine, CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE,
     };
     use ayeaye_core::model::{CONFIG_FILE, ModelId, Role, TOKENIZER_FILE, WEIGHTS_FILE};
 
@@ -1419,6 +1559,21 @@ mod tests {
         }
     }
 
+    struct Answers {
+        choices: RefCell<Vec<usize>>,
+        confirms: RefCell<Vec<bool>>,
+    }
+
+    impl crate::setup::Ask for Answers {
+        fn confirm(&self, _: &str, _: bool) -> bool {
+            self.confirms.borrow_mut().remove(0)
+        }
+
+        fn choose(&self, _: &str, _: &[String]) -> Option<usize> {
+            Some(self.choices.borrow_mut().remove(0))
+        }
+    }
+
     #[derive(Default)]
     struct ReachesInference { speech: bool, cleanup: bool }
     impl SmokeEngine for ReachesInference {
@@ -1441,7 +1596,9 @@ mod tests {
 
     impl Fetcher for RecordedHub {
         fn get(&self, url: &str, into: &Path) -> Result<(), String> {
-            let response = if url.contains("/api/models/good/speech?") {
+            let response = if url.ends_with("/api/models/good/speech/revision/main") {
+                r#"{"sha":"deadbeef"}"#
+            } else if url.contains("/api/models/good/speech?") {
                 if !url.contains("files_metadata=true") {
                     return Err("per-repository metadata did not request file sizes".to_string());
                 }
@@ -1496,6 +1653,88 @@ mod tests {
         assert_eq!(found[1].id, "good/speech");
         assert_eq!(found[1].bytes, 320, "weights plus both required companions");
         assert!(found.iter().all(|model| model.evidence == "metadata heuristic"));
+    }
+
+    #[test]
+    fn interactive_choose_filters_the_role_and_runs_staged_selection() {
+        let scratch = Scratch::named("interactive-selection");
+        let store = scratch.0.join("state");
+        installed_speech(&store.join("models/good/speech/deadbeef"));
+        let answers = Answers {
+            choices: RefCell::new(vec![0]),
+            confirms: RefCell::new(vec![]),
+        };
+
+        let selected = choose_interactive(
+            &RecordedHub,
+            &mut Reports(Ok("heard it".into())),
+            &answers,
+            Interactive { store: &store, config_file: &scratch.0.join("env"), hub_host: "https://hub.test", limits: SearchLimits {
+                ram_bytes: 1_000,
+                disk_bytes: 1_000,
+                speech_bytes: 0,
+                cleanup_bytes: 0,
+            }, role: Some(Role::Speech) },
+        )
+        .unwrap();
+
+        assert_eq!(selected.selected.len(), 1);
+        assert_eq!(selected.selected[0].id.to_string(), "good/speech@deadbeef");
+        assert_eq!(selected.selected[0].smoke, "heard it");
+    }
+
+    #[test]
+    fn paired_choose_can_leave_cleanup_unset_and_rolls_back_on_later_failure() {
+        let scratch = Scratch::named("paired-selection");
+        let store = scratch.0.join("state");
+        installed_speech(&store.join("models/good/speech/deadbeef"));
+        let config = scratch.0.join("env");
+        std::fs::write(
+            &config,
+            "# keep\nAYEAYE_CLEANUP_MODEL=old/cleanup@working\n",
+        )
+        .unwrap();
+        let limits = SearchLimits {
+            ram_bytes: 1_000,
+            disk_bytes: 1_000,
+            speech_bytes: 0,
+            cleanup_bytes: 0,
+        };
+        let decline = Answers {
+            choices: RefCell::new(vec![0]),
+            confirms: RefCell::new(vec![false]),
+        };
+        let selected = choose_interactive(
+            &RecordedHub,
+            &mut Reports(Ok("heard it".into())),
+            &decline,
+            Interactive { store: &store, config_file: &config, hub_host: "https://hub.test", limits, role: None },
+        )
+        .unwrap();
+        assert_eq!(selected.selected.len(), 1);
+        assert!(selected.cleanup_declined);
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# keep\nAYEAYE_SPEECH_MODEL=good/speech@deadbeef\n"
+        );
+
+        std::fs::write(&config, "# previous\nAYEAYE_SPEECH_MODEL=old/model@working\n").unwrap();
+        let accept = Answers {
+            choices: RefCell::new(vec![0]),
+            confirms: RefCell::new(vec![true]),
+        };
+        let error = choose_interactive(
+            &RecordedHub,
+            &mut Reports(Ok("heard it".into())),
+            &accept,
+            Interactive { store: &store, config_file: &config, hub_host: "https://hub.test", limits, role: None },
+        )
+        .unwrap_err();
+        assert!(error.contains("no compatible cleanup"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# previous\nAYEAYE_SPEECH_MODEL=old/model@working\n"
+        );
     }
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};

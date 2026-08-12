@@ -83,6 +83,11 @@ impl Places {
 pub trait Ask {
     /// Ask, and take the answer. `default` is what a bare newline means.
     fn confirm(&self, question: &str, default: bool) -> bool;
+
+    /// Ask for one item from a numbered list.
+    fn choose(&self, _question: &str, _options: &[String]) -> Option<usize> {
+        None
+    }
 }
 
 /// A real terminal.
@@ -98,6 +103,20 @@ impl Ask for Tty {
             return default;
         }
         answer(&line, default)
+    }
+
+    fn choose(&self, question: &str, options: &[String]) -> Option<usize> {
+        println!("{question}");
+        for (index, option) in options.iter().enumerate() {
+            println!("  {}. {option}", index + 1);
+        }
+        print!("which one? ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).ok()?;
+        line.trim().parse::<usize>().ok()
+            .filter(|choice| (1..=options.len()).contains(choice))
+            .map(|choice| choice - 1)
     }
 }
 
