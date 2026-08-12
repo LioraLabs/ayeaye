@@ -1,55 +1,102 @@
-# ayeaye
+<p align="center"><img src="assets/readme/mascot.png" width="180" alt="ayeaye"></p>
 
-See every local Claude Code and Codex session from one phone-sized page, open
-their transcripts, answer prompts, start agents, and dictate into tmux panes.
+<h1 align="center">ayeaye</h1>
 
-The server is one Rust binary. It contains the web app, setup, configuration,
-service management, process inspection, speech transcription, and cleanup
-inference. The server needs no Python interpreter, C++ inference runtime, or
-files beside the executable.
+<p align="center"><b>Your coding agents, in your pocket.</b></p>
+
+ayeaye puts every local Claude Code and Codex session on one phone-sized page.
+See who is working, who is waiting, and who delegated. Open a live terminal or
+read the clean transcript. Answer prompts, start agents, and dictate replies
+without returning to your desk.
+
+<p align="center"><img src="assets/readme/sessions.jpg" width="380" alt="Claude Code and Codex sessions with live status in ayeaye"></p>
+<p align="center"><sub>the whole fleet: working · waiting on you · agents working</sub></p>
+
+It is one self-contained Rust binary: web app, agent discovery, terminal
+control, transcript rendering, setup, service management, notifications, and
+local voice inference. Your sessions and transcripts stay on your machine.
 
 ## Install
 
-Linux and macOS builds are published for x86-64 and arm64:
+Linux and macOS, x86-64 and arm64:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | sh
 ```
 
-The downloader verifies the release checksum, installs `ayeaye` in
-`~/.local/bin`, then runs `ayeaye setup`. Setup writes the configuration and
-token, can install the user service, and reports anything still missing. It is
-safe to run again after an upgrade:
+The installer verifies the release, installs `ayeaye`, and runs setup. `tmux`
+is the only required runtime tool.
 
 ```sh
 ayeaye setup
 ayeaye check
 ```
 
-The only required runtime tool is `tmux`. Voice additionally needs `ffmpeg` to
-turn a recording into audio samples. A model is downloaded separately
-because the binary ships inference, not model weights:
+Setup normally installs and starts a user service. Open the address it prints,
+or run directly with `ayeaye serve`. The default is
+`http://127.0.0.1:8911`.
+
+## Run the room from your phone
+
+The sessions view derives live state from the agents and their panes—no agent
+plugin or check-in protocol required. Tap any session to move between its real
+terminal and a readable, live transcript.
+
+<p align="center"><img src="assets/readme/terminal.jpg" width="380" alt="A live Claude Code terminal controlled from a phone"></p>
+<p align="center"><sub>the real terminal: inspect it, type into it, answer prompts</sub></p>
+
+<p align="center"><img src="assets/readme/transcript.jpg" width="380" alt="A formatted Claude Code transcript on a phone"></p>
+<p align="center"><sub>the same session as a readable conversation</sub></p>
+
+From the same screen you can:
+
+- see Claude Code and Codex sessions across local tmux panes;
+- distinguish working, waiting, delegated, idle, and finished agents;
+- answer interactive prompts and send terminal keys;
+- find a project and launch a new agent there;
+- speak a reply and have local models transcribe and clean it up;
+- receive a Web Push notification when an agent needs you, then tap straight
+  into that session.
+
+## HTTPS for notifications
+
+Install ayeaye to your phone's home screen, serve it over HTTPS, then tap
+**enable notifications**. The watcher runs locally and uses Web Push only when
+an agent needs attention.
+
+The shortest HTTPS setup is [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve):
+
+```sh
+tailscale serve --bg http://127.0.0.1:8911
+```
+
+For local TLS, [Caddy](https://caddyserver.com/docs/automatic-https#local-https)
+works too:
+
+```caddyfile
+ayeaye.localhost {
+	reverse_proxy 127.0.0.1:8911
+}
+```
+
+Plain HTTP still runs the app; browsers simply refuse notifications there.
+
+## Voice
+
+Voice needs `ffmpeg` and a separately downloaded model—the binary contains the
+inference runtime, not model weights:
 
 ```sh
 ayeaye model pull openai/whisper-small.en
 ayeaye model use openai/whisper-small.en
 ```
 
-## Run
+The phone records in the web app. For dictation from another SSH client,
+`bin/voice-dictate-setup` prints the client-side setup and `bin/voice-agent`
+captures that device's microphone. Transcription and cleanup still happen
+inside ayeaye on your machine.
 
-Setup normally installs and starts a systemd user service on Linux or a launchd
-agent on macOS. To run it directly:
-
-```sh
-ayeaye serve
-```
-
-The default address is `http://127.0.0.1:8911`. Open it once as
-`http://127.0.0.1:8911/?token=<token>`; the browser stores the token locally.
-The token is in `$XDG_STATE_HOME/ayeaye/token`, or
-`~/.local/state/ayeaye/token` when `XDG_STATE_HOME` is unset.
-
-Useful commands:
+## Configuration
 
 ```text
 ayeaye setup [--yes] [--no-service] [--no-model] [--model ID]
@@ -59,60 +106,18 @@ ayeaye model <ls|pull ID|use ID|rm ID>
 ayeaye dictate <host/pane> [client-pid]
 ```
 
-Run `ayeaye --help` for every flag and environment setting. Configuration lives
-in `$XDG_CONFIG_HOME/ayeaye/env`, or `~/.config/ayeaye/env` by default.
-Environment variables override that file; the common ones are `AYEAYE_BIND`,
-`AYEAYE_PORT`, `AYEAYE_ALLOWED_HOSTS`, and `AYEAYE_TOKEN`.
+Run `ayeaye --help` for all settings. Configuration lives at
+`~/.config/ayeaye/env` by default; the access token lives at
+`~/.local/state/ayeaye/token`. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are
+respected.
 
-## HTTPS for notifications
+## Build
 
-Browser notifications require HTTPS. A plain-HTTP install still serves the app,
-but gets no notifications. Keep ayeaye on its default local port and put either
-of these HTTPS front ends in front of it.
-
-With [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve), run:
-
-```sh
-tailscale serve --bg http://127.0.0.1:8911
-```
-
-Then open the HTTPS URL printed by `tailscale serve status`.
-
-For local TLS with [Caddy](https://caddyserver.com/docs/automatic-https#local-https),
-use this `Caddyfile`:
-
-```caddyfile
-ayeaye.localhost {
-	reverse_proxy 127.0.0.1:8911
-}
-```
-
-Run `caddy run`, then open `https://ayeaye.localhost`.
-
-## Voice from another device
-
-`bin/voice-agent` is the one deliberate exception to the server's one-binary
-shape. It records on the client device you SSH from, not on the server, and is
-therefore not installed by `ayeaye setup`. `bin/voice-dictate-setup` prints the
-client-side setup instructions. Server-side transcription and cleanup still run
-inside the `ayeaye` binary.
-
-Bind dictation in tmux with a qualified pane id:
-
-```tmux
-bind -n M-v run-shell -b "ayeaye dictate #{host}/#{pane_id} #{client_pid}"
-```
-
-## Development
-
-Rust 1.88 or newer is required to build:
+Rust 1.88 or newer:
 
 ```sh
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-`cook test` runs the same cached release gates. `cook dist` builds the source
-archive and checksums; tagged releases build the platform binaries in CI.
-
-License: MIT.
+MIT licensed.
