@@ -32,7 +32,6 @@ use ayeaye_core::model::{Architecture, ModelId, Role, Unsupported, architecture}
 use ayeaye_core::model::{CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE};
 use ayeaye_infer::language::model::{
     TOKENIZER_FILE as CLEANUP_TOKENIZER_FILE, WEIGHTS_FILE as CLEANUP_WEIGHTS_FILE,
-    architecture as gguf_architecture,
 };
 use ayeaye_infer::{LanguageError, LanguageSlot, SpeechError, SpeechSlot};
 
@@ -327,11 +326,11 @@ pub fn add(store: &Path, source: &Path) -> Result<Added, PullError> {
     })
 }
 
-fn check_cleanup_architecture(path: &Path) -> Result<(), PullError> {
+fn check_cleanup_architecture(path: &Path) -> Result<String, PullError> {
     let found = ayeaye_infer::language::model::architecture(path)
         .map_err(|why| PullError::Invalid(why.to_string()))?;
     if ayeaye_infer::language::model::SUPPORTED.contains(&found.as_str()) {
-        Ok(())
+        Ok(found)
     } else {
         Err(PullError::Invalid(format!(
             "{found:?} is not a GGUF architecture this build can run; it runs {}",
@@ -562,12 +561,7 @@ fn fetch_cleanup(
             url: weights_url,
             why,
         })?;
-    let architecture = gguf_architecture(&weights).map_err(|why| {
-        PullError::Unusable(Unusable::Malformed {
-            file: CLEANUP_WEIGHTS_FILE.to_string(),
-            why: why.to_string(),
-        })
-    })?;
+    let architecture = check_cleanup_architecture(&weights)?;
     let tokenizer_wanted = Wanted {
         file: CLEANUP_TOKENIZER_FILE,
         decides: false,
