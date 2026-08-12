@@ -1159,6 +1159,8 @@ pub fn select_staged(
     let id = if given.contains('@') {
         requested
     } else {
+        std::fs::create_dir_all(store)
+            .map_err(|why| format!("could not create {}: {why}", store.display()))?;
         let url = format!("{}/api/models/{}/revision/main", hub_host.trim_end_matches('/'), requested.repo());
         let metadata = store.join(format!(".pin-{}-{}", std::process::id(), requested.name()));
         let result = fetcher.get(&url, &metadata)
@@ -1384,6 +1386,17 @@ mod tests {
         }
     }
 
+    struct PinsThenStops;
+    impl Fetcher for PinsThenStops {
+        fn get(&self, url: &str, into: &Path) -> Result<(), String> {
+            if url.ends_with("/api/models/acme/model/revision/main") {
+                std::fs::write(into, r#"{"sha":"deadbeef"}"#).map_err(|why| why.to_string())
+            } else {
+                Err("fixture stops after pinning".to_string())
+            }
+        }
+    }
+
     struct Reports(Result<String, String>);
     impl Smoke for Reports {
         fn run(&mut self, _: Role, _: &Path) -> Result<String, String> { self.0.clone() }
@@ -1532,6 +1545,19 @@ mod tests {
         assert_eq!(selected.smoke, "heard it");
         assert_eq!(std::fs::read_to_string(&config).unwrap(),
             "AYEAYE_SPEECH_MODEL=acme/model@deadbeef\n");
+    }
+
+    #[test]
+    fn first_selection_can_pin_before_the_model_store_exists() {
+        let scratch = Scratch::named("first-staged-selection");
+        let store = scratch.0.join("missing/store");
+
+        let error = select_staged(&PinsThenStops, &mut Reports(Ok("unused".into())), &store,
+            &scratch.0.join("env"), "https://hub.test", Role::Speech, "acme/model")
+            .unwrap_err();
+
+        assert!(store.is_dir());
+        assert!(error.contains("fixture stops after pinning"), "{error}");
     }
 
     #[test]
