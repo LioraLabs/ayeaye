@@ -199,6 +199,9 @@ pub trait Fetcher {
 pub struct Curl;
 
 impl Curl {
+    const TOTAL_SECONDS: u64 = 3600;
+    const STALL_SECONDS: u64 = 30;
+
     /// The command line, as its own function so the flags are readable and so a
     /// test can be written against them without running anything.
     ///
@@ -214,6 +217,10 @@ impl Curl {
     /// options is what makes "the URL is the last argument" actually mean the
     /// URL is data.
     pub fn argv(url: &str, into: &Path) -> Vec<String> {
+        Self::argv_with_deadlines(url, into, Self::TOTAL_SECONDS, Self::STALL_SECONDS)
+    }
+
+    fn argv_with_deadlines(url: &str, into: &Path, total: u64, stall: u64) -> Vec<String> {
         [
             "curl",
             "--fail",
@@ -222,6 +229,12 @@ impl Curl {
             "--show-error",
             "--connect-timeout",
             "30",
+            "--max-time",
+            &total.to_string(),
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            &stall.to_string(),
             "--output",
         ]
         .iter()
@@ -242,7 +255,13 @@ impl Curl {
 
 impl Fetcher for Curl {
     fn get(&self, url: &str, into: &Path) -> Result<(), String> {
-        let mut argv = Curl::argv(url, into);
+        Self::get_with_deadlines(url, into, Self::TOTAL_SECONDS, Self::STALL_SECONDS)
+    }
+}
+
+impl Curl {
+    fn get_with_deadlines(url: &str, into: &Path, total: u64, stall: u64) -> Result<(), String> {
+        let mut argv = Curl::argv_with_deadlines(url, into, total, stall);
         let authorization = hf_token()?.and_then(|token| Self::authorization(url, &token));
         if authorization.is_some() {
             let before_separator = argv.len() - 2;
@@ -2507,6 +2526,8 @@ mod tests {
         assert_eq!(argv[0], "curl");
         assert!(argv.iter().any(|arg| arg == "--fail"), "{argv:?}");
         assert!(argv.iter().any(|arg| arg == "--location"), "{argv:?}");
+        assert!(argv.windows(2).any(|pair| pair == ["--max-time", "3600"]), "{argv:?}");
+        assert!(argv.windows(2).any(|pair| pair == ["--speed-time", "30"]), "{argv:?}");
         // curl reads options at any position, not only before the first
         // non-option, so the URL is data only because `--` ends the options
         // ahead of it. Verified against the real curl: without it, a hub
@@ -2517,6 +2538,31 @@ mod tests {
             argv.last().unwrap(),
             "https://hub.test/a/b/resolve/main/config.json"
         );
+    }
+
+    #[test]
+    fn an_accepted_connection_that_stops_sending_is_bounded() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nx").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let scratch = Scratch::named("stalled-curl");
+        let started = std::time::Instant::now();
+        let error = Curl::get_with_deadlines(
+            &format!("http://{address}/metadata"),
+            &scratch.0.join("metadata"),
+            2,
+            1,
+        ).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
     }
 
     #[test]
