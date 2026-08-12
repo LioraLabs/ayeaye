@@ -271,22 +271,29 @@ fn model_verb(args: &[String]) -> ExitCode {
 
     match args.first().map(String::as_str) {
         Some("ls") => {
-            let installed = models::installed(&store);
+            let installed = models::inspect(&store);
             if installed.is_empty() {
                 println!("no models yet — `ayeaye model pull openai/whisper-small.en` gets one");
                 return ExitCode::SUCCESS;
             }
-            let chosen = settings.speech.as_ref().map(ToString::to_string);
             for model in installed {
                 // The chosen one is marked rather than listed separately: the
                 // question somebody runs this to answer is usually "is the one
                 // I configured actually here".
-                let mark = if chosen.as_deref() == Some(&model.to_string()) {
+                let chosen = match &model.role {
+                    Ok(ayeaye_core::model::Role::Speech) => settings.speech.as_ref(),
+                    Ok(ayeaye_core::model::Role::Cleanup) => settings.cleanup.as_ref(),
+                    Err(_) => None,
+                };
+                let mark = if chosen == Some(&model.id) {
                     " (in use)"
                 } else {
                     ""
                 };
-                println!("{model}{mark}");
+                match model.role {
+                    Ok(role) => println!("{}  {role}  {}{mark}", model.id, human(model.bytes)),
+                    Err(why) => println!("{}  unusable: {why}  {}", model.id, human(model.bytes)),
+                }
             }
             ExitCode::SUCCESS
         }

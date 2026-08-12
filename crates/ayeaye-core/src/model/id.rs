@@ -199,6 +199,14 @@ mod tests {
             plain.relative_dir(),
             PathBuf::from("models/openai/whisper-small.en/main")
         );
+
+        let local = ModelId::parse("local/cleanup").expect("a local model id");
+        assert_eq!(local.to_string(), "local/cleanup");
+        assert_eq!(ModelId::parse(&local.to_string()), Ok(local.clone()));
+        assert_eq!(
+            local.relative_dir(),
+            PathBuf::from("models/local/cleanup/main")
+        );
     }
 
     // AYEAYE-56 — the refusals that matter: the id names a directory under the

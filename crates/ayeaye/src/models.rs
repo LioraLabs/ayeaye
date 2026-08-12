@@ -18,6 +18,7 @@
 //! daemon serves without it, and only acquiring needs it.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -27,7 +28,11 @@ use ayeaye_core::model::hub::{self, Wanted};
 use ayeaye_core::model::residency::{self, Plan, Policy};
 use ayeaye_core::model::settings::{self, BadSetting, ModelSettings};
 use ayeaye_core::model::verify::{self, Unusable};
-use ayeaye_core::model::{Architecture, ModelId, Unsupported, architecture};
+use ayeaye_core::model::{Architecture, ModelId, Role, Unsupported, architecture};
+use ayeaye_core::model::{CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE};
+use ayeaye_infer::language::model::{
+    TOKENIZER_FILE as CLEANUP_TOKENIZER_FILE, WEIGHTS_FILE as CLEANUP_WEIGHTS_FILE,
+};
 use ayeaye_infer::{LanguageError, LanguageSlot, SpeechError, SpeechSlot};
 
 /// Something that can fetch one URL into one file.
@@ -361,6 +366,119 @@ pub fn installed(store: &Path) -> Vec<ModelId> {
     }
     found.sort();
     found
+}
+
+/// What one directory in the model store can serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledModel {
+    pub id: ModelId,
+    pub role: Result<Role, String>,
+    pub bytes: u64,
+}
+
+/// Inspect every model-shaped directory in stable ID order.
+pub fn inspect(store: &Path) -> Vec<InstalledModel> {
+    installed(store)
+        .into_iter()
+        .map(|id| {
+            let dir = store.join(id.relative_dir());
+            InstalledModel {
+                role: role(&dir),
+                bytes: directory_bytes(&dir),
+                id,
+            }
+        })
+        .collect()
+}
+
+fn role(dir: &Path) -> Result<Role, String> {
+    let speech = [CONFIG_FILE, TOKENIZER_FILE, WEIGHTS_FILE];
+    let cleanup = [CLEANUP_TOKENIZER_FILE, CLEANUP_WEIGHTS_FILE];
+    let has_speech = speech.iter().all(|file| dir.join(file).is_file());
+    let has_cleanup = cleanup.iter().all(|file| dir.join(file).is_file());
+
+    match (has_speech, has_cleanup) {
+        (true, true) => Err("matches both speech and cleanup layouts".to_string()),
+        (true, false) => {
+            valid_json(&dir.join(CONFIG_FILE))?;
+            valid_json(&dir.join(TOKENIZER_FILE))?;
+            valid_safetensors(&dir.join(WEIGHTS_FILE))?;
+            Ok(Role::Speech)
+        }
+        (false, true) => {
+            valid_json(&dir.join(CLEANUP_TOKENIZER_FILE))?;
+            valid_gguf(&dir.join(CLEANUP_WEIGHTS_FILE))?;
+            Ok(Role::Cleanup)
+        }
+        (false, false) => Err("missing a complete speech or cleanup file layout".to_string()),
+    }
+}
+
+fn prefix(path: &Path, length: usize) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(path).map_err(|why| format!("{}: {why}", path.display()))?;
+    let mut bytes = vec![0; length];
+    let read = file
+        .read(&mut bytes)
+        .map_err(|why| format!("{}: {why}", path.display()))?;
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+fn valid_json(path: &Path) -> Result<(), String> {
+    let bytes = prefix(path, 4_096)?;
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
+        Ok(())
+    } else {
+        Err(format!("{} is not a JSON object", path.display()))
+    }
+}
+
+fn valid_safetensors(path: &Path) -> Result<(), String> {
+    let bytes = prefix(path, 9)?;
+    let length = bytes
+        .get(..8)
+        .and_then(|length| length.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| format!("{} is too short for safetensors", path.display()))?;
+    let file_length = std::fs::metadata(path)
+        .map_err(|why| format!("{}: {why}", path.display()))?
+        .len();
+    if length > 0 && length <= file_length.saturating_sub(8) && bytes.get(8) == Some(&b'{') {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} has an invalid safetensors header",
+            path.display()
+        ))
+    }
+}
+
+fn valid_gguf(path: &Path) -> Result<(), String> {
+    let bytes = prefix(path, 8)?;
+    let version = bytes
+        .get(4..8)
+        .and_then(|version| version.try_into().ok())
+        .map(u32::from_le_bytes);
+    if bytes.starts_with(b"GGUF") && matches!(version, Some(2 | 3)) {
+        Ok(())
+    } else {
+        Err(format!("{} has an invalid GGUF header", path.display()))
+    }
+}
+
+fn directory_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Remove a model from the store, saying whether there was one.
