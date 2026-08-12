@@ -1030,7 +1030,13 @@ pub fn cleanup_policy(config_file: &Path) -> Result<CleanupPolicy, PolicyError> 
 /// Read, change one key, write the whole file back. Not an append: appending
 /// leaves the old value above the new one, and the file then says two things.
 pub fn choose(config_file: &Path, key: &str, value: &str) -> Result<(), PullError> {
-    choose_with(config_file, key, value, |from, to| std::fs::rename(from, to))
+    choose_with(
+        config_file,
+        key,
+        value,
+        |from, to| std::fs::rename(from, to),
+        |dir| std::fs::File::open(dir).and_then(|dir| dir.sync_all()),
+    )
 }
 
 fn choose_with(
@@ -1038,6 +1044,7 @@ fn choose_with(
     key: &str,
     value: &str,
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), PullError> {
     let disk = |what: String| {
         move |why: std::io::Error| PullError::Disk {
@@ -1063,9 +1070,11 @@ fn choose_with(
             .map_err(disk(format!("write {}", temporary.display())))?;
         rename(&temporary, config_file)
             .map_err(disk(format!("replace {}", config_file.display())))?;
-        std::fs::File::open(config_file.parent().unwrap_or(Path::new(".")))
-            .and_then(|dir| dir.sync_all())
-            .map_err(disk(format!("sync directory for {}", config_file.display())))
+        // Rename is the commit point. A directory sync is still attempted for
+        // crash durability, but a failure after commit cannot honestly be
+        // reported as though the prior selection survived.
+        let _ = sync_parent(config_file.parent().unwrap_or(Path::new(".")));
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
@@ -1607,7 +1616,7 @@ mod tests {
 
         let error = choose_with(&config, super::settings::SPEECH_MODEL, "new/model@pinned", |_, _| {
             Err(std::io::Error::other("disk stopped"))
-        }).unwrap_err();
+        }, |_| Ok(())).unwrap_err();
 
         assert!(error.to_string().contains("disk stopped"));
         assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
@@ -1615,8 +1624,13 @@ mod tests {
         let unreadable = scratch.0.join("directory-not-a-file");
         std::fs::create_dir(&unreadable).unwrap();
         let error = choose_with(&unreadable, super::settings::SPEECH_MODEL,
-            "new/model@pinned", |_, _| Ok(())).unwrap_err();
+            "new/model@pinned", |_, _| Ok(()), |_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("read"), "{error}");
+
+        choose_with(&config, super::settings::SPEECH_MODEL, "new/model@pinned",
+            |from, to| std::fs::rename(from, to),
+            |_| Err(std::io::Error::other("post-commit sync failed"))).unwrap();
+        assert!(std::fs::read_to_string(&config).unwrap().contains("new/model@pinned"));
     }
 
     /// A safetensors file of the smallest shape that is a real one.
