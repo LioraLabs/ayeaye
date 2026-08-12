@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+/// The Hub config field naming an architecture in its short form.
+pub const MODEL_TYPE_FIELD: &str = "model_type";
+
 /// An architecture this build implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
