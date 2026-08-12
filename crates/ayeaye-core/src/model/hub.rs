@@ -61,13 +61,18 @@ pub const WANTED: &[Wanted] = &[
 /// refused at [`ModelId::parse`] if they carry anything a path should not, so
 /// every part of the URL below is something this crate has already judged.
 pub fn url(host: &str, id: &ModelId, file: &Wanted) -> String {
+    file_url(host, id, file.file)
+}
+
+/// The resolve URL for a filename already validated by the caller.
+pub fn file_url(host: &str, id: &ModelId, file: &str) -> String {
     format!(
         "{}/{}/{}/resolve/{}/{}",
         host.trim_end_matches('/'),
         id.owner(),
         id.name(),
         id.revision(),
-        file.file
+        file
     )
 }
 
