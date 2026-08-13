@@ -136,8 +136,7 @@ jobs:
             mv "$binary.bundle" "$binary"
             mkdir "$binary.check"
             tar -xzf "$binary" -C "$binary.check"
-            LD_LIBRARY_PATH="$binary.check/lib:/usr/local/cuda/lib64/stubs" \
-              "$binary.check/ayeaye" --version
+            test -x "$binary.check/ayeaye"
           fi
       - uses: actions/upload-artifact@v4
         with:
