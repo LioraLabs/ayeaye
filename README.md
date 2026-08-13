@@ -83,13 +83,30 @@ Plain HTTP still runs the app; browsers simply refuse notifications there.
 
 ## Voice
 
-Voice needs `ffmpeg` and a separately downloaded model—the binary contains the
-inference runtime, not model weights:
+Voice needs `ffmpeg` and separately downloaded models—the binary contains the
+inference runtime, not model weights. Setup can search Hugging Face for models
+that fit this machine, smoke-test them, and keep the previous configuration if
+either role fails:
 
 ```sh
-ayeaye model pull openai/whisper-small.en
-ayeaye model use openai/whisper-small.en
+ayeaye model choose
 ```
+
+The same workflow is available as small, scriptable commands. Discovery is
+read-only; `add` imports models already on disk; selections are role-specific:
+
+```sh
+ayeaye model search whisper
+ayeaye model pull openai/whisper-small.en
+ayeaye model add ./model.gguf
+ayeaye model use speech openai/whisper-small.en
+ayeaye model use cleanup local/model@revision
+ayeaye model ls
+```
+
+Speech models use the supported Whisper/Safetensors layout. Cleanup models use
+a supported GGUF plus its tokenizer. Hub revisions are pinned, and downloads,
+imports, and configuration changes are staged before becoming active.
 
 The phone records in the web app. For dictation from another SSH client,
 `bin/voice-dictate-setup` prints the client-side setup and `bin/voice-agent`
@@ -99,10 +116,12 @@ inside ayeaye on your machine.
 ## Configuration
 
 ```text
-ayeaye setup [--yes] [--no-service] [--no-model] [--model ID]
+ayeaye setup [--yes] [--no-service] [--no-model]
 ayeaye check
 ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-ayeaye model <ls|pull ID|use ID|rm ID>
+ayeaye model search [QUERY]
+ayeaye model choose [speech|cleanup]
+ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
 ayeaye dictate <host/pane> [client-pid]
 ```
 
