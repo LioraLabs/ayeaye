@@ -18,7 +18,9 @@ ldd "$binary" | awk '$1 ~ /^(libcudart|libnvrtc|libcurand|libcublas|libcublasLt)
 while read -r soname path; do
   cp -L "$path" "$work/bundle/lib/$soname"
 done
-cp -a "$cuda_home"/lib64/libnvrtc-builtins.so.12* "$work/bundle/lib/"
+for path in "$cuda_home"/lib64/libnvrtc-builtins.so.12*; do
+  cp -L "$path" "$work/bundle/lib/$(basename "$path")"
+done
 
 test -f "$work/bundle/lib/libcudart.so.12"
 test -f "$work/bundle/lib/libnvrtc.so.12"
@@ -30,3 +32,4 @@ awk -v lib="$work/bundle/lib/" \
   "$work/dependencies"
 awk '$1 != "libcuda.so.1" && /not found/ { exit 1 }' "$work/dependencies"
 tar -czf "$output" -C "$work/bundle" .
+tar -tvzf "$output" | awk 'substr($1, 1, 1) ~ /[lh]/ { found = 1 } END { exit found }'
