@@ -8,7 +8,11 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bundle/lib"
 cp "$binary" "$work/bundle/ayeaye"
-cp "$cuda_home/LICENSE" "$cuda_home/EULA.txt" "$work/bundle/"
+printf '%s\n' \
+  'This bundle redistributes NVIDIA CUDA libraries under the CUDA Toolkit EULA:' \
+  'https://docs.nvidia.com/cuda/eula/' \
+  'Copyright © 2005-2026 NVIDIA Corporation.' \
+  >"$work/bundle/CUDA-NOTICE"
 
 ldd "$binary" | awk '$1 ~ /^(libcudart|libnvrtc|libcurand|libcublas|libcublasLt)\.so/ && $2 == "=>" { print $1, $3 }' |
 while read -r soname path; do
