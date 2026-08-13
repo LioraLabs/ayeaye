@@ -25,7 +25,9 @@ curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | 
 ```
 
 The installer verifies the release, installs `ayeaye`, and runs setup. `tmux`
-is the only required runtime tool.
+is the only required runtime tool. On x86-64 Linux with an NVIDIA driver, it
+installs the GPU build with its matching CUDA runtime included; no distro CUDA
+toolkit package is required.
 
 ```sh
 ayeaye setup

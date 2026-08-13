@@ -39,19 +39,20 @@ case "$os/$arch" in
     exit 1 ;;
 esac
 
-work="$(mktemp -d)"
+mkdir -p "$bin_dir"
+work="$(mktemp -d "$bin_dir/.ayeaye-install.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS"
 
 fetch() {
   echo "fetching $artifact"
-  curl -fsSL -o "$work/ayeaye" "$base/$artifact"
+  curl -fsSL -o "$work/download" "$base/$artifact"
   want="$(awk -v name="$artifact" '$2 == name { print $1; exit }' "$work/SHA256SUMS")"
   [ -n "$want" ] || { echo "the release's SHA256SUMS does not mention $artifact" >&2; return 1; }
   if command -v sha256sum >/dev/null 2>&1; then
-    got="$(sha256sum "$work/ayeaye")"
+    got="$(sha256sum "$work/download")"
   elif command -v shasum >/dev/null 2>&1; then
-    got="$(shasum -a 256 "$work/ayeaye")"
+    got="$(shasum -a 256 "$work/download")"
   else
     echo "neither sha256sum nor shasum is on this machine - nothing can verify the download" >&2
     return 1
@@ -63,8 +64,27 @@ fetch() {
     echo "  fetched   $got" >&2
     return 1
   fi
-  chmod +x "$work/ayeaye"
-  "$work/ayeaye" --version >/dev/null 2>&1
+  if [ "$artifact" = ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
+    tar -tzf "$work/download" >"$work/members" || return 1
+    awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { bad = 1 }
+      END { exit bad }
+    ' "$work/members" || return 1
+    tar -tvzf "$work/download" >"$work/member-types" || return 1
+    awk '
+      substr($1, 1, 1) ~ /[lh]/ { bad = 1 }
+      END { exit bad }
+    ' "$work/member-types" || return 1
+    rm -rf "$work/cuda"
+    mkdir "$work/cuda"
+    tar -xzf "$work/download" -C "$work/cuda" || return 1
+    [ -f "$work/cuda/ayeaye" ] && [ -d "$work/cuda/lib" ] || return 1
+    candidate="$work/cuda/ayeaye"
+  else
+    candidate="$work/download"
+  fi
+  chmod +x "$candidate"
+  "$candidate" --version >/dev/null 2>&1
 }
 
 if ! fetch; then
@@ -77,9 +97,19 @@ if ! fetch; then
   fetch || { echo "the portable CPU build cannot run either - keeping the existing install" >&2; exit 1; }
 fi
 
-# Release assets are bare bytes; the exec bit is this script's to grant.
-mkdir -p "$bin_dir"
-mv "$work/ayeaye" "$bin_dir/ayeaye"
+if [ "$artifact" = ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
+  bundle=".ayeaye-cuda-$want"
+  if [ ! -d "$bin_dir/$bundle" ]; then
+    mv "$work/cuda" "$bin_dir/$bundle"
+  fi
+  [ -f "$bin_dir/$bundle/ayeaye" ] && [ -d "$bin_dir/$bundle/lib" ] \
+    && "$bin_dir/$bundle/ayeaye" --version >/dev/null 2>&1 \
+    || { echo "the staged CUDA bundle is incomplete - keeping the existing install" >&2; exit 1; }
+  ln -s "$bundle/ayeaye" "$work/ayeaye"
+  mv "$work/ayeaye" "$bin_dir/ayeaye"
+else
+  mv "$candidate" "$bin_dir/ayeaye"
+fi
 echo "installed $bin_dir/ayeaye"
 case ":$PATH:" in
   *:"$bin_dir":*) ;;

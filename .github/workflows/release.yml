@@ -106,7 +106,7 @@ jobs:
         if: matrix.kind == 'cuda'
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config git
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config git patchelf
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: target
@@ -130,6 +130,15 @@ jobs:
           cargo "$cmd" --release --locked -p ayeaye \
             --target "${{ matrix.target }}" \
             ${features:+--features "$features"}
+          if [ "${{ matrix.kind }}" = cuda ]; then
+            binary="target/${{ matrix.target }}/release/ayeaye"
+            sh scripts/package-cuda.sh "$binary" "$binary.bundle"
+            mv "$binary.bundle" "$binary"
+            mkdir "$binary.check"
+            tar -xzf "$binary" -C "$binary.check"
+            LD_LIBRARY_PATH="$binary.check/lib:/usr/local/cuda/lib64/stubs" \
+              "$binary.check/ayeaye" --version
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.row }}
@@ -159,8 +168,9 @@ jobs:
             row="$(basename "$dir")"
             # The versioned name, and the versionless alias that lets
             # releases/latest/download fetch the newest without an API call.
-            # Release assets are bare bytes, so the execute bit is the
-            # downloader's job - the installer chmods what it fetches.
+            # Portable assets are bare executables; the CUDA row is a
+            # self-contained runtime bundle. The installer knows the one
+            # exceptional row and grants the executable bit after extraction.
             cp "$dir/ayeaye" "dist/ayeaye-$tag-$row"
             cp "$dir/ayeaye" "dist/ayeaye-$row"
             rows=$((rows + 1))
@@ -183,7 +193,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --verify-tag --title "ayeaye $tag" \
-              --notes "Five binaries and the source tarball, each under a versioned name and a versionless alias, all covered by SHA256SUMS. The newest release is always at releases/latest/download/<alias>, no API call required."
+              --notes "Four portable binaries, one self-contained CUDA bundle, and the source tarball, each under a versioned name and a versionless alias, all covered by SHA256SUMS. The newest release is always at releases/latest/download/<alias>, no API call required."
           else
             # The local flow may already have uploaded the tarball whose
             # checksum is stamped into install.sh on main. Ours is rebuilt

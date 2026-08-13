@@ -34,6 +34,21 @@ EOF
   chmod +x "$work/release/$name"
 }
 
+cuda_candidate() {
+  result="$1"
+  bundle="$work/cuda-bundle"
+  rm -rf "$bundle"
+  mkdir -p "$bundle/lib"
+  cat >"$bundle/ayeaye" <<EOF
+#!/bin/sh
+[ "\${1:-}" = --version ] && exit $result
+echo ayeaye-x86_64-unknown-linux-gnu-cuda >"$work/ran"
+EOF
+  chmod +x "$bundle/ayeaye"
+  printf '%s\n' bundled-runtime >"$bundle/lib/libcudart.so.12"
+  tar -czf "$work/release/ayeaye-x86_64-unknown-linux-gnu-cuda" -C "$bundle" .
+}
+
 install() {
   rm -f "$work/ran"
   PATH="$work/bin:$PATH" HOME="$work/home" RELEASE_DIR="$work/release" \
@@ -42,7 +57,7 @@ install() {
 
 # AYEAYE-81 — a CUDA artifact that cannot load falls back without replacing
 # the working install until the portable candidate has executed successfully.
-candidate ayeaye-x86_64-unknown-linux-gnu-cuda 127
+cuda_candidate 127
 candidate ayeaye-x86_64-unknown-linux-musl 0
 sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
 printf '%s\n' old >"$work/home/.local/bin/ayeaye"
@@ -53,13 +68,41 @@ printf '%s\n' "$install_output" | grep -q 'README.*HTTPS'
 grep -qx ayeaye-x86_64-unknown-linux-musl "$work/ran"
 grep -q unknown-linux-musl "$work/home/.local/bin/ayeaye"
 
-candidate ayeaye-x86_64-unknown-linux-gnu-cuda 0
+# A checksum-valid archive still cannot escape staging through a link member.
+bundle="$work/cuda-bundle"
+rm -rf "$bundle"
+mkdir -p "$bundle/lib"
+ln -s "$work/escaped" "$bundle/ayeaye"
+tar -czf "$work/release/ayeaye-x86_64-unknown-linux-gnu-cuda" -C "$bundle" .
+sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
+install
+test ! -e "$work/escaped"
+grep -q unknown-linux-musl "$work/home/.local/bin/ayeaye"
+
+cuda_candidate 0
 sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
 install
 grep -qx ayeaye-x86_64-unknown-linux-gnu-cuda "$work/ran"
-grep -q gnu-cuda "$work/home/.local/bin/ayeaye"
+test -L "$work/home/.local/bin/ayeaye"
+cuda_install="$(readlink -f "$work/home/.local/bin/ayeaye")"
+grep -q gnu-cuda "$cuda_install"
+grep -qx bundled-runtime "$(dirname "$cuda_install")/lib/libcudart.so.12"
 
-candidate ayeaye-x86_64-unknown-linux-gnu-cuda 127
+# An interrupted checksum-addressed destination is never trusted or activated.
+cuda_candidate 0
+sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
+cuda_sum="$(sha256sum "$work/release/ayeaye-x86_64-unknown-linux-gnu-cuda")"
+cuda_sum="${cuda_sum%% *}"
+rm -rf "$work/home/.local/bin/.ayeaye-cuda-$cuda_sum"
+mkdir -p "$work/home/.local/bin/.ayeaye-cuda-$cuda_sum"
+printf '%s\n' old >"$work/home/.local/bin/ayeaye"
+if install; then
+  echo 'installer activated an incomplete prior CUDA bundle' >&2
+  exit 1
+fi
+grep -qx old "$work/home/.local/bin/ayeaye"
+
+cuda_candidate 127
 candidate ayeaye-x86_64-unknown-linux-musl 127
 sha256sum "$work/release"/ayeaye-* | sed "s|$work/release/||" >"$work/release/SHA256SUMS"
 printf '%s\n' old >"$work/home/.local/bin/ayeaye"
