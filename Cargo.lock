@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "ayeaye"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "ayeaye-core",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "ayeaye-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "ayeaye-infer"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ayeaye-core",
  "candle-core",
@@ -433,7 +433,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "constitution"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "toml",
 ]

@@ -14,9 +14,9 @@
 #
 # Cutting a release is one commit:
 #
-#   cook bump v0.5.0    then commit and push
+#   cook bump v0.5.1    then commit and push
 #   cook dist
-#   cook publish v0.5.0
+#   cook publish v0.5.1
 #
 # The tag lands on that commit: the artifact is archived from it, and publish
 # reads the commit back out of the tarball and tags exactly that. The release
@@ -141,7 +141,7 @@ recipe release-version
     ingredients "scripts/check-release-version.sh"
     seal scripts
     seal manifest
-    test { bash scripts/check-release-version.sh v0.5.0 }
+    test { bash scripts/check-release-version.sh v0.5.1 }
 
 # --- the artifacts ------------------------------------------------------
 # Gated on the Rust checks: a red test blocks the tarball rather than shipping it.
@@ -151,13 +151,13 @@ recipe release-version
 recipe dist: release-version rust-suite rust-lint installer-suite
     seal commit
     seal scripts
-    cook "dist/ayeaye-v0.5.0.tar.gz" { bash scripts/release-archive.sh $<out> }
+    cook "dist/ayeaye-v0.5.1.tar.gz" { bash scripts/release-archive.sh $<out> }
     cook "dist/SHA256SUMS" { bash scripts/release-checksums.sh $<in> $<out> }
 
 # No source, so it always runs: the question is not "did the inputs change"
 # but "is the thing on disk right now something the bootstrap can install".
 recipe release-installable: dist
-    test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.5.0.tar.gz }
+    test { bash scripts/check-release-artifact.sh dist/ayeaye-v0.5.1.tar.gz }
 
 # --- publishing ---------------------------------------------------------
 # A chore, not a recipe: it talks to GitHub, and `cook test` must never
@@ -167,7 +167,7 @@ recipe release-installable: dist
 # proves it reproducible from the commit named inside it, so a stale or
 # hand-built tarball is refused rather than silently rebuilt. The Rust and
 # version gates still stand in the way of a red tree.
-chore publish version="v0.5.0": release-version rust-suite rust-lint installer-suite
+chore publish version="v0.5.1": release-version rust-suite rust-lint installer-suite
     bash scripts/release-publish.sh $<version>
 
 chore bump version
