@@ -11,7 +11,7 @@ members = [
 # Cookfile's artifact name and the lockfile in step with it; `cook bump` moves
 # all three.
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
