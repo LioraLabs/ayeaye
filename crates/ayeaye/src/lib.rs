@@ -1,9 +1,12 @@
 //! The shell: the only crate allowed to touch the world.
 //!
-//! Subprocesses, the filesystem, sockets and model lifetime live here or below
-//! in `ayeaye-infer`. Anything that is a decision rather than an effect belongs
-//! in `ayeaye-core`, where a test can reach it without a machine — which is
-//! also why the async colouring starts here and goes no deeper.
+//! Subprocesses, the filesystem and sockets live here. Anything that is a
+//! decision rather than an effect belongs in `ayeaye-core`, where a test can
+//! reach it without a machine — which is also why the async colouring starts
+//! here and goes no deeper.
+//!
+//! Inference is no longer among the effects: since AYEAYE-101 the models live
+//! behind `llama-swap`, and `crate::swap` is a socket rather than a stratum.
 //!
 //! This is a library with a binary on top of it so the server can be driven by
 //! an integration test over a real socket, rather than only by starting the
@@ -32,5 +35,6 @@ pub mod server;
 pub mod service;
 pub mod session;
 pub mod setup;
+pub mod swap;
 pub mod tmux;
 pub mod transcript;

@@ -42,39 +42,30 @@ fn the_bare_binary_prints_the_banner_and_succeeds() {
     assert_eq!(versioned, out, "--version should be the same banner");
 }
 
-// AYEAYE-57 — the capability report names what this run actually got, and says
-// why when that is not what the build asked for.
+// AYEAYE-57, narrowed by AYEAYE-101. The banner used to name the acceleration
+// this run actually got, because this process held the models. It no longer
+// holds any, so there is nothing about a device for it to claim — and claiming
+// one would be the silent-degradation failure AYEAYE-57 exists to refuse,
+// arrived at from the other direction.
 //
-// The shape is asserted against a selection made in the test rather than
-// against the literal `cpu`, so it holds on every row of the release matrix.
-// The second line cannot be produced on a machine with no card — a build with
-// no acceleration in it has nothing to fall back from — so what runs here is
-// the negative half: exactly one line, and it names the backend in use.
+// What survives is the shape, which is what a `--version`-style probe parses.
 #[test]
-fn the_banner_reports_the_acceleration_this_run_actually_got() {
-    let selection = ayeaye_infer::backend::select();
-
+fn the_banner_is_one_line_and_claims_no_device() {
     let (code, out, err) = ayeaye(&["--version"]);
 
     assert_eq!(code, 0);
-    assert!(
-        out.contains(&format!("({})", selection.got().label())),
-        "the banner should name the backend in use ({}): {out:?}",
-        selection.got().label()
-    );
-    // Whatever happened, stdout stays one line: it is what a `--version`-style
-    // probe parses, and a fallback must not change its shape.
     assert_eq!(
         out.lines().count(),
         1,
-        "stdout is one line whether or not anything was given up: {out:?}"
+        "stdout is one line, which is what a probe parses: {out:?}"
     );
-    if let Some(why) = selection.fallback() {
+    for device in ["cpu", "cuda", "metal"] {
         assert!(
-            err.contains(why),
-            "the reason has to reach the person reading it, on stderr: {err:?}"
+            !out.contains(&format!("({device})")),
+            "this binary runs no model and must not claim a device: {out:?}"
         );
     }
+    assert!(err.is_empty(), "nothing to explain: {err:?}");
 }
 
 // AYEAYE-42 — an unrecognised command fails rather than starting something.
@@ -310,9 +301,10 @@ fn check_runs_the_health_report_on_its_own() {
     );
 }
 
-// AYEAYE-62 — the help names the two verbs and says what setup will ask about,
-// because "it asks before two things and nothing else" is the promise somebody
-// is trusting when they run it on a machine they care about.
+// AYEAYE-62, narrowed by AYEAYE-101 — the help names the two verbs and says what
+// setup will ask about, because "it asks before one thing and nothing else" is
+// the promise somebody is trusting when they run it on a machine they care
+// about. It was two until the model download went away.
 #[test]
 fn help_says_what_setup_will_and_will_not_do() {
     let (code, out, _) = ayeaye(&["--help"]);
@@ -321,8 +313,11 @@ fn help_says_what_setup_will_and_will_not_do() {
         "ayeaye setup",
         "ayeaye check",
         "--yes",
-        "asks before two things",
+        "asks before one thing",
         "never configures",
+        // And it says out loud that this binary is not where the models live,
+        // because somebody reading `ayeaye model` would otherwise assume it is.
+        "does not download, store or run models",
     ] {
         assert!(out.contains(said), "--help does not mention {said:?}");
     }

@@ -166,7 +166,9 @@ fn markdown_target(text: &str) -> Option<&str> {
 /// Whether this is the daemon's `[1-9][0-9]*`: digits, no leading zero.
 fn is_line_number(text: &str) -> bool {
     let mut digits = text.chars();
-    digits.next().is_some_and(|first| ('1'..='9').contains(&first))
+    digits
+        .next()
+        .is_some_and(|first| ('1'..='9').contains(&first))
         && digits.all(|digit| digit.is_ascii_digit())
 }
 
@@ -499,9 +501,15 @@ mod tests {
     // odd path with colons in it stays a path.
     #[test]
     fn a_reference_is_a_path_and_maybe_a_line() {
-        assert_eq!(reference("src/main.rs:42"), ("src/main.rs".into(), Some(42)));
+        assert_eq!(
+            reference("src/main.rs:42"),
+            ("src/main.rs".into(), Some(42))
+        );
         assert_eq!(reference("src/main.rs"), ("src/main.rs".into(), None));
-        assert_eq!(reference("  src/main.rs:7  "), ("src/main.rs".into(), Some(7)));
+        assert_eq!(
+            reference("  src/main.rs:7  "),
+            ("src/main.rs".into(), Some(7))
+        );
         // No leading zero and no zero: those are names, not line numbers.
         assert_eq!(reference("a.txt:0"), ("a.txt:0".into(), None));
         assert_eq!(reference("a.txt:007"), ("a.txt:007".into(), None));
@@ -524,17 +532,17 @@ mod tests {
             reference("[the config](src/config.rs)"),
             ("src/config.rs".into(), None)
         );
-        assert_eq!(reference("`src/main.rs:9`"), ("src/main.rs".into(), Some(9)));
+        assert_eq!(
+            reference("`src/main.rs:9`"),
+            ("src/main.rs".into(), Some(9))
+        );
         assert_eq!(
             reference("[see](`src/lib.rs:2`)"),
             ("src/lib.rs".into(), Some(2))
         );
         // A link with a `]` in the label is not the daemon's link shape, and a
         // sentence mentioning brackets is not a link at all.
-        assert_eq!(
-            reference("[a][b](c.txt)"),
-            ("[a][b](c.txt)".into(), None)
-        );
+        assert_eq!(reference("[a][b](c.txt)"), ("[a][b](c.txt)".into(), None));
         // One lone backtick is text, not a wrapper.
         assert_eq!(reference("`a.txt"), ("`a.txt".into(), None));
     }
@@ -616,7 +624,10 @@ mod tests {
             candidates("./src/main.rs", "", ["src/main.rs"]),
             vec!["src/main.rs"],
         );
-        assert_eq!(candidates("main.rs", "", ["src/domain.rs"]), Vec::<&str>::new());
+        assert_eq!(
+            candidates("main.rs", "", ["src/domain.rs"]),
+            Vec::<&str>::new()
+        );
         // AYEAYE-76 — a suffix match is whole components: `b/c.txt` is not `ab/c.txt`.
         assert_eq!(candidates("b/c.txt", "", ["ab/c.txt"]), Vec::<&str>::new());
         assert_eq!(candidates("b/c.txt", "", ["a/b/c.txt"]), vec!["a/b/c.txt"]);
@@ -628,7 +639,10 @@ mod tests {
     #[test]
     fn the_panes_directory_is_repo_relative() {
         assert_eq!(relative("/home/a/repo", "/home/a/repo"), "");
-        assert_eq!(relative("/home/a/repo", "/home/a/repo/src/http"), "src/http");
+        assert_eq!(
+            relative("/home/a/repo", "/home/a/repo/src/http"),
+            "src/http"
+        );
         // Outside the root is a walk up, which distance prices as steps.
         assert_eq!(relative("/home/a/repo", "/home/a/other"), "../other");
     }
@@ -640,7 +654,13 @@ mod tests {
         let text: String = (1..=300).map(|n| format!("line {n}\n")).collect();
         let rows = excerpt(text.as_bytes(), text.len() as u64, None);
         assert_eq!(rows.len(), MAX_PREVIEW_LINES);
-        assert_eq!(rows[0], Row { number: 1, text: "line 1\n".into() });
+        assert_eq!(
+            rows[0],
+            Row {
+                number: 1,
+                text: "line 1\n".into()
+            }
+        );
         assert_eq!(rows[199].number, 200);
     }
 
@@ -656,7 +676,13 @@ mod tests {
         assert_eq!(rows.first().map(|row| row.number), Some(400));
         assert_eq!(rows.last().map(|row| row.number), Some(599));
         assert!(rows.iter().any(|row| row.number == 500));
-        assert_eq!(rows[100], Row { number: 500, text: "line 500\n".into() });
+        assert_eq!(
+            rows[100],
+            Row {
+                number: 500,
+                text: "line 500\n".into()
+            }
+        );
     }
 
     // AYEAYE-52 — a line near the top does not push the window below it: the
@@ -681,7 +707,10 @@ mod tests {
         let line = "y".repeat(3071) + "\n";
         let text = line.repeat(200);
         let rows = excerpt(text.as_bytes(), text.len() as u64, Some(100));
-        assert!(rows.iter().any(|row| row.number == 100), "the anchor is gone");
+        assert!(
+            rows.iter().any(|row| row.number == 100),
+            "the anchor is gone"
+        );
         assert_eq!(rows.first().map(|row| row.number), Some(16));
         assert_eq!(rows.last().map(|row| row.number), Some(101));
         // The one line past the request is cut to what the budget had left.
@@ -734,11 +763,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text.len(), MAX_TEXT_PREVIEW_BYTES);
 
-        let text: String = (1..=100).map(|_| "y".repeat(8191).to_string() + "\n").collect();
+        let text: String = (1..=100)
+            .map(|_| "y".repeat(8191).to_string() + "\n")
+            .collect();
         let rows = excerpt(text.as_bytes(), text.len() as u64, None);
         let total: usize = rows.iter().map(|row| row.text.len()).sum();
         assert!(total <= MAX_TEXT_PREVIEW_BYTES, "{total} bytes kept");
-        assert!(rows.len() == MAX_TEXT_PREVIEW_BYTES / 8192, "{} rows", rows.len());
+        assert!(
+            rows.len() == MAX_TEXT_PREVIEW_BYTES / 8192,
+            "{} rows",
+            rows.len()
+        );
     }
 
     // AYEAYE-52 — bytes that are not UTF-8 become replacement characters, and
@@ -791,8 +826,14 @@ mod tests {
     #[test]
     fn the_bodies_carry_the_shapes_the_page_reads() {
         let found = [
-            Candidate { path: "src/main.rs".into(), size: 120 },
-            Candidate { path: "shot.png".into(), size: 4096 },
+            Candidate {
+                path: "src/main.rs".into(),
+                size: 120,
+            },
+            Candidate {
+                path: "shot.png".into(),
+                size: 4096,
+            },
         ];
         assert_eq!(
             resolve_body(&found, Some(7)),
@@ -801,8 +842,14 @@ mod tests {
         assert_eq!(resolve_body(&[], None), r#"{"candidates":[],"line":null}"#);
 
         let rows = [
-            Row { number: 41, text: "fn main() {\n".into() },
-            Row { number: 42, text: "}\n".into() },
+            Row {
+                number: 41,
+                text: "fn main() {\n".into(),
+            },
+            Row {
+                number: 42,
+                text: "}\n".into(),
+            },
         ];
         assert_eq!(
             text_body("src/main.rs", 999, &rows, Some(42)),

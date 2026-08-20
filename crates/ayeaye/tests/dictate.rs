@@ -138,59 +138,100 @@ async fn something_that_is_not_audio_comes_back_as_the_converters_own_reason() {
     };
     assert!(!said.is_empty(), "the converter's reason is the message");
 }
-
 // ------------------------------------------------------------- the pipeline
 
-use ayeaye::dictate::{self, Cleanup, Speech};
+use ayeaye::dictate::{self, Cleanup, Lists, Speech};
 use ayeaye_core::Pcm16kMono;
 use ayeaye_core::cleanup::{Cleaned, Kept, Policy, settle};
 use ayeaye_core::dictation::Outcome;
+use ayeaye_core::model::settings::ModelSettings;
+use std::sync::Mutex;
 
-/// A speech model that says what it was told to, and remembers being asked.
+/// A backend that answers what it was told to, and remembers being asked.
 ///
-/// The point of substituting it is the point of `models::Slot`: a real one is a
-/// directory of weights and hundreds of megabytes of device memory, and the
-/// properties worth asserting here are about the order things happen in.
-struct Heard {
-    said: Result<String, String>,
-    asked: usize,
+/// One double for all three traits, because since AYEAYE-101 there is one thing
+/// behind them: a proxy. Substituting it is the same boundary the two model
+/// slots used to be — a real one is a process holding hundreds of megabytes of
+/// device memory, and the properties worth asserting here are about the order
+/// things happen in and what survives a failure.
+struct Fake {
+    /// What a transcription answers.
+    said: Mutex<Result<String, String>>,
+    /// What a rewrite answers. `None` is a model that declined to say anything
+    /// usable, which is what an unreachable proxy looks like from here.
+    rewrite: Mutex<Option<String>>,
+    /// The models it will admit to serving.
+    serving: Vec<String>,
+    /// How many transcriptions were asked for.
+    asked: Mutex<usize>,
+    /// The names handed to each cleanup, in order.
+    names: Mutex<Vec<String>>,
+    /// The model each cleanup was asked of, in order.
+    cleaned: Mutex<Vec<String>>,
 }
 
-impl Heard {
-    fn saying(text: &str) -> Heard {
-        Heard {
-            said: Ok(text.to_string()),
-            asked: 0,
+impl Default for Fake {
+    fn default() -> Fake {
+        Fake {
+            // An empty transcript rather than an error: a backend nobody told
+            // what to say is one that heard nothing, which is a state, not a
+            // fault.
+            said: Mutex::new(Ok(String::new())),
+            rewrite: Mutex::new(None),
+            serving: Vec::new(),
+            asked: Mutex::new(0),
+            names: Mutex::new(Vec::new()),
+            cleaned: Mutex::new(Vec::new()),
         }
     }
 }
 
-impl Speech for Heard {
-    fn transcribe(&mut self, _audio: &Pcm16kMono) -> Result<String, String> {
-        self.asked += 1;
-        self.said.clone()
-    }
-}
-
-/// A cleanup model that rewrites to a fixed answer, remembering the names.
-struct Rewrites {
-    into: Option<String>,
-    names: Vec<String>,
-}
-
-impl Rewrites {
-    fn into(text: &str) -> Rewrites {
-        Rewrites {
-            into: Some(text.to_string()),
-            names: Vec::new(),
+impl Fake {
+    fn saying(text: &str) -> Fake {
+        Fake {
+            said: Mutex::new(Ok(text.to_string())),
+            ..Fake::default()
         }
     }
+
+    fn rewriting_to(self, text: &str) -> Fake {
+        *self.rewrite.lock().expect("a lock") = Some(text.to_string());
+        self
+    }
+
+    fn serving(mut self, models: &[&str]) -> Fake {
+        self.serving = models.iter().map(|name| (*name).to_string()).collect();
+        self
+    }
+
+    fn asked(&self) -> usize {
+        *self.asked.lock().expect("a lock")
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.names.lock().expect("a lock").clone()
+    }
 }
 
-impl Cleanup for Rewrites {
-    fn clean(&mut self, raw: &str, names: &str, policy: &Policy) -> Cleaned {
-        self.names.push(names.to_string());
-        settle(policy, raw, self.into.as_deref())
+impl Speech for Fake {
+    async fn transcribe(&self, _model: &str, _audio: &Pcm16kMono) -> Result<String, String> {
+        *self.asked.lock().expect("a lock") += 1;
+        self.said.lock().expect("a lock").clone()
+    }
+}
+
+impl Cleanup for Fake {
+    async fn clean(&self, model: &str, raw: &str, names: &str, policy: &Policy) -> Cleaned {
+        self.names.lock().expect("a lock").push(names.to_string());
+        self.cleaned.lock().expect("a lock").push(model.to_string());
+        let rewrite = self.rewrite.lock().expect("a lock").clone();
+        settle(policy, raw, rewrite.as_deref())
+    }
+}
+
+impl Lists for Fake {
+    async fn available(&self) -> Result<Vec<String>, String> {
+        Ok(self.serving.clone())
     }
 }
 
@@ -208,18 +249,20 @@ fn speech(seconds: f32) -> Pcm16kMono {
 //
 // The whole path in one case: audio in, words out, cleaned up, with the names
 // off the pane handed to the cleanup step.
-#[test]
-fn a_clip_of_speech_becomes_a_cleaned_up_line_primed_by_the_pane() {
-    let mut speech_model = Heard::saying("um so run the parse config tests");
-    let mut cleanup = Rewrites::into("Run the parse_config tests.");
+#[tokio::test]
+async fn a_clip_of_speech_becomes_a_cleaned_up_line_primed_by_the_pane() {
+    let backend = Fake::saying("um so run the parse config tests")
+        .rewriting_to("Run the parse_config tests.");
 
     let outcome = dictate::hear(
-        &mut speech_model,
-        &mut cleanup,
+        &backend,
+        "whisper",
+        Some("qwen"),
         &speech(1.0),
         "parse_config server.py",
         &Policy::default(),
-    );
+    )
+    .await;
 
     let Outcome::Heard { raw, cleaned } = &outcome else {
         panic!("expected words, got {outcome:?}");
@@ -228,35 +271,39 @@ fn a_clip_of_speech_becomes_a_cleaned_up_line_primed_by_the_pane() {
     assert_eq!(cleaned.text(), "Run the parse_config tests.");
     assert!(cleaned.was_rewritten());
     assert_eq!(
-        cleanup.names,
+        backend.names(),
         vec!["parse_config server.py".to_string()],
         "the names on the pane have to reach the cleanup step"
+    );
+    // And each model is asked for by the name it goes by in the backend's
+    // config. One name for both would be the bug this cannot otherwise see.
+    assert_eq!(
+        *backend.cleaned.lock().expect("a lock"),
+        vec!["qwen".to_string()]
     );
 }
 
 // AYEAYE-58
 //
-// The gate comes first, and that is the assertion: transcription is seconds of
-// a model's time, and a clip nobody spoke into is knowable for free.
-#[test]
-fn a_clip_nobody_spoke_into_is_refused_before_a_model_is_asked() {
-    let mut speech_model = Heard::saying("thank you");
-    let mut cleanup = Rewrites::into("Thank you.");
+// The gate comes first, and that is the assertion: transcription is a round trip
+// and a model's time, and a clip nobody spoke into is knowable for free.
+#[tokio::test]
+async fn a_clip_nobody_spoke_into_is_refused_before_a_model_is_asked() {
+    let backend = Fake::saying("thank you").rewriting_to("Thank you.");
     let quiet = Pcm16kMono::from_i16(&[400, -400, 400, -400]);
 
     let outcome = dictate::hear(
-        &mut speech_model,
-        &mut cleanup,
+        &backend,
+        "whisper",
+        Some("qwen"),
         &quiet,
         "",
         &Policy::default(),
-    );
+    )
+    .await;
 
     assert!(matches!(outcome, Outcome::Silence { .. }), "{outcome:?}");
-    assert_eq!(
-        speech_model.asked, 0,
-        "silence must not cost a transcription"
-    );
+    assert_eq!(backend.asked(), 0, "silence must not cost a transcription");
     // And the loudness rides along, because it is the number that tells somebody
     // their microphone is muted rather than their voice quiet.
     assert!(outcome.body().contains(r#""rms":"#), "{}", outcome.body());
@@ -267,26 +314,27 @@ fn a_clip_nobody_spoke_into_is_refused_before_a_model_is_asked() {
 // A clip can clear the energy gate — a door, a cough — and still transcribe to
 // one of a speech model's stock answers to silence. Typing that into somebody's
 // terminal is worse than typing nothing.
-#[test]
-fn a_stock_answer_to_silence_is_nothing_recognised_rather_than_a_dictation() {
+#[tokio::test]
+async fn a_stock_answer_to_silence_is_nothing_recognised_rather_than_a_dictation() {
     for said in ["", "   ", "Thank you.", "[BLANK_AUDIO]"] {
-        let mut speech_model = Heard::saying(said);
-        let mut cleanup = Rewrites::into("Something else entirely.");
+        let backend = Fake::saying(said).rewriting_to("Something else entirely.");
 
         let outcome = dictate::hear(
-            &mut speech_model,
-            &mut cleanup,
+            &backend,
+            "whisper",
+            Some("qwen"),
             &speech(1.0),
             "",
             &Policy::default(),
-        );
+        )
+        .await;
 
         assert!(
             matches!(outcome, Outcome::Empty { .. }),
             "{said:?}: {outcome:?}"
         );
         assert!(
-            cleanup.names.is_empty(),
+            backend.names().is_empty(),
             "{said:?} is not worth a cleanup model's time"
         );
     }
@@ -296,43 +344,48 @@ fn a_stock_answer_to_silence_is_nothing_recognised_rather_than_a_dictation() {
 //
 // A speech model that failed is not a dictation that failed differently: there
 // are no words, and there is nothing to type.
-#[test]
-fn a_transcription_that_failed_is_said_out_loud() {
-    let mut speech_model = Heard {
-        said: Err("the model is not loaded".to_string()),
-        asked: 0,
+#[tokio::test]
+async fn a_transcription_that_failed_is_said_out_loud() {
+    let backend = Fake {
+        said: Mutex::new(Err("it answered HTTP 400: no such model".to_string())),
+        ..Fake::default()
     };
-    let mut cleanup = Rewrites::into("anything");
 
     let outcome = dictate::hear(
-        &mut speech_model,
-        &mut cleanup,
+        &backend,
+        "whisper",
+        Some("qwen"),
         &speech(1.0),
         "",
         &Policy::default(),
-    );
+    )
+    .await;
 
     let Outcome::Unavailable(why) = &outcome else {
         panic!("expected an unavailable model, got {outcome:?}");
     };
-    assert!(why.contains("not loaded"), "{why}");
+    assert!(why.contains("no such model"), "{why}");
 }
 
 // AYEAYE-58
 //
 // The rule the whole cleanup design exists for, at the level that matters: a
-// machine with no cleanup model dictates the words the speaker said.
-#[test]
-fn a_machine_with_no_cleanup_model_still_types_what_was_said() {
-    let mut speech_model = Heard::saying("um so run the tests");
+// machine with no cleanup model dictates the words the speaker said. `None`
+// rather than a second implementation standing in for the empty case — the two
+// used to be different types, and the branch is the thing worth watching.
+#[tokio::test]
+async fn a_machine_with_no_cleanup_model_still_types_what_was_said() {
+    let backend = Fake::saying("um so run the tests").rewriting_to("Run the tests.");
 
     let outcome = dictate::hear(
-        &mut speech_model,
-        &mut dictate::AsSpoken,
+        &backend,
+        "whisper",
+        None,
         &speech(1.0),
         "",
         &Policy::default(),
-    );
+    )
+    .await;
 
     let Outcome::Heard { raw, cleaned } = &outcome else {
         panic!("expected words, got {outcome:?}");
@@ -343,37 +396,47 @@ fn a_machine_with_no_cleanup_model_still_types_what_was_said() {
         outcome.body(),
         r#"{"raw":"um so run the tests","final":"um so run the tests"}"#
     );
+    assert!(
+        backend.names().is_empty(),
+        "no cleanup model configured is no request, not a request that was ignored"
+    );
+}
+
+// AYEAYE-58
+//
+// The other side of the same branch: a cleanup model that says nothing usable
+// costs the rewrite and nothing else. The dictation comes back as the words the
+// speaker said, which is the acceptance criterion in the place it is easiest to
+// get wrong — the model *was* asked for, so an implementation that treated a
+// failed rewrite as a failed dictation would lose the words.
+#[tokio::test]
+async fn a_cleanup_model_that_says_nothing_usable_costs_the_rewrite_and_not_the_words() {
+    let backend = Fake::saying("um so run the tests");
+
+    let outcome = dictate::hear(
+        &backend,
+        "whisper",
+        Some("qwen"),
+        &speech(1.0),
+        "",
+        &Policy::default(),
+    )
+    .await;
+
+    let Outcome::Heard { raw, cleaned } = &outcome else {
+        panic!("expected the words anyway, got {outcome:?}");
+    };
+    assert_eq!(raw, "um so run the tests");
+    assert_eq!(cleaned.text(), raw, "the dictation has to survive");
+    assert_eq!(cleaned.kept(), Some(Kept::Unavailable));
+    assert_eq!(
+        backend.names().len(),
+        1,
+        "and it really was asked, rather than skipped"
+    );
 }
 
 // ---------------------------------------------------------------- the holder
-
-use ayeaye_core::model::ModelId;
-use ayeaye_core::model::settings::ModelSettings;
-
-/// A store of this test's own, removed when it goes out of scope.
-struct Store(std::path::PathBuf);
-
-impl Store {
-    fn named(what: &str) -> Store {
-        let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("dictate-{what}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("a store");
-        Store(path)
-    }
-
-    /// Put a model in it, as a pull would have.
-    fn holding(self, id: &ModelId) -> Store {
-        std::fs::create_dir_all(self.0.join(id.relative_dir())).expect("a model directory");
-        self
-    }
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn settings(speech: Option<&str>, cleanup: Option<&str>) -> ModelSettings {
     let mut file = String::new();
@@ -386,114 +449,60 @@ fn settings(speech: Option<&str>, cleanup: Option<&str>) -> ModelSettings {
     ModelSettings::resolve(|_| None, &file).expect("a readable configuration")
 }
 
-// AYEAYE-58
+fn voice(backend: Fake, settings: ModelSettings, converter: &str) -> dictate::Voice<Fake> {
+    dictate::Voice::with_backend(settings, Policy::default(), converter.to_string(), backend)
+}
+
+// AYEAYE-58, rewritten by AYEAYE-101.
 //
-// The probe answers about the store as it is, not about the configuration file.
-// A model chosen and never pulled is the state a machine is in between two
-// commands, and calling it ready lights up a talk button that cannot work.
+// The probe answers about what the backend is *serving*, not about what the
+// configuration file names. A model chosen and never added to llama-swap's
+// config is the state a machine is in between two edits, and calling it ready
+// lights up a talk button that cannot work. The store walk this used to be is
+// now a request, and the fact it establishes is the same one.
 #[tokio::test]
-async fn the_probe_tells_a_model_that_is_here_from_one_that_was_only_chosen() {
-    let speech = ModelId::parse("openai/whisper-small.en").expect("an id");
-    let store = Store::named("probe").holding(&speech);
+async fn the_probe_tells_a_model_the_backend_serves_from_one_that_was_only_chosen() {
     let converter = if have_converter() {
         audio::CONVERTER
     } else {
         "true"
     };
 
-    let here = dictate::Voice::new(
-        store.0.clone(),
-        settings(Some("openai/whisper-small.en"), None),
-        Policy::default(),
-        converter.to_string(),
-        ayeaye_infer::backend::select(),
+    let here = voice(
+        Fake::default().serving(&["whisper", "qwen"]),
+        settings(Some("whisper"), None),
+        converter,
     )
     .probe()
     .await;
-    assert!(here.speech_ready, "the model really is in the store");
+    assert!(here.speech_ready, "the backend really is serving it");
     assert!(here.ok(), "{:?}", here.why());
 
-    let chosen_only = dictate::Voice::new(
-        store.0.clone(),
-        settings(Some("openai/whisper-tiny.en"), None),
-        Policy::default(),
-        converter.to_string(),
-        ayeaye_infer::backend::select(),
+    let chosen_only = voice(
+        Fake::default().serving(&["qwen"]),
+        settings(Some("whisper"), None),
+        converter,
     )
     .probe()
     .await;
     assert!(!chosen_only.speech_ready);
     assert!(!chosen_only.ok());
     assert!(
-        chosen_only
-            .why()
-            .expect("a reason")
-            .contains("whisper-tiny.en"),
+        chosen_only.why().expect("a reason").contains("whisper"),
         "{:?}",
         chosen_only.why()
     );
 
-    // And a machine with no converter cannot dictate whatever it has pulled.
-    let no_converter = dictate::Voice::new(
-        store.0.clone(),
-        settings(Some("openai/whisper-small.en"), None),
-        Policy::default(),
-        "ayeaye-58-no-such-converter".to_string(),
-        ayeaye_infer::backend::select(),
+    // And a machine with no converter cannot dictate whatever is being served.
+    let no_converter = voice(
+        Fake::default().serving(&["whisper"]),
+        settings(Some("whisper"), None),
+        "ayeaye-58-no-such-converter",
     )
     .probe()
     .await;
     assert!(!no_converter.converter);
     assert!(!no_converter.ok());
-}
-
-// AYEAYE-73
-//
-// The process makes the device decision once and hands the same one to every
-// slot: a voice built on a selection that fell back shows that selection's own
-// words from both slots, before any model has loaded. That is what makes the
-// startup banner and the resident models unable to disagree — they are
-// readings of one value, not two probes that happened to answer alike. The
-// selection is built by asking for cuda and opening the processor, which is a
-// fallback by definition on every build row, no card involved.
-#[tokio::test]
-async fn one_selection_reaches_both_slots_and_each_reports_its_fallback() {
-    use ayeaye_infer::backend::{self, Backend};
-
-    let selection = backend::choose(Backend::Cuda, |_| backend::open(Backend::Cpu));
-    let why = selection
-        .fallback()
-        .expect("a cpu opened for a cuda ask is a fallback")
-        .to_string();
-
-    let store = Store::named("one-selection");
-    let voice = dictate::Voice::new(
-        store.0.clone(),
-        settings(None, None),
-        Policy::default(),
-        "ayeaye-73-no-such-converter".to_string(),
-        selection,
-    );
-
-    let (speech_why, cleanup_why) = voice
-        .with_both(|speech, cleanup| {
-            (
-                speech.fallback().map(str::to_string),
-                cleanup.fallback().map(str::to_string),
-            )
-        })
-        .await;
-
-    assert_eq!(
-        speech_why.as_deref(),
-        Some(why.as_str()),
-        "the speech slot holds the process's decision"
-    );
-    assert_eq!(
-        cleanup_why.as_deref(),
-        Some(why.as_str()),
-        "and the language slot holds the same one"
-    );
 }
 
 // AYEAYE-58
@@ -503,13 +512,10 @@ async fn one_selection_reaches_both_slots_and_each_reports_its_fallback() {
 // reach a refusal that was knowable for free.
 #[tokio::test]
 async fn a_machine_with_no_speech_model_refuses_before_decoding_anything() {
-    let store = Store::named("no-model");
-    let voice = dictate::Voice::new(
-        store.0.clone(),
+    let voice = voice(
+        Fake::default(),
         settings(None, None),
-        Policy::default(),
-        "ayeaye-58-no-such-converter".to_string(),
-        ayeaye_infer::backend::select(),
+        "ayeaye-58-no-such-converter",
     );
 
     let outcome = voice.dictate(&stereo_44100(0.2), "wav", "").await;
@@ -522,44 +528,31 @@ async fn a_machine_with_no_speech_model_refuses_before_decoding_anything() {
     assert!(why.contains("model"), "{why}");
 }
 
-// AYEAYE-58
-//
-// The sweeper never loads and never trips over a machine that has not dictated
-// anything yet, which is every machine until somebody speaks.
+// AYEAYE-101 — a voice reaches the backend for the model each role names, and
+// for nothing else. This is what replaced the residency tests: there is no slot
+// to load, so what is worth watching is that the two names in the config file
+// reach the two requests unmixed.
 #[tokio::test]
-async fn sweeping_a_voice_that_has_never_been_used_lets_go_of_nothing() {
-    let store = Store::named("sweep");
-    let voice = dictate::Voice::with_slots(
-        store.0.clone(),
-        ModelSettings::resolve(
-            |_| None,
-            "AYEAYE_SPEECH_MODEL=openai/whisper-small.en\n\
-             AYEAYE_CLEANUP_MODEL=Qwen/Qwen2.5-7B-Instruct-GGUF\n\
-             AYEAYE_MODEL_IDLE=1s\n",
-        )
-        .expect("a readable configuration"),
-        Policy::default(),
-        "true".to_string(),
-        StubSpeech::default(),
-        StubCleanup::default(),
+async fn each_role_is_asked_of_the_model_its_own_setting_names() {
+    let voice = voice(
+        Fake::saying("um so run the tests").rewriting_to("Run the tests."),
+        settings(Some("whisper"), Some("qwen")),
+        "true",
     );
 
-    // Long past any idle time, on a machine where nobody has dictated yet.
-    assert!(
-        !voice
-            .sweep(std::time::Instant::now() + std::time::Duration::from_secs(3_600))
-            .await
-    );
-    // The part worth asserting, and the part the slots are the only witness to:
-    // the sweep did not *load* anything in order to discover there was nothing
-    // to release. Reading the store instead would be true whatever it did.
+    let outcome = voice.hear_decoded(&speech(1.0), "").await;
+
+    let Outcome::Heard { cleaned, .. } = &outcome else {
+        panic!("expected words, got {outcome:?}");
+    };
+    assert_eq!(cleaned.text(), "Run the tests.");
+    assert!(cleaned.was_rewritten());
     assert_eq!(
-        voice
-            .with_both(|speech, cleanup| (speech.resident, cleanup.resident))
-            .await,
-        (false, false),
-        "a sweep of a voice nobody has dictated through loaded a model"
+        *voice.backend().cleaned.lock().expect("a lock"),
+        vec!["qwen".to_string()],
+        "the cleanup request goes to the cleanup model"
     );
+    assert_eq!(voice.backend().asked(), 1);
 }
 
 // ------------------------------------------------------------- the tmux path
@@ -902,201 +895,6 @@ fn a_write_that_cannot_be_staged_leaves_the_recording_that_was_there() {
         "a write that could not be staged must leave the recording that was there"
     );
 }
-
-// --------------------------------------------------- residency, without models
-
-/// A speech slot that loads instantly and says what it was told to.
-///
-/// The real one is a directory of weights and hundreds of megabytes of device
-/// memory. Substituting it is the same boundary `models::Slot` already is, and
-/// it is what lets the two branches below be watched at all.
-#[derive(Default)]
-struct StubSpeech {
-    resident: bool,
-    releases: usize,
-}
-
-impl ayeaye::models::Slot for StubSpeech {
-    type Error = String;
-
-    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
-        self.resident = true;
-        Ok(())
-    }
-
-    fn unload(&mut self) -> bool {
-        self.releases += usize::from(self.resident);
-        std::mem::take(&mut self.resident)
-    }
-
-    fn fallback(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl Speech for StubSpeech {
-    fn transcribe(&mut self, _: &Pcm16kMono) -> Result<String, String> {
-        assert!(self.resident, "a slot that is not loaded cannot transcribe");
-        Ok("um so run the tests".to_string())
-    }
-}
-
-/// A cleanup slot whose weights are not there.
-struct NoWeights;
-
-impl ayeaye::models::Slot for NoWeights {
-    type Error = String;
-
-    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Err("model.gguf: No such file or directory".to_string())
-    }
-
-    fn unload(&mut self) -> bool {
-        false
-    }
-
-    fn fallback(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl Cleanup for NoWeights {
-    fn clean(&mut self, _: &str, _: &str, _: &Policy) -> Cleaned {
-        panic!("a cleanup model that would not load must never be asked to clean");
-    }
-}
-
-/// A cleanup slot that loads and rewrites.
-#[derive(Default)]
-struct StubCleanup {
-    resident: bool,
-    releases: usize,
-}
-
-impl ayeaye::models::Slot for StubCleanup {
-    type Error = String;
-
-    fn load(&mut self, _: &std::path::Path) -> Result<(), String> {
-        self.resident = true;
-        Ok(())
-    }
-
-    fn unload(&mut self) -> bool {
-        self.releases += usize::from(self.resident);
-        std::mem::take(&mut self.resident)
-    }
-
-    fn fallback(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl Cleanup for StubCleanup {
-    fn clean(&mut self, raw: &str, _: &str, policy: &Policy) -> Cleaned {
-        settle(policy, raw, Some("Run the tests."))
-    }
-}
-
-// AYEAYE-58
-//
-// A cleanup model that is configured and will not load costs the rewrite and
-// nothing else: the dictation comes back as the words the speaker said, with the
-// reason recorded. That is the acceptance criterion in the one place it is
-// easiest to get wrong — the model *was* asked for, so a naive implementation
-// reaches for a slot that is empty and loses the dictation.
-#[tokio::test]
-async fn a_cleanup_model_that_will_not_load_costs_the_rewrite_and_not_the_words() {
-    let store = Store::named("cleanup-broken");
-    let voice = ayeaye::dictate::Voice::with_slots(
-        store.0.clone(),
-        settings(
-            Some("openai/whisper-small.en"),
-            Some("Qwen/Qwen2.5-7B-Instruct-GGUF"),
-        ),
-        Policy::default(),
-        "true".to_string(),
-        StubSpeech::default(),
-        NoWeights,
-    );
-
-    let outcome = voice.hear_decoded(&speech(1.0), "").await;
-
-    let Outcome::Heard { raw, cleaned } = &outcome else {
-        panic!("expected the words anyway, got {outcome:?}");
-    };
-    assert_eq!(raw, "um so run the tests");
-    assert_eq!(cleaned.text(), raw, "the dictation has to survive");
-    assert_eq!(cleaned.kept(), Some(Kept::Unavailable));
-}
-
-// AYEAYE-58
-//
-// The other side: both models load, and the rewrite is what gets typed. Asserted
-// beside the case above because the two differ by one branch, and a mistake in
-// that branch would make one of them pass on its own.
-#[tokio::test]
-async fn both_models_loading_gives_the_rewrite_rather_than_the_raw_words() {
-    let store = Store::named("cleanup-good");
-    let voice = ayeaye::dictate::Voice::with_slots(
-        store.0.clone(),
-        settings(
-            Some("openai/whisper-small.en"),
-            Some("Qwen/Qwen2.5-7B-Instruct-GGUF"),
-        ),
-        Policy::default(),
-        "true".to_string(),
-        StubSpeech::default(),
-        StubCleanup::default(),
-    );
-
-    let outcome = voice.hear_decoded(&speech(1.0), "").await;
-
-    let Outcome::Heard { cleaned, .. } = &outcome else {
-        panic!("expected words, got {outcome:?}");
-    };
-    assert_eq!(cleaned.text(), "Run the tests.");
-    assert!(cleaned.was_rewritten());
-}
-
-// AYEAYE-58
-//
-// The sweeper's whole point: a model is released because nobody is dictating,
-// and both of them go. The idle clock starts when the dictation *finished*, so a
-// sweep inside the window keeps them and one past it does not.
-#[tokio::test]
-async fn a_model_nobody_has_dictated_through_is_let_go_of() {
-    let store = Store::named("sweep-release");
-    let idle = std::time::Duration::from_secs(60);
-    let voice = ayeaye::dictate::Voice::with_slots(
-        store.0.clone(),
-        ModelSettings::resolve(
-            |_| None,
-            "AYEAYE_SPEECH_MODEL=openai/whisper-small.en\n\
-             AYEAYE_CLEANUP_MODEL=Qwen/Qwen2.5-7B-Instruct-GGUF\n\
-             AYEAYE_MODEL_IDLE=60s\n",
-        )
-        .expect("a readable configuration"),
-        Policy::default(),
-        "true".to_string(),
-        StubSpeech::default(),
-        StubCleanup::default(),
-    );
-
-    voice.hear_decoded(&speech(1.0), "").await;
-    let finished = std::time::Instant::now();
-
-    assert!(
-        !voice.sweep(finished + idle / 2).await,
-        "a model somebody dictated through a moment ago is still wanted"
-    );
-    assert!(
-        voice.sweep(finished + idle * 2).await,
-        "a model nobody has used for twice its idle time is not worth the memory"
-    );
-    // And sweeping again lets go of nothing, because there is nothing left.
-    assert!(!voice.sweep(finished + idle * 4).await);
-}
-
 // AYEAYE-58
 //
 // The converter's flags, held to without running anything. Each is load-bearing:

@@ -484,14 +484,17 @@ mod tests {
 
     /// A voice with no models and a converter that is not there, so nothing in
     /// this file can reach a model or start a process by accident.
+    ///
+    /// The backend address points at a port nothing listens on, which is the
+    /// same guarantee the converter name gives: reaching for it fails rather
+    /// than working by accident on the machine the suite happens to run on.
     fn silent() -> std::sync::Arc<super::Voice> {
         std::sync::Arc::new(super::Voice::new(
-            std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
-            ayeaye_infer::backend::select(),
+            crate::swap::Swap::at("127.0.0.1:1").expect("a well-formed address"),
         ))
     }
 

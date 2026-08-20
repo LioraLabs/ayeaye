@@ -161,12 +161,11 @@ async fn the_picker_answers_over_a_socket() {
         // Nothing here can load a model or start a process by accident; the
         // cases that care about voice build their own.
         voice: std::sync::Arc::new(ayeaye::dictate::Voice::new(
-            std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
-            ayeaye_infer::backend::select(),
+            ayeaye::swap::Swap::at("127.0.0.1:1").expect("an address nothing listens on"),
         )),
         // This test never spawns, and a `None` store is the same guarantee
         // the `fits: None` above makes: nothing here writes into the state

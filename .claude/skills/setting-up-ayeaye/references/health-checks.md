@@ -46,13 +46,19 @@ that could not be addressed (a Mac whose launchd domain would not answer).
 platform; installing a package is the user's consent to get, then theirs or
 yours with a yes. Nothing else works until this does.
 
-**acceleration** — *what this build can use of what this machine has.*
-`FAILED`: a usable card beside a build not compiled for it — everything works
-but transcription runs on the processor and is mysteriously slow. The fix is
-the matching artifact (the CUDA build for NVIDIA), never a setting. `skipped`
-with a reason: the card cannot be used (AMD — candle has no ROCm backend — or
-too small); that is the machine's ceiling, said plainly. `unknown`: the card
-would not say how much memory it has.
+**backend** — *the llama-swap serving the two models dictation needs.*
+This replaced the old **acceleration** check, which asked what this build could
+use of this machine's graphics card. That question is gone with the models: the
+binary runs no inference, so the card belongs to llama-swap's process and
+llama-swap is what was built for it.
+`FAILED`: it answered, and it is not serving a model named in
+`~/.config/ayeaye/env`. The detail line names which one is missing and lists
+what the proxy does serve — so the fix is either a `models:` entry on that side
+or `ayeaye model use speech|cleanup NAME` on this one.
+`unknown`: nothing answered at the address. Is llama-swap running, and is
+`AYEAYE_LLAMA_SWAP` pointing at it? It defaults to `http://127.0.0.1:8080`.
+`skipped`: no model is configured at all, which is a text-only machine — a
+legitimate way to run ayeaye, not a fault.
 
 **local** — *ayeaye answers on its own address.*
 `unknown`: nothing answered at all — the daemon is not up (`ayeaye service

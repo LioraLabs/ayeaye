@@ -7,14 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-cuda = ["ayeaye-infer/cuda"]
-metal = ["ayeaye-infer/metal"]
-
 [dependencies]
 ayeaye-core.workspace = true
-ayeaye-infer.workspace = true
 
 # axum and tokio are declared here rather than in [workspace.dependencies]:
 # the root manifest is the file every ticket in this milestone touches, and

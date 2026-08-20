@@ -4,9 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | bash
 #
 # It looks at this machine just enough to name one release artifact - an
-# operating system, an architecture, and whether an NVIDIA card answers -
-# fetches the newest release's copy, refuses it unless the SHA256SUMS
-# published beside it agrees with the bytes, puts it on the PATH, and hands
+# operating system and an architecture - fetches the newest release's copy,
+# refuses it unless the SHA256SUMS published beside it agrees with the bytes,
+# puts it on the PATH, and hands
 # everything else to the binary's own `ayeaye setup`. Arguments pass through
 # to setup, so `... | bash -s -- --yes` still means what it always meant.
 #
@@ -24,14 +24,11 @@ arch="$(uname -m)"
 case "$arch" in arm64) arch="aarch64" ;; esac
 case "$os/$arch" in
   Linux/x86_64|Linux/aarch64)
-    artifact="ayeaye-$arch-unknown-linux-musl"
-    # The one question asked of the hardware: does an NVIDIA driver answer?
-    # The release has a single CUDA row, x86_64; every verdict beyond this -
-    # tier, model, whether the card is worth using - belongs to the binary.
-    if [ "$arch" = x86_64 ] && command -v nvidia-smi >/dev/null 2>&1 \
-        && nvidia-smi -L 2>/dev/null | grep -q '^GPU '; then
-      artifact="ayeaye-x86_64-unknown-linux-gnu-cuda"
-    fi ;;
+    # No question is asked of the hardware any more. Since AYEAYE-101 this
+    # binary runs no model, so there is no CUDA row to choose and nothing about
+    # a graphics card that changes which artifact is right - whatever card is
+    # here belongs to llama-swap, which was built for it separately.
+    artifact="ayeaye-$arch-unknown-linux-musl" ;;
   Darwin/x86_64|Darwin/aarch64)
     artifact="ayeaye-$arch-apple-darwin" ;;
   *)
@@ -64,52 +61,20 @@ fetch() {
     echo "  fetched   $got" >&2
     return 1
   fi
-  if [ "$artifact" = ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
-    tar -tzf "$work/download" >"$work/members" || return 1
-    awk '
-      /^\// || /(^|\/)\.\.($|\/)/ { bad = 1 }
-      END { exit bad }
-    ' "$work/members" || return 1
-    tar -tvzf "$work/download" >"$work/member-types" || return 1
-    awk '
-      substr($1, 1, 1) ~ /[lh]/ { bad = 1 }
-      END { exit bad }
-    ' "$work/member-types" || return 1
-    rm -rf "$work/cuda"
-    mkdir "$work/cuda"
-    tar -xzf "$work/download" -C "$work/cuda" || return 1
-    [ -f "$work/cuda/ayeaye" ] && [ -d "$work/cuda/lib" ] || return 1
-    candidate="$work/cuda/ayeaye"
-  else
-    candidate="$work/download"
-  fi
+  # Every artifact is now one static binary. The tar handling that was here
+  # unpacked the CUDA bundle and checked it for absolute paths, `..` members
+  # and links before trusting it; there is no bundle left to unpack.
+  candidate="$work/download"
   chmod +x "$candidate"
   "$candidate" --version >/dev/null 2>&1
 }
 
-if ! fetch; then
-  if [ "$artifact" != ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
-    echo "$artifact cannot run on this machine - keeping the existing install" >&2
-    exit 1
-  fi
-  echo "the CUDA build cannot run on this machine; falling back to the portable CPU build" >&2
-  artifact=ayeaye-x86_64-unknown-linux-musl
-  fetch || { echo "the portable CPU build cannot run either - keeping the existing install" >&2; exit 1; }
-fi
+# One artifact per machine and no fallback row to try: the CUDA build was the
+# only artifact that could fail to run on the machine it was chosen for, and it
+# is gone.
+fetch || { echo "$artifact cannot run on this machine - keeping the existing install" >&2; exit 1; }
 
-if [ "$artifact" = ayeaye-x86_64-unknown-linux-gnu-cuda ]; then
-  bundle=".ayeaye-cuda-$want"
-  if [ ! -d "$bin_dir/$bundle" ]; then
-    mv "$work/cuda" "$bin_dir/$bundle"
-  fi
-  [ -f "$bin_dir/$bundle/ayeaye" ] && [ -d "$bin_dir/$bundle/lib" ] \
-    && "$bin_dir/$bundle/ayeaye" --version >/dev/null 2>&1 \
-    || { echo "the staged CUDA bundle is incomplete - keeping the existing install" >&2; exit 1; }
-  ln -s "$bundle/ayeaye" "$work/ayeaye"
-  mv "$work/ayeaye" "$bin_dir/ayeaye"
-else
-  mv "$candidate" "$bin_dir/ayeaye"
-fi
+mv "$candidate" "$bin_dir/ayeaye"
 echo "installed $bin_dir/ayeaye"
 case ":$PATH:" in
   *:"$bin_dir":*) ;;

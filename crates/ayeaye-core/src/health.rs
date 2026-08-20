@@ -33,8 +33,6 @@
 //! verdict in the whole step that fails it outright rather than leaving it
 //! unfinished.
 
-use crate::machine::{Acceleration, Machine, Usability};
-
 /// What became of one check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -89,7 +87,7 @@ pub struct Check {
     /// The default qualification for `skipped` is "you did not ask for this",
     /// and it is right for every check that reports on something a person
     /// chooses. It is *wrong* for the ones that report a fact about the machine:
-    /// "ayeaye cannot use an AMD graphics card — you did not ask for this" tells
+    /// "this tiering does not size AMD cards — you did not ask for this" tells
     /// somebody they declined a thing they never had the option of. So a check
     /// whose own claim carries the reason says so, and keeps the mark without
     /// the sentence.
@@ -407,119 +405,49 @@ pub fn tmux(present: bool) -> Verdict {
     }
 }
 
-/// What this build can use of what this machine has.
+/// Whether the inference backend is there and serving what was chosen.
 ///
-/// A CPU build on a machine with a usable card is the case this exists for: it
-/// works perfectly, and the only other symptom is inference being mysteriously
-/// slow, which nobody diagnoses. So it is said out loud, and it is said as
-/// [`Verdict::Failed`] — the machine has a capability the running binary is not
-/// using, which is a thing to act on.
+/// `served` is the model names llama-swap answered with, or `None` when it could
+/// not be asked at all — which are different facts and get different verdicts.
+/// A configured model the proxy does not serve is a [`Verdict::Failed`]: it is
+/// the exact shape of failure that used to be "the model is not in the store",
+/// and it is the one somebody can fix.
 ///
-/// An unusable card is not this machine's fault and not a failure of it. AMD is
-/// the case that matters: `machine::tier` detects and names the card and reports
-/// [`Usability::Unsupported`] because candle has no ROCm backend, and this
-/// repeats that verdict in its own words rather than inventing a cheerier one.
-pub fn acceleration(build: Acceleration, machine: &Machine) -> Check {
-    let (verdict, claim, detail) = match (machine.usability(), machine.acceleration()) {
-        // Usable acceleration this build was not compiled for. One arm for both
-        // kinds, because the fact is the same fact and the card names itself.
-        (Usability::Usable, found) if found != build => (
-            Verdict::Failed,
-            "this build is using the graphics card in this machine".to_string(),
-            Some(format!(
-                "there is a usable {} here and this is a {} build, so \
-                 transcription runs on the processor and will be slow",
-                machine.gpu_name().unwrap_or(found.as_str()),
-                build.as_str()
-            )),
-        ),
-        (Usability::Usable, _) => (
-            Verdict::Passed,
-            format!("transcription runs on {}", describe(machine)),
-            None,
-        ),
-        // Named, and declined, with the reason said plainly. Not a failure of
-        // this machine: nothing here is broken and nothing can be done about it.
-        (Usability::Unsupported(why), _) => (
-            Verdict::Skipped,
-            format!("transcription runs on the processor: {why}"),
-            machine
-                .gpu_name()
-                .map(|name| format!("the card is a {name}")),
-        ),
-        // A card that would not say how big it is. Not a kind of TooSmall —
-        // telling somebody their card is too small when what happened is that a
-        // command did not answer is a lie about their hardware — and the one
-        // place in this module where "setup could not tell" is about the machine
-        // rather than about a request.
-        (Usability::Unsized, _) => (
-            Verdict::Unknown,
-            "which processor transcription will run on".to_string(),
-            Some(format!(
-                "there is a {} here and it would not say how much memory it has",
-                machine.gpu_name().unwrap_or("graphics card")
-            )),
-        ),
-        (Usability::TooSmall, _) => (
-            Verdict::Skipped,
-            "transcription runs on the processor: the graphics card is too small to be any use"
-                .to_string(),
-            machine
-                .gpu_name()
-                .map(|name| format!("the card is a {name}")),
-        ),
-        (Usability::None, _) => (
-            Verdict::Passed,
-            "transcription runs on the processor".to_string(),
-            None,
-        ),
-    };
-    Check {
-        name: "acceleration",
-        claim,
-        verdict,
-        detail,
-        // Every arm's claim already carries its own reason — "the graphics card
-        // is too small to be any use", "ayeaye cannot use an AMD graphics card".
-        // These are facts about the machine, and the default qualification for a
-        // skip is "you did not ask for this", which would tell somebody they
-        // declined a card they never had the option of using.
-        explains_itself: true,
+/// A machine with no speech model configured is [`Verdict::Skipped`] rather than
+/// failed. That is a text-only machine, which is a legitimate way to run ayeaye
+/// and not a broken one.
+pub fn backend(served: Option<&[String]>, wanted: &[&str]) -> Verdict {
+    // Asked before the proxy is: a machine that chose no model has nothing to
+    // check whether or not anything answered, and reporting "could not tell"
+    // there would be an unknown about a question nobody asked.
+    if wanted.is_empty() {
+        return Verdict::Skipped;
     }
-}
-
-/// What is doing the work, named.
-fn describe(machine: &Machine) -> String {
-    match machine.gpu_name() {
-        Some(name) => name.to_string(),
-        None => match machine.acceleration() {
-            Acceleration::Cuda => "the NVIDIA card".to_string(),
-            Acceleration::Metal => "this Mac's graphics".to_string(),
-            Acceleration::Rocm => "the AMD card".to_string(),
-            Acceleration::Cpu => "the processor".to_string(),
-        },
+    let Some(served) = served else {
+        return Verdict::Unknown;
+    };
+    if wanted
+        .iter()
+        .all(|name| served.iter().any(|had| had == name))
+    {
+        Verdict::Passed
+    } else {
+        Verdict::Failed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, Outcome, Report, Verdict, acceleration, agents, board, hosts, https,
-        insecure_warning, local, mesh, service, service_claim, tmux, unauthenticated,
+        Check, Outcome, Report, Verdict, agents, backend, board, hosts, https, insecure_warning,
+        local, mesh, service, service_claim, tmux, unauthenticated,
     };
-    use crate::machine::{Acceleration, Machine, Probes, Usability};
 
     /// The captured probe output, reaching this crate the only way it may.
     ///
     /// `machine::fixture!` cannot be reused: the relative path in it resolves
     /// against the file the macro is expanded in, and every module using that
     /// one sits a directory below `src/` while this sits in it.
-    macro_rules! fixture {
-        ($path:literal) => {
-            include_str!(concat!("../../../tests/fixtures/", $path))
-        };
-    }
-
     fn check(name: &'static str, verdict: Verdict) -> Check {
         Check {
             name,
@@ -840,162 +768,46 @@ mod tests {
         assert_eq!(tmux(false), Verdict::Failed);
     }
 
-    // AYEAYE-62 — the acceptance criterion in its own words: a CPU build running
-    // on a machine with a usable NVIDIA card says so, because the only other
-    // symptom is inference being mysteriously slow.
+    // AYEAYE-101 — the acceleration check went with candle. What replaced it is
+    // the question that actually stops a dictation: is the backend there, and is
+    // it serving the models named in the config file.
     #[test]
-    fn a_cpu_build_on_a_machine_with_a_usable_card_says_so() {
-        let machine = Machine::read(&Probes {
-            os_release: Some(fixture!("os-release/ubuntu-24.04")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            nvidia_smi: Some(fixture!("nvidia-smi/rtx-4090")),
-            ..Probes::default()
-        });
-        assert_eq!(machine.usability(), Usability::Usable);
+    fn a_backend_serving_what_was_chosen_passes_and_one_that_is_not_fails() {
+        let served = ["whisper".to_string(), "qwen".to_string()];
 
-        let said = acceleration(Acceleration::Cpu, &machine);
-        assert_eq!(said.verdict, Verdict::Failed);
-        let detail = said.detail.expect("it must name the card");
-        assert!(detail.contains("NVIDIA GeForce RTX 4090"), "{detail}");
-        assert!(detail.contains("slow"), "{detail}");
-
-        // The same machine, built for it, has nothing to report.
-        let matched = acceleration(Acceleration::Cuda, &machine);
-        assert_eq!(matched.verdict, Verdict::Passed);
-        assert!(matched.claim.contains("RTX 4090"), "{}", matched.claim);
-
-        // And a build compiled for the *other* card is just as wrong as a
-        // processor build: what matters is that the acceleration this machine
-        // has is not the acceleration this binary can use.
-        let mismatched = acceleration(Acceleration::Metal, &machine);
-        assert_eq!(mismatched.verdict, Verdict::Failed);
-        assert!(
-            mismatched
-                .detail
-                .is_some_and(|detail| detail.contains("metal build")),
-            "it must name the build, or nobody knows which artifact to replace"
-        );
-    }
-
-    // AYEAYE-62 — the same criterion the other way round: an Apple machine
-    // whose build cannot use its graphics.
-    #[test]
-    fn a_cpu_build_on_an_apple_machine_says_so_too() {
-        let machine = Machine::read(&Probes {
-            uname_s: Some("Darwin"),
-            uname_m: Some("arm64"),
-            sw_vers: Some(fixture!("sw_vers/macos-15.1")),
-            system_profiler: Some(fixture!("system_profiler/apple-m3-24gb")),
-            df_pk: Some(fixture!("df/roomy")),
-            ..Probes::default()
-        });
-        assert_eq!(machine.acceleration(), Acceleration::Metal);
         assert_eq!(
-            acceleration(Acceleration::Cpu, &machine).verdict,
-            Verdict::Failed
-        );
-        assert_eq!(
-            acceleration(Acceleration::Metal, &machine).verdict,
+            backend(Some(&served), &["whisper", "qwen"]),
             Verdict::Passed
         );
+        assert_eq!(backend(Some(&served), &["whisper"]), Verdict::Passed);
+        // One missing is a failure, not a partial pass: the dictation that asks
+        // for it gets a 400 and no words.
+        assert_eq!(
+            backend(Some(&served), &["whisper", "llama"]),
+            Verdict::Failed
+        );
+        assert_eq!(backend(Some(&[]), &["whisper"]), Verdict::Failed);
     }
 
-    // AYEAYE-62 — a card that would not say how big it is. Not a kind of "too
-    // small": telling somebody their card is too small when what happened is
-    // that a command did not answer is a lie about their hardware. This is the
-    // one place in the module where "setup could not tell" is about the machine
-    // rather than about a request.
+    // AYEAYE-101 — "could not ask" and "asked, and no" are different facts and
+    // neither may wear the other's mark. A proxy that is not running is unknown
+    // rather than failed: nothing has been shown to be misconfigured.
     #[test]
-    fn a_card_that_would_not_say_its_size_is_unknown_and_not_declined() {
-        let machine = Machine::read(&Probes {
-            os_release: Some(fixture!("os-release/debian-12")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            nvidia_smi: Some("NVIDIA GeForce RTX 4090, [N/A]\n"),
-            ..Probes::default()
-        });
-        assert_eq!(machine.usability(), Usability::Unsized);
-        let said = acceleration(Acceleration::Cpu, &machine);
-        assert_eq!(said.verdict, Verdict::Unknown);
-        assert!(
-            said.detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("would not say")),
-            "{said:?}"
-        );
+    fn a_backend_that_could_not_be_asked_is_unknown_rather_than_failed() {
+        assert_eq!(backend(None, &["whisper"]), Verdict::Unknown);
+        // Except when nothing was configured: that is skipped whether or not
+        // the proxy answered, because the question was never asked.
+        assert_eq!(backend(None, &[]), Verdict::Skipped);
     }
 
-    // AYEAYE-62 — AMD, which is AYEAYE-60's deliberate departure carried
-    // through: the card is real, it is named, and ayeaye cannot use it because
-    // candle has no ROCm backend. That is not a failure of this machine and
-    // nothing can be done about it, so it is skipped rather than failed — and it
-    // is never reported as a card being used.
+    // AYEAYE-101 — a machine with no model configured runs text-only, which is
+    // a legitimate way to run ayeaye. Failing it would nag somebody about a
+    // feature they did not ask for.
     #[test]
-    fn an_amd_card_is_named_and_declined_in_the_detectors_own_words() {
-        let machine = Machine::read(&Probes {
-            os_release: Some(fixture!("os-release/arch")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            rocminfo: Some(fixture!("rocminfo/gfx1100")),
-            ..Probes::default()
-        });
-        let said = acceleration(Acceleration::Cpu, &machine);
-        assert_eq!(said.verdict, Verdict::Skipped);
-        assert!(
-            said.claim
-                .contains("ayeaye cannot use an AMD graphics card"),
-            "the detector's own words, not a cheerier invention: {}",
-            said.claim
+    fn a_machine_with_no_model_configured_is_skipped_rather_than_failed() {
+        assert_eq!(
+            backend(Some(&["whisper".to_string()]), &[]),
+            Verdict::Skipped
         );
-        assert!(
-            said.detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("AMD Radeon RX 7900 XTX")),
-            "somebody who paid for the card is told it was seen"
-        );
-    }
-
-    // AYEAYE-62 — a card too small to be any use is named too, for the same
-    // reason: saying "there is no graphics card here" to somebody who paid for
-    // one is how a tool stops being believed about anything else.
-    #[test]
-    fn a_card_too_small_to_use_is_still_named() {
-        let machine = Machine::read(&Probes {
-            os_release: Some(fixture!("os-release/debian-12")),
-            uname_s: Some("Linux"),
-            uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            nvidia_smi: Some(fixture!("nvidia-smi/gtx-1050")),
-            ..Probes::default()
-        });
-        let said = acceleration(Acceleration::Cpu, &machine);
-        assert_eq!(said.verdict, Verdict::Skipped);
-        assert!(said.claim.contains("too small"), "{}", said.claim);
-        assert!(
-            said.detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("GTX 1050"))
-        );
-    }
-
-    // AYEAYE-62 — a machine with no card at all has nothing to report and is not
-    // nagged about it.
-    #[test]
-    fn a_machine_with_no_card_is_not_told_it_is_missing_one() {
-        let said = acceleration(Acceleration::Cpu, &Machine::read(&Probes::default()));
-        assert_eq!(said.verdict, Verdict::Passed);
-        assert_eq!(said.detail, None);
     }
 }

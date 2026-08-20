@@ -7,7 +7,6 @@
 
 use crate::cleanup::Cleaned;
 use crate::json;
-use crate::model::ModelId;
 
 /// What a speech model writes when it is handed near-silence.
 ///
@@ -65,11 +64,11 @@ pub struct Capability {
     /// Whether the audio converter is on this machine.
     pub converter: bool,
     /// The speech model somebody has chosen, if they have.
-    pub speech: Option<ModelId>,
+    pub speech: Option<String>,
     /// Whether that model's files are really in the store.
     pub speech_ready: bool,
     /// The cleanup model somebody has chosen, if they have.
-    pub cleanup: Option<ModelId>,
+    pub cleanup: Option<String>,
     /// Whether that model's files are really in the store.
     pub cleanup_ready: bool,
 }
@@ -96,8 +95,9 @@ impl Capability {
         }
         match &self.speech {
             None => Some(NO_SPEECH_MODEL.to_string()),
-            Some(id) if !self.speech_ready => Some(format!(
-                "{id} is not on this machine yet — `ayeaye model pull {id}`"
+            Some(name) if !self.speech_ready => Some(format!(
+                "the backend is not serving a model called {name} — check it is \
+                 running and that {name} is a model in its config"
             )),
             Some(_) => None,
         }
@@ -110,8 +110,8 @@ impl Capability {
     /// out of this `Capability` rather than running a second probe that can
     /// disagree with this one. The rest is what somebody needs to fix it.
     pub fn body(&self) -> String {
-        let model = |chosen: &Option<ModelId>| match chosen {
-            Some(id) => json::string(&id.to_string()),
+        let model = |chosen: &Option<String>| match chosen {
+            Some(name) => json::string(name),
             None => "null".to_string(),
         };
         format!(
@@ -312,10 +312,9 @@ mod tests {
         Capability, Outcome, State, is_hallucination, on_sixteen_bit_scale, recording_device,
     };
     use crate::cleanup::{Kept, Policy, settle};
-    use crate::model::ModelId;
 
-    fn id(spelled: &str) -> ModelId {
-        ModelId::parse(spelled).expect("a well-formed id")
+    fn id(spelled: &str) -> String {
+        spelled.to_string()
     }
 
     fn ready() -> Capability {

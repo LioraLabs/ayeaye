@@ -195,7 +195,10 @@ mod tests {
     fn a_tail_discards_its_partial_first_line() {
         let mut text = String::new();
         for index in 0..100 {
-            text.push_str(&format!("line number {index:03} padded out {}\n", "x".repeat(40)));
+            text.push_str(&format!(
+                "line number {index:03} padded out {}\n",
+                "x".repeat(40)
+            ));
         }
         let scratch = Scratch::holding("partial", &text);
         let (chunk, _) = tail(scratch.path(), 1_000).expect("a readable file");
@@ -223,17 +226,22 @@ mod tests {
     // Transcribed from session_state.py's tail_bytes=2000 case.
     #[test]
     fn a_launch_that_scrolled_out_of_the_tail_is_forgotten() {
-        let mut lines = vec![
-            format!(
-                r#"{{"type":"assistant","timestamp":"2026-03-04T09:00:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_A","name":"Agent","input":{{}}}}]}}}}"#
-            ),
-        ];
+        let mut lines = vec![format!(
+            r#"{{"type":"assistant","timestamp":"2026-03-04T09:00:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_A","name":"Agent","input":{{}}}}]}}}}"#
+        )];
         for index in 0..200 {
-            lines.push(said("assistant", &format!("line {index} {}", "x".repeat(200))));
+            lines.push(said(
+                "assistant",
+                &format!("line {index} {}", "x".repeat(200)),
+            ));
         }
         let scratch = Scratch::holding("horizon", &(lines.join("\n") + "\n"));
         let (chunk, touched) = tail(scratch.path(), 2_000).expect("a readable file");
         let got = classify(&chunk, Kind::Claude, touched + 60.0, touched);
-        assert_eq!(got.state, State::Waiting, "the launch is out of the horizon");
+        assert_eq!(
+            got.state,
+            State::Waiting,
+            "the launch is out of the horizon"
+        );
     }
 }

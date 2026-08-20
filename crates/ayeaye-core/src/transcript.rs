@@ -96,7 +96,11 @@ const TASK_NOTIFICATION: &str = "<task-notification>";
 fn rows_claude(line: &Value) -> Vec<Row> {
     let cls = match line.get("type").and_then(Value::text) {
         Some(t @ ("user" | "assistant")) => {
-            if t == "assistant" { "assistant" } else { "user" }
+            if t == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            }
         }
         _ => return Vec::new(),
     };
@@ -517,8 +521,7 @@ mod tests {
         assert_eq!(done[0].cls, "result");
         assert_eq!(done[0].label, "agent");
         assert_eq!(
-            done[0].text,
-            "  <task-notification>agent finished</task-notification>",
+            done[0].text, "  <task-notification>agent finished</task-notification>",
             "the text is kept whole, markup included — the page renders it"
         );
     }
@@ -611,7 +614,8 @@ mod tests {
         let opaque = codex(r#"{"payload":{"type":"custom_tool_call_output","output":"plain"}}"#);
         assert_eq!(opaque[0].text, "plain");
 
-        let contentless = codex(r#"{"payload":{"type":"function_call_output","output":{"ok":true}}}"#);
+        let contentless =
+            codex(r#"{"payload":{"type":"function_call_output","output":{"ok":true}}}"#);
         assert_eq!(contentless[0].text, r#"{"ok": true}"#);
     }
 
@@ -643,7 +647,10 @@ mod tests {
         let long = "é".repeat(MAX_BLOCK + 7);
         let (kept, cut) = clip(&long);
         assert!(cut);
-        assert_eq!(kept.chars().count(), MAX_BLOCK + "\n… (7 more chars)".chars().count());
+        assert_eq!(
+            kept.chars().count(),
+            MAX_BLOCK + "\n… (7 more chars)".chars().count()
+        );
         assert!(kept.ends_with("\n… (7 more chars)"));
 
         // Exactly at the limit is not clipped: nothing would be saved.
@@ -699,7 +706,9 @@ mod tests {
     fn a_reference_is_read_strictly() {
         assert_eq!(reference("0:0"), Some((0, 0)));
         assert_eq!(reference("41:1"), Some((41, 1)));
-        for bad in ["", ":", "1:", ":2", "01:2", "1:02", "-1:2", "1:2:3", "1 :2", "x:y", "1.0:2"] {
+        for bad in [
+            "", ":", "1:", ":2", "01:2", "1:02", "-1:2", "1:2:3", "1 :2", "x:y", "1.0:2",
+        ] {
             assert_eq!(reference(bad), None, "for {bad:?}");
         }
     }
@@ -741,7 +750,8 @@ mod tests {
     // row with what there is rather than costing it.
     #[test]
     fn a_broken_timestamp_costs_the_label_not_the_row() {
-        let short = claude(r#"{"type":"user","timestamp":"2026-08-10T12","message":{"content":"hi"}}"#);
+        let short =
+            claude(r#"{"type":"user","timestamp":"2026-08-10T12","message":{"content":"hi"}}"#);
         assert_eq!(short[0].ts, "12");
         let none = claude(r#"{"type":"user","message":{"content":"hi"}}"#);
         assert_eq!(none[0].ts, "");

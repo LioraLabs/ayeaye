@@ -14,14 +14,20 @@
 //! walks somebody through a judgement call better than a branching wizard does,
 //! and the binary's job is to do the mechanical part and verify the result. So
 //! setup asks a person exactly where the shell asks — before an act with a
-//! consequence — and there are two of those:
+//! consequence — and since AYEAYE-101 there is exactly one of those:
 //!
-//! - **fetching a model**, which is bytes over the internet onto this disk;
 //! - **enabling the service**, which is a program that runs whenever you log in.
 //!
-//! Minting the key, writing the settings file and *writing* the service
-//! definition are not gated. All three land under directories the user already
-//! owns, all three are idempotent, and AYEAYE-61 already settled that the
+//! **Choosing models used to be the second.** It was gated because it
+//! downloaded weights: bytes over the internet onto this disk, which is a thing
+//! to ask about. It downloads nothing now — the models live in a `llama-swap`
+//! somebody already runs, and choosing is two names written into a file after
+//! asking that backend what it serves. A yes/no in front of a step that is
+//! itself a question is a question asked twice.
+//!
+//! Minting the key, writing the settings file, choosing models and *writing*
+//! the service definition are not gated. All of them land under directories the
+//! user already owns, all are idempotent, and AYEAYE-61 already settled that the
 //! definition is the one thing setup does to the machine.
 //!
 //! Everything the old wizard configured and this does not — network exposure,
@@ -35,8 +41,6 @@ use crate::machine::Machine;
 /// Why a step needs saying yes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consequence {
-    /// It fetches something from the internet onto this disk.
-    Network,
     /// It leaves a program running whenever this person logs in.
     RunsAtLogin,
 }
@@ -45,7 +49,6 @@ impl Consequence {
     /// The question a person is actually being asked.
     pub fn question(self) -> &'static str {
         match self {
-            Consequence::Network => "download it now?",
             Consequence::RunsAtLogin => "enable and start it now?",
         }
     }
@@ -60,7 +63,8 @@ pub enum Step {
     MintKey,
     /// Write the settings file setup owns, merging rather than replacing.
     WriteSettings,
-    /// Discover, smoke-test, and select speech and optional cleanup models.
+    /// Ask the backend what it serves, and choose which of those models
+    /// transcribes and which cleans transcripts up.
     ChooseModels,
     /// Write the service definition.
     InstallService,
@@ -72,9 +76,8 @@ impl Step {
     /// Why this needs consent, or `None` when it does not.
     pub fn consequence(&self) -> Option<Consequence> {
         match self {
-            Step::ChooseModels => Some(Consequence::Network),
             Step::EnableService => Some(Consequence::RunsAtLogin),
-            Step::MintKey | Step::WriteSettings | Step::InstallService => None,
+            Step::MintKey | Step::WriteSettings | Step::ChooseModels | Step::InstallService => None,
         }
     }
 
@@ -83,7 +86,9 @@ impl Step {
         match self {
             Step::MintKey => "generate the key that locks the page".to_string(),
             Step::WriteSettings => "write the settings file".to_string(),
-            Step::ChooseModels => "discover and choose models from the model hub".to_string(),
+            Step::ChooseModels => {
+                "choose which of the backend's models transcribes, and which cleans up".to_string()
+            }
             Step::InstallService => "write the service definition".to_string(),
             Step::EnableService => "start ayeaye now, and whenever you log in".to_string(),
         }
@@ -150,8 +155,6 @@ pub fn urlsafe(bytes: &[u8]) -> String {
 /// to either the cautious answer to both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Consent {
-    /// Fetching a model may go to the internet.
-    pub network: bool,
     /// The service may be enabled and started.
     pub run_at_login: bool,
 }
@@ -159,16 +162,12 @@ pub struct Consent {
 impl Consent {
     /// Yes to everything — what `--yes` means.
     pub fn all() -> Self {
-        Consent {
-            network: true,
-            run_at_login: true,
-        }
+        Consent { run_at_login: true }
     }
 
     /// Whether this covers that consequence.
     pub fn allows(&self, consequence: Consequence) -> bool {
         match consequence {
-            Consequence::Network => self.network,
             Consequence::RunsAtLogin => self.run_at_login,
         }
     }
@@ -234,8 +233,10 @@ pub fn plan(_machine: &Machine, has_manager: bool, existing: &Existing, choices:
     }
     plan.steps.push(Step::WriteSettings);
 
+    // Not gated. Choosing is itself a question, asked of a person at a
+    // terminal; a yes/no in front of it would be the same question twice.
     if choices.models {
-        gate(&mut plan, Step::ChooseModels, &choices.consent);
+        plan.steps.push(Step::ChooseModels);
     }
 
     if has_manager && choices.service {
@@ -274,30 +275,38 @@ mod tests {
         Machine::read(&tier_maker)
     }
 
-    fn roomy() -> Machine {
+    /// An ordinary machine. It used to be a *roomy* one — memory, cores, disk
+    /// and a card — because the plan was once shaped by how much of a model
+    /// would fit. Nothing about the plan depends on hardware any more, which is
+    /// why `plan` takes the machine as `_machine`.
+    fn ordinary() -> Machine {
         a_machine(Probes {
             os_release: Some(fixture!("os-release/ubuntu-24.04")),
             uname_s: Some("Linux"),
             uname_m: Some("x86_64"),
-            meminfo: Some(fixture!("meminfo/64gb")),
-            lscpu: Some(fixture!("lscpu/x86_64-8core")),
-            df_pk: Some(fixture!("df/roomy")),
-            nvidia_smi: Some(fixture!("nvidia-smi/rtx-4090")),
             ..Probes::default()
         })
     }
 
-    // AYEAYE-62 — the two acts with a consequence, and the three without. This
-    // is the answer to the milestone's load-bearing unknown, and it is asserted
-    // rather than left in a comment.
+    // AYEAYE-62, narrowed by AYEAYE-101 — the one act with a consequence, and
+    // the four without. This is the answer to the milestone's load-bearing
+    // unknown, and it is asserted rather than left in a comment.
+    //
+    // `ChooseModels` moved from the first list to the second, and that is the
+    // ticket: it was gated because it downloaded weights, and it downloads
+    // nothing now.
     #[test]
-    fn exactly_two_steps_have_a_consequence_worth_asking_about() {
-        assert_eq!(Step::ChooseModels.consequence(), Some(Consequence::Network),);
+    fn exactly_one_step_has_a_consequence_worth_asking_about() {
         assert_eq!(
             Step::EnableService.consequence(),
             Some(Consequence::RunsAtLogin)
         );
-        for harmless in [Step::MintKey, Step::WriteSettings, Step::InstallService] {
+        for harmless in [
+            Step::MintKey,
+            Step::WriteSettings,
+            Step::ChooseModels,
+            Step::InstallService,
+        ] {
             assert_eq!(
                 harmless.consequence(),
                 None,
@@ -312,7 +321,7 @@ mod tests {
     #[test]
     fn a_fresh_machine_with_consent_gets_the_whole_plan_in_order() {
         let made = plan(
-            &roomy(),
+            &ordinary(),
             true,
             &Existing::default(),
             &Choices {
@@ -334,19 +343,28 @@ mod tests {
         assert!(made.consequential());
     }
 
-    // AYEAYE-62 — without consent the two consequential steps do not happen, and
-    // are not silently dropped either: each is reported with the command that
-    // takes it, so declining is never a dead end. This is what makes setup safe
-    // for AYEAYE-63's downloader to hand off to with no terminal attached.
+    // AYEAYE-62 — without consent the consequential step does not happen, and is
+    // not silently dropped either: it is reported with the command that takes
+    // it, so declining is never a dead end. This is what makes setup safe for
+    // AYEAYE-63's downloader to hand off to with no terminal attached.
+    //
+    // `ChooseModels` is still on `steps` here, ungated. It asks its own
+    // question when it runs, and answers it with a declined line when there is
+    // nobody to ask — see `models::choose_interactive`.
     #[test]
     fn without_consent_nothing_consequential_happens_and_it_says_what_would() {
-        let made = plan(&roomy(), true, &Existing::default(), &Choices::default());
+        let made = plan(&ordinary(), true, &Existing::default(), &Choices::default());
         assert_eq!(
             made.steps,
-            vec![Step::MintKey, Step::WriteSettings, Step::InstallService]
+            vec![
+                Step::MintKey,
+                Step::WriteSettings,
+                Step::ChooseModels,
+                Step::InstallService
+            ]
         );
         assert!(!made.consequential());
-        assert_eq!(made.declined, vec![Step::ChooseModels, Step::EnableService]);
+        assert_eq!(made.declined, vec![Step::EnableService]);
         for step in &made.declined {
             let by_hand = step.by_hand().expect("a way to take it later");
             assert!(by_hand.starts_with("ayeaye "), "{by_hand}");
@@ -360,7 +378,7 @@ mod tests {
     fn a_second_run_keeps_the_key() {
         let already = Existing { key: true };
         let made = plan(
-            &roomy(),
+            &ordinary(),
             true,
             &already,
             &Choices {
@@ -394,7 +412,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_service_manager_is_not_offered_a_service() {
         let made = plan(
-            &roomy(),
+            &ordinary(),
             false,
             &Existing::default(),
             &Choices {
@@ -414,7 +432,7 @@ mod tests {
     #[test]
     fn asking_for_less_gets_less() {
         let made = plan(
-            &roomy(),
+            &ordinary(),
             true,
             &Existing::default(),
             &Choices {
@@ -427,41 +445,30 @@ mod tests {
         assert!(made.declined.is_empty(), "not declined — never asked for");
     }
 
-    // AYEAYE-62 — the two questions are two, and answering one does not answer
-    // the other. Somebody on a metered connection may well want the service and
-    // not the download; collapsing them would make the cautious answer to either
-    // the cautious answer to both.
+    // AYEAYE-62, narrowed by AYEAYE-101 — there is one consent left, and
+    // refusing it must not take anything else with it.
+    //
+    // This used to assert that the two consents were independent, because
+    // somebody on a metered connection might want the service and not the model
+    // download. There is no download, so what is left to prove is that saying no
+    // to the service still leaves the models chosen — the failure a single
+    // collapsed "yes to everything" flag would reintroduce.
     #[test]
-    fn the_two_consents_are_independent_of_each_other() {
-        let network_only = plan(
-            &roomy(),
+    fn refusing_the_service_does_not_refuse_anything_else() {
+        let made = plan(
+            &ordinary(),
             true,
             &Existing::default(),
             &Choices {
                 consent: Consent {
-                    network: true,
                     run_at_login: false,
                 },
                 ..Choices::default()
             },
         );
-        assert!(network_only.steps.contains(&Step::ChooseModels));
-        assert_eq!(network_only.declined, vec![Step::EnableService]);
-
-        let service_only = plan(
-            &roomy(),
-            true,
-            &Existing::default(),
-            &Choices {
-                consent: Consent {
-                    network: false,
-                    run_at_login: true,
-                },
-                ..Choices::default()
-            },
-        );
-        assert!(service_only.steps.contains(&Step::EnableService));
-        assert_eq!(service_only.declined, vec![Step::ChooseModels]);
+        assert!(made.steps.contains(&Step::ChooseModels));
+        assert!(made.steps.contains(&Step::InstallService));
+        assert_eq!(made.declined, vec![Step::EnableService]);
     }
 
     // AYEAYE-62 — the key goes on the end of a URL, so it has to survive being

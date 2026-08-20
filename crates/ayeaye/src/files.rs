@@ -25,9 +25,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 
-use ayeaye_core::files::{
-    self, Candidate, Kind, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_SCAN_BYTES,
-};
+use ayeaye_core::files::{self, Candidate, Kind, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_SCAN_BYTES};
 use ayeaye_core::json;
 use ayeaye_core::peer::PaneId;
 
@@ -146,12 +144,7 @@ fn sized(root: &str, ranked: &[String]) -> Vec<Candidate> {
 /// a request that could never name a tracked file, `not found` for everything
 /// else — so what exists outside the tracked list cannot be probed through
 /// the error text.
-pub async fn preview(
-    settings: &Settings,
-    pane: &str,
-    path: &str,
-    line: &str,
-) -> Preview {
+pub async fn preview(settings: &Settings, pane: &str, path: &str, line: &str) -> Preview {
     if pane.is_empty() || path.is_empty() {
         return refuse(StatusCode::BAD_REQUEST, "pane and path required");
     }
@@ -350,7 +343,16 @@ async fn repo_root(cwd: &str) -> Option<String> {
 /// root, wherever in the repository the pane sits.
 async fn tracked_files(cwd: &str) -> Option<Vec<String>> {
     let ran = command::run(
-        &["git", "-C", cwd, "ls-files", "--full-name", "-z", "--", ":/"],
+        &[
+            "git",
+            "-C",
+            cwd,
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--",
+            ":/",
+        ],
         LIST_LIMIT,
     )
     .await

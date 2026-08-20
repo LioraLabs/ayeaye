@@ -33,7 +33,10 @@ enum Kind {
     /// A character or byte literal.
     CharLiteral,
     /// A string of any flavor. `inner` is the char range between the quotes.
-    Str { inner_start: usize, inner_end: usize },
+    Str {
+        inner_start: usize,
+        inner_end: usize,
+    },
 }
 
 /// One lexed span: its kind and the half-open char range it covers.
@@ -518,8 +521,7 @@ mod tests {
     // AYEAYE-64 — a `{` inside a string must not derail the brace count.
     #[test]
     fn a_brace_inside_a_string_does_not_derail_the_blanking() {
-        let source =
-            "#[cfg(test)]\nmod tests {\n    const S: &str = \"{\";\n}\nfn shipped() {}\n";
+        let source = "#[cfg(test)]\nmod tests {\n    const S: &str = \"{\";\n}\nfn shipped() {}\n";
         let out = without_test_blocks(source);
         assert!(out.contains("fn shipped()"), "{out}");
         assert!(!out.contains("mod tests"), "{out}");
@@ -607,8 +609,7 @@ mod tests {
     // field blanks to its comma, and the next field survives.
     #[test]
     fn a_cfg_test_array_field_blanks_to_its_own_comma() {
-        let source =
-            "struct S {\n    #[cfg(test)]\n    probe: [u8; 2],\n    kept: u8,\n}\nfn shipped() {}\n";
+        let source = "struct S {\n    #[cfg(test)]\n    probe: [u8; 2],\n    kept: u8,\n}\nfn shipped() {}\n";
         let out = without_test_blocks(source);
         assert!(out.contains("kept: u8"), "{out}");
         assert!(out.contains("fn shipped()"), "{out}");

@@ -22,12 +22,11 @@ fn settings(what: &str) -> ayeaye::config::Settings {
         Some("desktop".to_string()),
         ayeaye::cliban::Cliban::new("/nonexistent/cliban".to_string()),
         std::sync::Arc::new(ayeaye::dictate::Voice::new(
-            std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-46-no-such-converter".to_string(),
-            ayeaye_infer::backend::select(),
+            ayeaye::swap::Swap::at("127.0.0.1:1").expect("an address nothing listens on"),
         )),
     )
     .expect("settings a test can drive");
@@ -43,7 +42,14 @@ fn settings(what: &str) -> ayeaye::config::Settings {
 #[tokio::test]
 async fn the_module_owns_one_path_and_no_other() {
     let settings = settings("transcript-paths");
-    for path in ["/api/messages", "/api/message/", "/api/stream", "/api/session", "/", ""] {
+    for path in [
+        "/api/messages",
+        "/api/message/",
+        "/api/stream",
+        "/api/session",
+        "/",
+        "",
+    ] {
         assert!(
             ayeaye::transcript::answer(&settings, path, None)
                 .await
@@ -69,7 +75,10 @@ async fn the_stream_is_gated_and_a_sessionless_pane_is_the_daemons_404() {
         .await
         .expect("the settings should describe a bindable address");
     let port = listener.local_addr().expect("a bound address").port();
-    tokio::spawn(ayeaye::server::serve(listener, std::sync::Arc::new(settings)));
+    tokio::spawn(ayeaye::server::serve(
+        listener,
+        std::sync::Arc::new(settings),
+    ));
 
     // `Connection: close` so the whole answer is "read to EOF" — which is
     // also the proof these are complete responses, not streams.
@@ -115,7 +124,12 @@ async fn the_stream_is_gated_and_a_sessionless_pane_is_the_daemons_404() {
 #[tokio::test]
 async fn a_message_nobody_can_have_is_the_daemons_404() {
     let settings = settings("transcript-nobody");
-    for query in [None, Some("pane=desktop/%25999"), Some("ref=0:0"), Some("pane=desktop/%25999&ref=0:0")] {
+    for query in [
+        None,
+        Some("pane=desktop/%25999"),
+        Some("ref=0:0"),
+        Some("pane=desktop/%25999&ref=0:0"),
+    ] {
         let (status, body) = ayeaye::transcript::answer(&settings, "/api/message", query)
             .await
             .expect("the message endpoint owns this path");

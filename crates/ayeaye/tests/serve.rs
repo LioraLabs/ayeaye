@@ -266,12 +266,11 @@ fn settings_with(port: u16, cliban: &str) -> Settings {
         // a model or start a process by accident. The cases that care about
         // voice say so.
         voice: Arc::new(ayeaye::dictate::Voice::new(
-            std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-58-no-such-converter".to_string(),
-            ayeaye_infer::backend::select(),
+            ayeaye::swap::Swap::at("127.0.0.1:1").expect("an address nothing listens on"),
         )),
         // No path, for the reason `fits` has none: a test must never write
         // into the pick history of whoever is running the suite. The case
@@ -2977,45 +2976,98 @@ fn settings_with_voice(port: u16, voice: ayeaye::dictate::Voice) -> Settings {
     }
 }
 
-/// A model store of this test's own, removed when it goes out of scope.
-struct Store(std::path::PathBuf);
+/// A llama-swap that serves the names it was given and nothing else.
+///
+/// A real socket, answering real HTTP, because `crate::swap` reaches it through
+/// `curl` — a double in front of the trait would prove the pipeline and skip the
+/// only part of this that talks a protocol. It answers `/v1/models` and refuses
+/// everything else, which is all the probe asks of a backend.
+///
+/// One connection at a time, served for as long as the test holds it. That is
+/// enough: the probe makes one request, and a queue is a thing to get wrong in a
+/// test harness.
+struct FakeSwap {
+    port: u16,
+    _serving: tokio::task::JoinHandle<()>,
+}
 
-impl Store {
-    fn named(what: &str) -> Store {
-        let path = scratch().join(format!("store-{what}"));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("a store");
-        Store(path)
+impl FakeSwap {
+    async fn serving(models: &[&str]) -> FakeSwap {
+        let body = format!(
+            r#"{{"object":"list","data":[{}]}}"#,
+            models
+                .iter()
+                .map(|name| format!(r#"{{"id":"{name}","object":"model"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a port of our own");
+        let port = listener.local_addr().expect("an address").port();
+        let serving = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Enough of the request to see the path. curl sends the
+                    // request line first, so one read is enough for a test.
+                    let mut buffer = [0u8; 2048];
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    let asked = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let answer = if asked.contains("/v1/models") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        FakeSwap {
+            port,
+            _serving: serving,
+        }
     }
 
-    /// Put a model in it, as a pull would have.
-    fn holding(self, id: &str) -> Store {
-        let id = ayeaye_core::model::ModelId::parse(id).expect("a well-formed id");
-        std::fs::create_dir_all(self.0.join(id.relative_dir())).expect("a model directory");
-        self
+    fn at(&self) -> ayeaye::swap::Swap {
+        ayeaye::swap::Swap::at(&format!("http://127.0.0.1:{}", self.port))
+            .expect("a well-formed address")
     }
 }
 
-impl Drop for Store {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A voice pointed at a store, with a converter that is really there or a name
-/// that is not.
-fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictate::Voice {
+/// A voice pointed at a backend, with a converter that is really there or a
+/// name that is not.
+fn voice(
+    backend: ayeaye::swap::Swap,
+    speech: Option<&str>,
+    converter: &str,
+) -> ayeaye::dictate::Voice {
     let file = speech
-        .map(|id| format!("AYEAYE_SPEECH_MODEL={id}\n"))
+        .map(|name| format!("AYEAYE_SPEECH_MODEL={name}\n"))
         .unwrap_or_default();
     ayeaye::dictate::Voice::new(
-        store.0.clone(),
         ayeaye_core::model::settings::ModelSettings::resolve(|_| None, &file)
             .expect("a readable configuration"),
         ayeaye_core::cleanup::Policy::default(),
         converter.to_string(),
-        ayeaye_infer::backend::select(),
+        backend,
     )
+}
+
+/// A backend on a port nothing listens on.
+fn nowhere() -> ayeaye::swap::Swap {
+    ayeaye::swap::Swap::at("127.0.0.1:1").expect("an address nothing listens on")
 }
 
 // AYEAYE-58
@@ -3026,10 +3078,9 @@ fn voice(store: &Store, speech: Option<&str>, converter: &str) -> ayeaye::dictat
 // with a model and a converter says it can dictate.
 #[tokio::test]
 async fn the_capability_probe_says_what_is_missing_and_what_is_not() {
-    let bare = Store::named("probe-bare");
     let server = Server::start(settings_with_voice(
         0,
-        voice(&bare, None, "ayeaye-58-no-such-converter"),
+        voice(nowhere(), None, "ayeaye-58-no-such-converter"),
     ))
     .await;
 
@@ -3048,10 +3099,10 @@ async fn the_capability_probe_says_what_is_missing_and_what_is_not() {
         answer.body_text()
     );
 
-    let ready = Store::named("probe-ready").holding("openai/whisper-small.en");
+    let backend = FakeSwap::serving(&["whisper"]).await;
     let server = Server::start(settings_with_voice(
         0,
-        voice(&ready, Some("openai/whisper-small.en"), "sh"),
+        voice(backend.at(), Some("whisper"), "sh"),
     ))
     .await;
     let answer = server
@@ -3091,10 +3142,9 @@ async fn neither_voice_endpoint_answers_without_a_token() {
 // rather than "voice not configured".
 #[tokio::test]
 async fn a_server_with_no_voice_refuses_a_clip_and_says_what_to_do_about_it() {
-    let bare = Store::named("dictate-bare");
     let server = Server::start(settings_with_voice(
         0,
-        voice(&bare, None, "ayeaye-58-no-such-converter"),
+        voice(nowhere(), None, "ayeaye-58-no-such-converter"),
     ))
     .await;
 
@@ -3113,10 +3163,10 @@ async fn a_server_with_no_voice_refuses_a_clip_and_says_what_to_do_about_it() {
 // silent empty transcription.
 #[tokio::test]
 async fn a_model_that_was_chosen_and_never_pulled_is_named_in_the_refusal() {
-    let store = Store::named("dictate-unpulled");
+    let backend = FakeSwap::serving(&["qwen"]).await;
     let server = Server::start(settings_with_voice(
         0,
-        voice(&store, Some("openai/whisper-small.en"), "sh"),
+        voice(backend.at(), Some("whisper"), "sh"),
     ))
     .await;
 
@@ -3124,7 +3174,7 @@ async fn a_model_that_was_chosen_and_never_pulled_is_named_in_the_refusal() {
 
     assert_eq!(answer.status, 503);
     assert!(
-        answer.body_text().contains("whisper-small.en"),
+        answer.body_text().contains("whisper"),
         "{}",
         answer.body_text()
     );
@@ -3136,10 +3186,10 @@ async fn a_model_that_was_chosen_and_never_pulled_is_named_in_the_refusal() {
 // one it was — the client chose it, and it is the thing to change.
 #[tokio::test]
 async fn a_container_this_build_does_not_read_is_refused_over_the_socket() {
-    let store = Store::named("dictate-ext").holding("openai/whisper-small.en");
+    let backend = FakeSwap::serving(&["whisper"]).await;
     let server = Server::start(settings_with_voice(
         0,
-        voice(&store, Some("openai/whisper-small.en"), "sh"),
+        voice(backend.at(), Some("whisper"), "sh"),
     ))
     .await;
 

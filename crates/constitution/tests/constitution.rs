@@ -184,21 +184,27 @@ fn no_default_build_turns_on_a_feature_that_needs_a_toolchain() {
     let corpus = corpus();
 
     // A rule that finds nothing in manifests it is not really reading would
-    // pass this vacuously, and unlike the lockfile there is nothing to plant:
-    // the real tree has no violation. So the proof runs the other way round —
-    // hand it a table naming `metal`, which `ayeaye-infer` really does turn on
-    // for Apple builds through a target table, and it has to say so.
+    // pass this vacuously, and there is nothing in the real tree to plant on
+    // any more: AYEAYE-101 deleted `ayeaye-infer`, which used to be the manifest
+    // this probe read because it turned `metal` on for Apple builds through a
+    // target table. So the violation is written out here instead — which is what
+    // this crate's own doc asks for, and is why the rule takes its input as
+    // text rather than reading a path.
     let probe = &[toolchain::Gated {
         feature: "metal",
         also: &[],
         cost: "nothing at all, which is why it is not really gated",
         artifact: "no artifact",
     }];
-    let infer = corpus
-        .member("ayeaye-infer")
-        .expect("ayeaye-infer should be a workspace member");
+    let planted = r#"
+[package]
+name = "planted"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+"#;
     assert!(
-        !toolchain::gated(&infer.dir, &infer.manifest, probe).is_empty(),
+        !toolchain::gated("crates/planted", planted, probe).is_empty(),
         "the rule found nothing in a manifest that turns metal on for macOS; \
          it is not reading the manifests"
     );
@@ -250,10 +256,14 @@ fn the_default_build_resolves_to_no_acceleration_package() {
     );
     // ...and a rule that cannot find a package the default build certainly has
     // is not reading the list it was given.
+    // Named against a package the default build certainly has. It was
+    // `candle-core` until AYEAYE-101 took candle out — which is exactly the
+    // event this assertion exists to survive: a probe naming a package that has
+    // since left the graph fails loudly rather than passing vacuously.
     assert!(
-        !toolchain::in_default_build(&packages, &[("candle-core", "the graph really has this")])
+        !toolchain::in_default_build(&packages, &[("serde_json", "the graph really has this")])
             .is_empty(),
-        "the rule found nothing in a resolution containing candle-core"
+        "the rule found nothing in a resolution containing serde_json"
     );
 
     let findings = toolchain::in_default_build(&packages, toolchain::ACCELERATED);
@@ -279,12 +289,16 @@ fn no_decision_is_implemented_twice() {
     let sources = duplication::scope(&corpus);
 
     // A scope that emptied out would pass both rules vacuously: prove it
-    // still covers the three shipped crates, with a real number of files.
+    // still covers every shipped crate, with a real number of files. Two since
+    // AYEAYE-101, which deleted `ayeaye-infer` — the models moved behind
+    // llama-swap, so the stratum between the core and the shell had nothing
+    // left in it.
     let crates: std::collections::BTreeSet<&str> =
         sources.iter().map(|s| s.crate_name.as_str()).collect();
-    assert!(
-        crates.len() >= 3,
-        "the duplication scope covers {crates:?}, not the three shipped crates"
+    assert_eq!(
+        crates,
+        ["ayeaye", "ayeaye-core"].into_iter().collect(),
+        "the duplication scope covers {crates:?}, not the shipped crates"
     );
     assert!(
         sources.len() >= NON_TRIVIAL,

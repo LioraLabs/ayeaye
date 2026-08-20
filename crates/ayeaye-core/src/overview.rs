@@ -315,10 +315,7 @@ mod tests {
     fn the_body_carries_every_field_the_daemon_sends() {
         let mut with_prompt = agent("%1", State::Waiting, 42);
         with_prompt.last = "done — two bugs".to_string();
-        let cards = vec![
-            with_prompt,
-            Card::of(pane("%0", "sh"), None, None),
-        ];
+        let cards = vec![with_prompt, Card::of(pane("%0", "sh"), None, None)];
         assert_eq!(
             body(&host(), &cards, true, None),
             concat!(

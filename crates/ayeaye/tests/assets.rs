@@ -5,8 +5,8 @@
 //! binary can tell you that.
 
 use std::fs;
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn share_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -105,9 +105,8 @@ fn the_service_worker_always_notifies_and_clicks_back_into_the_app() {
 // AYEAYE-85 — the shipped page owns the complete native opt-in state machine.
 #[test]
 fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
-    let page = String::from_utf8_lossy(
-        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
-    );
+    let page =
+        String::from_utf8_lossy(ayeaye::assets::bytes("app.html").expect("the app is embedded"));
     for required in [
         "id=\"notifications\"",
         "aria-live=\"polite\"",
@@ -126,7 +125,9 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
         assert!(page.contains(required), "app is missing {required:?}");
     }
 
-    let daemon_unsubscribe = page.find("const response = await fetch('/api/push/unsubscribe'").unwrap();
+    let daemon_unsubscribe = page
+        .find("const response = await fetch('/api/push/unsubscribe'")
+        .unwrap();
     let reject_unsubscribe = page[daemon_unsubscribe..]
         .find("if(!response.ok) throw new Error('the server refused to unsubscribe')")
         .map(|at| daemon_unsubscribe + at)
@@ -137,7 +138,9 @@ fn the_app_exposes_one_native_notification_control_and_explicit_fallbacks() {
         .unwrap();
     assert!(daemon_unsubscribe < reject_unsubscribe && reject_unsubscribe < browser_unsubscribe);
 
-    let register = page.find("const response = await fetch('/api/push/subscribe'").unwrap();
+    let register = page
+        .find("const response = await fetch('/api/push/subscribe'")
+        .unwrap();
     let reject_register = page[register..]
         .find("if(!response.ok) throw new Error('the server refused the subscription')")
         .map(|at| register + at)
@@ -169,9 +172,8 @@ fn the_notification_https_link_matches_the_readme_heading() {
             _ => None,
         })
         .collect();
-    let page = String::from_utf8_lossy(
-        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
-    );
+    let page =
+        String::from_utf8_lossy(ayeaye::assets::bytes("app.html").expect("the app is embedded"));
     assert!(
         page.contains(&format!(
             "href=\"https://github.com/LioraLabs/ayeaye#{slug}\""
@@ -181,13 +183,16 @@ fn the_notification_https_link_matches_the_readme_heading() {
 }
 
 fn notification_case(mode: &str) {
-    let page = String::from_utf8_lossy(
-        ayeaye::assets::bytes("app.html").expect("the app is embedded"),
-    );
+    let page =
+        String::from_utf8_lossy(ayeaye::assets::bytes("app.html").expect("the app is embedded"));
     let source = page
-        .split_once("// ---- notifications -------------------------------------------------------\n")
+        .split_once(
+            "// ---- notifications -------------------------------------------------------\n",
+        )
         .and_then(|(_, rest)| {
-            rest.split_once("// ---- ticket links ---------------------------------------------------------")
+            rest.split_once(
+                "// ---- ticket links ---------------------------------------------------------",
+            )
         })
         .map(|(source, _)| source)
         .expect("the notification block is bounded");

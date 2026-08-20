@@ -148,6 +148,46 @@ const FORMAT_FIELDS: usize = 16;
 /// The `wFormatTag` that means uncompressed integer samples.
 const PCM: u16 = 1;
 
+/// Write the clip back out as a 16 kHz mono 16-bit WAVE file.
+///
+/// The inverse of [`from_wav`], and it exists because the speech model now
+/// lives behind an HTTP boundary: `/v1/audio/transcriptions` takes a container,
+/// not a float slice. The header is forty-four bytes and the body is the
+/// samples, so this is the whole of it — a crate to write one canonical header
+/// would be a dependency for arithmetic.
+///
+/// Samples are clamped before scaling. A converter is allowed to hand back
+/// something a hair outside [-1, 1], and `as i16` on an out-of-range float
+/// saturates rather than wrapping in Rust — but clamping says so rather than
+/// relying on a cast's rounding mode to be the loud kind.
+pub fn to_wav(audio: &Pcm16kMono) -> Vec<u8> {
+    let samples = audio.samples();
+    let data = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + data);
+
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&(FORMAT_FIELDS as u32).to_le_bytes());
+    out.extend_from_slice(&PCM.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // one channel
+    out.extend_from_slice(&SAMPLE_RATE_HZ.to_le_bytes());
+    out.extend_from_slice(&(SAMPLE_RATE_HZ * 2).to_le_bytes()); // bytes per second
+    out.extend_from_slice(&2u16.to_le_bytes()); // bytes per frame
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data as u32).to_le_bytes());
+    for sample in samples {
+        let scaled =
+            (sample.clamp(-1.0, 1.0) * I16_SCALE).clamp(f32::from(i16::MIN), f32::from(i16::MAX));
+        out.extend_from_slice(&(scaled as i16).to_le_bytes());
+    }
+    out
+}
+
 /// Read 16 kHz mono 16-bit PCM out of a WAVE file.
 ///
 /// **The one shape, and everything else refused by name.** A speech model
@@ -251,7 +291,7 @@ fn little_endian_i16(bytes: &[u8]) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BadWav, Pcm16kMono, SAMPLE_RATE_HZ, SILENCE_RMS, from_wav, is_silence};
+    use super::{BadWav, Pcm16kMono, SAMPLE_RATE_HZ, SILENCE_RMS, from_wav, is_silence, to_wav};
 
     /// A WAVE file, built here so a test can say what is wrong with one.
     ///
@@ -425,5 +465,38 @@ mod tests {
         assert!(pcm.is_empty());
         assert_eq!(pcm.len(), 0);
         assert_eq!(pcm.duration_secs(), 0.0);
+    }
+
+    // The transcription endpoint takes a container, so the clip has to survive
+    // being written and read back. Round-tripping is the assertion rather than
+    // a byte-for-byte header comparison: what matters is that `from_wav` — the
+    // reader that refuses every shape but this one — accepts what `to_wav`
+    // wrote, which is exactly what the speech server will do with it.
+    #[test]
+    fn a_clip_written_out_reads_back_as_the_same_clip() {
+        let original = Pcm16kMono::from_i16(&[0, 16_384, -16_384, i16::MIN, i16::MAX]);
+        let read_back = from_wav(&to_wav(&original)).expect("what we wrote is a WAVE we read");
+        assert_eq!(read_back, original);
+
+        // An empty clip is legal input, and forty-four bytes of header is a
+        // legal WAVE. A reader that needed a `data` chunk with something in it
+        // would turn "nobody spoke" into "that is not audio".
+        let silence = Pcm16kMono::new(Vec::new());
+        assert_eq!(from_wav(&to_wav(&silence)).expect("an empty WAVE"), silence);
+
+        // Out of range is clamped rather than wrapped. A converter handing back
+        // 1.0000001 must not come out the other side as full-scale negative.
+        let hot = Pcm16kMono::new(vec![2.0, -2.0]);
+        let clamped = from_wav(&to_wav(&hot)).expect("a WAVE");
+        assert!(
+            clamped.samples().iter().all(|s| s.abs() <= 1.0),
+            "{:?}",
+            clamped.samples()
+        );
+        assert!(
+            clamped.samples()[0] > 0.9 && clamped.samples()[1] < -0.9,
+            "{:?}",
+            clamped.samples()
+        );
     }
 }

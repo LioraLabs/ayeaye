@@ -4,24 +4,17 @@
 # else we control - that was the milestone's hard blocker the moment there is
 # one Apple user.
 #
-# Five rows, and why each is shaped the way it is:
+# Four rows, all of them static, and that uniformity is what AYEAYE-101 bought:
 #
-#   x86_64/aarch64-unknown-linux-musl   static, via cargo-zigbuild. The whole
-#                                       point of choosing candle: no C
-#                                       toolchain, so musl static linking works.
-#   x86_64/aarch64-apple-darwin         Apple acceleration on. metal costs no
-#                                       toolchain and is already forced on for
-#                                       every macOS target by ayeaye-infer's
-#                                       target table; naming the feature here
-#                                       keeps the claim visible in the matrix.
-#   x86_64-unknown-linux-gnu + cuda     the one row that is not static: nvcc
-#                                       compiles real kernels and links
-#                                       libstdc++ and cudart dynamically, so it
-#                                       builds against the system C library
-#                                       inside a CUDA devel container, which
-#                                       pins both nvcc and the glibc baseline.
-#                                       No aarch64 NVIDIA row: niche hardware,
-#                                       no convenient runner.
+#   x86_64/aarch64-unknown-linux-musl   static, via cargo-zigbuild.
+#   x86_64/aarch64-apple-darwin         the host toolchain, no features.
+#
+# There is no NVIDIA row any more, and no feature column. Inference moved behind
+# `llama-swap`, so this binary compiles no kernels, links no CUDA runtime and
+# has no acceleration to be built for — which deleted the one row that was
+# glibc-dynamic rather than static musl, the CUDA devel container it needed, the
+# `CUDA_COMPUTE_CAP` guess it needed, and `scripts/package-cuda.sh`. Whatever
+# card is in the machine is llama-swap's business now, and it is built for it.
 #
 # Every artifact is published under a versioned name and a versionless alias,
 # so releases/latest/download/<alias> fetches the newest release without first
@@ -85,59 +78,25 @@ jobs:
             target: x86_64-apple-darwin
             os: macos-14
             kind: host
-            features: metal
           - row: aarch64-apple-darwin
             target: aarch64-apple-darwin
             os: macos-14
             kind: host
-            features: metal
-          - row: x86_64-unknown-linux-gnu-cuda
-            target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            kind: cuda
-            features: cuda
-            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
     runs-on: ${{ matrix.os }}
     # Empty for the Apple rows, which run on the runner itself.
     container: ${{ matrix.container || '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: rust, inside the cuda container
-        if: matrix.kind == 'cuda'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config git patchelf
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: target
         run: rustup target add "${{ matrix.target }}"
       - name: build
-        # CUDA_COMPUTE_CAP: candle-kernels' build script asks nvidia-smi for
-        # the compute capability when this is unset, and a build container has
-        # no driver to answer - the cuda row would die in the build script and
-        # starve publish. 80 (Ampere) is the floor; the kernels are emitted as
-        # PTX, which the driver JIT-compiles forward onto newer
-        # architectures. Turing and older get CPU inference.
-        env:
-          CUDA_COMPUTE_CAP: "80"
-        # `set -eu`, not `-o pipefail`: there is no pipe here, and the cuda
-        # container's /bin/sh is dash, which has no pipefail to set.
+        # `set -eu`, not `-o pipefail`: there is no pipe here, and not every
+        # container's /bin/sh has a pipefail to set.
         run: |
           set -eu
           cmd=build
           [ "${{ matrix.kind }}" = zigbuild ] && cmd=zigbuild
-          features="${{ matrix.features }}"
-          cargo "$cmd" --release --locked -p ayeaye \
-            --target "${{ matrix.target }}" \
-            ${features:+--features "$features"}
-          if [ "${{ matrix.kind }}" = cuda ]; then
-            binary="target/${{ matrix.target }}/release/ayeaye"
-            sh scripts/package-cuda.sh "$binary" "$binary.bundle"
-            mv "$binary.bundle" "$binary"
-            mkdir "$binary.check"
-            tar -xzf "$binary" -C "$binary.check"
-            test -x "$binary.check/ayeaye"
-          fi
+          cargo "$cmd" --release --locked -p ayeaye --target "${{ matrix.target }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.row }}

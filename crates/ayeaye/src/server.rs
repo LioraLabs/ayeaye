@@ -123,9 +123,9 @@ pub async fn serve(
     // test has the sweeper a real one has. A lease that only expired in
     // production would be a lease nothing ever proved expires.
     crate::fit::sweeper(Arc::clone(&settings));
-    // The same argument for the models: they are released because nobody is
-    // dictating, so a policy that only ran during a dictation would never fire.
-    crate::dictate::sweeper(Arc::clone(&settings));
+    // No model sweeper any more. Letting go of an idle model is llama-swap's
+    // decision now, and it is better placed to make it: it can see every model
+    // on the machine, including the ones ayeaye is not asking for.
     axum::serve(listener, router(settings)).await
 }
 
@@ -262,13 +262,15 @@ async fn handle(
             }
             Err(refusal) => refusal,
         },
-        Route::FilesPreview if method == Method::GET || method == Method::HEAD => preview(
-            &settings,
-            query.pane.as_deref().unwrap_or(""),
-            query.path.as_deref().unwrap_or(""),
-            query.line.as_deref().unwrap_or(""),
-        )
-        .await,
+        Route::FilesPreview if method == Method::GET || method == Method::HEAD => {
+            preview(
+                &settings,
+                query.pane.as_deref().unwrap_or(""),
+                query.path.as_deref().unwrap_or(""),
+                query.line.as_deref().unwrap_or(""),
+            )
+            .await
+        }
         // An `/api/` path that got this far is authenticated and simply does
         // not exist yet; an unknown path never needed a token to be told so;
         // and a method with no route here is the same answer the daemon gives.
@@ -1048,24 +1050,19 @@ async fn preview(settings: &Settings, pane: &str, path: &str, line: &str) -> Res
             content_type,
             body,
             svg,
-        } => build(
-            StatusCode::OK,
-            content_type,
-            Body::from(body),
-            |response| {
-                let response = response
-                    .header(header::CONTENT_DISPOSITION, "inline")
-                    .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-                if svg {
-                    response.header(
-                        header::CONTENT_SECURITY_POLICY,
-                        "sandbox; default-src 'none'",
-                    )
-                } else {
-                    response
-                }
-            },
-        ),
+        } => build(StatusCode::OK, content_type, Body::from(body), |response| {
+            let response = response
+                .header(header::CONTENT_DISPOSITION, "inline")
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+            if svg {
+                response.header(
+                    header::CONTENT_SECURITY_POLICY,
+                    "sandbox; default-src 'none'",
+                )
+            } else {
+                response
+            }
+        }),
     }
 }
 

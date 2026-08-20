@@ -140,7 +140,11 @@ mod tests {
     #[test]
     fn a_fully_waived_list_is_clean() {
         let f = finding("high+low");
-        let out = apply(&[f.clone()], &[waiver(&f.key(), "predates the tiers")], FILE);
+        let out = apply(
+            &[f.clone()],
+            &[waiver(&f.key(), "predates the tiers")],
+            FILE,
+        );
         assert!(out.is_empty(), "{out:?}");
     }
 
@@ -211,10 +215,7 @@ mod tests {
             "[[waiver]]\nkey = \"duplicate-literal/\\\"x\\\"/a+b\"\njustification = \"why\"\n",
         )
         .expect("a well-formed file");
-        assert_eq!(
-            waivers,
-            vec![waiver("duplicate-literal/\"x\"/a+b", "why")]
-        );
+        assert_eq!(waivers, vec![waiver("duplicate-literal/\"x\"/a+b", "why")]);
         assert_eq!(parse("").expect("an empty file"), Vec::new());
     }
 

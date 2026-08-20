@@ -15,6 +15,7 @@ use ayeaye::probe;
 use ayeaye::server;
 use ayeaye::service::{Runner, Services, Subprocess};
 use ayeaye::setup;
+use ayeaye_core::model::settings;
 use ayeaye_core::service::{Definition, Layout, manual_instructions};
 
 fn main() -> ExitCode {
@@ -45,27 +46,27 @@ usage: ayeaye [serve [--bind ADDR] [--port N]]
                     [--bind ADDR] [--port N]
        ayeaye check
        ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-       ayeaye model <ls|search [QUERY]|choose [speech|cleanup]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
+       ayeaye model <ls|choose [speech|cleanup]|use [speech|cleanup] NAME>
        ayeaye dictate <pane> [client-pid]
 
   serve      run the HTTP server
   setup      make this computer ready to run ayeaye, and check that it is
   check      re-run the health checks on their own
   service    manage the service this binary installs for itself
-  model      fetch and choose the models this binary runs
+  model      choose which of the backend's models plays which part
   dictate    toggle dictation for one pane; bind it to a key in tmux
-  --version  print the version and what this build can do
+  --version  print the version
   --help     this
 
-setup asks before two things and nothing else: downloading a model, which
-goes to the internet, and starting a service, which runs whenever you log
-in. --yes answers both. With no terminal it does neither and prints the
-command that would. Everything else it finds — how you reach this machine
-from outside, a reverse proxy, a mesh network, your coding agents, tmux —
-it checks and reports, and never configures.
+setup asks before one thing and nothing else: starting a service, which
+runs whenever you log in. --yes answers it. With no terminal it does not,
+and prints the command that would. Everything else it finds — how you
+reach this machine from outside, a reverse proxy, a mesh network, your
+coding agents, tmux — it checks and reports, and never configures.
 
-a model ID is owner/name, as in openai/whisper-small.en, optionally
-@revision. ayeaye ships the inference, not the weights.
+ayeaye does not download, store or run models. speech and cleanup happen
+in a llama-swap you run yourself, and a model name here is the key it goes
+by in that config. --no-model skips choosing them.
 
 environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_BIND           address to bind (default 127.0.0.1)
@@ -77,8 +78,7 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_SPEECH_MODEL   which model transcribes; `ayeaye model use speech` writes it
   AYEAYE_CLEANUP_MODEL  which model cleans transcripts; `ayeaye model use cleanup` writes it
   AYEAYE_CLEANUP_PROMPT what the cleanup model is told it is for
-  AYEAYE_MODEL_IDLE     how long a model stays resident idle (default 5m, 0 keeps it)
-  AYEAYE_MODEL_HUB      where models are fetched from
+  AYEAYE_LLAMA_SWAP     the backend serving both models (default http://127.0.0.1:8080)
   AYEAYE_PROJECT_ROOTS  colon-separated roots the picker walks (default ~)
   AYEAYE_PROJECT_DEPTH  how far below a root a project may sit (default 6)
   AYEAYE_PROJECT_BUDGET seconds one walk may spend (default 4)
@@ -89,38 +89,27 @@ environment (AYEAYE_*, or the legacy VOICE_REMOTE_*):
   AYEAYE_NOTIFY_STATES  states that notify (default blocked,waiting)
   VOICE_PORT            the port the recording agent listens on (default 8787)";
 
-/// One line naming the version and what this build can do *here*.
+/// The one line a `--version`-style probe reads.
 ///
-/// `got()` and not `selected()`, which is the whole of AYEAYE-57 in one line: a
-/// capability report that goes on claiming `cuda` after finding no card is the
-/// silent degradation the ticket exists to refuse.
-///
-/// The serve path hands the selection it prints here to the daemon's slots as
-/// well — one decision per process, so the banner and the resident models are
-/// readings of one value and cannot disagree (AYEAYE-73). `report()` makes its
-/// own, which in that process is the only one there is.
-fn banner(selection: &ayeaye_infer::backend::Selection) -> String {
+/// The capability list is where the acceleration used to be named, and it is now
+/// empty on purpose rather than by omission: this binary runs no model, so it has
+/// no acceleration to claim. What device transcription runs on is a fact about
+/// llama-swap's process, and `ayeaye check` asks the thing that knows.
+fn banner() -> String {
     ayeaye_core::Identity {
         version: ayeaye_core::VERSION,
-        capabilities: &[selection.got().label()],
+        capabilities: &[],
     }
     .banner()
 }
 
-/// Say what this build is, and — when it is not what it was compiled to be —
-/// why.
+/// Say what this build is.
 ///
 /// The banner goes to stdout and stays **one line**, because that is what a
 /// `--version`-style probe reads and a second line would be a parsing change
-/// that only appears on the artifacts hardest to test. The reason goes to
-/// stderr, which is where the serve path puts it too: stdout answers the
-/// question that was asked, stderr explains a degradation nobody asked about.
+/// that only appears on the artifacts hardest to test.
 fn report() -> ExitCode {
-    let selection = ayeaye_infer::backend::select();
-    println!("{}", banner(&selection));
-    if let Some(why) = selection.fallback() {
-        eprintln!("ayeaye: {why}");
-    }
+    println!("{}", banner());
     ExitCode::SUCCESS
 }
 
@@ -136,19 +125,10 @@ fn serve(args: &[String]) -> ExitCode {
     // is: both are the machine's answer rather than the caller's, and neither
     // should depend on which flags were typed.
     let cliban = ayeaye::cliban::Cliban::new(config::locate_cliban());
-    // Voice is a progressive enhancement: a machine with no models and no
-    // converter serves everything else, and the probe is what tells the page so.
-    // A configuration file it cannot read is a different matter — that is a typo
+    // Voice is a progressive enhancement: a machine whose backend is not running
+    // serves everything else, and the probe is what tells the page so. A
+    // configuration file it cannot read is a different matter — that is a typo
     // somebody has to be told about rather than a feature to switch off.
-    // Where models live has to be one answer, and a daemon that cannot name it
-    // is a daemon whose voice would look configured and never load anything.
-    // Refused rather than defaulted to the working directory, which is wherever
-    // a service manager happened to start this.
-    let Some(store) = config::state_dir() else {
-        return complain(
-            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
-        );
-    };
     let config_file = PathBuf::from(layout(from_environment).env_file);
     let models = match models::settings(&config_file) {
         Ok(models) => models,
@@ -164,17 +144,18 @@ fn serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The process's one device decision, made before the daemon takes shape:
-    // the same value feeds the slots here and the banner below, which is what
-    // makes the acceleration the daemon reports provably the acceleration its
-    // models are running on.
-    let selection = ayeaye_infer::backend::select();
+    // The backend address is read once, here, and refused loudly: a daemon that
+    // fell back to a default because somebody typed `https://` would look
+    // configured and fail at the first dictation.
+    let backend = match ayeaye::swap::Swap::at(&models.backend) {
+        Ok(backend) => backend,
+        Err(why) => return complain(&format!("ayeaye: AYEAYE_LLAMA_SWAP: {why}")),
+    };
     let voice = Arc::new(ayeaye::dictate::Voice::new(
-        store,
         models,
         policy,
         ayeaye::audio::CONVERTER.to_string(),
-        selection.clone(),
+        backend,
     ));
     // The environment first, then the settings file `ayeaye setup` owns, then
     // the defaults. The file layer is what `manual_instructions` promises with
@@ -216,17 +197,9 @@ fn serve(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // The acceleration line first and on its own: it is a fact about the
-        // machine rather than about the address, and folding it into the
-        // startup line would bury the one sentence somebody needs when their
-        // card is not being used. The selection is the one the slots hold —
-        // made above, before the daemon took shape.
-        if let Some(why) = selection.fallback() {
-            eprintln!("ayeaye: {why}");
-        }
         eprintln!(
             "{} on {} · token auth on, browsers log in once via /?token=<token>",
-            banner(&selection),
+            banner(),
             settings.address()
         );
         // Before the first request, and only here: a window a previous process
@@ -245,17 +218,13 @@ fn serve(args: &[String]) -> ExitCode {
     })
 }
 
-/// `ayeaye model <verb>` — the models this binary runs.
+/// `ayeaye model <verb>` — which of the backend's models plays which part.
 ///
-/// ayeaye ships the inference and not the weights, so this is how weights get
-/// onto a machine: a repository id in, a directory under the state directory
-/// out, with the architecture checked before anything large is fetched.
+/// Three verbs where there were seven. `search`, `pull`, `add` and `rm` all
+/// existed because ayeaye kept a model store of its own, and AYEAYE-101 gave
+/// that job to `llama-swap`: models arrive by being written into its config,
+/// which is a file this binary has no business editing.
 fn model_verb(args: &[String]) -> ExitCode {
-    let Some(store) = config::state_dir() else {
-        return complain(
-            "cannot tell where this machine keeps its state: set HOME or XDG_STATE_HOME",
-        );
-    };
     let config_file = PathBuf::from(layout(from_environment).env_file);
 
     // Resolved before the verb runs, so a configuration file with a typo in it
@@ -264,73 +233,48 @@ fn model_verb(args: &[String]) -> ExitCode {
         Ok(settings) => settings,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };
-
-    let id = |given: Option<&String>| match given {
-        Some(given) => ayeaye_core::model::ModelId::parse(given).map_err(|why| why.to_string()),
-        None => Err("which model? give it as owner/name".to_string()),
+    let backend = match ayeaye::swap::Swap::at(&settings.backend) {
+        Ok(backend) => backend,
+        Err(why) => return complain(&format!("ayeaye: AYEAYE_LLAMA_SWAP: {why}")),
+    };
+    let policy = match models::cleanup_policy(&config_file) {
+        Ok(policy) => policy,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
     };
 
     match args.first().map(String::as_str) {
-        Some("search") => {
-            let installed = models::inspect(&store);
-            let selected = |role, id: Option<&ayeaye_core::model::ModelId>| {
-                installed.iter().find(|model| model.role == Ok(role) && Some(&model.id) == id)
-                    .map(|model| model.bytes).unwrap_or(0)
-            };
-            let machine = probe::capture(&probe::System, &store.to_string_lossy()).machine();
-            let mb = 1024 * 1024;
-            let limits = models::SearchLimits {
-                ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
-                disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
-                speech_bytes: selected(ayeaye_core::model::Role::Speech, settings.speech.as_ref()),
-                cleanup_bytes: selected(ayeaye_core::model::Role::Cleanup, settings.cleanup.as_ref()),
-            };
-            match models::search(&models::Curl, &settings.hub, &args[1..].join(" "), limits) {
-                Err(why) => complain(&format!("ayeaye: {why}")),
-                Ok(found) => {
-                    let token = match models::token_available() {
-                        Ok(token) => token,
-                        Err(why) => return complain(&format!("ayeaye: {why}")),
-                    };
-                    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-                        for model in found {
-                            let gated = if model.gated && !token { "  gated" } else { "" };
-                            println!("{}  {}  {}  {}{gated}", model.id, model.role, human(model.bytes), model.evidence);
-                        }
-                    } else {
-                        let rows: Vec<_> = found.into_iter().map(|model| serde_json::json!({
-                            "id": model.id, "role": model.role.to_string(), "bytes": model.bytes,
-                            "gated": model.gated && !token, "evidence": model.evidence,
-                        })).collect();
-                        println!("{}", serde_json::Value::Array(rows));
-                    }
-                    ExitCode::SUCCESS
-                }
-            }
-        }
         Some("ls") => {
-            let installed = models::inspect(&store);
-            if installed.is_empty() {
-                println!("no models yet — `ayeaye model pull openai/whisper-small.en` gets one");
+            let mut smoke = match models::RealSmoke::new(&backend, policy) {
+                Ok(smoke) => smoke,
+                Err(why) => return complain(&format!("ayeaye: {why}")),
+            };
+            let served = match models::Smoke::models(&mut smoke) {
+                Ok(served) => served,
+                Err(why) => {
+                    return complain(&format!(
+                        "ayeaye: could not ask {} what it serves: {why}",
+                        backend.base()
+                    ));
+                }
+            };
+            if served.is_empty() {
+                println!("{} is serving no models", backend.base());
                 return ExitCode::SUCCESS;
             }
-            for model in installed {
-                // The chosen one is marked rather than listed separately: the
-                // question somebody runs this to answer is usually "is the one
-                // I configured actually here".
-                let chosen = match &model.role {
-                    Ok(ayeaye_core::model::Role::Speech) => settings.speech.as_ref(),
-                    Ok(ayeaye_core::model::Role::Cleanup) => settings.cleanup.as_ref(),
-                    Err(_) => None,
-                };
-                let mark = if chosen == Some(&model.id) {
-                    " (in use)"
+            for name in served {
+                // The mark says which of these two names is in the config file,
+                // which is the one question `ls` is actually asked.
+                let mut roles = Vec::new();
+                if settings.speech.as_deref() == Some(name.as_str()) {
+                    roles.push("speech");
+                }
+                if settings.cleanup.as_deref() == Some(name.as_str()) {
+                    roles.push("cleanup");
+                }
+                if roles.is_empty() {
+                    println!("{name}");
                 } else {
-                    ""
-                };
-                match model.role {
-                    Ok(role) => println!("{}  {role}  {}{mark}", model.id, human(model.bytes)),
-                    Err(why) => println!("{}  unusable: {why}  {}", model.id, human(model.bytes)),
+                    println!("{name}  <- {}", roles.join(", "));
                 }
             }
             ExitCode::SUCCESS
@@ -342,54 +286,24 @@ fn model_verb(args: &[String]) -> ExitCode {
                 Some("cleanup") => Some(ayeaye_core::model::Role::Cleanup),
                 Some(_) => return complain("usage: ayeaye model choose [speech|cleanup]"),
             };
-            if args.len() > 2 {
-                return complain("usage: ayeaye model choose [speech|cleanup]");
-            }
             if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 return complain(
-                    "ayeaye: model choose needs a terminal; script it with `ayeaye model search`, then `ayeaye model pull ID` and `ayeaye model use speech|cleanup ID`",
+                    "ayeaye: model choose needs a terminal; script it with `ayeaye model ls` and `ayeaye model use speech|cleanup NAME`",
                 );
             }
-            let installed = models::inspect(&store);
-            let selected_bytes = |role, id: Option<&ayeaye_core::model::ModelId>| {
-                installed.iter().find(|model| model.role == Ok(role) && Some(&model.id) == id)
-                    .map(|model| model.bytes).unwrap_or(0)
-            };
-            let machine = probe::capture(&probe::System, &store.to_string_lossy()).machine();
-            let mb = 1024 * 1024;
-            let limits = models::SearchLimits {
-                ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
-                disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
-                speech_bytes: selected_bytes(ayeaye_core::model::Role::Speech, settings.speech.as_ref()),
-                cleanup_bytes: selected_bytes(ayeaye_core::model::Role::Cleanup, settings.cleanup.as_ref()),
-            };
-            let cleanup = match models::cleanup_policy(&config_file) {
-                Ok(cleanup) => cleanup,
+            let mut smoke = match models::RealSmoke::new(&backend, policy) {
+                Ok(smoke) => smoke,
                 Err(why) => return complain(&format!("ayeaye: {why}")),
             };
-            let mut smoke = models::RealSmoke {
-                selection: ayeaye_infer::backend::select(),
-                cleanup,
-                engine: models::InProcess,
-            };
-            match models::choose_interactive(
-                &models::Curl,
-                &mut smoke,
-                &setup::Tty,
-                models::Interactive {
-                    store: &store,
-                    config_file: &config_file,
-                    hub_host: &settings.hub,
-                    limits,
-                    role,
-                },
-            ) {
-                Err(why) => complain(&format!(
-                    "ayeaye: {why}; previous configuration is intact"
-                )),
+            match models::choose_interactive(&mut smoke, &setup::Tty, &config_file, role) {
+                Err(why) => complain(&format!("ayeaye: {why}; previous configuration is intact")),
                 Ok(result) => {
                     for selected in result.selected {
-                        println!("{} selected; smoke output: {}", selected.id, selected.smoke.trim());
+                        println!(
+                            "{} selected; smoke output: {}",
+                            selected.name,
+                            selected.smoke.trim()
+                        );
                     }
                     if result.cleanup_declined {
                         println!("cleanup left unset; dictation will use raw transcripts");
@@ -398,112 +312,60 @@ fn model_verb(args: &[String]) -> ExitCode {
                 }
             }
         }
-        Some("pull") => match id(args.get(1)) {
-            Err(why) => complain(&format!("ayeaye: {why}")),
-            Ok(id) => {
-                eprintln!("fetching {id} from {}", settings.hub);
-                match models::pull(&models::Curl, &store, &settings.hub, &id) {
-                    Ok(pulled) => {
-                        println!(
-                            "{} is in {} ({}, {})",
-                            pulled.id,
-                            pulled.dir.display(),
-                            pulled.architecture,
-                            human(pulled.bytes)
-                        );
-                        ExitCode::SUCCESS
-                    }
-                    Err(why) => complain(&format!("ayeaye: {why}")),
-                }
-            }
-        },
-        Some("add") => match args.get(1) {
-            None => complain("ayeaye: which model? give a file or directory path"),
-            Some(path) => match models::add(&store, &PathBuf::from(path)) {
-                Ok(added) => {
-                    let state = if added.already {
-                        "already in"
-                    } else {
-                        "imported into"
-                    };
-                    println!(
-                        "{} {state} {} ({})",
-                        added.id,
-                        added.dir.display(),
-                        added.role
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(why) => complain(&format!("ayeaye: {why}")),
-            },
-        },
         Some("use") => {
             let (role, given) = match args.get(1).map(String::as_str) {
                 Some("speech") => (ayeaye_core::model::Role::Speech, args.get(2)),
                 Some("cleanup") => (ayeaye_core::model::Role::Cleanup, args.get(2)),
                 _ => (ayeaye_core::model::Role::Speech, args.get(1)),
             };
-            match id(given) {
-                Err(why) => complain(&format!("ayeaye: {why}")),
-                Ok(id) => {
-                    let Some(installed) = models::inspect(&store)
-                        .into_iter()
-                        .find(|model| model.id == id)
-                    else {
-                        return complain(&format!(
-                            "ayeaye: {id} is not installed — `ayeaye model pull {id}` or `ayeaye model add PATH`"
-                        ));
-                    };
-                    let actual = match installed.role {
-                        Ok(actual) if actual == role => actual,
-                        Ok(actual) => {
-                            return complain(&format!("ayeaye: {id} serves {actual}, not {role}"));
+            let Some(name) = given
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            else {
+                return complain(
+                    "ayeaye: which model? give the name it has in llama-swap's config",
+                );
+            };
+            // Warned about, not refused. The proxy may be stopped right now, and
+            // a machine being configured before its backend is started is an
+            // ordinary order to do things in — but a name that is a typo is
+            // worth catching here rather than at somebody's first dictation.
+            let mut smoke = match models::RealSmoke::new(&backend, policy) {
+                Ok(smoke) => smoke,
+                Err(why) => return complain(&format!("ayeaye: {why}")),
+            };
+            match models::Smoke::models(&mut smoke) {
+                Ok(served) if !served.iter().any(|had| had == name) => {
+                    eprintln!(
+                        "ayeaye: warning: {} is not serving {name} — it serves {}",
+                        backend.base(),
+                        if served.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            served.join(", ")
                         }
-                        Err(why) => return complain(&format!("ayeaye: {id} is unusable: {why}")),
-                    };
-                    let key = match actual {
-                        ayeaye_core::model::Role::Speech => {
-                            ayeaye_core::model::settings::SPEECH_MODEL
-                        }
-                        ayeaye_core::model::Role::Cleanup => {
-                            ayeaye_core::model::settings::CLEANUP_MODEL
-                        }
-                    };
-                    if let Err(why) = models::choose(&config_file, key, &id.to_string()) {
-                        return complain(&format!("ayeaye: {why}"));
-                    }
-                    match role {
-                        ayeaye_core::model::Role::Speech => {
-                            println!("{id} is the model to transcribe with")
-                        }
-                        ayeaye_core::model::Role::Cleanup => println!("{id} is the cleanup model"),
-                    }
-                    println!("  written to {}", config_file.display());
-                    ExitCode::SUCCESS
+                    );
                 }
+                Ok(_) => {}
+                Err(why) => eprintln!(
+                    "ayeaye: warning: could not ask {} what it serves: {why}",
+                    backend.base()
+                ),
             }
+            if let Err(why) = models::choose(&config_file, models::key_for(role), name) {
+                return complain(&format!("ayeaye: {why}"));
+            }
+            match role {
+                ayeaye_core::model::Role::Speech => {
+                    println!("{name} is the model to transcribe with")
+                }
+                ayeaye_core::model::Role::Cleanup => println!("{name} is the cleanup model"),
+            }
+            println!("  written to {}", config_file.display());
+            ExitCode::SUCCESS
         }
-        Some("rm") => match id(args.get(1)) {
-            Err(why) => complain(&format!("ayeaye: {why}")),
-            Ok(id) => match models::remove(&store, &id) {
-                Ok(true) => {
-                    println!("removed {id}");
-                    if settings.speech.as_ref() == Some(&id) {
-                        println!("  warning: the speech selection now has no installed model");
-                    }
-                    if settings.cleanup.as_ref() == Some(&id) {
-                        println!("  warning: the cleanup selection now has no installed model");
-                    }
-                    ExitCode::SUCCESS
-                }
-                Ok(false) => {
-                    println!("there was no {id} to remove");
-                    ExitCode::SUCCESS
-                }
-                Err(why) => complain(&format!("ayeaye: {why}")),
-            },
-        },
-        _ => complain("usage: ayeaye model <ls|search [QUERY]|choose [speech|cleanup]|pull ID|add PATH|use [speech|cleanup] ID|rm ID>"),
+        _ => complain("usage: ayeaye model <ls|choose [speech|cleanup]|use [speech|cleanup] NAME>"),
     }
 }
 
@@ -552,6 +414,10 @@ fn dictate_verb(args: &[String]) -> ExitCode {
         Ok(policy) => policy,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };
+    let backend = match ayeaye::swap::Swap::at(&models.backend) {
+        Ok(backend) => backend,
+        Err(why) => return complain(&format!("ayeaye: AYEAYE_LLAMA_SWAP: {why}")),
+    };
 
     // What this machine calls itself, in the same order `Settings::resolve`
     // reads it — the two have to agree, or a pane id written by the daemon is
@@ -576,13 +442,10 @@ fn dictate_verb(args: &[String]) -> ExitCode {
     runtime.block_on(async move {
         let tmux = ayeaye::tmux::Tmux::new();
         let voice = ayeaye::dictate::Voice::new(
-            store.clone(),
             models,
             policy,
             ayeaye::audio::CONVERTER.to_string(),
-            // This process's one device decision — a toggle is short-lived,
-            // so its one decision is simply made here.
-            ayeaye_infer::backend::select(),
+            backend,
         );
         let state = store.join(ayeaye::dictate::STATE_FILE);
         let toggle = ayeaye::dictate::Toggle {
@@ -680,17 +543,6 @@ fn agent_port() -> u16 {
         .unwrap_or(ayeaye::recorder::DEFAULT_PORT)
 }
 
-/// A byte count somebody can read at a glance.
-fn human(bytes: u64) -> String {
-    const STEP: u64 = 1024;
-    for (limit, unit) in [(STEP.pow(3), "GB"), (STEP.pow(2), "MB"), (STEP, "kB")] {
-        if bytes >= limit {
-            return format!("{:.1} {unit}", bytes as f64 / limit as f64);
-        }
-    }
-    format!("{bytes} bytes")
-}
-
 /// `ayeaye setup` — make this computer ready, and then check that it is.
 ///
 /// The one command somebody with the binary and nothing else runs. It decides
@@ -724,13 +576,8 @@ fn setup_verb(args: &[String]) -> ExitCode {
     };
 
     println!("looking at this computer…");
-    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
-    let machine = captured.machine();
-    println!("  {}", machine.summary());
-    println!("  {}", machine.verdict.tier.as_str());
-    if let Some(reason) = machine.verdict.reason {
-        println!("  {reason}");
-    }
+    let captured = probe::capture(&probe::System);
+    println!("  {}", captured.machine().summary());
     // Out of the capture that already happened, rather than asking this machine
     // the same three questions a second time — and so setup cannot end up with
     // two ideas of what it is running on.
@@ -757,27 +604,25 @@ fn setup_verb(args: &[String]) -> ExitCode {
         Ok(cleanup) => cleanup,
         Err(why) => return complain(&format!("ayeaye: {why}")),
     };
-    let mut smoke = models::RealSmoke {
-        selection: ayeaye_infer::backend::select(),
-        cleanup,
-        engine: models::InProcess,
+    let settings = match models::settings(&places.config_file) {
+        Ok(settings) => settings,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
+    };
+    let backend = match ayeaye::swap::Swap::at(&settings.backend) {
+        Ok(backend) => backend,
+        Err(why) => return complain(&format!("ayeaye: AYEAYE_LLAMA_SWAP: {why}")),
+    };
+    let mut smoke = match models::RealSmoke::new(&backend, cleanup) {
+        Ok(smoke) => smoke,
+        Err(why) => return complain(&format!("ayeaye: {why}")),
     };
     let carried = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        setup::carry_out(
-            &plan,
-            &run,
-            Subprocess,
-            &models::Curl,
-            &mut smoke,
-            &setup::Tty,
-            &stamp(),
-        )
+        setup::carry_out(&plan, &run, Subprocess, &mut smoke, &setup::Tty, &stamp())
     } else {
         setup::carry_out(
             &plan,
             &run,
             Subprocess,
-            &models::Curl,
             &mut smoke,
             &setup::Assumed(flags.yes),
             &stamp(),
@@ -791,7 +636,12 @@ fn setup_verb(args: &[String]) -> ExitCode {
         println!("  {line}");
     }
     if !did.declined.is_empty() {
-        println!("\nnot done, because you did not ask for it:");
+        // "not done", not "not done because you did not ask for it". Since
+        // AYEAYE-101 this list holds two kinds of line: a step declined for
+        // want of consent, and one that ran and could not finish — a backend
+        // that is not up is the common case, and telling somebody they declined
+        // it would be a sentence about a choice they never made.
+        println!("\nnot done:");
         for line in &did.declined {
             println!("  {line}");
         }
@@ -823,7 +673,7 @@ fn check_verb() -> ExitCode {
         );
     };
     let places = setup::Places::from(&layout, &state_dir);
-    let captured = probe::capture(&probe::System, &places.model_store.to_string_lossy());
+    let captured = probe::capture(&probe::System);
     // Asked as a question, so the exit code is the answer: 0 for a machine with
     // nothing outstanding, 1 for one that has something, 2 for the lock being
     // off. `setup` treats the middle one differently on purpose — see there.
@@ -884,7 +734,26 @@ fn check(
         state_dir: Some(places.state_dir.clone()),
         captured,
         session,
-        build: setup::build_acceleration(),
+        // Read the same way, from the same file, so the check asks the address
+        // the daemon will use rather than a second guess at it.
+        backend: setup::effective(
+            &places.config_file,
+            settings::LLAMA_SWAP,
+            settings::DEFAULT_BACKEND,
+        )
+        .trim_end_matches('/')
+        .to_string(),
+        // The core's own names for these, not a second spelling of them: a
+        // check reading `SPEECH_MODEL` while the daemon reads something else
+        // would report on a setting nobody set.
+        wanted: [
+            setup::effective(&places.config_file, settings::SPEECH_MODEL, ""),
+            setup::effective(&places.config_file, settings::CLEANUP_MODEL, ""),
+        ]
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect(),
         runner: Subprocess,
     };
 

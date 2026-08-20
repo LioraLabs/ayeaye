@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/ayeaye",
     "crates/ayeaye-core",
-    "crates/ayeaye-infer",
     "crates/constitution",
 ]
 
@@ -19,17 +18,3 @@ repository = "https://github.com/LioraLabs/ayeaye"
 
 [workspace.dependencies]
 ayeaye-core = { path = "crates/ayeaye-core" }
-ayeaye-infer = { path = "crates/ayeaye-infer" }
-
-# candle lives here because `ayeaye-infer` names it from two dependency tables
-# and cargo does not intersect two requirements for one crate — it resolves
-# both. One requirement, `workspace = true` on both edges; the long version of
-# why, and of why it is 0.9 rather than 0.11, is in
-# `crates/ayeaye-infer/Cargo.toml`. **Read it before changing these lines.**
-#
-# The constitution has an opinion about what may be turned on here:
-# `toolchain::gated` judges this table, because a `features = [...]` on one of
-# these edges is on for every crate in the workspace.
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
-candle-transformers = "0.9.1"

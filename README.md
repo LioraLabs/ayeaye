@@ -14,7 +14,10 @@ without returning to your desk.
 
 It is one self-contained Rust binary: web app, agent discovery, terminal
 control, transcript rendering, setup, service management, notifications, and
-local voice inference. Your sessions and transcripts stay on your machine.
+voice. Speech and cleanup run on your own
+[llama-swap](https://github.com/mostlygeek/llama-swap), which ayeaye talks to
+over its OpenAI-compatible API. Your sessions and transcripts stay on your
+machine.
 
 ## Install
 
@@ -25,9 +28,9 @@ curl -fsSL https://raw.githubusercontent.com/LioraLabs/ayeaye/main/install.sh | 
 ```
 
 The installer verifies the release, installs `ayeaye`, and runs setup. `tmux`
-is the only required runtime tool. On x86-64 Linux with an NVIDIA driver, it
-installs the GPU build with its matching CUDA runtime included; no distro CUDA
-toolkit package is required.
+is the only required runtime tool. There is one static binary per platform: no
+GPU build, no CUDA runtime, nothing to match against your driver — the models
+run in llama-swap, which you build for your own hardware.
 
 ```sh
 ayeaye setup
@@ -85,35 +88,52 @@ Plain HTTP still runs the app; browsers simply refuse notifications there.
 
 ## Voice
 
-Voice needs `ffmpeg` and separately downloaded models—the binary contains the
-inference runtime, not model weights. Setup can search Hugging Face for models
-that fit this machine, smoke-test them, and keep the previous configuration if
-either role fails:
+Voice needs `ffmpeg` and a running [llama-swap](https://github.com/mostlygeek/llama-swap)
+serving two models: a speech model (whisper.cpp's `whisper-server`, which
+llama-swap proxies at `/v1/audio/transcriptions`) and a language model for
+cleaning transcripts up. ayeaye downloads nothing and loads nothing — llama-swap
+owns the weights, the acceleration, and the swapping in and out.
+
+Point ayeaye at it, then pick which of its models plays which part:
 
 ```sh
-ayeaye model choose
+ayeaye model ls                       # what the backend is serving
+ayeaye model choose                   # pick both, smoke-testing each
+ayeaye model use speech whisper       # or one at a time, by name
+ayeaye model use cleanup qwen3-coder
 ```
 
-The same workflow is available as small, scriptable commands. Discovery is
-read-only; `add` imports models already on disk; selections are role-specific:
+The names are whatever keys you gave those models in llama-swap's `config.yaml`.
+`choose` and `use` check the name against what the backend is actually serving,
+and `choose` proves each model answers before writing the choice down.
+
+A minimal `config.yaml` on the other side:
+
+```yaml
+models:
+  "whisper":
+    checkEndpoint: /v1/audio/transcriptions/
+    cmd: |
+      whisper-server --host 127.0.0.1 --port ${PORT}
+        -m ggml-large-v3-turbo-q8_0.bin
+        --request-path /v1/audio/transcriptions --inference-path ""
+  "qwen3-coder":
+    cmd: llama-server --port ${PORT} -m Qwen3-Coder-30B-Q5_K_XL.gguf
+```
+
+Set `AYEAYE_LLAMA_SWAP` if it is not on `http://127.0.0.1:8080` — `https://` and
+a path prefix both work, and a backend on another machine is an ordinary setup:
 
 ```sh
-ayeaye model search whisper
-ayeaye model pull openai/whisper-small.en
-ayeaye model add ./model.gguf
-ayeaye model use speech openai/whisper-small.en
-ayeaye model use cleanup local/model@revision
-ayeaye model ls
+AYEAYE_LLAMA_SWAP=https://llama.example.test
 ```
 
-Speech models use the supported Whisper/Safetensors layout. Cleanup models use
-a supported GGUF plus its tokenizer. Hub revisions are pinned, and downloads,
-imports, and configuration changes are staged before becoming active.
+Cleanup is optional. Without `AYEAYE_CLEANUP_MODEL`, dictation types the raw
+transcript, which is what it degrades to when the model is unreachable anyway.
 
 The phone records in the web app. For dictation from another SSH client,
 `bin/voice-dictate-setup` prints the client-side setup and `bin/voice-agent`
-captures that device's microphone. Transcription and cleanup still happen
-inside ayeaye on your machine.
+captures that device's microphone.
 
 ## Configuration
 
@@ -121,9 +141,7 @@ inside ayeaye on your machine.
 ayeaye setup [--yes] [--no-service] [--no-model]
 ayeaye check
 ayeaye service <install|repair|enable|disable|start|stop|status|remove>
-ayeaye model search [QUERY]
-ayeaye model choose [speech|cleanup]
-ayeaye model <ls|pull ID|add PATH|use [speech|cleanup] ID|rm ID>
+ayeaye model <ls|choose [speech|cleanup]|use [speech|cleanup] NAME>
 ayeaye dictate <host/pane> [client-pid]
 ```
 

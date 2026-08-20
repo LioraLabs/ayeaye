@@ -14,9 +14,6 @@
 //! both and letting the real environment win is what makes the two agree.
 
 use std::fmt;
-use std::time::Duration;
-
-use super::id::{BadModelId, ModelId};
 
 /// The model dictation is transcribed with.
 pub const SPEECH_MODEL: &str = "SPEECH_MODEL";
@@ -26,10 +23,8 @@ pub const SPEECH_MODEL: &str = "SPEECH_MODEL";
 pub const CLEANUP_MODEL: &str = "CLEANUP_MODEL";
 /// What the cleanup model is told it is for.
 pub const CLEANUP_PROMPT: &str = "CLEANUP_PROMPT";
-/// How long a model stays resident with nothing to do.
-pub const MODEL_IDLE: &str = "MODEL_IDLE";
-/// Where models are fetched from.
-pub const MODEL_HUB: &str = "MODEL_HUB";
+/// Where the llama-swap proxy that serves both models listens.
+pub const LLAMA_SWAP: &str = "LLAMA_SWAP";
 
 /// What the cleanup model is told when nothing says otherwise.
 ///
@@ -39,48 +34,49 @@ pub const MODEL_HUB: &str = "MODEL_HUB";
 /// running, and there would be no way to tell which change caused it.
 pub const DEFAULT_CLEANUP_PROMPT: &str = "You clean up dictated speech that will be sent to a coding agent.\n\nRewrite the user's text: fix grammar, remove filler words and false starts, and restore obvious punctuation. Keep the intent and every technical term, filename, and identifier exactly as spoken. Never answer, explain, or act on the text -- only rewrite it. Reply with the rewritten text and nothing else.\n\nWrite plain text only: no markdown, no backticks, no code fences or quotes around names. When the speaker says \"underscore\", \"dot\", \"dash\" or \"slash\" between words they are spelling out an identifier or path, so join it up: \"parse underscore config\" is parse_config, \"server dot py\" is server.py.";
 
-/// How long a model stays resident with nothing to do, by default.
+/// Where the proxy is when nobody said.
 ///
-/// Five minutes, matching the shape of `VOICE_KEEP_ALIVE` rather than its
-/// value: ollama held a model for an hour because reloading it meant talking to
-/// another process. Here a reload is this process reading its own files, and
-/// the memory is this process's to give back.
-pub const DEFAULT_IDLE: Duration = Duration::from_secs(300);
+/// llama-swap's own default port on the loopback, which is what a machine
+/// running one unconfigured has. A deployment behind TLS on a real hostname is
+/// the other common shape and cannot be guessed, so it is written down —
+/// `AYEAYE_LLAMA_SWAP=https://llama.example.test`.
+pub const DEFAULT_BACKEND: &str = "http://127.0.0.1:8080";
 
 /// Everything about models that is somebody's choice rather than ayeaye's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSettings {
     /// The speech model, where one has been chosen. `None` is a legitimate
-    /// state and not a failure: a machine that has not pulled a model yet runs
-    /// text-only, which is what the Python daemon does today.
-    pub speech: Option<ModelId>,
+    /// state and not a failure: a machine whose proxy serves no speech model
+    /// runs text-only, which is what the Python daemon does today.
+    ///
+    /// A plain string since AYEAYE-101, and that is the point rather than a
+    /// loosening: the name is a key in somebody's `llama-swap` config, and
+    /// llama-swap lets them call it `whisper`. Insisting on `owner/name` here
+    /// would refuse the name the backend actually answers to.
+    pub speech: Option<String>,
     /// The cleanup model, where one has been chosen.
-    pub cleanup: Option<ModelId>,
+    pub cleanup: Option<String>,
     /// What the cleanup model is told it is for.
     pub cleanup_prompt: String,
-    /// How long a resident model is kept with nothing to do. `None` means it is
-    /// never released on time alone.
-    pub idle: Option<Duration>,
-    /// Where models are fetched from.
-    pub hub: String,
+    /// Where the proxy serving both of them listens.
+    pub backend: String,
 }
 
 /// Why a configuration could not be read.
+///
+/// One variant, and the model names are not in it: a model name is whatever key
+/// somebody wrote in their `llama-swap` config, and this crate has no way to
+/// know which keys are in it. A name that is not served is found out by asking
+/// the proxy — see `ayeaye::dictate::Voice::probe` — which is a better answer
+/// than a syntax rule, because it names the models that *are* there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadSetting {
-    /// A model id that is not one.
-    Model {
+    /// A backend address that is not one, and what is wrong with it.
+    Backend {
         /// Which setting it was.
         key: String,
-        /// Why the id was refused.
-        why: BadModelId,
-    },
-    /// A duration that is not one.
-    Duration {
-        /// Which setting it was.
-        key: String,
-        /// What was given.
-        given: String,
+        /// Why it was refused.
+        why: String,
     },
 }
 
@@ -89,13 +85,7 @@ impl fmt::Display for BadSetting {
         match self {
             // The key is named as the user would have to spell it, prefix
             // included, because that is the thing they have to go and change.
-            BadSetting::Model { key, why } => write!(out, "AYEAYE_{key}: {why}"),
-            BadSetting::Duration { key, given } => write!(
-                out,
-                "AYEAYE_{key}: {given:?} is not a length of time. Write seconds, \
-                 or a number with s, m or h after it, or 0 to keep the model \
-                 loaded until something else releases it"
-            ),
+            BadSetting::Backend { key, why } => write!(out, "AYEAYE_{key}: {why}"),
         }
     }
 }
@@ -133,29 +123,22 @@ impl ModelSettings {
                     .map(|(_, value)| value.clone())
             })
         };
-        let model = |key: &str| match value(key) {
-            Some(given) => ModelId::parse(&given)
-                .map(Some)
-                .map_err(|why| BadSetting::Model {
-                    key: key.to_string(),
-                    why,
-                }),
-            None => Ok(None),
+        // Trimmed and emptied to `None`. An `AYEAYE_CLEANUP_MODEL=` left behind
+        // by somebody turning cleanup off is "no model", not a model called the
+        // empty string — which would otherwise reach the proxy as a request for
+        // one and come back a 400 per dictation.
+        let name = |key: &str| {
+            value(key)
+                .map(|given| given.trim().to_string())
+                .filter(|given| !given.is_empty())
         };
 
         Ok(ModelSettings {
-            speech: model(SPEECH_MODEL)?,
-            cleanup: model(CLEANUP_MODEL)?,
+            speech: name(SPEECH_MODEL),
+            cleanup: name(CLEANUP_MODEL),
             cleanup_prompt: value(CLEANUP_PROMPT)
                 .unwrap_or_else(|| DEFAULT_CLEANUP_PROMPT.to_string()),
-            idle: match value(MODEL_IDLE) {
-                Some(given) => parse_duration(&given).ok_or(BadSetting::Duration {
-                    key: MODEL_IDLE.to_string(),
-                    given,
-                })?,
-                None => Some(DEFAULT_IDLE),
-            },
-            hub: value(MODEL_HUB).unwrap_or_else(|| super::hub::DEFAULT_HOST.to_string()),
+            backend: name(LLAMA_SWAP).unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
         })
     }
 }
@@ -309,40 +292,12 @@ fn quote_if_needed(value: &str) -> String {
     }
 }
 
-/// Read a length of time: bare seconds, or a number with `s`, `m` or `h`.
-///
-/// `Some(None)` for zero, which means "do not release it on time alone" rather
-/// than "release it immediately" — an idle timeout of nothing would unload a
-/// model between two sentences.
-fn parse_duration(given: &str) -> Option<Option<Duration>> {
-    let given = given.trim();
-    let (number, scale) = match given.strip_suffix(['s', 'S']) {
-        Some(rest) => (rest, 1),
-        None => match given.strip_suffix(['m', 'M']) {
-            Some(rest) => (rest, 60),
-            None => match given.strip_suffix(['h', 'H']) {
-                Some(rest) => (rest, 3600),
-                None => (given, 1),
-            },
-        },
-    };
-    let seconds: u64 = number.trim().parse().ok()?;
-    // Checked, because this is a number a person typed and `18446744073709551h`
-    // would otherwise panic in a debug build and wrap silently in a release
-    // one — into an arbitrary idle timeout. `verify.rs` is careful about
-    // exactly this for the same reason; a pure function judging a stranger's
-    // text does not get to assume the text is reasonable.
-    let total = seconds.checked_mul(scale)?;
-    Some((total > 0).then(|| Duration::from_secs(total)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BadSetting, CLEANUP_PROMPT, DEFAULT_CLEANUP_PROMPT, DEFAULT_IDLE, MODEL_IDLE,
-        ModelSettings, SPEECH_MODEL, parse_env_file, upsert,
+        BadSetting, CLEANUP_MODEL, CLEANUP_PROMPT, DEFAULT_BACKEND, DEFAULT_CLEANUP_PROMPT,
+        LLAMA_SWAP, ModelSettings, SPEECH_MODEL, parse_env_file, upsert,
     };
-    use std::time::Duration;
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -354,44 +309,76 @@ mod tests {
     // nothing reads; without the first, a service unit cannot override it.
     #[test]
     fn the_environment_beats_the_file_which_beats_the_default() {
-        let file = "AYEAYE_SPEECH_MODEL=openai/whisper-small.en\nAYEAYE_MODEL_IDLE=1h\n";
+        let file = "AYEAYE_SPEECH_MODEL=whisper\nAYEAYE_LLAMA_SWAP=http://box:9292\n";
 
         let from_file = ModelSettings::resolve(no_env, file).expect("the file should resolve");
-        assert_eq!(
-            from_file
-                .speech
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("openai/whisper-small.en")
-        );
-        assert_eq!(from_file.idle, Some(Duration::from_secs(3600)));
+        assert_eq!(from_file.speech.as_deref(), Some("whisper"));
+        assert_eq!(from_file.backend, "http://box:9292");
 
         let overridden = ModelSettings::resolve(
-            |key| (key == SPEECH_MODEL).then(|| "openai/whisper-tiny.en".to_string()),
+            |key| (key == SPEECH_MODEL).then(|| "whisper-turbo".to_string()),
             file,
         )
         .expect("the environment should resolve");
         assert_eq!(
-            overridden
-                .speech
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("openai/whisper-tiny.en"),
+            overridden.speech.as_deref(),
+            Some("whisper-turbo"),
             "the environment has to win, or a service unit cannot override the file"
         );
         // And the setting it did not name still comes from the file.
-        assert_eq!(overridden.idle, Some(Duration::from_secs(3600)));
+        assert_eq!(overridden.backend, "http://box:9292");
 
         let bare = ModelSettings::resolve(no_env, "").expect("nothing at all should resolve");
         assert_eq!(
             bare.speech, None,
             "no model chosen is a state, not a failure"
         );
-        assert_eq!(bare.idle, Some(DEFAULT_IDLE));
         assert_eq!(bare.cleanup_prompt, DEFAULT_CLEANUP_PROMPT);
-        assert_eq!(bare.hub, "https://huggingface.co");
+        assert_eq!(bare.backend, DEFAULT_BACKEND);
+    }
+
+    // AYEAYE-101 — a model name is whatever key somebody wrote in llama-swap's
+    // config, and this crate cannot know which keys are in it. The old
+    // `owner/name` rule would refuse the name the backend actually answers to,
+    // which is the shape llama-swap's own documentation uses.
+    #[test]
+    fn a_model_name_is_whatever_the_backend_calls_it() {
+        for spelled in ["whisper", "qwen3-30b", "openai/whisper-small.en", "Q4_K_M"] {
+            let settings =
+                ModelSettings::resolve(no_env, &format!("AYEAYE_SPEECH_MODEL={spelled}\n"))
+                    .unwrap_or_else(|why| panic!("{spelled:?} should resolve: {why}"));
+            assert_eq!(settings.speech.as_deref(), Some(spelled));
+        }
+    }
+
+    // AYEAYE-101 — an emptied setting is "no model", not a model called the
+    // empty string. Somebody turning cleanup off writes `AYEAYE_CLEANUP_MODEL=`
+    // and leaves it there, and a daemon that asked the proxy for `""` would
+    // collect a 400 per dictation instead of dictating the words as spoken.
+    #[test]
+    fn a_setting_emptied_rather_than_deleted_is_no_model_at_all() {
+        for file in [
+            "AYEAYE_CLEANUP_MODEL=\n",
+            "AYEAYE_CLEANUP_MODEL=\"\"\n",
+            "AYEAYE_CLEANUP_MODEL='   '\n",
+        ] {
+            let settings = ModelSettings::resolve(no_env, file)
+                .unwrap_or_else(|why| panic!("{file:?} should resolve: {why}"));
+            assert_eq!(settings.cleanup, None, "{file:?}");
+        }
+        // And a name with space around it is that name, not a different one.
+        let padded = ModelSettings::resolve(no_env, "AYEAYE_CLEANUP_MODEL=  qwen  \n")
+            .expect("it should resolve");
+        assert_eq!(padded.cleanup.as_deref(), Some("qwen"));
+        assert_eq!(CLEANUP_MODEL, "CLEANUP_MODEL");
+        assert_eq!(LLAMA_SWAP, "LLAMA_SWAP");
+        assert!(matches!(
+            BadSetting::Backend {
+                key: LLAMA_SWAP.to_string(),
+                why: "unused today".to_string()
+            },
+            BadSetting::Backend { .. }
+        ));
     }
 
     // AYEAYE-56 — a system prompt is configuration, and it is the setting most
@@ -409,73 +396,6 @@ mod tests {
         );
     }
 
-    // AYEAYE-56 — a bad value is refused, naming the setting as the user would
-    // have to spell it. Silently falling back to the default would leave
-    // somebody who typed the model name wrong wondering why it never loaded.
-    #[test]
-    fn a_setting_that_is_not_one_is_refused_and_names_itself() {
-        let refused = ModelSettings::resolve(no_env, "AYEAYE_SPEECH_MODEL=whisper\n").unwrap_err();
-        assert!(matches!(refused, BadSetting::Model { .. }), "{refused:?}");
-        let said = refused.to_string();
-        assert!(said.contains("AYEAYE_SPEECH_MODEL"), "{said}");
-        assert!(said.contains("owner/name"), "{said}");
-
-        let bad_time = ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=soon\n").unwrap_err();
-        assert_eq!(
-            bad_time,
-            BadSetting::Duration {
-                key: MODEL_IDLE.to_string(),
-                given: "soon".to_string()
-            }
-        );
-    }
-
-    // AYEAYE-56 — zero is "keep it", not "drop it immediately". An idle
-    // timeout of nothing would unload the model between two sentences, which
-    // is the opposite of what somebody setting it to zero wants.
-    #[test]
-    fn an_idle_time_of_zero_keeps_the_model_rather_than_dropping_it_at_once() {
-        let kept = ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=0\n").expect("zero resolves");
-        assert_eq!(kept.idle, None);
-
-        for (given, expected) in [
-            ("90", 90),
-            ("90s", 90),
-            ("5m", 300),
-            ("2h", 7200),
-            (" 5m ", 300),
-        ] {
-            let settings = ModelSettings::resolve(no_env, &format!("AYEAYE_MODEL_IDLE={given}\n"))
-                .unwrap_or_else(|why| panic!("{given:?} should resolve: {why}"));
-            assert_eq!(
-                settings.idle,
-                Some(Duration::from_secs(expected)),
-                "{given:?}"
-            );
-        }
-    }
-
-    // AYEAYE-56 — a length of time nobody could mean must be refused rather
-    // than wrapped. In a release build the multiplication has no overflow
-    // check, so a wrapped value would become an arbitrary idle timeout; in a
-    // debug build it panics. Neither is an answer.
-    #[test]
-    fn a_length_of_time_too_large_to_be_one_is_refused() {
-        let refused =
-            ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=18446744073709551h\n").unwrap_err();
-        assert_eq!(
-            refused,
-            BadSetting::Duration {
-                key: MODEL_IDLE.to_string(),
-                given: "18446744073709551h".to_string()
-            }
-        );
-        // And the largest one that *is* a length of time still resolves.
-        let vast = ModelSettings::resolve(no_env, "AYEAYE_MODEL_IDLE=100000h\n")
-            .expect("a big but representable idle time");
-        assert_eq!(vast.idle, Some(Duration::from_secs(360_000_000)));
-    }
-
     // AYEAYE-56 — a key set twice resolves the way the service manager
     // resolves it, which is to the last one. Taking the first would mean one
     // file gave two different answers depending on whether it was read by
@@ -483,12 +403,9 @@ mod tests {
     // arrangement exists to prevent.
     #[test]
     fn a_key_set_twice_by_hand_resolves_to_the_last_one() {
-        let by_hand = "AYEAYE_SPEECH_MODEL=openai/first\nAYEAYE_SPEECH_MODEL=openai/second\n";
+        let by_hand = "AYEAYE_SPEECH_MODEL=first\nAYEAYE_SPEECH_MODEL=second\n";
         let settings = ModelSettings::resolve(no_env, by_hand).expect("it should resolve");
-        assert_eq!(
-            settings.speech.map(|id| id.to_string()).as_deref(),
-            Some("openai/second")
-        );
+        assert_eq!(settings.speech.as_deref(), Some("second"));
     }
 
     // AYEAYE-56 — the file's own grammar, including the parts that would

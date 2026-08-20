@@ -19,13 +19,10 @@
 
 use std::path::Path;
 
-use ayeaye_core::machine::{Privilege, Probes, ServiceManager, packages, platform, share, size};
+use ayeaye_core::machine::{Privilege, Probes, ServiceManager, packages, platform};
 use ayeaye_core::service::Session;
 
 use crate::service::{Outcome, Runner, Subprocess};
-
-/// Where `/proc/self/cgroup` names the paths a container's limits live under.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Every command whose mere presence a decision is made from.
 ///
@@ -63,14 +60,6 @@ pub const LOOKED_FOR: &[&str] = &[
 /// The prefixes a Homebrew is installed under, in the order the shell tries
 /// them: Apple silicon, Intel, and Linuxbrew.
 const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
-
-/// The three files a container leaves. None is reliable alone, and the fourth
-/// mark is the `container` environment variable, which is not a path.
-const CONTAINER_MARKERS: &[&str] = &[
-    "/.dockerenv",
-    "/run/.containerenv",
-    "/run/systemd/container",
-];
 
 /// Where the world is asked.
 ///
@@ -165,26 +154,6 @@ pub struct Captured {
     user_bus_responds: bool,
     brew_on_path: Option<String>,
     brew_in_prefix: Option<String>,
-    nproc: Option<String>,
-    lscpu: Option<String>,
-    cpuinfo: Option<String>,
-    sysctl_ncpu: Option<String>,
-    sysctl_memsize: Option<String>,
-    system_profiler: Option<String>,
-    meminfo: Option<String>,
-    free_m: Option<String>,
-    df_pk: Option<String>,
-    nvidia_smi: Option<String>,
-    rocminfo: Option<String>,
-    sysctl_brand_string: Option<String>,
-    container_marker: bool,
-    proc1_cgroup: Option<String>,
-    mountinfo: Option<String>,
-    cgroup_memory_max: Option<String>,
-    cgroup_memory_limit: Option<String>,
-    cgroup_cpu_max: Option<String>,
-    cgroup_cpu_quota: Option<String>,
-    cgroup_cpu_period: Option<String>,
     route: Option<String>,
     route6: Option<String>,
     route_default_exists: Option<bool>,
@@ -213,26 +182,6 @@ impl Captured {
             user_bus_responds: self.user_bus_responds,
             brew_on_path: self.brew_on_path.as_deref(),
             brew_in_prefix: self.brew_in_prefix.as_deref(),
-            nproc: self.nproc.as_deref(),
-            lscpu: self.lscpu.as_deref(),
-            cpuinfo: self.cpuinfo.as_deref(),
-            sysctl_ncpu: self.sysctl_ncpu.as_deref(),
-            sysctl_memsize: self.sysctl_memsize.as_deref(),
-            system_profiler: self.system_profiler.as_deref(),
-            meminfo: self.meminfo.as_deref(),
-            free_m: self.free_m.as_deref(),
-            df_pk: self.df_pk.as_deref(),
-            nvidia_smi: self.nvidia_smi.as_deref(),
-            rocminfo: self.rocminfo.as_deref(),
-            sysctl_brand_string: self.sysctl_brand_string.as_deref(),
-            container_marker: self.container_marker,
-            proc1_cgroup: self.proc1_cgroup.as_deref(),
-            mountinfo: self.mountinfo.as_deref(),
-            cgroup_memory_max: self.cgroup_memory_max.as_deref(),
-            cgroup_memory_limit: self.cgroup_memory_limit.as_deref(),
-            cgroup_cpu_max: self.cgroup_cpu_max.as_deref(),
-            cgroup_cpu_quota: self.cgroup_cpu_quota.as_deref(),
-            cgroup_cpu_period: self.cgroup_cpu_period.as_deref(),
             route: self.route.as_deref(),
             route6: self.route6.as_deref(),
             route_default_exists: self.route_default_exists,
@@ -348,10 +297,14 @@ pub fn launchd_uid(sources: &impl Sources, manager: ServiceManager) -> Option<St
 
 /// Ask this machine everything, once.
 ///
-/// `model_dir` is where the weights would land, and it is an argument because
-/// free space is measured *there* rather than wherever this process happens to
-/// have been started from.
-pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
+/// It used to take the model directory, because free space had to be measured
+/// where the weights would land. AYEAYE-101 took the weights away, and with them
+/// every question about how big this machine is: memory, processors, disk, the
+/// graphics card, and the container share that corrected the first two. What is
+/// left is what ayeaye actually acts on — which operating system this is, what
+/// installs software here, where a user service can live, and whether there is a
+/// way out to the internet.
+pub fn capture(sources: &impl Sources) -> Captured {
     let mut captured = Captured {
         os_release: read_first(sources, &["/etc/os-release", "/usr/lib/os-release"]),
         uname_s: said(sources, &["uname", "-s"]),
@@ -372,50 +325,10 @@ pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
             .iter()
             .find(|prefix| sources.is_executable(&format!("{prefix}/bin/brew")))
             .map(|prefix| (*prefix).to_string()),
-        nproc: said(sources, &["nproc"]),
-        // Under `LC_ALL=C`, because util-linux is translated and every field
-        // this is parsed for is an English label. Through `env` rather than a
-        // variable on the runner, so that what changes the locale is visible in
-        // the recorded argv.
-        lscpu: said(sources, &["env", "LC_ALL=C", "lscpu"]),
-        cpuinfo: sources.read("/proc/cpuinfo"),
-        sysctl_ncpu: said(sources, &["sysctl", "-n", "hw.ncpu"]),
-        sysctl_memsize: said(sources, &["sysctl", "-n", "hw.memsize"]),
-        system_profiler: said(sources, &["system_profiler", "SPHardwareDataType"]),
-        meminfo: sources.read("/proc/meminfo"),
-        free_m: said(sources, &["free", "-m"]),
-        nvidia_smi: said(
-            sources,
-            &[
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader",
-            ],
-        ),
-        rocminfo: said(sources, &["rocminfo"]),
-        sysctl_brand_string: said(sources, &["sysctl", "-n", "machdep.cpu.brand_string"]),
-        container_marker: CONTAINER_MARKERS
-            .iter()
-            .any(|mark| sources.read(mark).is_some())
-            || sources.env("container").is_some(),
-        proc1_cgroup: sources.read("/proc/1/cgroup"),
-        mountinfo: sources.read("/proc/self/mountinfo"),
         route: sources.read("/proc/net/route"),
         route6: sources.read("/proc/net/ipv6_route"),
         ..Captured::default()
     };
-
-    captured.df_pk = size::model_dir_ancestors(model_dir)
-        .iter()
-        .find(|dir| sources.is_dir(dir))
-        .and_then(|dir| said(sources, &["df", "-Pk", dir]));
-
-    let self_cgroup = sources.read("/proc/self/cgroup").unwrap_or_default();
-    captured.cgroup_memory_max = cgroup(sources, &self_cgroup, "", "memory.max");
-    captured.cgroup_memory_limit = cgroup(sources, &self_cgroup, "memory", "memory.limit_in_bytes");
-    captured.cgroup_cpu_max = cgroup(sources, &self_cgroup, "", "cpu.max");
-    captured.cgroup_cpu_quota = cgroup(sources, &self_cgroup, "cpu", "cpu.cfs_quota_us");
-    captured.cgroup_cpu_period = cgroup(sources, &self_cgroup, "cpu", "cpu.cfs_period_us");
 
     // Only where there is no `/proc/net/route` to read, which is what makes
     // this a Mac question. Asked otherwise it would start a process on every
@@ -453,31 +366,6 @@ pub fn capture(sources: &impl Sources, model_dir: &str) -> Captured {
     captured
 }
 
-/// One cgroup file, at the path this process's own cgroup names, falling back to
-/// the fixed one.
-///
-/// The fallback is the shell's, and it is not redundant: `/sys/fs/cgroup/memory.max`
-/// under a shared cgroup namespace is the *host's* root and says `max`, while
-/// the path built from `/proc/self/cgroup` is the one that carries the limit
-/// this process is really under. Either can be the readable one.
-fn cgroup(
-    sources: &impl Sources,
-    self_cgroup: &str,
-    controller: &str,
-    leaf: &str,
-) -> Option<String> {
-    let derived = share::cgroup_path(self_cgroup, controller, leaf, CGROUP_ROOT)
-        .and_then(|path| sources.read(&path));
-    derived.or_else(|| {
-        let fallback = if controller.is_empty() {
-            format!("{CGROUP_ROOT}/{leaf}")
-        } else {
-            format!("{CGROUP_ROOT}/{controller}/{leaf}")
-        };
-        sources.read(&fallback)
-    })
-}
-
 /// The first of those files that can be read at all.
 fn read_first(sources: &impl Sources, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| sources.read(path))
@@ -486,10 +374,10 @@ fn read_first(sources: &impl Sources, paths: &[&str]) -> Option<String> {
 /// What that command printed, or `None` when it could not be run or said
 /// nothing.
 ///
-/// A command that failed said nothing worth parsing: `nvidia-smi` on a machine
-/// with no driver exits non-zero and prints an explanation, and treating that
-/// explanation as a list of graphics cards is how a machine acquires an
-/// imaginary one. Whitespace alone is not an answer either — `Probes` is built
+/// A command that failed said nothing worth parsing: `sw_vers` on a Linux exits
+/// non-zero and prints a complaint, and reading that complaint as a macOS
+/// version is how a machine acquires an imaginary one. Whitespace alone is not
+/// an answer either — `Probes` is built
 /// on the distinction between "nothing to read" and "an empty answer", and a
 /// command that printed a newline has told us nothing.
 fn said(sources: &impl Sources, words: &[&str]) -> Option<String> {
@@ -508,7 +396,7 @@ fn argv(words: &[&str]) -> Vec<String> {
 mod tests {
     use super::{Captured, LOOKED_FOR, Sources, capture, session};
     use crate::service::Outcome;
-    use ayeaye_core::machine::{Acceleration, PackageManager, ServiceManager, Tier};
+    use ayeaye_core::machine::{PackageManager, ServiceManager};
     use ayeaye_core::service::Manager;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -541,11 +429,6 @@ mod tests {
 
         fn holds(mut self, path: &str, text: &str) -> Self {
             self.files.insert(path.to_string(), text.to_string());
-            self
-        }
-
-        fn directory(mut self, path: &str) -> Self {
-            self.dirs.push(path.to_string());
             self
         }
 
@@ -592,15 +475,16 @@ mod tests {
         }
     }
 
-    fn linux_with_nvidia() -> Fake {
+    /// An ordinary Linux with a user session.
+    ///
+    /// It used to be `linux_with_nvidia`, and carried meminfo, lscpu, df and
+    /// nvidia-smi fixtures so the capture could be judged into a tier. None of
+    /// those probes is made any more — see `capture`.
+    fn linux_with_systemd() -> Fake {
         Fake::default()
             .holds(
                 "/etc/os-release",
                 include_str!("../../../tests/fixtures/os-release/ubuntu-24.04"),
-            )
-            .holds(
-                "/proc/meminfo",
-                include_str!("../../../tests/fixtures/meminfo/64gb"),
             )
             .holds(
                 "/proc/net/route",
@@ -608,41 +492,22 @@ mod tests {
             )
             .says("uname -s", "Linux\n")
             .says("uname -m", "x86_64\n")
-            .says(
-                "env LC_ALL=C lscpu",
-                include_str!("../../../tests/fixtures/lscpu/x86_64-8core"),
-            )
-            .says(
-                "df -Pk /home/tester/.local/state/ayeaye",
-                include_str!("../../../tests/fixtures/df/roomy"),
-            )
-            .says(
-                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
-                include_str!("../../../tests/fixtures/nvidia-smi/rtx-4090"),
-            )
             .says("systemctl --user show-environment", "PATH=/usr/bin\n")
-            .directory("/home/tester/.local/state/ayeaye")
             .on_path("apt-get")
             .on_path("systemctl")
             .on_path("tmux")
     }
 
-    // AYEAYE-62 — the whole point of the capture: what the real machine says,
-    // judged by AYEAYE-60's parsers, comes out as one verdict. The figures here
-    // are the ones machine/mod.rs pins for these same fixtures, reached through
-    // the commands and files instead of through a literal.
+    // AYEAYE-62, narrowed by AYEAYE-101 — what the real machine says, read
+    // through the commands and files rather than through a literal. The tier,
+    // the card and the three figures that fed them are gone: they existed to
+    // size a local speech model, and there is no local speech model.
     #[test]
-    fn what_this_machine_says_becomes_one_verdict_about_it() {
-        let captured = capture(&linux_with_nvidia(), "/home/tester/.local/state/ayeaye");
+    fn what_this_machine_says_becomes_one_answer_about_it() {
+        let captured = capture(&linux_with_systemd());
         let machine = captured.machine();
-        assert_eq!(machine.tier(), Tier::Maximum);
-        assert_eq!(machine.acceleration(), Acceleration::Cuda);
-        assert_eq!(machine.gpu_name(), Some("NVIDIA GeForce RTX 4090"));
         assert_eq!(machine.packaging.manager, PackageManager::AptGet);
         assert_eq!(machine.services, ServiceManager::Systemd);
-        assert_eq!(machine.ram_mb, Some(64263));
-        assert_eq!(machine.cores, Some(8));
-        assert_eq!(machine.disk_mb, Some(510580));
         assert!(captured.has("tmux"));
         assert!(!captured.has("ffmpeg"));
     }
@@ -662,7 +527,7 @@ mod tests {
             .says("uname -m", "x86_64\n")
             .on_path("systemctl");
         // `show-environment` is deliberately not answered, so it fails.
-        let machine = capture(&container, "/tmp/models").machine();
+        let machine = capture(&container).machine();
         assert_eq!(machine.services, ServiceManager::None);
     }
 
@@ -674,8 +539,8 @@ mod tests {
     // mutating verb in here would do it to every machine ayeaye is installed on.
     #[test]
     fn nothing_the_capture_runs_changes_anything() {
-        let fake = linux_with_nvidia();
-        capture(&fake, "/home/tester/.local/state/ayeaye");
+        let fake = linux_with_systemd();
+        capture(&fake);
         let ran = fake.ran.borrow();
         assert!(!ran.is_empty(), "it should have asked something");
         for argv in ran.iter() {
@@ -708,60 +573,15 @@ mod tests {
         }
     }
 
-    // AYEAYE-62 — a command that fails said nothing worth parsing. nvidia-smi
-    // on a machine with no driver exits non-zero and prints an explanation, and
-    // reading that explanation as a list of cards is how a machine acquires an
-    // imaginary one.
-    #[test]
-    fn a_command_that_failed_is_not_an_answer() {
-        let mut fake = Fake::default().says("uname -s", "Linux\n");
-        fake.commands.insert(
-            "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader".to_string(),
-            Outcome {
-                ok: false,
-                output: "NVIDIA-SMI has failed because it couldn't communicate with the driver\n"
-                    .to_string(),
-            },
-        );
-        let machine = capture(&fake, "/tmp/models").machine();
-        assert_eq!(machine.acceleration(), Acceleration::Cpu);
-        assert_eq!(machine.gpu_name(), None);
-    }
-
     // AYEAYE-62 — whitespace is not an answer either. `Probes` is built on the
     // distinction between nothing to read and an empty answer, and a command
     // that printed one newline has told us nothing.
     #[test]
     fn a_command_that_printed_only_whitespace_is_not_an_answer() {
         let fake = Fake::default().says("uname -s", " \n").says("uname -m", "");
-        let captured = capture(&fake, "/tmp/models");
+        let captured = capture(&fake);
         assert_eq!(captured.probes().uname_s, None);
         assert_eq!(captured.probes().uname_m, None);
-    }
-
-    // AYEAYE-62 — free space is measured where the weights would land, and on a
-    // first run that directory does not exist yet, so the nearest ancestor that
-    // does is what df is asked about. Measuring the current directory instead
-    // would answer about a different filesystem on any machine with a separate
-    // home.
-    #[test]
-    fn free_space_is_measured_at_the_nearest_directory_that_exists() {
-        let fake = Fake::default().directory("/home/tester").says(
-            "df -Pk /home/tester",
-            include_str!("../../../tests/fixtures/df/roomy"),
-        );
-        let captured = capture(&fake, "/home/tester/.local/state/ayeaye/models/openai");
-        assert_eq!(
-            ayeaye_core::machine::size::disk_mb(&captured.probes()),
-            Some(510580)
-        );
-        assert!(
-            fake.ran
-                .borrow()
-                .iter()
-                .any(|argv| argv == &["df", "-Pk", "/home/tester"]),
-            "df should have been asked about the nearest existing ancestor"
-        );
     }
 
     // AYEAYE-62 — the seam, on a machine that has one. A Linux with a user bus
@@ -834,102 +654,6 @@ mod tests {
 
         let mac_without_launchctl = Fake::default().says("uname -s", "Darwin\n");
         assert_eq!(session(&mac_without_launchctl), None);
-    }
-
-    // AYEAYE-62 — a container is judged on its share and not on the host it is
-    // running on, and every one of the four marks it leaves is read. None is
-    // reliable alone, which is why only their disjunction is a judgement worth
-    // making — so each is checked on its own here.
-    #[test]
-    fn a_container_is_detected_by_any_of_its_marks_and_judged_on_its_share() {
-        let host = |mark: &str| {
-            Fake::default()
-                .holds(
-                    "/etc/os-release",
-                    include_str!("../../../tests/fixtures/os-release/debian-12"),
-                )
-                .holds(
-                    "/proc/meminfo",
-                    include_str!("../../../tests/fixtures/meminfo/64gb"),
-                )
-                .holds(mark, "")
-                .holds(
-                    "/sys/fs/cgroup/memory.max",
-                    include_str!("../../../tests/fixtures/cgroup/memory-max-1g"),
-                )
-                .holds(
-                    "/sys/fs/cgroup/cpu.max",
-                    include_str!("../../../tests/fixtures/cgroup/cpu-max-two-cores"),
-                )
-                .says("uname -s", "Linux\n")
-                .says(
-                    "env LC_ALL=C lscpu",
-                    include_str!("../../../tests/fixtures/lscpu/x86_64-8core"),
-                )
-        };
-        for mark in [
-            "/.dockerenv",
-            "/run/.containerenv",
-            "/run/systemd/container",
-        ] {
-            let machine = capture(&host(mark), "/tmp/models").machine();
-            assert_eq!(machine.cores, Some(2), "{mark}: lscpu sees eight");
-            assert_eq!(machine.ram_mb, Some(1024), "{mark}: meminfo sees 64 GB");
-        }
-
-        // The fourth mark is an environment variable and nothing on disk, which
-        // is how podman and systemd-nspawn say it.
-        let mut by_variable = host("/nowhere");
-        by_variable
-            .environment
-            .insert("container".to_string(), "podman".to_string());
-        let machine = capture(&by_variable, "/tmp/models").machine();
-        assert_eq!(machine.ram_mb, Some(1024));
-
-        // A machine under a limit is judged on that limit whether or not it
-        // left a container mark: a systemd slice bounds an ordinary process just
-        // as a container runtime bounds one, and the marks say what this is, not
-        // what it may use.
-        let unmarked = capture(&host("/nowhere"), "/tmp/models").machine();
-        assert_eq!(unmarked.cores, Some(2));
-
-        // And with no limit to read anywhere, the whole machine is the answer.
-        let unlimited = Fake::default()
-            .holds(
-                "/proc/meminfo",
-                include_str!("../../../tests/fixtures/meminfo/64gb"),
-            )
-            .says("uname -s", "Linux\n")
-            .says(
-                "env LC_ALL=C lscpu",
-                include_str!("../../../tests/fixtures/lscpu/x86_64-8core"),
-            );
-        let whole = capture(&unlimited, "/tmp/models").machine();
-        assert_eq!(whole.cores, Some(8));
-        assert_eq!(whole.ram_mb, Some(64263));
-    }
-
-    // AYEAYE-62 — the limit that is really in force is the one at the path
-    // `/proc/self/cgroup` names, and the fixed path is a fallback rather than
-    // the answer: under a shared cgroup namespace `/sys/fs/cgroup/memory.max` is
-    // the *host's* root and says `max`, while the derived path carries the limit
-    // this process is actually under.
-    #[test]
-    fn a_containers_limit_is_read_where_its_own_cgroup_says_it_is() {
-        let nested = Fake::default()
-            .holds("/proc/self/cgroup", "0::/payload/leaf\n")
-            .holds("/sys/fs/cgroup/memory.max", "max\n")
-            .holds(
-                "/sys/fs/cgroup/payload/leaf/memory.max",
-                include_str!("../../../tests/fixtures/cgroup/memory-max-1g"),
-            )
-            .holds("/.dockerenv", "")
-            .holds(
-                "/proc/meminfo",
-                include_str!("../../../tests/fixtures/meminfo/64gb"),
-            )
-            .says("uname -s", "Linux\n");
-        assert_eq!(capture(&nested, "/tmp/models").machine().ram_mb, Some(1024));
     }
 
     // AYEAYE-62 — a name nobody captured would answer `false` for ever, which

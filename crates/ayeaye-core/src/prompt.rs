@@ -294,7 +294,10 @@ pub fn body(prompt: Option<&Prompt>) -> String {
 /// field of every pane's card, where the wrapper would be a second spelling
 /// of the shape `share/app.html` reads.
 pub fn object(prompt: &Prompt) -> String {
-    let mut out = format!(r#"{{"question":{},"options":["#, json::string(&prompt.question));
+    let mut out = format!(
+        r#"{{"question":{},"options":["#,
+        json::string(&prompt.question)
+    );
     for (index, choice) in prompt.options.iter().enumerate() {
         if index > 0 {
             out.push(',');

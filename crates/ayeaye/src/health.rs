@@ -22,7 +22,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ayeaye_core::health::{self, Check, Report, Verdict};
-use ayeaye_core::machine::Acceleration;
 use ayeaye_core::service::{Manager, Operation, Session};
 
 use crate::probe::Captured;
@@ -55,8 +54,10 @@ pub struct Asking<'a, R: Runner> {
     pub captured: &'a Captured,
     /// The session the service lives in, if this machine has one.
     pub session: Option<&'a Session>,
-    /// What this build can run inference on.
-    pub build: Acceleration,
+    /// Where the inference backend is, as a URL with no trailing slash.
+    pub backend: String,
+    /// The models dictation has been configured to ask it for.
+    pub wanted: Vec<String>,
     /// How commands are run.
     pub runner: R,
 }
@@ -97,7 +98,7 @@ impl<R: Runner> Asking<'_, R> {
 
         report.record(self.service_check());
         report.record(self.tmux_check());
-        report.record(health::acceleration(self.build, &self.captured.machine()));
+        report.record(self.backend_check(curl));
 
         if !curl {
             // Said once, at the top, rather than underneath every request — but
@@ -441,6 +442,96 @@ impl<R: Runner> Asking<'_, R> {
         asked.ok.then_some(asked.output)
     }
 
+    /// The inference backend: reachable, and serving what was chosen.
+    ///
+    /// This replaced the acceleration check, and the replacement is the ticket
+    /// in one function. "Which device is this build compiled for" was a question
+    /// about this binary, and this binary no longer runs a model — llama-swap
+    /// does, in its own process, on whatever it decided to use. What is worth
+    /// checking now is the thing that actually breaks a dictation: the proxy is
+    /// not running, or it is running and has never heard of the model named in
+    /// `~/.config/ayeaye/env`.
+    ///
+    /// Through curl for the same reason every other request here is: the shell
+    /// makes requests with the program the machine already has, and this check
+    /// must be answerable from `ayeaye check`, which is synchronous.
+    fn backend_check(&self, curl: bool) -> Check {
+        let wanted: Vec<&str> = self.wanted.iter().map(String::as_str).collect();
+        let url = format!("{}/v1/models", self.backend);
+        let served = curl.then(|| self.served(&url)).flatten();
+        let verdict = health::backend(served.as_deref(), &wanted);
+        let detail = match (&served, &verdict) {
+            (None, _) if !curl => {
+                Some("this computer has no curl, so this could not be asked".to_string())
+            }
+            (None, _) => Some(format!(
+                "nothing answered at {url} — is llama-swap running?"
+            )),
+            (Some(served), Verdict::Failed) => {
+                let missing: Vec<&str> = wanted
+                    .iter()
+                    .filter(|name| !served.iter().any(|had| had == *name))
+                    .copied()
+                    .collect();
+                Some(format!(
+                    "it is not serving {}; it serves {}",
+                    missing.join(", "),
+                    if served.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        served.join(", ")
+                    }
+                ))
+            }
+            _ => None,
+        };
+        Check {
+            name: "backend",
+            claim: if wanted.is_empty() {
+                format!("an inference backend at {}", self.backend)
+            } else {
+                format!("{} is serving {}", self.backend, wanted.join(" and "))
+            },
+            verdict,
+            detail,
+            explains_itself: false,
+        }
+    }
+
+    /// The model names the proxy answered with, or `None` if it did not answer.
+    ///
+    /// No key: llama-swap is not ayeaye and does not have ayeaye's secret. A
+    /// proxy that wants one is behind something that terminates TLS, which this
+    /// client could not reach either — see `crate::swap`.
+    fn served(&self, url: &str) -> Option<Vec<String>> {
+        let argv: Vec<String> = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            TIMEOUT,
+            "--",
+            url,
+        ]
+        .iter()
+        .map(|word| (*word).to_string())
+        .collect();
+        let asked = self.runner.run(&argv);
+        if !asked.ok {
+            return None;
+        }
+        let body = ayeaye_core::json::parse(&asked.output).ok()?;
+        let ayeaye_core::json::Value::List(models) = body.get("data")? else {
+            return None;
+        };
+        Some(
+            models
+                .iter()
+                .filter_map(|model| Some(model.get("id")?.text()?.to_string()))
+                .collect(),
+        )
+    }
+
     /// The coding agents: detected and verified, never installed.
     fn agents_check(&self) -> Check {
         // Every candidate with whether it is here, and not only the ones that
@@ -556,7 +647,6 @@ mod tests {
     use crate::probe::{Captured, Sources, capture};
     use crate::service::{Outcome, Runner};
     use ayeaye_core::health::{Outcome as StepOutcome, Verdict};
-    use ayeaye_core::machine::Acceleration;
     use ayeaye_core::service::{Manager, Session};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -636,13 +726,10 @@ mod tests {
     }
 
     fn machine_with(commands: &[&str]) -> Captured {
-        capture(
-            &Bare {
-                path: commands.iter().map(|name| (*name).to_string()).collect(),
-                files: HashMap::new(),
-            },
-            "/tmp/models",
-        )
+        capture(&Bare {
+            path: commands.iter().map(|name| (*name).to_string()).collect(),
+            files: HashMap::new(),
+        })
     }
 
     fn asking<'a>(captured: &'a Captured, runner: Answers) -> Asking<'a, Answers> {
@@ -654,7 +741,8 @@ mod tests {
             state_dir: None,
             captured,
             session: None,
-            build: Acceleration::Cpu,
+            backend: "http://127.0.0.1:8080".to_string(),
+            wanted: Vec::new(),
             runner,
         }
     }
@@ -1001,7 +1089,7 @@ mod tests {
         let expected = [
             "service",
             "tmux",
-            "acceleration",
+            "backend",
             "local",
             "auth",
             "authorised",
@@ -1066,23 +1154,44 @@ mod tests {
         assert_eq!(verdict(&down.run(), "mesh"), Verdict::Failed);
     }
 
-    // AYEAYE-62 — the fourth mark means "you did not ask for this", and a fact
-    // about the machine must never wear it. Telling somebody they declined an
-    // AMD card is telling them they turned down a thing they never had.
+    // AYEAYE-62 — the fourth mark means "you did not ask for this", and a check
+    // must only wear it when somebody really did decline something.
+    //
+    // AYEAYE-101 moved this from the acceleration check to the backend one, and
+    // the reasoning transferred whole: a machine with no model configured did
+    // not ask for dictation, so `skipped` is honest there — but a *configured*
+    // model the proxy is not serving is a failure, and rendering that as "you
+    // did not ask" would be telling somebody they declined the thing they wrote
+    // into their config file.
     #[test]
-    fn a_fact_about_the_machine_is_never_rendered_as_a_choice_nobody_made() {
+    fn a_check_only_says_you_did_not_ask_when_somebody_declined_something() {
         let captured = machine_with(&["curl"]);
         let report = asking(&captured, Answers::default().to("curl", true, "200")).run();
-        let acceleration = report
+        let backend = report
             .checks
             .iter()
-            .find(|check| check.name == "acceleration")
+            .find(|check| check.name == "backend")
             .expect("recorded");
+        // Nothing configured in this fixture, so nothing was asked for.
+        assert_eq!(backend.verdict, Verdict::Skipped);
+
+        // And a machine that did name a model gets a real verdict rather than a
+        // shrug, whichever way it goes.
+        let mut configured = asking(&captured, Answers::default().to("curl", true, "200"));
+        configured.wanted = vec!["whisper".to_string()];
+        let named = configured.run();
+        let backend = named
+            .checks
+            .iter()
+            .find(|check| check.name == "backend")
+            .expect("recorded");
+        assert_ne!(backend.verdict, Verdict::Skipped, "{}", backend.line());
         assert!(
-            !acceleration.line().contains("you did not ask"),
+            !backend.line().contains("you did not ask"),
             "{}",
-            acceleration.line()
+            backend.line()
         );
+
         // While a check that really is about a choice still says so.
         let hosts = report
             .checks

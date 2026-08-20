@@ -96,10 +96,6 @@ key = 'duplicate-literal/"systemctl"/ayeaye+ayeaye-core'
 justification = "same shape as launchctl: verdict in the core, execution in the shell"
 
 [[waiver]]
-key = 'duplicate-literal/"container"/ayeaye+ayeaye-core'
-justification = "the cgroup tier verdict word, decided in the core and probed by the shell; predates the gate"
-
-[[waiver]]
 key = 'duplicate-literal/"{prefix}/bin/brew"/ayeaye+ayeaye-core'
 justification = "the Homebrew path template, planned in the core's platform verdicts and checked by the shell's probe; predates the gate"
 
@@ -116,22 +112,6 @@ justification = "the other spelling of loopback: the core allows it as a Host, t
 [[waiver]]
 key = 'duplicate-literal/"X-Voice-Token"/ayeaye+ayeaye-core'
 justification = "the auth header is the wire contract: the core checks it, the recorder page the shell generates sends it"
-
-# --- model files: the hub contract between core and infer ------------------
-# The core's model manifest names the HuggingFace files a model needs; infer
-# opens the same names when it loads. The file name is the contract.
-
-[[waiver]]
-key = 'duplicate-literal/"config.json"/ayeaye-core+ayeaye-infer'
-justification = "the HuggingFace file name is the contract between the core's model manifest and infer's loader; predates the gate"
-
-[[waiver]]
-key = 'duplicate-literal/"model.safetensors"/ayeaye-core+ayeaye-infer'
-justification = "same shape as config.json: manifest in the core, loader in infer"
-
-[[waiver]]
-key = 'duplicate-literal/"tokenizer.json"/ayeaye-core+ayeaye-infer'
-justification = "same shape as config.json: manifest in the core, loader in infer"
 
 # --- tmux vocabulary -------------------------------------------------------
 

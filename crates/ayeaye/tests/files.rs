@@ -266,12 +266,11 @@ fn settings_on_port(port: u16) -> Settings {
         pane_cache: Arc::new(Mutex::new(ayeaye_core::pane::Cache::default())),
         fits: Arc::new(Fits::new(ayeaye_core::fit::DEFAULT_TTL_MS, None)),
         voice: Arc::new(ayeaye::dictate::Voice::new(
-            std::path::PathBuf::from("/nonexistent/store"),
             ayeaye_core::model::settings::ModelSettings::resolve(|_| None, "")
                 .expect("the defaults resolve"),
             ayeaye_core::cleanup::Policy::default(),
             "ayeaye-52-no-such-converter".to_string(),
-            ayeaye_infer::backend::select(),
+            ayeaye::swap::Swap::at("127.0.0.1:1").expect("an address nothing listens on"),
         )),
         // No path, as in serve.rs: a test must never write into the pick
         // history of whoever is running the suite.
@@ -328,13 +327,18 @@ async fn a_reference_resolves_ranked_against_the_panes_repository() {
     let text = answer.body_text();
     // The pane works at the repository root, so `notes/notes.md` is one step
     // away and `deep/x/y/notes.md` three: the near one must come first.
-    let near = text.find(r#""path":"notes/notes.md""#).expect("the near file");
+    let near = text
+        .find(r#""path":"notes/notes.md""#)
+        .expect("the near file");
     let far = text
         .find(r#""path":"deep/x/y/notes.md""#)
         .expect("the far file");
     assert!(near < far, "the near file must rank first: {text}");
     assert!(text.contains(r#""kind":"text""#), "{text}");
-    assert!(text.ends_with(r#""line":2}"#), "the line rides along: {text}");
+    assert!(
+        text.ends_with(r#""line":2}"#),
+        "the line rides along: {text}"
+    );
 
     // A name the repository does not track resolves to nothing, which the
     // page renders as "no tracked file found" rather than an error.
@@ -366,12 +370,18 @@ async fn a_text_preview_carries_the_region_around_the_line() {
     assert_eq!(answer.header("content-type"), Some("application/json"));
     let text = answer.body_text();
     assert!(text.contains(r#""kind":"text""#), "{text}");
-    assert!(text.contains(r#""start":101"#), "the region starts at 101: {text}");
+    assert!(
+        text.contains(r#""start":101"#),
+        "the region starts at 101: {text}"
+    );
     assert!(
         text.contains(r#"{"number":250,"text":"line 250\n"}"#),
         "the requested line is in the region: {text}"
     );
-    assert!(text.contains(r#"{"number":300,"text":"line 300\n"}"#), "{text}");
+    assert!(
+        text.contains(r#"{"number":300,"text":"line 300\n"}"#),
+        "{text}"
+    );
     assert!(!text.contains(r#""number":100,"#), "bounded above: {text}");
     assert!(text.ends_with(r#""line":250}"#), "{text}");
 
@@ -469,7 +479,10 @@ async fn escapes_and_nonsense_are_bad_requests() {
     // resolve, and a 404 on the preview — the daemon's shapes, and neither
     // says anything about what exists.
     let forged = server
-        .get(&preview_url("desktop/%9999", "src/main.rs", None), Some(TOKEN))
+        .get(
+            &preview_url("desktop/%9999", "src/main.rs", None),
+            Some(TOKEN),
+        )
         .await;
     assert_eq!(forged.status, 404);
     let body = r#"{"pane":"desktop/%9999","reference":"notes.md"}"#;

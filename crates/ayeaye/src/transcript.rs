@@ -398,9 +398,18 @@ mod tests {
         );
         // The last two, with refs naming their lines in the *file*: the first
         // row fell to the limit, not out of the file.
-        assert_eq!(next(&mut stream, "the first shown row").await, user_row_event("two", "1:0"));
-        assert_eq!(next(&mut stream, "the second shown row").await, user_row_event("three", "2:0"));
-        assert_eq!(next(&mut stream, "ready").await, "event: ready\ndata: {}\n\n");
+        assert_eq!(
+            next(&mut stream, "the first shown row").await,
+            user_row_event("two", "1:0")
+        );
+        assert_eq!(
+            next(&mut stream, "the second shown row").await,
+            user_row_event("three", "2:0")
+        );
+        assert_eq!(
+            next(&mut stream, "ready").await,
+            "event: ready\ndata: {}\n\n"
+        );
 
         // What lands after ready arrives live, numbered by its line.
         file.append(&format!("{}\n", user_line("four")));
@@ -419,7 +428,10 @@ mod tests {
         let file = File::holding("partial", "");
         let mut stream = tailing(&file, 200, None);
         assert!(next(&mut stream, "init").await.starts_with("event: init"));
-        assert_eq!(next(&mut stream, "ready").await, "event: ready\ndata: {}\n\n");
+        assert_eq!(
+            next(&mut stream, "ready").await,
+            "event: ready\ndata: {}\n\n"
+        );
 
         // Half a line: everything the tail sees for a while is a keep-alive.
         let line = user_line("whole in the end");
@@ -453,7 +465,10 @@ mod tests {
         let file = File::holding("idle", "");
         let mut stream = tailing(&file, 200, Some(2));
         assert!(next(&mut stream, "init").await.starts_with("event: init"));
-        assert_eq!(next(&mut stream, "ready").await, "event: ready\ndata: {}\n\n");
+        assert_eq!(
+            next(&mut stream, "ready").await,
+            "event: ready\ndata: {}\n\n"
+        );
         assert_eq!(next(&mut stream, "the first ping").await, PING);
         assert_eq!(next(&mut stream, "the second ping").await, PING);
         assert_eq!(stream.next().await, None, "two idle polls were the limit");
@@ -565,7 +580,9 @@ mod tests {
         );
         assert_eq!(
             one_row(file.path(), Kind::Codex, "0:0"),
-            Some(r#"{"cls":"assistant","ts":"09:30:00","label":"codex","text":"hello"}"#.to_string())
+            Some(
+                r#"{"cls":"assistant","ts":"09:30:00","label":"codex","text":"hello"}"#.to_string()
+            )
         );
     }
 
@@ -594,6 +611,9 @@ mod tests {
             assert_eq!(one_row(file.path(), Kind::Claude, bad), None, "for {bad:?}");
         }
         // No file, no row.
-        assert_eq!(one_row("/nonexistent/transcript.jsonl", Kind::Claude, "0:0"), None);
+        assert_eq!(
+            one_row("/nonexistent/transcript.jsonl", Kind::Claude, "0:0"),
+            None
+        );
     }
 }

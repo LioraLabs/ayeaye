@@ -20,12 +20,7 @@ pub struct CrateNode {
 ///
 /// `constitution` sits above everything on purpose: it must be able to read
 /// every crate, and nothing may be built on it.
-pub const STRATA: &[(&str, u8)] = &[
-    ("ayeaye-core", 0),
-    ("ayeaye-infer", 1),
-    ("ayeaye", 2),
-    ("constitution", 3),
-];
+pub const STRATA: &[(&str, u8)] = &[("ayeaye-core", 0), ("ayeaye", 1), ("constitution", 2)];
 
 /// Judge a set of crates against a table of strata.
 ///

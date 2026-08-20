@@ -269,7 +269,10 @@ impl Delegation {
         ) {
             return;
         }
-        let Some(content) = line.get("message").and_then(|message| message.get("content")) else {
+        let Some(content) = line
+            .get("message")
+            .and_then(|message| message.get("content"))
+        else {
             return;
         };
         if let Some(text) = content.text() {
@@ -469,9 +472,7 @@ mod tests {
             Some(ts) => format!(r#""timestamp":"{ts}","#),
             None => String::new(),
         };
-        format!(
-            r#"{{"type":"{kind}",{stamp}"message":{{"role":"{kind}","content":{blocks}}}}}"#
-        )
+        format!(r#"{{"type":"{kind}",{stamp}"message":{{"role":"{kind}","content":{blocks}}}}}"#)
     }
 
     fn said(kind: &str, text: &str) -> String {
@@ -479,11 +480,7 @@ mod tests {
     }
 
     fn said_at(kind: &str, text: &str, ts: Option<&str>) -> String {
-        claude(
-            kind,
-            &format!(r#"[{{"type":"text","text":"{text}"}}]"#),
-            ts,
-        )
+        claude(kind, &format!(r#"[{{"type":"text","text":"{text}"}}]"#), ts)
     }
 
     fn launched(tool_id: &str, name: &str) -> String {
@@ -526,9 +523,7 @@ mod tests {
     }
 
     fn tool_use(tool_id: &str, name: &str) -> String {
-        format!(
-            r#"{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{}}}}"#
-        )
+        format!(r#"{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{}}}}"#)
     }
 
     fn codex(payload: &str) -> String {
@@ -646,7 +641,11 @@ mod tests {
     // ago is still a turn handed back, and the age says how long.
     #[test]
     fn the_age_is_reported_however_old_and_never_becomes_a_state() {
-        let lines = [said_at("assistant", "done", Some("2026-03-04T09:00:00.000Z"))];
+        let lines = [said_at(
+            "assistant",
+            "done",
+            Some("2026-03-04T09:00:00.000Z"),
+        )];
         let got = classified(&lines, Kind::Claude, NINE + 7.0 * 86_400.0, NINE);
         assert_eq!(got.state, State::Waiting);
         assert_eq!(got.age, Some(7 * 86_400));
@@ -708,7 +707,11 @@ mod tests {
     // AYEAYE-49 — a clock behind the transcript does not read as the future.
     #[test]
     fn a_clock_behind_the_transcript_does_not_read_as_the_future() {
-        let lines = [said_at("assistant", "done", Some("2026-03-04T11:00:00.000Z"))];
+        let lines = [said_at(
+            "assistant",
+            "done",
+            Some("2026-03-04T11:00:00.000Z"),
+        )];
         let got = classified(&lines, Kind::Claude, NINE, NINE);
         assert_eq!(got.age, Some(0));
     }
@@ -728,7 +731,10 @@ mod tests {
     // that launched it: what the session is waiting on is the agent.
     #[test]
     fn a_launched_agent_is_outstanding() {
-        let lines = [said("user", "explore both of these"), launched("toolu_A", "Agent")];
+        let lines = [
+            said("user", "explore both of these"),
+            launched("toolu_A", "Agent"),
+        ];
         assert_eq!(state(&lines), State::Delegating);
     }
 
@@ -845,7 +851,9 @@ mod tests {
     // AYEAYE-49 — codex: the agent spoke last, so the turn is yours.
     #[test]
     fn a_codex_that_spoke_last_is_waiting_on_you() {
-        let lines = [codex(r#"{"type":"agent_message","message":"that's landed on main"}"#)];
+        let lines = [codex(
+            r#"{"type":"agent_message","message":"that's landed on main"}"#,
+        )];
         assert_eq!(
             classified(&lines, Kind::Codex, NINE + 60.0, NINE).state,
             State::Waiting

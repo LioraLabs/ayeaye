@@ -1,6 +1,6 @@
 ---
 name: setting-up-ayeaye
-description: Set up and troubleshoot ayeaye by driving the binary's own verbs. Use when installing ayeaye on a machine (including one that has never had it), deciding where it sits on the network and what may reach it, choosing which speech model suits this machine or its graphics card, or reading why `ayeaye check` reported a failed health check.
+description: Set up and troubleshoot ayeaye by driving the binary's own verbs. Use when installing ayeaye on a machine (including one that has never had it), deciding where it sits on the network and what may reach it, pointing it at the llama-swap that serves its speech and cleanup models, or reading why `ayeaye check` reported a failed health check.
 ---
 
 # Setting up ayeaye
@@ -13,12 +13,13 @@ same commands they would type. Two ground rules govern every step:
   the user could run by hand, and anything consequential is shown before it
   runs.
 - **Consent is relayed, never assumed.** Run from a shell, `ayeaye setup` has
-  no terminal to ask on, so it declines both acts with a consequence —
-  downloading a model, starting a login service — and prints the exact by-hand
-  command under "not done, because you did not ask for it". Lean on that: run
-  setup bare, put its questions to the user in conversation with what each
-  means, and run the printed command (or re-run with `--yes`) only after the
-  user has said yes to that specific act.
+  no terminal to ask on, so it declines the one act with a consequence —
+  starting a login service — and prints the exact by-hand command under "not
+  done". Lean on that: run setup bare, put its
+  question to the user in conversation with what it means, and run the printed
+  command (or re-run with `--yes`) only after the user has said yes to that
+  specific act. Choosing models is *not* gated: it downloads nothing, and it is
+  itself a question, so it simply reports that it had nobody to ask.
 
 The binary *detects and verifies* network exposure, reverse proxies, mesh
 networks, coding agents, and tmux — it configures none of them. This skill
@@ -30,20 +31,25 @@ user's hand or explicit say-so, and every file edit is shown first.
 1. **Is ayeaye here at all?** `command -v ayeaye`. On a machine that has never
    had it, offer the README's one-line installer, or fetch the artifact for
    this OS and architecture from the GitHub releases page and put it on PATH.
-   Builds differ by acceleration: a machine with a usable NVIDIA card wants the
-   CUDA build, a Mac gets Metal in the Apple artifacts, and everything else the
-   static CPU build. Step 4's acceleration check is what catches a mismatch.
+   There is one artifact per OS and architecture — no acceleration variants,
+   because this binary runs no model. Speech and cleanup happen in a
+   [llama-swap](https://github.com/mostlygeek/llama-swap) the user runs
+   themselves, and the graphics card is that process's business.
 2. **`ayeaye setup`**, bare. Read what it prints back to the user:
-   - the machine summary and its **tier verdict** — `text-only`,
-     `lightweight`, `recommended`, or `maximum` — with the reason line naming
-     the constraint that held it back;
+   - the machine summary — the operating system, what installs software here,
+     and where a user service can live. **Not a hardware verdict.** There used
+     to be a tier — `text-only` through `maximum` — computed from memory,
+     cores, disk and the graphics card; it went with the models, because it was
+     only ever answering "which speech model fits here" and the models are not
+     here;
    - what it did: key minted, settings file written (`~/.config/ayeaye/env`),
-     service definition written;
-   - the "not done" list: the consent questions, each with its by-hand command.
-3. **Relay consent.** For each declined step, say what it costs — the model
-   download's size goes over the network; the service runs whenever they log
-   in — and on a yes, run the printed command (`ayeaye model pull <id>`,
-   `ayeaye service enable`).
+     models chosen, service definition written;
+   - the "not done" list: the consent question, with its by-hand command, and
+     any step that could not finish — a backend that was not running says so
+     here.
+3. **Relay consent.** For each declined step, say what it costs — the service
+   runs whenever they log in — and on a yes, run the printed command
+   (`ayeaye service enable`).
 4. **`ayeaye check`** to finish, and after every later change. Exit 0 is done;
    exit 1 means something is unfinished; exit 2 means the lock is off — stop
    and read [references/health-checks.md](references/health-checks.md) before
@@ -58,30 +64,34 @@ again and read the report" is always a safe move.
 
 ## Choosing a model
 
-The tier verdict already accounts for RAM, disk, cores, and the card; its
-suggested model (printed by setup) is the right default. The judgement the
-verdict cannot make:
+**ayeaye does not download, store, size or run models.** It asks a llama-swap
+what it is serving and calls two of them by name. So the questions this section
+used to answer — which model fits this machine's RAM, whether the architecture
+is supported, how big the download is — all belong to whoever configured
+llama-swap. ayeaye no longer even measures the memory, disk or graphics card it
+would have needed to answer them.
 
-- **Language.** The suggested `.en` models are English-only. Someone dictating
-  another language wants the multilingual twin — drop the `.en`
-  (`openai/whisper-small`), or `openai/whisper-large-v3-turbo` at the top
-  tier. Model IDs are `owner/name`, and the architecture allowlist is checked
-  at `pull` time, so trying one is cheap: an unsupported model is refused
-  before the weights download, never at first inference.
-- **The constraint names the fix.** A tier held back by `disk` rises after
-  freeing space where models land and re-running setup; `ram` or `cores` is
-  the machine's ceiling. Read the reason line rather than guessing.
-- **A slow machine that wants accuracy anyway** can hold a bigger model than
-  its tier suggests — say out loud that transcription latency is the price,
-  then `ayeaye model pull <id>` and `ayeaye model use <id>`.
-- **The card is not a model choice.** A CPU build beside a usable NVIDIA card
-  is reported by the acceleration check as `FAILED` — the fix is the CUDA
-  build artifact, not a smaller model. An AMD card runs on the processor
-  (candle has no ROCm backend); that is the machine's ceiling, reported as
-  skipped with its reason, and no setting changes it.
+What is left here:
 
-`ayeaye model ls` shows what is installed and which model is in use;
-`ayeaye model rm <id>` frees the space of one that did not work out.
+- **Is the backend reachable and serving both parts?** `ayeaye check`'s
+  **backend** line answers exactly that. A `FAILED` there names the models the
+  proxy does not have; `unknown` means nothing answered at the address.
+- **Which model plays which part.** `ayeaye model ls` lists what the backend
+  serves and marks the two in use. `ayeaye model choose` walks both roles and
+  smoke-tests each before writing anything down; `ayeaye model use speech NAME`
+  sets one. The names are the keys in llama-swap's `config.yaml`, not
+  `owner/name` ids.
+- **Where the backend is.** `AYEAYE_LLAMA_SWAP`, defaulting to
+  `http://127.0.0.1:8080`. `https://` and a path prefix both work, and a
+  backend on another machine is an ordinary setup.
+- **A speech model has to be one.** The proxy will happily list a language
+  model, and nothing but the smoke test can tell that it is the wrong kind —
+  which is why `choose` runs one. On the llama-swap side a speech model is
+  whisper.cpp's `whisper-server` with `--request-path /v1/audio/transcriptions
+  --inference-path ""`.
+- **Cleanup is optional.** Without `AYEAYE_CLEANUP_MODEL` dictation types the
+  raw transcript, which is what it degrades to when the model is unreachable
+  anyway. That is a worse dictation, not a broken one.
 
 ## Where settings live
 

@@ -22,12 +22,11 @@
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-use ayeaye_core::machine::Acceleration;
-use ayeaye_core::model::{Role, settings};
+use ayeaye_core::model::settings;
 use ayeaye_core::service::{Definition, Layout, Session, manual_instructions};
 use ayeaye_core::setup::{Choices, Consent, Consequence, Existing, Plan, Step, plan};
 
-use crate::models::{self, Fetcher};
+use crate::models::{self, Smoke};
 use crate::probe::Captured;
 use crate::service::{Runner, Services};
 
@@ -56,12 +55,6 @@ pub struct Places {
     pub state_dir: PathBuf,
     /// The key.
     pub token_file: PathBuf,
-    /// Where model weights land, spelled the way `models::` expects its
-    /// `store` argument: the state dir itself. `models::pull` and
-    /// `models::installed` append `models/` on their own, so a pre-joined
-    /// path here puts the weights in `models/models/` — a directory the
-    /// daemon never reads.
-    pub model_store: PathBuf,
 }
 
 impl Places {
@@ -71,7 +64,6 @@ impl Places {
             config_file: PathBuf::from(&layout.env_file),
             state_dir: state_dir.to_path_buf(),
             token_file: state_dir.join("token"),
-            model_store: state_dir.to_path_buf(),
         }
     }
 }
@@ -163,7 +155,7 @@ pub struct Flags {
     pub yes: bool,
     /// Do not install a service.
     pub no_service: bool,
-    /// Do not fetch any model.
+    /// Do not choose models.
     pub no_model: bool,
     /// The address to listen on.
     pub bind: Option<String>,
@@ -187,7 +179,7 @@ pub fn parse(args: &[String]) -> Result<Flags, String> {
             "--no-model" => flags.no_model = true,
             "--model" => {
                 let _ = value("--model")?;
-                return Err("--model was replaced; use `ayeaye model pull ID` then `ayeaye model use speech ID`, or run `ayeaye model choose`".to_string());
+                return Err("--model was replaced; use `ayeaye model use speech NAME`, or run `ayeaye model choose`".to_string());
             }
             "--bind" => flags.bind = Some(value("--bind")?),
             "--port" => {
@@ -298,7 +290,6 @@ pub fn decide(run: &Run<'_>, ask: &impl Ask) -> Plan {
                 false,
             );
         match consequence {
-            Consequence::Network => consent.network = agreed,
             Consequence::RunsAtLogin => consent.run_at_login = agreed,
         }
     }
@@ -312,11 +303,10 @@ pub fn decide(run: &Run<'_>, ask: &impl Ask) -> Plan {
 }
 
 /// Do it.
-pub fn carry_out<R: Runner, F: Fetcher, S: models::Smoke>(
+pub fn carry_out<R: Runner, S: Smoke>(
     plan: &Plan,
     run: &Run<'_>,
     runner: R,
-    fetcher: &F,
     smoke: &mut S,
     ask: &impl Ask,
     stamp: &str,
@@ -353,46 +343,28 @@ pub fn carry_out<R: Runner, F: Fetcher, S: models::Smoke>(
                 did.lines.push(written);
             }
             Step::ChooseModels => {
-                let settings = models::settings(&places.config_file)
-                    .map_err(|why| Failed::Model(why.to_string()))?;
-                let installed = models::inspect(&places.model_store);
-                let selected_bytes = |role, id: Option<&ayeaye_core::model::ModelId>| {
-                    installed
-                        .iter()
-                        .find(|model| model.role == Ok(role) && Some(&model.id) == id)
-                        .map(|model| model.bytes)
-                        .unwrap_or(0)
-                };
-                let machine = captured.machine();
-                let mb = 1024 * 1024;
-                let result = models::choose_interactive(
-                    fetcher,
-                    smoke,
-                    ask,
-                    models::Interactive {
-                        store: &places.model_store,
-                        config_file: &places.config_file,
-                        hub_host: &settings.hub,
-                        limits: models::SearchLimits {
-                            ram_bytes: machine.ram_mb.unwrap_or(0).saturating_mul(mb),
-                            disk_bytes: machine.disk_mb.unwrap_or(0).saturating_mul(mb),
-                            speech_bytes: selected_bytes(Role::Speech, settings.speech.as_ref()),
-                            cleanup_bytes: selected_bytes(Role::Cleanup, settings.cleanup.as_ref()),
-                        },
-                        role: None,
-                    },
-                );
-                match result {
+                // No search, no sizing against this machine, no download. The
+                // backend's own model list is the catalogue, and whoever wrote
+                // llama-swap's config already decided what fits here.
+                match models::choose_interactive(smoke, ask, &places.config_file, None) {
                     Ok(result) => {
-                        did.lines.extend(result.selected.into_iter().map(|selected| {
-                            format!("{} selected; smoke output: {}", selected.id, selected.smoke.trim())
-                        }));
+                        did.lines
+                            .extend(result.selected.into_iter().map(|selected| {
+                                format!(
+                                    "{} selected; smoke output: {}",
+                                    selected.name,
+                                    selected.smoke.trim()
+                                )
+                            }));
                         if result.cleanup_declined {
-                            did.lines.push("cleanup left unset; dictation will use raw transcripts".to_string());
+                            did.lines.push(
+                                "cleanup left unset; dictation will use raw transcripts"
+                                    .to_string(),
+                            );
                         }
                     }
                     Err(why) => did.declined.push(format!(
-                        "models skipped ({why}) — `ayeaye model add PATH` for an offline model, or `ayeaye model choose` when online"
+                        "models skipped ({why}) — start llama-swap and run `ayeaye model choose`"
                     )),
                 }
             }
@@ -599,28 +571,14 @@ pub fn effective(config_file: &Path, key: &str, default: &str) -> String {
     crate::config::env_then_file(config_file)(key).unwrap_or_else(|| default.to_string())
 }
 
-/// What this build runs inference on, as the core names it.
-///
-/// The one place `ayeaye_infer::Backend` is turned into `machine::Acceleration`,
-/// so the health check can compare what this build has against what this machine
-/// has without either crate learning the other's vocabulary.
-pub fn build_acceleration() -> Acceleration {
-    match ayeaye_infer::backend::selected() {
-        ayeaye_infer::backend::Backend::Cpu => Acceleration::Cpu,
-        ayeaye_infer::backend::Backend::Cuda => Acceleration::Cuda,
-        ayeaye_infer::backend::Backend::Metal => Acceleration::Metal,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Ask, Assumed, Flags, Places, Run, answer, build_acceleration, carry_out, decide, effective,
-        mint, parse, record_consent, write_settings,
+        Ask, Assumed, Flags, Places, Run, answer, carry_out, decide, effective, mint, parse,
+        record_consent, write_settings,
     };
     use crate::probe::{Captured, Sources, capture};
     use crate::service::{Outcome, Runner};
-    use ayeaye_core::machine::Acceleration;
     use ayeaye_core::service::{Layout, Session};
     use ayeaye_core::setup::{Step, urlsafe};
     use std::cell::RefCell;
@@ -642,24 +600,21 @@ mod tests {
         }
     }
 
-    /// A fetcher that records and downloads nothing.
-    #[derive(Default)]
-    struct NoDownloads {
-        asked: RefCell<Vec<String>>,
-    }
-
-    impl crate::models::Fetcher for NoDownloads {
-        fn get(&self, url: &str, _into: &Path) -> Result<(), String> {
-            self.asked.borrow_mut().push(url.to_string());
-            Err("this test never reaches the network".to_string())
-        }
-    }
-
+    /// A backend that is not there, which is what every check in this file has.
+    ///
+    /// It answers rather than panicking, because "the proxy is not running" is
+    /// the state a machine is in *during* setup more often than not — the whole
+    /// point of the step is that it degrades to a declined line rather than a
+    /// failed run.
     struct NoSmoke;
 
     impl crate::models::Smoke for NoSmoke {
-        fn run(&mut self, _role: ayeaye_core::model::Role, _dir: &Path) -> Result<String, String> {
-            panic!("these checks never reach inference")
+        fn models(&mut self) -> Result<Vec<String>, String> {
+            Err("nothing is listening on this test's backend".to_string())
+        }
+
+        fn run(&mut self, _role: ayeaye_core::model::Role, _model: &str) -> Result<String, String> {
+            panic!("a model is never reached without one being listed first")
         }
     }
 
@@ -699,10 +654,9 @@ mod tests {
     }
 
     fn machine_with(commands: &[&str]) -> Captured {
-        capture(
-            &Bare(commands.iter().map(|name| (*name).to_string()).collect()),
-            "/tmp/models",
-        )
+        capture(&Bare(
+            commands.iter().map(|name| (*name).to_string()).collect(),
+        ))
     }
 
     /// A directory of this test's own.
@@ -722,7 +676,6 @@ mod tests {
             config_file: root.join("config/ayeaye/env"),
             state_dir: root.join("state/ayeaye"),
             token_file: root.join("state/ayeaye/token"),
-            model_store: root.join("state/ayeaye"),
         }
     }
 
@@ -732,21 +685,6 @@ mod tests {
             &root.join("config").to_string_lossy(),
             &root.join("state").to_string_lossy(),
         )
-    }
-
-    // AYEAYE-81's sibling — setup's pull and the daemon's read must name the
-    // same store. `models::` appends `models/` internally, so the store is the
-    // state dir itself; a pre-joined `state_dir.join("models")` here once put
-    // every setup-fetched model in `models/models/`, where `Voice` (handed
-    // `config::state_dir()` bare) never looked, and dictation reported the
-    // model absent right after setup said it fetched it.
-    #[test]
-    fn the_model_store_is_the_path_the_daemon_reads_models_from() {
-        let root = scratch("store-agreement");
-        let state_dir = root.join("state/ayeaye");
-        let handed = Places::from(&layout(&root), &state_dir);
-        assert_eq!(handed.model_store, state_dir);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // AYEAYE-62 — the flags, including the pair that ask for opposite things. A
@@ -814,7 +752,6 @@ mod tests {
             &plan,
             &run,
             Recorder::default(),
-            &NoDownloads::default(),
             &mut NoSmoke,
             &Assumed(true),
             "1",
@@ -823,7 +760,7 @@ mod tests {
         assert!(
             did.declined
                 .iter()
-                .any(|line| line.contains("ayeaye model add PATH")),
+                .any(|line| line.contains("ayeaye model choose")),
             "{:#?}",
             did.declined
         );
@@ -857,20 +794,10 @@ mod tests {
             "and it is owed, not forgotten"
         );
 
-        let fetcher = NoDownloads::default();
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &run,
-            &runner,
-            &fetcher,
-            &mut NoSmoke,
-            &Assumed(false),
-            "1",
-        )
-        .expect("it should finish");
+        let did = carry_out(&decided, &run, &runner, &mut NoSmoke, &Assumed(false), "1")
+            .expect("it should finish");
 
-        assert!(fetcher.asked.borrow().is_empty(), "nothing was downloaded");
         assert!(
             runner.ran.borrow().is_empty(),
             "no service manager was addressed: {:?}",
@@ -912,16 +839,8 @@ mod tests {
         };
         let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &run,
-            &runner,
-            &NoDownloads::default(),
-            &mut NoSmoke,
-            &Assumed(false),
-            "1",
-        )
-        .expect("it should finish");
+        let did = carry_out(&decided, &run, &runner, &mut NoSmoke, &Assumed(false), "1")
+            .expect("it should finish");
 
         let unit = root.join("config/systemd/user/ayeaye.service");
         assert!(unit.exists(), "{:?}", did.lines);
@@ -1157,16 +1076,8 @@ mod tests {
         let decided = decide(&run, &Assumed(true));
         assert!(!decided.steps.contains(&Step::InstallService));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &run,
-            &runner,
-            &NoDownloads::default(),
-            &mut NoSmoke,
-            &Assumed(false),
-            "1",
-        )
-        .expect("a finished run");
+        let did = carry_out(&decided, &run, &runner, &mut NoSmoke, &Assumed(false), "1")
+            .expect("a finished run");
         assert!(
             did.lines
                 .iter()
@@ -1200,16 +1111,8 @@ mod tests {
         };
         let decided = decide(&run, &Assumed(false));
         let runner = Recorder::default();
-        let did = carry_out(
-            &decided,
-            &run,
-            &runner,
-            &NoDownloads::default(),
-            &mut NoSmoke,
-            &Assumed(false),
-            "1",
-        )
-        .expect("a finished run");
+        let did = carry_out(&decided, &run, &runner, &mut NoSmoke, &Assumed(false), "1")
+            .expect("a finished run");
         assert!(
             did.lines
                 .iter()
@@ -1333,15 +1236,7 @@ mod tests {
                 }
             }
         }
-        let failed = carry_out(
-            &decided,
-            &run,
-            Refuses,
-            &NoDownloads::default(),
-            &mut NoSmoke,
-            &Assumed(false),
-            "7",
-        );
+        let failed = carry_out(&decided, &run, Refuses, &mut NoSmoke, &Assumed(false), "7");
         assert!(failed.is_err(), "the enable should have failed");
         let held = std::fs::read_to_string(places.state_dir.join("consent"))
             .expect("the record survives the failure it preceded");
@@ -1349,28 +1244,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // AYEAYE-62 — the one place a compiled-in backend is turned into the core's
-    // word for it, so the health check can compare the two without either crate
-    // learning the other's vocabulary. The assertion is chosen at compile time
-    // because so is the answer.
+    // AYEAYE-62, rewritten by AYEAYE-101. There is no compiled-in backend any
+    // more: this binary runs no model, so it has no acceleration to name. What
+    // is left of the original assertion is the half that still means something
+    // — that this file reaches for the core's encoder rather than growing a
+    // second one.
     #[test]
-    fn the_build_names_its_acceleration_in_the_cores_words() {
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        assert_eq!(build_acceleration(), Acceleration::Cpu);
-        #[cfg(feature = "cuda")]
-        assert_eq!(build_acceleration(), Acceleration::Cuda);
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        assert_eq!(build_acceleration(), Acceleration::Metal);
-        // And whatever it is, it is one the core can compare against a machine.
-        assert_ne!(
-            build_acceleration(),
-            Acceleration::Rocm,
-            "no ROCm backend exists"
-        );
-        assert_eq!(
-            urlsafe(&[0, 0, 0]),
-            "AAAA",
-            "the core's encoder, not a second one"
-        );
+    fn the_shell_uses_the_cores_encoder_rather_than_a_second_one() {
+        assert_eq!(urlsafe(&[0, 0, 0]), "AAAA");
     }
 }
